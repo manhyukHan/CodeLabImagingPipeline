@@ -1,0 +1,11 @@
+numpy
+pandas
+openpyxl
+h5py
+opencv-python
+scipy
+scikit-image
+tifffile
+matplotlib
+ipywidgets
+cellpose

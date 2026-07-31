@@ -7,7 +7,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import ipywidgets as widgets
 import time
-import cellpose.models
 import h5py
 
 import matplotlib.pyplot as plt
@@ -24,7 +23,6 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
-model_cyto = cellpose.models.Cellpose(model_type='cyto3')
 
 colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
           '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff',
@@ -516,3 +514,238 @@ def localize_spots_worker(fov, hybe, hybe_list, cell_parameter_dict,
         return np.array(xyzs, dtype=float), (img,bimg,np.array(xyzs_crop, dtype=float)), hybe
     else:
         return np.zeros((0,7), dtype=float), (img,bimg,np.zeros((0,7), dtype=float)), hybe
+
+def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
+                            max_to_background, max_to_average, absolute_threshold,
+                            min_distance, frac, max_num_alleles, pad):
+    """
+    2D localization for one cell in one hybe, with sub-pixel gaussian
+    refinement (the fit_gaussian_2d step that exists but is commented out
+    in localize_spots_worker above, reactivated here). Ports
+    scripts/utils.py's localize_2d_spots_worker, adapted to this project's
+    ACell/composed-matrix model instead of the old flat H5 /cells/matrix
+    arrays. Returns (cell.id, hybe, [ASpot, ...]) -- run inside a
+    ProcessPoolExecutor, so results are returned rather than mutating cell
+    in place (a separate-process copy wouldn't be visible to the caller).
+    """
+    from .spot import ASpot
+    spots = []
+    try:
+        x_area, y_area = cell.get_area_in_readout(hybe)
+    except KeyError:
+        return cell.id, hybe, spots
+    if len(x_area) == 0:
+        return cell.id, hybe, spots
+    x_area, y_area = x_area.astype(int), y_area.astype(int)
+
+    height, width = cell.frame_shape
+    rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
+    rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
+
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        # h5py fancy-indexing requires ascending-order indices (unlike numpy);
+        # y_area/x_area come from np.where and aren't sorted, so slice the
+        # rectangular crop first (always contiguous/ascending) and do the
+        # cell-mask fancy indexing on the resulting in-memory array instead.
+        mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
+        stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]
+        img = np.full((rymax - rymin, rxmax - rxmin), np.nan, dtype=float)
+        img[y_area - rymin, x_area - rxmin] = mip_crop[y_area - rymin, x_area - rxmin]
+
+    depth = stacks_value.shape[-1]
+    stacks = np.full((rymax - rymin, rxmax - rxmin, depth), np.nan, dtype=float)
+    stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
+    bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth) -- Z-profile per column
+
+    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
+    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+
+    cutoff = max_to_background * np.nanquantile(img, 0.5)
+    yx = peak_local_max(img, min_distance=min_distance, exclude_border=1,
+                        threshold_abs=max(cutoff, absolute_threshold))
+    if len(yx) == 0:
+        return cell.id, hybe, spots
+    brightness = img[yx[:, 0], yx[:, 1]]
+
+    for j in brightness.argsort()[::-1][:max_num_alleles]:
+        y, x = yx[j]
+        z_candidates = peak_local_max(bimg[x], exclude_border=1,
+                                      threshold_abs=max(bimg[x].max() * .9, absolute_threshold, cutoff))
+        if len(z_candidates) == 0:
+            continue
+        z = int(z_candidates[bimg[x, z_candidates].argmax()])
+
+        symin, symax = max(0, y - pad), min(img.shape[0], y + pad + 1)
+        sxmin, sxmax = max(0, x - pad), min(img.shape[1], x + pad + 1)
+        params = fit_gaussian_2d(img[symin:symax, sxmin:sxmax], x - sxmin, y - symin)
+        if params is None:
+            continue
+        amp, xo, yo, sigma_x, sigma_y, theta, offset = params
+        if not (abs(sigma_x) > .5 and abs(sigma_y) > .5):
+            continue
+        if ((xo + sxmin - x) ** 2 + (yo + symin - y) ** 2) ** .5 >= 3:
+            continue
+        if not (amp + offset > max_to_average * offset and brightness[j] > brightness.max() * frac):
+            continue
+
+        raw_x, raw_y = x + rxmin, y + rymin
+        x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
+        z1 = z + Hz[1, 2]
+
+        spot = ASpot()
+        spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
+                          coordinate=(float(x1), float(y1), float(z1)),
+                          raw_coordinate=(float(raw_x), float(raw_y), float(z)),
+                          brightness=float(brightness[j]))
+        spots.append(spot)
+
+    return cell.id, hybe, spots
+
+def localize_cells_2d(cell_container, fov, hybe_records, channel,
+                      max_to_background=1.25, max_to_average=1.25, absolute_threshold=450.0,
+                      min_distance=3, frac=0.8, max_num_alleles=2, pad=5,
+                      storage_path=None, n_procs=4):
+    """
+    Bulk (non-interactive) 2D localization over every cell in
+    cell_container.get_cells(fov), across every hybe in hybe_records.
+    Parameters are an already-confirmed set -- tune interactively via
+    LocalizationWidget first, then run this in bulk; not re-tuned per call.
+    Writes results directly into each cell's .spots/.num_spots/.total_num_spots.
+    """
+    cells = cell_container.get_cells(fov)
+    tasks = [(cell, record['folder']) for cell in cells for record in hybe_records]
+
+    with ProcessPoolExecutor(max_workers=n_procs) as executor:
+        futures = [executor.submit(localize_cell_2d_worker, cell, hybe, channel, storage_path, fov,
+                                   max_to_background, max_to_average, absolute_threshold,
+                                   min_distance, frac, max_num_alleles, pad)
+                  for cell, hybe in tasks]
+        cells_by_id = {c.id: c for c in cells}
+        for future in as_completed(futures):
+            cell_id, hybe, spots = future.result()
+            if len(spots) == 0:
+                continue
+            cell = cells_by_id[cell_id]
+            cell.spots.extend(spots)
+            cell.num_spots[hybe] = cell.num_spots.get(hybe, 0) + len(spots)
+            cell.total_num_spots += len(spots)
+
+def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
+                            max_to_background, max_to_average, absolute_threshold,
+                            min_distance, frac, max_num_alleles, max_sigma, max_deviation, pad, spad):
+    """
+    3D localization for one cell in one hybe, with sub-pixel 2D+3D gaussian
+    refinement -- ports scripts/utils.py's localize_3d_spots_worker, same
+    adaptation as localize_cell_2d_worker above.
+    """
+    from .spot import ASpot
+    spots = []
+    try:
+        x_area, y_area = cell.get_area_in_readout(hybe)
+    except KeyError:
+        return cell.id, hybe, spots
+    if len(x_area) == 0:
+        return cell.id, hybe, spots
+    x_area, y_area = x_area.astype(int), y_area.astype(int)
+
+    height, width = cell.frame_shape
+    rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
+    rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
+
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        # h5py fancy-indexing requires ascending-order indices (unlike numpy);
+        # y_area/x_area come from np.where and aren't sorted, so slice the
+        # rectangular crop first (always contiguous/ascending) and do the
+        # cell-mask fancy indexing on the resulting in-memory array instead.
+        mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
+        stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]
+        img = np.full((rymax - rymin, rxmax - rxmin), np.nan, dtype=float)
+        img[y_area - rymin, x_area - rxmin] = mip_crop[y_area - rymin, x_area - rxmin]
+
+    depth = stacks_value.shape[-1]
+    stacks = np.full((rymax - rymin, rxmax - rxmin, depth), np.nan, dtype=float)
+    stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
+    bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth)
+
+    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
+    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+
+    cutoff = max_to_background * np.nanquantile(img, 0.5)
+    yx = peak_local_max(img, min_distance=min_distance, exclude_border=1,
+                        threshold_abs=max(cutoff, absolute_threshold))
+    if len(yx) == 0:
+        return cell.id, hybe, spots
+    brightness = img[yx[:, 0], yx[:, 1]]
+
+    for j in brightness.argsort()[::-1][:max_num_alleles]:
+        y, x = yx[j]
+        z_candidates = peak_local_max(bimg[x], exclude_border=1,
+                                      threshold_abs=max(bimg[x].max() * .9, absolute_threshold, cutoff))
+        if len(z_candidates) == 0:
+            continue
+        z = int(z_candidates[bimg[x, z_candidates].argmax()])
+
+        symin, symax = max(0, y - pad), min(img.shape[0], y + pad + 1)
+        sxmin, sxmax = max(0, x - pad), min(img.shape[1], x + pad + 1)
+        params2d = fit_gaussian_2d(img[symin:symax, sxmin:sxmax], x - sxmin, y - symin)
+        if params2d is None:
+            continue
+        amp, xo, yo, sigma_x, sigma_y, theta, offset = params2d
+        if not (abs(sigma_x) > .5 and abs(sigma_y) > .5 and (sigma_x * sigma_y) ** .5 < max_sigma):
+            continue
+        if ((xo + sxmin - x) ** 2 + (yo + symin - y) ** 2) ** .5 >= max_deviation:
+            continue
+        if not (amp > (max_to_average - 1) * offset and brightness[j] > brightness.max() * frac):
+            continue
+
+        szmin, szmax = max(0, z - spad), min(depth, z + spad + 1)
+        zyx = stacks[symin:symax, sxmin:sxmax, szmin:szmax]
+        params3d = fit_gaussian_3d(zyx, x - sxmin, y - symin, z - szmin)
+        if params3d is None:
+            continue
+        amp3, x0, y0, z0, sigma_x3, sigma_y3, sigma_z3, offset3 = params3d
+        sigma3 = abs(sigma_x3 * sigma_y3 * sigma_z3) ** (1 / 3)
+        if not (abs(sigma_x3) > .5 and abs(sigma_y3) > .5 and abs(sigma_z3) > .5 and sigma3 < max_sigma):
+            continue
+        if ((x0 + sxmin - x) ** 2 + (y0 + symin - y) ** 2 + (z0 + szmin - z) ** 2) ** .5 >= max_deviation:
+            continue
+        if not (amp3 > (max_to_average - 1) * offset3 and brightness[j] > brightness.max() * frac):
+            continue
+
+        raw_x, raw_y, raw_z = x + rxmin, y + rymin, z0 + szmin
+        x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
+        z1 = raw_z + Hz[1, 2]
+
+        spot = ASpot()
+        spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
+                          coordinate=(float(x1), float(y1), float(z1)),
+                          raw_coordinate=(float(raw_x), float(raw_y), float(raw_z)),
+                          brightness=float(brightness[j]))
+        spots.append(spot)
+
+    return cell.id, hybe, spots
+
+def localize_cells_3d(cell_container, fov, hybe_records, channel,
+                      max_to_background=1.25, max_to_average=1.25, absolute_threshold=450.0,
+                      min_distance=3, frac=0.8, max_num_alleles=2, max_sigma=3.0, max_deviation=3.0,
+                      pad=5, spad=5, storage_path=None, n_procs=4):
+    """3D counterpart of localize_cells_2d -- see localize_cell_3d_worker."""
+    cells = cell_container.get_cells(fov)
+    tasks = [(cell, record['folder']) for cell in cells for record in hybe_records]
+
+    with ProcessPoolExecutor(max_workers=n_procs) as executor:
+        futures = [executor.submit(localize_cell_3d_worker, cell, hybe, channel, storage_path, fov,
+                                   max_to_background, max_to_average, absolute_threshold,
+                                   min_distance, frac, max_num_alleles, max_sigma, max_deviation, pad, spad)
+                  for cell, hybe in tasks]
+        cells_by_id = {c.id: c for c in cells}
+        for future in as_completed(futures):
+            cell_id, hybe, spots = future.result()
+            if len(spots) == 0:
+                continue
+            cell = cells_by_id[cell_id]
+            cell.spots.extend(spots)
+            cell.num_spots[hybe] = cell.num_spots.get(hybe, 0) + len(spots)
+            cell.total_num_spots += len(spots)

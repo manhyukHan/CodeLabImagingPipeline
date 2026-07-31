@@ -120,6 +120,271 @@ def convert_tiff_to_h5_worker(trial_path, readouts, fov, channel_list, fiducial_
     except Exception as e:
         logging.error(f'Error processing FOV {fov} in trial {trial_path}: {e}')
 
+def parse_experiment_layout(xlsx_path):
+    """
+    Parse an ExperimentLayout.xlsx sheet into one record per hybe -- the
+    authoritative source for which channels exist per hybe (never a fixed
+    405/488/555/635 set), the fiducial channel, readout identity/datatype,
+    and ingestion order (hybe_num). datatype/readout_id are informational
+    only: alignment logic must never branch on them (the alignment reference
+    is always an explicit input, not inferred from e.g. a 'barcode' datatype).
+
+    Returns a list of dicts: folder, readout_id, datatype, hybe_num,
+    channels (list[int]), fiducial_channel (int), channel_layout (str),
+    total_frames (int), readout_name (str or None -- DNA layouts have no
+    rnaNames column, so target rounds are anonymous).
+    """
+    df = pd.read_excel(xlsx_path)
+    has_names = 'rnaNames' in df.columns
+    records = []
+    for _, row in df.iterrows():
+        channels = [int(c.strip()) for c in str(row['channels']).strip('[]').split(',')]
+        readout_name = str(row['rnaNames']) if has_names and pd.notna(row['rnaNames']) else None
+        records.append({
+            'folder': str(row['FolderName']),
+            'readout_id': int(row['Readouts']),
+            'datatype': str(row['DataType']),
+            'hybe_num': int(row['HybNum']),
+            'channels': channels,
+            'fiducial_channel': int(row['fiducialChannel']),
+            'channel_layout': str(row['channelLayout']),
+            'total_frames': int(row['totalFrames']),
+            'readout_name': readout_name,
+        })
+    return records
+
+def read_dax(filename, matlab=False):
+    """
+    Parse a .dax + .inf pair into a (height, width, frames) array. Ported
+    from scripts/utils.py -- validated against real RNA_Expt/DNA_Expt .dax
+    files (shape and non-degenerate signal confirmed against
+    ExperimentLayout.xlsx's totalFrames/channels for the same hybes).
+    """
+    if filename.endswith('.dax'):
+        daxname = filename
+        infofile = filename.replace('.dax', '.inf')
+    elif filename.endswith('.inf'):
+        infofile = filename
+        daxname = filename.replace('.inf', '.dax')
+    else:
+        daxname = filename + '.dax'
+        infofile = filename + '.inf'
+
+    width, height, frames = 0, 0, 0
+    dtype = np.uint16
+
+    with open(infofile, 'r') as f:
+        for line in f:
+            if 'frame dimensions' in line:
+                width, height = map(int, line.split('=')[-1].split('x'))
+            elif 'number of frames' in line:
+                frames = int(line.split('=')[-1])
+            elif 'data type' in line:
+                if '16 bit integers' in line:
+                    dtype = np.uint16
+                elif '8 bit integers' in line:
+                    dtype = np.uint8
+                else:
+                    dtype = np.float32
+
+    if matlab:
+        with open(daxname, 'rb') as f:
+            data = np.fromfile(f, dtype=dtype).reshape((height, width, frames), order='F').transpose((1, 0, 2)).squeeze()
+    else:
+        with open(daxname, 'rb') as f:
+            data = np.fromfile(f, dtype=dtype).reshape((height, width, frames), order='F').squeeze()
+    return data
+
+def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False):
+    """
+    Convert one FOV's raw .dax for one hybe into a per-(fov,hybe) H5 file,
+    channel/readout/datatype-aware per parse_experiment_layout. Only the
+    channels actually listed for this hybe get a dataset -- e.g. this real
+    dataset is always [555, 635], so no empty 405/488 containers are made.
+    Note: DAX-sourced /stack/ch{ch} is (height, width, depth) -- depth last,
+    since that's what read_dax naturally produces -- unlike the TIFF path
+    above, which is (depth, height, width). Any future unified reader needs
+    to know which ingestion path produced a given file.
+    """
+    folder = hybe_record['folder']
+    channels = hybe_record['channels']
+    os.makedirs(os.path.join(storage_path, f'FOV{fov:02d}'), exist_ok=True)
+    stack_h5name = os.path.join(storage_path, f'FOV{fov:02d}', f'{folder}_stack.h5')
+
+    if os.path.exists(stack_h5name):
+        if not overwrite:
+            return fov, folder, None
+        os.remove(stack_h5name)
+
+    # ExperimentLayout's totalFrames is the authoritative source for depth (z-plane
+    # count) per hybe -- e.g. barcode hybes here have totalFrames=354 (177 z-planes
+    # per channel) vs. 260 (130 z-planes) for regular hybes, so this must be read
+    # per-hybe from the layout, never assumed uniform across a dataset.
+    expected_depth = hybe_record['total_frames'] // len(channels)
+
+    dax_path = os.path.join(dax_directory, folder, f'ConvZscan_{fov-1:02d}.dax')
+    try:
+        dax = read_dax(dax_path)
+        attributes = {
+            'hybe': folder,
+            'fov': fov,
+            'readout_id': hybe_record['readout_id'],
+            'readout_name': hybe_record['readout_name'] or '',
+            'datatype': hybe_record['datatype'],
+            'modality': modality,
+            'fiducial_channel': hybe_record['fiducial_channel'],
+            'channel_list': np.array([str(ch) for ch in channels], dtype='S'),
+            'total_frames': hybe_record['total_frames'],
+            'expected_depth': expected_depth,
+            'shape': (),
+            'path': dax_path,
+        }
+
+        with h5py.File(stack_h5name, 'w') as f:
+            stack_group = f.create_group('/stack')
+            mip_group = f.create_group('/mip')
+            matrix_group = f.create_group('/matrix')
+            f.attrs.update(attributes)
+
+            dat = None
+            for cid, ch in enumerate(channels):
+                dat = dax[:, :, cid::len(channels)]
+                if dat.shape[-1] != expected_depth:
+                    # Layout and actual DAX content disagree -- surface it loudly
+                    # rather than silently ingesting a shape the layout didn't predict.
+                    raise ValueError(f'depth mismatch for {folder} ch{ch}: DAX has '
+                                     f'{dat.shape[-1]} z-planes, ExperimentLayout '
+                                     f'totalFrames predicts {expected_depth}')
+                create_or_replace_dataset(stack_group, f'ch{ch}', dat, 'uint16')
+                create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
+            create_or_replace_dataset(matrix_group, folder, np.eye(3), 'float32')
+            attributes['shape'] = dat.shape
+            f.attrs.update(attributes)
+        logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')
+        return fov, folder, None
+    except FileNotFoundError:
+        logging.error(f'DAX file not found: {dax_path}')
+        return fov, folder, 'FileNotFoundError'
+    except Exception as e:
+        logging.error(f'Error processing FOV {fov}, hybe {folder}: {e}')
+        return fov, folder, str(e)
+
+def convert_dax_to_h5_main(fov_list, hybe_records, dax_directory, storage_path, modality, overwrite=False, num_workers=4):
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for fov, hybe_record in product(fov_list, hybe_records):
+            futures.append(executor.submit(convert_dax_to_h5_worker, fov, hybe_record, dax_directory, storage_path, modality, overwrite))
+        for future in as_completed(futures):
+            fov, hybe, error = future.result()
+            if error is not None:
+                print(f'Error processing FOV {fov}, hybe {hybe}: {error}', file=sys.stderr)
+
+def dax_vlinks_h5(storage_path, fov_list, hybe_records, filename='vlinks.h5', overwrite=False):
+    """
+    Like vlinks_h5 below, but driven directly by ExperimentLayout records
+    (ordered by hybe_num) instead of re-parsing hybe codes out of filenames
+    -- convert_dax_to_h5_worker names per-hybe files after the raw source
+    folder (e.g. 'Hyb_101_stack.h5'), which reorder_hybe_list_frompath's
+    single-underscore-split assumption doesn't parse correctly.
+
+    Depth (z-plane count) is read per-hybe, not assumed uniform: this real
+    dataset's barcode hybes have a different totalFrames than regular hybes
+    (e.g. 177 vs 130 z-planes), so a single shared stack_shape silently
+    truncated the deeper hybes when a virtual dataset used the shallowest
+    hybe's depth for all of them. The virtual stack dataset is sized to the
+    max depth across hybes, and each hybe's VirtualSource is only assigned
+    into its own actual depth -- shallower hybes leave the remainder at the
+    HDF5 fill value, matching scripts/utils.py's combine_and_initialize_h5_files.
+    """
+    def create_fov_groups(vlink_file, fov):
+        fov_group = vlink_file.create_group(f'FOV{fov:02d}')
+        fov_group.create_group('mip')
+        fov_group.create_group('stack')
+        fov_group.create_group('matrix')
+        fov_group.create_group('cells')
+        return fov_group
+
+    def create_virtual_datasets(fov_path, hybe_list, channel_list, height, width, depth_by_hybe):
+        max_depth = max(depth_by_hybe.values())
+        stack_layouts = {}
+        mip_layouts = {}
+        for ch in channel_list:
+            stack_layout = h5py.VirtualLayout(shape=(len(hybe_list), height, width, max_depth), dtype='uint16')
+            mip_layout = h5py.VirtualLayout(shape=(len(hybe_list), height, width), dtype='uint16')
+            for hid, hybe in enumerate(hybe_list):
+                source_path = os.path.join(fov_path, f'{hybe}_stack.h5')
+                with h5py.File(source_path, 'r') as sample_h5:
+                    if f'ch{ch}' not in sample_h5['/stack']:
+                        continue
+                depth = depth_by_hybe[hybe]
+                vsource_stack = h5py.VirtualSource(source_path, f'/stack/ch{ch}', shape=(height, width, depth), dtype='uint16')
+                vsource_mip = h5py.VirtualSource(source_path, f'/mip/ch{ch}', shape=(height, width), dtype='uint16')
+                stack_layout[hid, :, :, :depth] = vsource_stack
+                mip_layout[hid, ...] = vsource_mip
+            stack_layouts[ch] = stack_layout
+            mip_layouts[ch] = mip_layout
+        return stack_layouts, mip_layouts
+
+    hybe_records = sorted(hybe_records, key=lambda r: r['hybe_num'])
+    hybe_list = [r['folder'] for r in hybe_records]
+    fov_dirs = [f'FOV{fov:02d}' for fov in fov_list if os.path.exists(os.path.join(storage_path, f'FOV{fov:02d}'))]
+    vlink_path = os.path.join(storage_path, filename)
+
+    if os.path.exists(vlink_path) and not overwrite:
+        vlink_file = h5py.File(vlink_path, 'r+')
+    else:
+        vlink_file = h5py.File(vlink_path, 'w')
+        overwrite = True
+
+    try:
+        vlink_file.attrs['fov_list'] = np.array(fov_list, dtype='i4')
+        vlink_file.attrs['hybe_list'] = np.array(hybe_list, dtype='S')
+        vlink_file.attrs['readout_id_list'] = np.array([r['readout_id'] for r in hybe_records], dtype='i4')
+        vlink_file.attrs['datatype_list'] = np.array([r['datatype'] for r in hybe_records], dtype='S')
+
+        total_channel_list = sorted(set(ch for r in hybe_records for ch in r['channels']))
+        vlink_file.attrs['channels_list'] = total_channel_list
+
+        # Depth is derived straight from ExperimentLayout's totalFrames (already
+        # validated per-hybe against the actual ingested DAX content at ingestion
+        # time -- see convert_dax_to_h5_worker) rather than re-opening every
+        # per-hybe file just to read its shape attr back.
+        depth_by_hybe = {r['folder']: r['total_frames'] // len(r['channels']) for r in hybe_records}
+        vlink_file.attrs['depth_by_hybe'] = np.array([depth_by_hybe[h] for h in hybe_list], dtype='i4')
+
+        height = width = None
+        for fov_dir in fov_dirs:
+            fov = int(fov_dir.replace('FOV', ''))
+            fov_group = create_fov_groups(vlink_file, fov) if overwrite else vlink_file[f'FOV{fov:02d}']
+            fov_path = os.path.join(storage_path, fov_dir)
+
+            if height is None:
+                # height/width aren't in ExperimentLayout -- read once from any
+                # already-ingested hybe file (uniform across a dataset in practice).
+                with h5py.File(os.path.join(fov_path, f'{hybe_list[0]}_stack.h5'), 'r') as sample_h5:
+                    h, w, _ = tuple(sample_h5.attrs['shape'])
+                    height, width = int(h), int(w)
+                vlink_file.attrs['stack_shape'] = np.array((height, width, max(depth_by_hybe.values())), dtype='i4')
+
+            stack_layouts, mip_layouts = create_virtual_datasets(fov_path, hybe_list, total_channel_list, height, width, depth_by_hybe)
+            for ch, stack_layout in stack_layouts.items():
+                if f'ch{ch}' in fov_group['stack']: del fov_group['stack'][f'ch{ch}']
+                fov_group['stack'].create_virtual_dataset(f'ch{ch}', stack_layout)
+            for ch, mip_layout in mip_layouts.items():
+                if f'ch{ch}' in fov_group['mip']: del fov_group['mip'][f'ch{ch}']
+                fov_group['mip'].create_virtual_dataset(f'ch{ch}', mip_layout)
+
+            for hybe in hybe_list:
+                with h5py.File(os.path.join(fov_path, f'{hybe}_stack.h5'), 'r') as hybe_h5:
+                    matrix = hybe_h5['/matrix'][hybe][:]
+                if hybe in fov_group['matrix']: del fov_group['matrix'][hybe]
+                fov_group['matrix'].create_dataset(hybe, data=matrix, dtype='float32')
+    finally:
+        vlink_file.flush()
+        vlink_file.close()
+
+    return vlink_path
+
 def convert_tiff_to_h5_main(trial_path_dict, fov_list, 
                             channel_list, fiducial_channel, depth, storage_path, template, job_name, 
                             num_workers=4):
@@ -367,6 +632,46 @@ def compute_msd_homography_matrix(moving_image, reference_image, fixed_scale=1.0
     
     #print(f"Homography Matrix:\n{homography_matrix}")
     return homography_matrix
+
+def compute_features_affinelike_matrix(moving_image, reference_image):
+    """
+    Ported from scripts/utils.py. ORB feature matching + RANSAC affine
+    estimation, with the estimated 2x2 linear part re-orthogonalized via SVD
+    (U @ Vt) so the result is a pure rotation+translation (no shear/skew) --
+    an "affine-like" (rigid) matrix.
+
+    Confirmed via a synthetic ground-truth test (apply a known rotation +
+    translation to a real MIP, recover it) to correctly detect rotation --
+    residual MSD ~280-300 after correction at both 3deg and 8deg synthetic
+    rotation, vs. thousands uncorrected. compute_msd_homography_matrix above
+    (Powell optimization over dx/dy/angle) was tested the same way and does
+    NOT recover rotation at all, even at 8deg -- it isn't just the small-
+    angle threshold in find_best_alignment, the optimizer itself converges
+    to angle=0 regardless of true rotation for this kind of image. Falls
+    back to the MSD method if feature matching fails (e.g. too few
+    keypoints/matches for RANSAC).
+    """
+    try:
+        orb = cv2.ORB_create()
+        kp1, des1 = orb.detectAndCompute(moving_image, None)
+        kp2, des2 = orb.detectAndCompute(reference_image, None)
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 2)
+
+        H = np.eye(3)
+        A, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
+        U, _, Vt = np.linalg.svd(A[:2, :2])
+        Afixed = U @ Vt
+        H[:2, :2] = Afixed
+        H[:2, 2] = A[:2, 2]
+        return H
+    except Exception:
+        return compute_msd_homography_matrix(moving_image, reference_image)
 
 def align_mips_worker(storage_path, fov, hybe, reference_hybe, reference_mip, reference_channel, lb=0.3, up=0.9999):
     """

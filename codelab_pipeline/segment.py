@@ -2,14 +2,22 @@ import os
 import sys
 import numpy as np
 import ipywidgets as widgets
-import cellpose.models
 import h5py
 
 from IPython.display import display, clear_output, HTML
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
-model_cyto = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
+
+_model_cyto = None
+
+def get_model_cyto():
+    """Lazily load the Cellpose cyto3 model on first use, not at import time."""
+    global _model_cyto
+    if _model_cyto is None:
+        import cellpose.models
+        _model_cyto = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
+    return _model_cyto
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -130,7 +138,13 @@ class SegmentWidget(object):
                     vmin=np.quantile(reference_image,0.3),
                     vmax=np.quantile(reference_image,0.999), )
 
-        masks, flows, styles, diams = model_cyto.eval([reference_image], diameter=diameter, channels=[0,0], do_3D=False)
+        # eval()'s return tuple length varies by cellpose version/model class
+        # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
+        # Cellpose/cyto3 class used here) -- take masks by position only,
+        # matching CellClassifier/utils/cellpose_segmentation.py's approach,
+        # so this doesn't break if that changes.
+        result = get_model_cyto().eval([reference_image], diameter=diameter, channels=[0,0], do_3D=False)
+        masks = result[0]
         mask = masks[0].astype(float)
         v,c = np.unique(mask, return_counts=True)
         mask[np.isin(mask, v[c < min_size])] = 0

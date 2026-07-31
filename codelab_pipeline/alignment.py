@@ -1,9 +1,9 @@
 import os
+from functools import reduce
 import numpy as np
 import numpy.linalg as la
 import ipywidgets as widgets
 import time
-import cellpose.models
 import h5py
 
 import matplotlib.pyplot as plt
@@ -18,7 +18,6 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
-model_cyto = cellpose.models.Cellpose(model_type='cyto3')
 
 colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
           '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff',
@@ -53,6 +52,256 @@ def align_cell(yx, H, shape):
     closed = cv2.morphologyEx(adjusted_mask, cv2.MORPH_CLOSE, kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
     cy,cx = np.where(closed > 0)
     return cy,cx
+
+def compose_chain(matrices):
+    """
+    Compose an ordered list of 3x3 affine-like matrices into one final
+    matrix. matrices[0] is applied to a raw point first (innermost),
+    matrices[-1] last (outermost) -- e.g. compose_chain([H_within, H_across])
+    for the within/across-experiment case, or
+    compose_chain([H_within, H_across, H_fine]) once a per-cell/per-spot
+    fine-alignment step (applied after segmentation/localization) exists.
+    """
+    return reduce(np.matmul, reversed(matrices))
+
+def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.5):
+    """
+    Mean squared pixel error after warping moving_norm by H, over the region
+    where both the warped image and reference have signal. Lower is a
+    better fit; used to pick between candidate alignment methods below.
+
+    Rejects (returns inf for) any H whose valid overlap covers less than
+    min_overlap_frac of the image. Plain MSD over the overlap alone isn't
+    enough: a degenerate transform that happens to rotate+translate the
+    moving image into a small, coincidentally-similar corner can score a
+    LOWER raw MSD than a correct, mostly-overlapping alignment simply
+    because it's averaging over far fewer, cherry-picked pixels -- observed
+    on a real cross-modal pair, where a bad transform (8.6% overlap) scored
+    better than the correct one (62.2% overlap) on raw MSD alone. Two
+    hybridization rounds of the same FOV should overlap by a large
+    majority of the frame; a tiny overlap is itself evidence of a bad fit.
+    """
+    h, w = reference_norm.shape[:2]
+    warped = cv2.warpAffine(moving_norm.astype(np.float32), H[:2], (w, h),
+                            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    valid = (warped > 0) & (reference_norm > 0)
+    if valid.sum() < min_overlap_frac * h * w:
+        return np.inf
+    return float(((warped[valid] - reference_norm[valid].astype(np.float32)) ** 2).mean())
+
+def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999):
+    """
+    Compute the affine-like matrix aligning moving_mip onto reference_mip.
+    Takes plain MIP arrays -- usable for both within-experiment (fiducial
+    MIP vs. fiducial MIP) and cross-experiment (readout MIP vs. readout
+    MIP) alignment; the caller is responsible for always passing
+    same-channel-type inputs on both sides, never mixed.
+
+    Tries both preprocess.compute_features_affinelike_matrix (ORB + RANSAC)
+    and preprocess.compute_msd_homography_matrix (MSD/Powell), and returns
+    whichever actually reconstructs reference_mip better (lower residual).
+    Neither method alone is reliable on its own: a synthetic ground-truth
+    test (apply a known rotation to a real MIP, recover it) showed the MSD
+    method never recovers rotation, even at 8 degrees -- it converges to
+    angle=0 regardless of true rotation. But the feature-based method isn't
+    uniformly better either: on real Hyb_130 (barcode) vs. a regular hybe,
+    where the two images have quite different content (punctate barcode
+    spots vs. diffuse fiducial staining), ORB found a confident but wrong
+    correspondence -- residual 3336 after "correction", worse than doing
+    nothing (2131) -- while MSD's small translation-only fit was sane
+    (residual 2082). Picking by actual residual, not by method identity,
+    is what makes this robust to both failure modes.
+    """
+    moving_norm = preprocess.normalize_to_uint8(moving_mip, lb, ub)
+    reference_norm = preprocess.normalize_to_uint8(reference_mip, lb, ub)
+
+    H_feature = preprocess.compute_features_affinelike_matrix(moving_norm, reference_norm)
+    H_msd = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=False)
+
+    residual_feature = _reconstruction_residual(moving_norm, reference_norm, H_feature)
+    residual_msd = _reconstruction_residual(moving_norm, reference_norm, H_msd)
+
+    return H_feature if residual_feature <= residual_msd else H_msd
+
+def align_within_experiment(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999):
+    """
+    Align every hybe's fiducial-channel MIP to reference_hybe's fiducial-
+    channel MIP -- always fiducial-to-fiducial, never the readout channel,
+    since fiducial images the same physical object (beads/chromatin) across
+    every readout in one experiment and is what's directly comparable.
+    reference_hybe can be any hybe in hybe_records, not just the first, so
+    the mechanism is exercised generally rather than defaulting trivially.
+    Writes each result into that hybe's own H5 /matrix/{hybe}, plus
+    reference_sequence/steps provenance attrs. Returns {hybe: matrix}.
+    """
+    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
+    record_by_folder = {r['folder']: r for r in hybe_records}
+    ref_record = record_by_folder[reference_hybe]
+
+    with h5py.File(os.path.join(fov_path, f'{reference_hybe}_stack.h5'), 'r') as f:
+        reference_mip = f[f'/mip/ch{ref_record["fiducial_channel"]}'][:]
+
+    matrices = {}
+    for record in hybe_records:
+        hybe = record['folder']
+        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
+        if hybe == reference_hybe:
+            H = np.eye(3)
+        else:
+            with h5py.File(h5path, 'r') as f:
+                moving_mip = f[f'/mip/ch{record["fiducial_channel"]}'][:]
+            H = align_readout_to_reference(moving_mip, reference_mip, lb, ub)
+        matrices[hybe] = H
+
+        with h5py.File(h5path, 'r+') as f:
+            f['/matrix'][hybe][:] = H
+            f['/matrix'][hybe].attrs['reference_sequence'] = np.array([f'{hybe}->{reference_hybe}'], dtype='S')
+            f['/matrix'][hybe].attrs['steps'] = H[None, ...].astype('float32')
+
+    return matrices
+
+def _readout_channel_mip(h5path):
+    """The one non-fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
+    with h5py.File(h5path, 'r') as f:
+        channels = [int(c.decode()) for c in f.attrs['channel_list']]
+        fiducial_ch = int(f.attrs['fiducial_channel'])
+        readout_ch = [c for c in channels if c != fiducial_ch][0]
+        return f[f'/mip/ch{readout_ch}'][:]
+
+def _fiducial_channel_mip(h5path):
+    """The fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
+    with h5py.File(h5path, 'r') as f:
+        fiducial_ch = int(f.attrs['fiducial_channel'])
+        return f[f'/mip/ch{fiducial_ch}'][:]
+
+def link_cross_modal(rna_storage_path, dna_storage_path, fov,
+                      rna_reference_hybe='Hyb_500', dna_reference_hybe='Hyb_400',
+                      channel_type='readout', lb=0.3, ub=0.9999):
+    """
+    Align the two experiments using the specified channel of each reference
+    hybe -- 'readout' (default) uses each hybe's non-fiducial channel, e.g.
+    DAPI via Hyb_500 (RNA) / Hyb_400 (DNA), since DNA_Expt/RNA_Expt are
+    different imaging sessions with no generally-shared fiducial signal.
+    'fiducial' is also valid when the chosen reference_hybe is itself a
+    readout physically shared between both experiments (e.g. the barcode
+    round Hyb_130, imaged in both DNA_Expt and RNA_Expt) -- in that specific
+    case the fiducial channel *is* comparable across experiments too, same
+    as within one experiment. The reference readout for each modality
+    (rna_reference_hybe/dna_reference_hybe) is always an explicit input,
+    never inferred from datatype -- barcode readouts exist in both
+    experiments for celltype classification, not as a hardcoded alignment
+    default.
+    Returns H_across: maps DNA's within-experiment reference frame
+    (dna_reference_hybe) onto RNA's within-experiment reference frame
+    (rna_reference_hybe). RNA's reference readout is the shared global
+    frame by convention (there's no third, independent frame without extra
+    information), so every RNA readout's final matrix is
+    compose_chain([H_within_RNA[readout], np.eye(3)]) -- H_across is
+    identity for RNA, appended for symmetry with the design rather than
+    treating RNA as a hardcoded special case -- while every DNA readout's
+    final matrix is compose_chain([H_within_DNA[readout], H_across]).
+    """
+    mip_fn = _fiducial_channel_mip if channel_type == 'fiducial' else _readout_channel_mip
+    rna_h5path = os.path.join(rna_storage_path, f'FOV{fov:02d}', f'{rna_reference_hybe}_stack.h5')
+    dna_h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
+    rna_mip = mip_fn(rna_h5path)
+    dna_mip = mip_fn(dna_h5path)
+    return align_readout_to_reference(dna_mip, rna_mip, lb, ub)
+
+def _hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub):
+    """
+    A cell-region Z-stack crop, max-projected along the height (Y) axis to
+    give an (width, depth) "X-by-Z" image usable for a 1D phase-correlation
+    Z-offset estimate. Stack datasets here are (height, width, depth) --
+    the DAX-sourced convention established in Phase 1 -- so this projects
+    axis 0, not the differently-shaped legacy virtual-link indexing
+    AlignmentWidget.cell_based_align uses; conceptually the same idea
+    (project out one in-plane axis, compare what's left via phase
+    correlation), just adapted to this project's own stack shape.
+    """
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
+    projection = stack.max(axis=0)  # (width, depth)
+    return preprocess.normalize_to_uint8(projection, lb, ub)
+
+def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
+                           pad=10, lb=0.3, ub=0.9999, including_z=True):
+    """
+    Compute this cell's own per-hybe alignment correction (matrices['yx']
+    and matrices['zx']), refining the already-established FOV-level matrix
+    with a small residual derived from RAW, native-frame crops -- ports
+    AlignmentWidget.cell_based_align's algorithm (codelab_pipeline/alignment.py)
+    as a standalone, non-widget function. Unlike SG_analysis.ipynb's
+    version, this never warps a whole image -- for each hybe, the cell mask
+    coordinates are inverse-warped via align_cell to find that hybe's own
+    native-frame crop, which is compared directly (via phase correlation)
+    against the reference hybe's native-frame crop at the cell's own bbox.
+    Only crops, never full images, ever get resampled.
+
+    fov_matrices: {hybe: 3x3} -- the already-established FOV-level matrices
+    for this FOV/modality (H_within, or H_within composed with H_across for
+    a cross-modal cell) -- always an explicit input; this function never
+    re-derives or infers them.
+
+    Writes cell.matrices[hybe] = {'yx': H_within_or_across @ ... composed
+    with the cell's own residual, 'zx': depth correction} and
+    cell.matrix_provenance[hybe] for traceability, mirroring the FOV-level
+    /matrix/{hybe} provenance from Phase 1.
+    """
+    height, width = cell.frame_shape
+    reference_hybe = cell.reference_hybe
+    x, y = cell.area
+    rymin, rymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
+    rxmin, rxmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
+
+    record_by_folder = {r['folder']: r for r in hybe_records}
+    ref_record = record_by_folder[reference_hybe]
+    with h5py.File(os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5'), 'r') as f:
+        reference_mip = f[f'/mip/ch{ref_record["fiducial_channel"]}'][:]
+    reference_crop = preprocess.normalize_to_uint8(reference_mip[rymin:rymax, rxmin:rxmax], lb, ub)
+
+    for record in hybe_records:
+        hybe = record['folder']
+        if hybe == reference_hybe:
+            cell.matrices[hybe] = {'yx': np.eye(3), 'zx': np.eye(3)}
+            continue
+
+        H1 = fov_matrices[hybe]
+        cy, cx = align_cell((y, x), la.inv(H1), (height, width))
+        if len(cy) == 0:
+            continue  # cell doesn't overlap this hybe's frame at all
+
+        cymin, cymax = max(0, int(cy.min()) - pad), min(height, int(cy.max()) + pad + 1)
+        cxmin, cxmax = max(0, int(cx.min()) - pad), min(width, int(cx.max()) + pad + 1)
+
+        with h5py.File(os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5'), 'r') as f:
+            target_mip = f[f'/mip/ch{record["fiducial_channel"]}'][:]
+        target_crop = preprocess.normalize_to_uint8(target_mip[cymin:cymax, cxmin:cxmax], lb, ub)
+
+        H2 = np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
+                        np.array([0, 0, 1])])
+        # H1 innermost (hybe's native frame -> FOV reference), H2 outermost (this
+        # cell's own residual refinement) -- matches utils.py's H = H2 @ H1.
+        H_yx = compose_chain([H1, H2])
+
+        H_zx = np.eye(3)
+        if including_z:
+            ref_zx = _hybe_zx_projection(storage_path, fov, reference_hybe, ref_record['fiducial_channel'],
+                                         rymin, rymax, rxmin, rxmax, lb, ub)
+            target_zx = _hybe_zx_projection(storage_path, fov, hybe, record['fiducial_channel'],
+                                            cymin, cymax, cxmin, cxmax, lb, ub)
+            # apply the just-computed yx residual to the target's projection so it's
+            # in the same orientation as the reference's before comparing depth
+            target_zx_aligned = cv2.warpAffine(target_zx, H2[:2], (target_zx.shape[1], target_zx.shape[0]))
+            A3 = preprocess.find_translation_via_phase_correlation(target_zx_aligned, ref_zx)
+            H_zx = np.vstack([A3[:2], np.array([0, 0, 1])])
+
+        cell.matrices[hybe] = {'yx': H_yx, 'zx': H_zx}
+        cell.matrix_provenance[hybe] = {
+            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}',
+            'steps': np.stack([H1, H2]),
+        }
 
 def crop_or_pad_to_shape(img, target_shape, pad_value=0):
     h, w = img.shape[:2]
