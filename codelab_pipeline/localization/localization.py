@@ -13,10 +13,10 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
-from . import preprocess
+from ..io import preprocess
 import cv2
 
-from . import preprocess, alignment
+from ..alignment import chain as alignment
 
 from IPython.display import display, clear_output
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -515,6 +515,61 @@ def localize_spots_worker(fov, hybe, hybe_list, cell_parameter_dict,
     else:
         return np.zeros((0,7), dtype=float), (img,bimg,np.zeros((0,7), dtype=float)), hybe
 
+def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad):
+    """
+    Shared crop-building logic for localize_cell_2d_worker/3d_worker AND
+    the interactive spot localization panel's "Current Cell" scope --
+    factored out so the bulk workers and the interactive panel can't drift
+    apart. Transforms this cell's own mask area into `hybe`'s native frame
+    (cell.get_area_in_readout, itself never resampling raw pixels -- only
+    coordinates move), reads a padded bbox crop of both the MIP and full
+    Z-stack, and NaNs out every pixel outside the cell's own mask within
+    that bbox (so background/neighboring-cell pixels never contaminate a
+    per-cell peak search). h5py fancy-indexing requires ascending-order
+    indices (unlike numpy); y_area/x_area come from np.where and aren't
+    sorted, so the rectangular crop is sliced first (always
+    contiguous/ascending) and the cell-mask fancy indexing done on the
+    resulting in-memory array instead.
+
+    Returns None if the cell has no area overlapping this hybe's frame
+    (either get_area_in_readout raised KeyError -- no alignment matrix for
+    this hybe yet -- or the transformed area is simply empty), otherwise
+    a dict: {'img': (h,w) MIP crop (NaN outside cell), 'stacks': (h,w,depth)
+    Z-stack crop (NaN outside cell), 'bimg': (w,depth) Z-profile per column
+    (nanmax over y), 'rxmin': int, 'rymin': int, 'H': cell's yx matrix for
+    this hybe (identity if none), 'Hz': cell's zx matrix for this hybe
+    (identity if none)}.
+    """
+    try:
+        x_area, y_area = cell.get_area_in_readout(hybe)
+    except KeyError:
+        return None
+    if len(x_area) == 0:
+        return None
+    x_area, y_area = x_area.astype(int), y_area.astype(int)
+
+    height, width = cell.frame_shape
+    rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
+    rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
+
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
+        stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]
+        img = np.full((rymax - rymin, rxmax - rxmin), np.nan, dtype=float)
+        img[y_area - rymin, x_area - rxmin] = mip_crop[y_area - rymin, x_area - rxmin]
+
+    depth = stacks_value.shape[-1]
+    stacks = np.full((rymax - rymin, rxmax - rxmin, depth), np.nan, dtype=float)
+    stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
+    bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth) -- Z-profile per column
+
+    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
+    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+
+    return {'img': img, 'stacks': stacks, 'bimg': bimg, 'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
+
+
 def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
                             max_to_background, max_to_average, absolute_threshold,
                             min_distance, frac, max_num_alleles, pad):
@@ -528,38 +583,13 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
     ProcessPoolExecutor, so results are returned rather than mutating cell
     in place (a separate-process copy wouldn't be visible to the caller).
     """
-    from .spot import ASpot
+    from ..models.spot import ASpot
     spots = []
-    try:
-        x_area, y_area = cell.get_area_in_readout(hybe)
-    except KeyError:
+    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad)
+    if crop is None:
         return cell.id, hybe, spots
-    if len(x_area) == 0:
-        return cell.id, hybe, spots
-    x_area, y_area = x_area.astype(int), y_area.astype(int)
-
-    height, width = cell.frame_shape
-    rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
-    rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
-
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        # h5py fancy-indexing requires ascending-order indices (unlike numpy);
-        # y_area/x_area come from np.where and aren't sorted, so slice the
-        # rectangular crop first (always contiguous/ascending) and do the
-        # cell-mask fancy indexing on the resulting in-memory array instead.
-        mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
-        stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]
-        img = np.full((rymax - rymin, rxmax - rxmin), np.nan, dtype=float)
-        img[y_area - rymin, x_area - rxmin] = mip_crop[y_area - rymin, x_area - rxmin]
-
-    depth = stacks_value.shape[-1]
-    stacks = np.full((rymax - rymin, rxmax - rxmin, depth), np.nan, dtype=float)
-    stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
-    bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth) -- Z-profile per column
-
-    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
-    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+    img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']
+    rxmin, rymin, H, Hz = crop['rxmin'], crop['rymin'], crop['H'], crop['Hz']
 
     cutoff = max_to_background * np.nanquantile(img, 0.5)
     yx = peak_local_max(img, min_distance=min_distance, exclude_border=1,
@@ -639,38 +669,14 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
     refinement -- ports scripts/utils.py's localize_3d_spots_worker, same
     adaptation as localize_cell_2d_worker above.
     """
-    from .spot import ASpot
+    from ..models.spot import ASpot
     spots = []
-    try:
-        x_area, y_area = cell.get_area_in_readout(hybe)
-    except KeyError:
+    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad)
+    if crop is None:
         return cell.id, hybe, spots
-    if len(x_area) == 0:
-        return cell.id, hybe, spots
-    x_area, y_area = x_area.astype(int), y_area.astype(int)
-
-    height, width = cell.frame_shape
-    rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
-    rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
-
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        # h5py fancy-indexing requires ascending-order indices (unlike numpy);
-        # y_area/x_area come from np.where and aren't sorted, so slice the
-        # rectangular crop first (always contiguous/ascending) and do the
-        # cell-mask fancy indexing on the resulting in-memory array instead.
-        mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
-        stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]
-        img = np.full((rymax - rymin, rxmax - rxmin), np.nan, dtype=float)
-        img[y_area - rymin, x_area - rxmin] = mip_crop[y_area - rymin, x_area - rxmin]
-
-    depth = stacks_value.shape[-1]
-    stacks = np.full((rymax - rymin, rxmax - rxmin, depth), np.nan, dtype=float)
-    stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
-    bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth)
-
-    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
-    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+    img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']
+    rxmin, rymin, H, Hz = crop['rxmin'], crop['rymin'], crop['H'], crop['Hz']
+    depth = stacks.shape[-1]
 
     cutoff = max_to_background * np.nanquantile(img, 0.5)
     yx = peak_local_max(img, min_distance=min_distance, exclude_border=1,

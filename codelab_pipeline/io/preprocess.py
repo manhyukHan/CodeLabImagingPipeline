@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import numpy as np
 import pandas as pd
@@ -10,6 +11,8 @@ from itertools import product,combinations
 import h5py
 import cv2
 from scipy.optimize import minimize
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import quoteattr
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -152,6 +155,86 @@ def parse_experiment_layout(xlsx_path):
             'readout_name': readout_name,
         })
     return records
+
+def make_xml_file(config, save_path):
+    """
+    Persist this app's config as a <settings> root with one <modality>
+    child per modality -- a real multi-layer structure (not hardcoded to
+    exactly RNA/DNA) since some of what a modality carries is genuinely
+    per-modality (layout_path/dax_directory/storage_path, its own within-
+    experiment reference_hybe + same_modality_channel_type, and its own
+    cross_modality_reference_hybe -- the hybe THIS modality uses as the
+    cross-modal bridge point), while other settings are genuinely global
+    (num_modalities, fov_list, cross_modality_channel_type, cell_align_reference_hybe,
+    cell_align_channel_type, cell_seg_fov). Deliberately excludes
+    cell_seg_reference_hybe/cell_seg_channel/cell_seg_method -- those
+    describe whatever a real segmentation run actually did (persisted in
+    vlinks.h5), not something an external config should be dictating.
+
+    config: {'global': {key: value}, 'modalities': {name: {key: value}}}.
+    list/tuple values are comma-joined; everything else is str()'d.
+    """
+    root = ET.Element('settings')
+    for key, value in config.get('global', {}).items():
+        if isinstance(value, (list, tuple)):
+            root.set(key, ','.join(str(v) for v in value))
+        else:
+            root.set(key, str(value))
+    for name, fields in config.get('modalities', {}).items():
+        elem = ET.SubElement(root, 'modality')
+        elem.set('name', str(name))
+        for key, value in fields.items():
+            elem.set(key, str(value))
+    with open(save_path, 'w') as f:
+        f.write('\n'.join(_render_element(root)) + '\n')
+
+def _render_element(elem, depth=0):
+    """
+    Serialize `elem` with one attribute per line (readable diffs/manual
+    editing for wide elements like <modality ...>) instead of
+    ElementTree's default single-line-per-tag output. Still plain,
+    parseable XML -- whitespace between attributes is legal XML, so
+    load_xml_file's ET.parse-based reading is unaffected.
+    """
+    indent = '  ' * depth
+    tag_indent = '  ' * (depth + 1)
+    items = list(elem.attrib.items())
+    children = list(elem)
+    lines = [f'{indent}<{elem.tag}']
+    for i, (key, value) in enumerate(items):
+        line = f'{tag_indent}{key}={quoteattr(str(value))}'
+        if i == len(items) - 1:
+            line += '>' if children else ' />'
+        lines.append(line)
+    if not items:
+        lines[0] += '>' if children else ' />'
+    if children:
+        for child in children:
+            lines.extend(_render_element(child, depth + 1))
+        lines.append(f'{indent}</{elem.tag}>')
+    return lines
+
+def load_xml_file(file_path):
+    """
+    Inverse of make_xml_file -- {'global': {key: str}, 'modalities':
+    {name: {key: str}}}, whatever keys/modalities the file happens to
+    have (older/narrower files just come back with fewer of them; callers
+    use .get(key, default)). global['fov_list'], if present, is parsed
+    into list[int] -- comma AND/OR whitespace separated, matching
+    windows/main_window.py's own _parse_fov_list convention (a config
+    field shouldn't be pickier about separators than the UI field it
+    feeds).
+    """
+    root = ET.parse(file_path).getroot()
+    cfg = {'global': dict(root.attrib), 'modalities': {}}
+    if 'fov_list' in cfg['global']:
+        cfg['global']['fov_list'] = [int(f) for f in re.split(r'[,\s]+', cfg['global']['fov_list'].strip()) if f.strip()]
+    for elem in root.findall('modality'):
+        name = elem.get('name')
+        fields = dict(elem.attrib)
+        fields.pop('name', None)
+        cfg['modalities'][name] = fields
+    return cfg
 
 def read_dax(filename, matlab=False):
     """
@@ -545,6 +628,15 @@ def pad_to_same_size(img1, img2, pad_value=0):
     return padded1, padded2, offset1, offset2
 
 def msd_cost_function(params, moving_image, reference_image, fixed_scale=1.0, fixed_angle=False):
+    """
+    fixed_angle: False (default) -- angle is a free Powell parameter, same
+    as always. True -- angle fixed at 0 (translation-only), the original
+    behavior. A number -- angle fixed at that exact degree value (Powell
+    still optimizes dx/dy under it); used to independently confirm a
+    translation under a rotation estimated elsewhere (e.g. ORB's own
+    angle), without letting Powell re-guess rotation (which it can't
+    reliably do anyway -- see compute_msd_homography_matrix's docstring).
+    """
     dx, dy, angle = params
 
     # Pad images
@@ -552,10 +644,8 @@ def msd_cost_function(params, moving_image, reference_image, fixed_scale=1.0, fi
     h, w = moving_padded.shape[:2]
     center = (w // 2, h // 2)
 
-    if fixed_angle:
-        M = np.eye(3)[:2].astype(float)
-    else:
-        M = cv2.getRotationMatrix2D(center, angle, fixed_scale)
+    angle_to_use = angle if fixed_angle is False else (0.0 if fixed_angle is True else float(fixed_angle))
+    M = cv2.getRotationMatrix2D(center, angle_to_use, fixed_scale)
     M[0, 2] += dx
     M[1, 2] += dy
 
@@ -585,12 +675,16 @@ def find_best_alignment(moving_image, reference_image, fixed_scale=1.0,
 
     # Extract optimal parameters
     dx, dy, angle = result.x
-    
-    # Compute final transformation matrix with fixed scale
-    if angle > 1/2:
+
+    # Compute final transformation matrix with fixed scale. angle here is
+    # whatever msd_cost_function actually used -- Powell's free-angle guess,
+    # 0 (fixed_angle=True), or the caller's fixed numeric angle -- not the
+    # raw (possibly-unused) optimizer parameter.
+    angle_to_use = angle if fixed_angle is False else (0.0 if fixed_angle is True else float(fixed_angle))
+    if abs(angle_to_use) > 1/2:
         h, w = moving_image.shape[:2]
         center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, fixed_scale)
+        M = cv2.getRotationMatrix2D(center, angle_to_use, fixed_scale)
     else:
         M = np.eye(3)[:2].astype(float)
     M[0, 2] += dx

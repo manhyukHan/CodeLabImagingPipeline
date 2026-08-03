@@ -1,0 +1,36 @@
+import os
+# Must be set before numpy is ever imported (transitively, by anything below
+# this line) -- OpenBLAS's internal thread pool can SIGSEGV when a
+# multi-threaded BLAS routine (e.g. np.linalg.inv, used by
+# compute_cell_alignment) is invoked from a non-main thread (a QThread
+# worker, here), which is exactly the pattern this app's alignment/cell
+# workers use. Confirmed via a real crash: SIGSEGV inside
+# dgetrf_parallel/dgesv_64_ (libopenblas) called from
+# CellAlignmentWorker.run() -> compute_cell_alignment -> la.inv(H1). Forcing
+# every BLAS backend to single-threaded avoids the race entirely.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+
+from PyQt5 import QtWidgets
+
+from config import path
+from windows.main_window import MainWindow
+
+if __name__ == '__main__':
+    question_app = QtWidgets.QApplication(sys.argv)
+    question_window = QtWidgets.QMainWindow()
+    question_window.show()
+    config_file = QtWidgets.QFileDialog.getOpenFileName(question_window, 'Load configuration file (Cancel to start fresh)', path, 'configuration file (*.xml)')[0]
+    question_window.close()
+
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow(config_file if config_file != '' else None)
+    window.show()
+    sys.exit(app.exec_())

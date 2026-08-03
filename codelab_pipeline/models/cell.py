@@ -4,7 +4,7 @@ import numpy.linalg as la
 import h5py
 import scipy.spatial.distance as ssd
 
-from . import alignment
+from ..alignment import chain as alignment
 
 
 class ACell():
