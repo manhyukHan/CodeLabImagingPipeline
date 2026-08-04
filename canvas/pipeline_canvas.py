@@ -481,9 +481,16 @@ class PipelineCanvas():
             a = ax[0][col]
             a.imshow(_composite_multi(imgs, lb, ub) if imgs else np.zeros((1, 1, 3)), aspect='auto')
             if ref_mask is not None and ref_mask.any():
+                # ref_mask is the reference hybe's own crop, sized independently
+                # of (h, w) (the target hybes' shared max crop size for this
+                # column) -- affine distortion between hybes means the
+                # reference crop can end up LARGER than every target crop in
+                # some cells, so clip rather than assume it always fits (a
+                # real crash seen on real data: mask (96,71) vs panel (96,70)).
                 mh, mw = ref_mask.shape
+                ch, cw = min(mh, h), min(mw, w)
                 mask_pad = np.zeros((h, w), dtype=np.uint8)
-                mask_pad[:mh, :mw] = ref_mask.astype(np.uint8)
+                mask_pad[:ch, :cw] = ref_mask[:ch, :cw].astype(np.uint8)
                 a.contour(mask_pad, levels=[0.5], colors='yellow', linewidths=1)
             a.set_title(f'YX: {col_titles[col]}', fontsize=10)
             a.axis('off')

@@ -141,6 +141,19 @@ class AlignmentPanelUI(object):
         # shift. The preview reuses this same value so it always shows
         # the actual window alignment computed against.
         cellLayout.addRow('Pad:', self.CellPadSpinBox)
+        self.CellOverlayAutoSaveThresholdSpinBox = QtWidgets.QSpinBox()
+        self.CellOverlayAutoSaveThresholdSpinBox.setRange(0, 500)
+        self.CellOverlayAutoSaveThresholdSpinBox.setValue(5)
+        self.CellOverlayAutoSaveThresholdSpinBox.setSuffix(' px')
+        # Automatic-mode overlay PNGs are no longer generated for every
+        # cell (too slow -- drawing+saving one is ~9x the cost of the
+        # actual per-cell alignment fit itself). Instead a cell's overlay
+        # is auto-saved only when its own cell-level residual shift
+        # exceeds this threshold -- flags the cells worth a human look
+        # without paying the cost for the (usual) well-behaved majority.
+        # Use Save All Cell Overlays below to generate every cell's
+        # overlay on demand regardless of this threshold.
+        cellLayout.addRow('Auto-save overlay if shift >', self.CellOverlayAutoSaveThresholdSpinBox)
         self.RunCellAlignmentPushButton = QtWidgets.QPushButton('Run Cell Alignment')
         cellLayout.addRow(self.RunCellAlignmentPushButton)
         self.CellResultsListWidget = QtWidgets.QListWidget()
@@ -157,6 +170,12 @@ class AlignmentPanelUI(object):
         cellLayout.addRow('Overlay cell:', self.CellOverlayCellListWidget)
         self.CellShowOverlayPushButton = QtWidgets.QPushButton('Show All-Readouts Overlay')
         cellLayout.addRow(self.CellShowOverlayPushButton)
+        self.SaveAllCellOverlaysPushButton = QtWidgets.QPushButton('Save All Cell Overlays')
+        # On-demand batch generation of every cell's overlay PNG (for
+        # skimming the whole run's alignment quality by eye), independent
+        # of the auto-save-on-large-shift threshold above -- covers the
+        # cells that didn't trip the threshold too.
+        cellLayout.addRow(self.SaveAllCellOverlaysPushButton)
         self.CellAcceptPushButton, self.CellRejectPushButton, cellAcceptRow = self._accept_reject_row()
         cellLayout.addRow(cellAcceptRow)
         controls_layout.addWidget(cellGroup)

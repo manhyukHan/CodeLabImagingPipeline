@@ -229,6 +229,20 @@ class CellAlignmentWorker(QtCore.QThread):
                 if other_ctx is not None:
                     other_storage_path, other_records_full, other_fov_matrices, other_reference_hybe = other_ctx
                     other_hybe_records = [r for r in other_records_full if r['folder'] in other_fov_matrices]
+                    if other_reference_hybe not in other_fov_matrices:
+                        # other_reference_hybe (that modality's own within-
+                        # experiment reference hybe, as configured on its
+                        # own Alignment tab) isn't itself in the ingested/
+                        # aligned set -- compute_cell_alignment's own
+                        # reference_hybe lookup (record_by_folder[reference_
+                        # _hybe]) would raise a bare KeyError for every cell
+                        # in this FOV, aborting the WHOLE batch run rather
+                        # than just skipping this optional extra layer.
+                        # Same "best-effort, not fatal to the already-done
+                        # same-modality result" treatment as the ValueError
+                        # catch below -- just caught here, before it can
+                        # happen, instead of after.
+                        other_hybe_records = None
                 else:
                     other_storage_path = other_hybe_records = other_fov_matrices = other_reference_hybe = None
                 for cell in cells:
@@ -237,9 +251,19 @@ class CellAlignmentWorker(QtCore.QThread):
                                                      pad=self.pad)
                     if other_ctx is not None and other_hybe_records:
                         try:
+                            # cell.reference_hybe is a same-modality-only
+                            # hybe name -- it's never a real key in
+                            # other_fov_matrices (the OTHER modality's own
+                            # hybes), so compute_cell_alignment's default
+                            # lookup would silently treat it as identity
+                            # there. Resolve it from fov_matrices (the
+                            # SAME modality this cell/its reference hybe
+                            # actually belongs to, already in scope here)
+                            # and pass it through explicitly instead.
                             alignment.compute_cell_alignment(cell, other_storage_path, fov, other_hybe_records,
                                                              other_fov_matrices, reference_hybe=other_reference_hybe,
-                                                             channel_type=self.channel_type, pad=self.pad)
+                                                             channel_type=self.channel_type, pad=self.pad,
+                                                             cell_reference_hybe_matrix=fov_matrices.get(cell.reference_hybe, np.eye(3)))
                         except ValueError:
                             # cell doesn't overlap the other modality's own
                             # reference-hybe frame at all -- a best-effort
@@ -309,6 +333,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fov_matrices = {}
         self.modality_names = ['DNA', 'RNA']
         self.modality_data = {name: self._blank_modality_state() for name in self.modality_names}
+        self.total_active_hybe_list = []  # [(hybe_record, modality_name), ...] -- see _refresh_active_hybe_lists
         self.current_modality = None
         self._job_queue = []
         self._job_queue_index = 0
@@ -412,6 +437,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.CellPadSpinBox.valueChanged.connect(lambda _: self._show_cell_alignment_preview_for_hybe())
         ap.CellOverlayFovLineEdit.editingFinished.connect(self._refresh_cell_overlay_list)
         ap.CellShowOverlayPushButton.clicked.connect(self._show_cell_all_readouts_overlay)
+        ap.SaveAllCellOverlaysPushButton.clicked.connect(self._save_all_cell_overlays)
         ap.CellAcceptPushButton.clicked.connect(self._accept_cell_alignment)
         ap.CellRejectPushButton.clicked.connect(self._reject_cell_alignment)
 
@@ -436,7 +462,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _blank_modality_state():
-        return {'layout_path': '', 'dax_directory': '', 'storage_path': '', 'reference_hybe': '', 'same_modality_channel_type': ''}
+        return {'layout_path': '', 'dax_directory': '', 'storage_path': '', 'reference_hybe': '', 'same_modality_channel_type': '',
+                'active_hybe_list': []}
 
     def _all_modality_combo_boxes(self):
         boxes = [self.ui.IngestionPanel.ModalityComboBox]
@@ -460,13 +487,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _save_current_modality_fields(self):
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
-        self.modality_data[self.current_modality] = {
+        # update() in place, not a wholesale dict replacement -- this
+        # modality's own active_hybe_list (and anything else computed
+        # separately, e.g. by _refresh_active_hybe_lists) must survive a
+        # switch-away/switch-back, not get silently wiped back to the
+        # blank-state default just because the user changed tabs.
+        data = self.modality_data.setdefault(self.current_modality, self._blank_modality_state())
+        data.update({
             'layout_path': ip.LayoutPathLineEdit.text().strip(),
             'dax_directory': ip.DaxDirectoryLineEdit.text().strip(),
             'storage_path': ip.StoragePathLineEdit.text().strip(),
             'reference_hybe': ap.ReferenceHybeComboBox.currentText(),
             'same_modality_channel_type': ap.SameModalityChannelTypeComboBox.currentText(),
-        }
+        })
 
     def _switch_current_modality(self, name):
         """
@@ -524,6 +557,12 @@ class MainWindow(QtWidgets.QMainWindow):
             # with whatever vlinks still has on disk from a prior run.
             self._refresh_params_from_vlinks(data['storage_path'])
             self._vlinks_refreshed_paths.add(data['storage_path'])
+        # active_hybe_list/total_active_hybe_list refresh -- unlike the
+        # params backfill above, this is never gated by
+        # _vlinks_refreshed_paths (see _refresh_active_hybe_lists' own
+        # docstring for why): every modality switch stands in for "the
+        # vlink was just parsed" for that modality, per explicit design.
+        self._refresh_active_hybe_lists()
         self._sync_modality_combo_text(name)
         self._refresh_same_modality_results_from_disk()
 
@@ -672,54 +711,111 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_modality = None
         self._sync_modality_combo_items(names)
         self._switch_current_modality(names[0])
-        self._refresh_cross_modal_hybe_choices()
 
-    def _all_modality_hybe_records(self):
+    def _active_hybe_records_for_modality(self, name):
         """
-        self.hybe_records (current modality) plus every OTHER configured
-        modality's own full parsed hybe list, deduped by folder name --
-        for combos that need choices spanning BOTH modalities regardless
-        of which one is "current" (e.g. CellReferenceHybeComboBox, now
-        that cell-based alignment processes both).
+        hybe_records (real folder dicts) for modality `name`, filtered
+        down to hybes actually INGESTED (real {hybe}_stack.h5 on disk
+        with real /mip data, see _ingested_hybes_for_fov) for at least
+        one FOV in the Ingestion tab's FOV list. A parsed ExperimentLayout
+        can declare far more hybes than were ever actually converted to
+        H5 (e.g. a 103-hybe DNA layout with only a handful ingested for
+        this local dataset) -- this is the ONE canonical "what's actually
+        usable right now" source; every hybe-choosing field must be
+        populated from this (directly, or via _refresh_active_hybe_lists'
+        combined total_active_hybe_list below), never from the raw parsed
+        ExperimentLayout and never from the Ingestion tab's hybe-to-
+        ingest checkboxes (those reflect intent-to-ingest, not ingestion-
+        complete -- see _run_ingestion/_add_job_to_queue for the one
+        legitimate use of checkbox state). Offering an unfiltered/wrong-
+        signal list here let a never-ingested hybe be picked as an
+        alignment reference/anchor, which then crashed deep inside
+        align_same_modality/compute_cell_alignment trying to open a
+        stack file that doesn't exist.
         """
-        seen = {r['folder'] for r in self.hybe_records}
-        merged = list(self.hybe_records)
-        for name, data in self.modality_data.items():
-            if name == self.current_modality or not data.get('layout_path'):
-                continue
+        ip = self.ui.IngestionPanel
+        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        data = self.modality_data.get(name)
+        if not data or not data.get('storage_path') or not fov_list:
+            return []
+        if name == self.current_modality and self.hybe_records:
+            records = self.hybe_records
+        elif data.get('layout_path'):
             try:
                 records = preprocess.parse_experiment_layout(data['layout_path'])
             except Exception:
-                continue
-            for r in records:
+                return []
+        else:
+            return []
+        ingested_folders = set()
+        for fov in fov_list:
+            ready, _, _ = self._ingested_hybes_for_fov(data['storage_path'], fov, records)
+            ingested_folders.update(ready)
+        return [r for r in records if r['folder'] in ingested_folders]
+
+    def _all_modality_hybe_records(self):
+        """
+        Every configured modality's own active_hybe_list, deduped by
+        folder name -- for combos that need choices spanning BOTH
+        modalities regardless of which one is "current" (e.g.
+        CellReferenceHybeComboBox, now that cell-based alignment
+        processes both). See _active_hybe_records_for_modality for the
+        actual ingestion-filtering.
+        """
+        merged = []
+        seen = set()
+        for name in self.modality_names:
+            for r in self._active_hybe_records_for_modality(name):
                 if r['folder'] not in seen:
                     seen.add(r['folder'])
                     merged.append(r)
         return merged
 
-    def _refresh_cross_modal_hybe_choices(self):
+    def _refresh_active_hybe_lists(self):
         """
-        The Cross-Modality section's RNA/DNA reference hybe combos need
-        BOTH modalities' hybe lists at once -- unlike the single-"current
-        modality" combos elsewhere, they aren't populated as a side effect
-        of _parse_layout, since _parse_layout only ever runs for whichever
-        modality happens to be current. Without this, a modality that was
-        never made "current" during the session (the common case right
-        after loading a config -- only the first modality in the file
-        becomes current) would leave its own combo empty forever, even
-        though its layout_path is already known.
+        Recomputes active_hybe_list for every configured modality (real,
+        disk-ingested hybes only) and total_active_hybe_list (every
+        modality's active hybes combined, each entry tagged with its own
+        modality name via (record, modality_name) tuples, so a folder
+        name that happens to collide across modalities can't be confused
+        for the other one's), then repopulates every hybe-choosing field
+        that must track them.
+
+        Called at exactly the two moments active_hybe_list is allowed to
+        change (per explicit design): whenever the current modality is
+        (re)activated -- _switch_current_modality, standing in for "the
+        vlink was just parsed" for that modality -- and right after
+        ingestion completes (_on_ingestion_finished). Deliberately NOT
+        gated by _vlinks_refreshed_paths (that gate exists specifically
+        to protect a live, in-session PARAMS edit from being clobbered by
+        a stale vlinks default -- active_hybe_list isn't a user choice at
+        all, just a disk-truth readout, so re-running this is always
+        safe and should always reflect disk's current real state).
         """
+        for name in self.modality_names:
+            self.modality_data.setdefault(name, self._blank_modality_state())['active_hybe_list'] = \
+                self._active_hybe_records_for_modality(name)
+
+        total = []
+        seen = set()
+        for name in self.modality_names:
+            for r in self.modality_data[name]['active_hybe_list']:
+                key = (r['folder'], name)
+                if key not in seen:
+                    seen.add(key)
+                    total.append((r, name))
+        self.total_active_hybe_list = total  # [(hybe_record, modality_name), ...]
+
         ap = self.ui.AlignmentPanel
+        current_active = self.modality_data.get(self.current_modality, {}).get('active_hybe_list', [])
+        ap.populate_reference_hybe_choices(current_active)
+        self.ui.CellSegmentPanel.populate_reference_hybe_choices(current_active)
+        self.ui.SpotLocalizationPanel.populate_hybe_choices(current_active)
+        self.ui.CelltypeDeterminationPanel.populate_hybe_choices(current_active)
+        ap.populate_cell_reference_hybe_choices([r for r, _ in self.total_active_hybe_list])
         for name, populate in (('RNA', ap.populate_rna_reference_hybe_choices),
                                ('DNA', ap.populate_dna_reference_hybe_choices)):
-            data = self.modality_data.get(name)
-            if not data or not data['layout_path']:
-                continue
-            try:
-                records = preprocess.parse_experiment_layout(data['layout_path'])
-            except Exception:
-                continue
-            populate(records)
+            populate(self.modality_data.get(name, {}).get('active_hybe_list', []))
 
     def _on_set_num_modalities(self):
         ip = self.ui.IngestionPanel
@@ -773,22 +869,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.populate_viewer_hybe_choices(self.hybe_records)
         ip.RunIngestionPushButton.setEnabled(True)
         ap = self.ui.AlignmentPanel
-        ap.populate_reference_hybe_choices(self.hybe_records)
-        ap.populate_cell_reference_hybe_choices(self._all_modality_hybe_records())
-        self.ui.CellSegmentPanel.populate_reference_hybe_choices(self.hybe_records)
-        self.ui.SpotLocalizationPanel.populate_hybe_choices(self.hybe_records)
-        self.ui.CelltypeDeterminationPanel.populate_hybe_choices(self.hybe_records)
-        # the cross-modal RNA/DNA reference hybe combos are keyed by literal
-        # modality name (that section is still hardcoded to exactly RNA/DNA,
-        # see _load_config's docstring) -- only refresh whichever one this
-        # parse actually belongs to.
-        if self.current_modality == 'RNA':
-            ap.populate_rna_reference_hybe_choices(self.hybe_records)
-        elif self.current_modality == 'DNA':
-            ap.populate_dna_reference_hybe_choices(self.hybe_records)
         ap.populate_overlay_fov_choices(self._parse_fov_list(ip.FovListLineEdit.text()))
         ip.LogTextEdit.append(f'Parsed {len(self.hybe_records)} hybe(s) from {layout_path}')
         self._check_ingestion_status(silent=True)
+        # active_hybe_list/total_active_hybe_list refresh -- covers every
+        # hybe-choosing combo (reference hybes, cell-alignment anchor,
+        # spot localization/celltype hybe pickers, RNA/DNA cross-modal
+        # reference hybes) in one place; see _refresh_active_hybe_lists.
+        self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
         self._refresh_same_modality_results_from_disk()
 
@@ -915,6 +1003,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ip = self.ui.IngestionPanel
         ip.RunIngestionPushButton.setEnabled(True)
         self._check_ingestion_status(silent=True)
+        # a freshly-ingested hybe must become choosable immediately, not
+        # only after the user happens to switch modality -- ingestion
+        # completion is the other of the two moments active_hybe_list is
+        # allowed to change (per explicit design; see
+        # _refresh_active_hybe_lists).
+        self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
         if n_errors > 0:
             # the worker never raised (each task's error is caught+
@@ -2352,10 +2446,19 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path and FOV list in the Ingestion tab first.')
             return
 
-        selected_folders = set(ip.hybe_checkbox_items())
-        hybe_records = [r for r in self.hybe_records if r['folder'] in selected_folders] if selected_folders else self.hybe_records
+        # active_hybe_list, never the Ingestion tab's hybe-to-ingest
+        # checkboxes -- a checked hybe only means the user WANTS it
+        # ingested (see _run_ingestion), not that it actually has a real
+        # {hybe}_stack.h5 on disk yet. Using checkbox state here let a
+        # checked-but-never-ingested hybe reach align_same_modality's
+        # bare h5py.File() open and crash.
+        hybe_records = self.modality_data.get(self.current_modality, {}).get('active_hybe_list', [])
+        if not hybe_records:
+            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
+                                          'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
+            return
         if reference_hybe not in {r['folder'] for r in hybe_records}:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Reference hybe must be checked (and ingested) in the Ingestion tab.')
+            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Reference hybe must be an ingested hybe.')
             return
 
         manual = ap.is_manual_mode()
@@ -2940,18 +3043,21 @@ class MainWindow(QtWidgets.QMainWindow):
             for path in storage_paths:
                 vlinks_store.write_global_params(path, cell_alignment_reference_hybe=cell_reference_hybe,
                                                  cell_alignment_channel_type=channel_type, cell_alignment_pad=pad)
-            record_by_folder = {r['folder']: r for r in self.hybe_records}
+            auto_save_threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
+            n_auto_saved = 0
             for fov, cells in results:
                 for cell in cells:
-                    reference_record = record_by_folder.get(cell.reference_hybe)
-                    if reference_record is None:
-                        continue
-                    save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{cell.id}_alignment_overlay.png')
-                    reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
-                    target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
-                    self.preview_canvas.draw_cell_all_readouts_overlay(
-                        cell, fov, cell.reference_hybe, storage_path, reference_channel,
-                        reference_record['fiducial_channel'], target_specs, pad=pad, save_path=save_path)
+                    # Drawing+saving one overlay costs ~9x the cell's own
+                    # alignment fit (real profiling: ~1.6s vs ~0.18s/cell) --
+                    # doing this unconditionally for every cell is exactly
+                    # what made automatic mode's "after finishing, it takes
+                    # a minute" for a FOV's worth of cells. Only auto-save
+                    # the ones whose own residual shift is large enough to
+                    # be worth a human look; Save All Cell Overlays covers
+                    # the rest on demand.
+                    if self._cell_max_residual_shift(cell) > auto_save_threshold:
+                        if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad):
+                            n_auto_saved += 1
                 # automatic mode's own docstring: cells here ARE the real
                 # objects inside cell_container_permanent.data[fov], mutated
                 # in place -- but that in-memory mutation alone never
@@ -2964,7 +3070,66 @@ class MainWindow(QtWidgets.QMainWindow):
                     vlinks_store.mirror_write_cells(storage_paths, fov, self.cell_container_permanent)
             QtWidgets.QMessageBox.information(self, 'Cell alignment complete',
                                               f'{total_cells} cell(s) across {len(results)} FOV(s) aligned, saved to vlinks.h5; '
-                                              f'overlay image(s) written.')
+                                              f'{n_auto_saved} overlay image(s) auto-saved (shift > {auto_save_threshold}px). '
+                                              f'Use Save All Cell Overlays to generate the rest on demand.')
+
+    @staticmethod
+    def _cell_max_residual_shift(cell):
+        """
+        The largest cell-level residual correction (compute_cell_alignment's
+        own H2, before composition with the FOV/cross-modal matrices)
+        across this cell's hybes, in px -- cell.matrix_provenance[hybe]
+        ['steps'] is [H1, H2] (see compute_cell_alignment), so steps[1] is
+        always this cell's own fine-tuning fit, not the FOV-level shift
+        that H1 already carries. Used to flag cells worth a human look
+        (see CellOverlayAutoSaveThresholdSpinBox) -- the residual is the
+        right quantity here, not the final composed matrix's translation,
+        since a legitimately large FOV-level drift shouldn't itself
+        trigger a "was this cell's OWN fit unusual" flag.
+        """
+        if not cell.matrix_provenance:
+            return 0.0
+        return max(
+            float(np.hypot(prov['steps'][1][0, 2], prov['steps'][1][1, 2]))
+            for prov in cell.matrix_provenance.values()
+        )
+
+    def _save_cell_overlay(self, cell, fov, storage_path, channel_type, pad):
+        """Draws + saves one cell's all-readouts overlay PNG. Returns False
+        (no-op) if this cell's own segmentation hybe record can't be
+        resolved from the current hybe list, matching the automatic-mode
+        skip that already existed before this was factored out."""
+        record_by_folder = {r['folder']: r for r in self.hybe_records}
+        reference_record = record_by_folder.get(cell.reference_hybe)
+        if reference_record is None:
+            return False
+        save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{cell.id}_alignment_overlay.png')
+        reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
+        target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
+        self.preview_canvas.draw_cell_all_readouts_overlay(
+            cell, fov, cell.reference_hybe, storage_path, reference_channel,
+            reference_record['fiducial_channel'], target_specs, pad=pad, save_path=save_path)
+        return True
+
+    def _save_all_cell_overlays(self):
+        """On-demand batch save of every currently-computed cell's overlay
+        PNG (self._cell_alignment_display_cells, populated by the last Run
+        Cell Alignment call, manual or automatic) -- lets a user skim the
+        whole run's alignment quality by eye without needing every cell to
+        have tripped the auto-save-on-large-shift threshold."""
+        ip = self.ui.IngestionPanel
+        storage_path = ip.StoragePathLineEdit.text().strip()
+        if not storage_path or not self._cell_alignment_display_cells:
+            QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', 'Run Cell Alignment first.')
+            return
+        ap = self.ui.AlignmentPanel
+        channel_type = ap.CellChannelTypeComboBox.currentText()
+        pad = ap.CellPadSpinBox.value()
+        n_saved = 0
+        for fov, cell in self._cell_alignment_display_cells:
+            if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad):
+                n_saved += 1
+        QtWidgets.QMessageBox.information(self, 'Save All Cell Overlays', f'{n_saved} overlay image(s) saved.')
 
     def _on_cell_alignment_failed(self, message):
         ap = self.ui.AlignmentPanel
