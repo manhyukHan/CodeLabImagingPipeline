@@ -25,8 +25,8 @@ def write_cells(storage_path, fov, cell_container):
     /FOV##/cells/ already exists (created by preprocess.py's aggregate
     vlinks builder) but confirmed empty on every real vlinks.h5 on disk;
     the legacy resizable-array/id-indexed schema the old Jupyter-widget
-    classes (segment.py's SegmentWidget etc, both dead code, never
-    instantiated by this GUI) would have used is not worth replicating --
+    classes (legacy/segment_widgets.py's SegmentWidget etc, dead code,
+    never instantiated by this GUI) would have used is not worth replicating --
     nothing else reads /FOV##/cells/ today, so the simplest fully
     round-trippable choice (reusing CellContainer/ACell's own already-
     correct save()/load()) wins over inventing a schema with no second

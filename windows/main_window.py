@@ -80,8 +80,8 @@ class IngestionWorker(QtCore.QThread):
                 self.progress.emit(i + 1, len(tasks), f'FOV{fov_r:02d} {hybe_r}: {status}')
             # dax_vlinks_h5 (a single aggregate vlinks.h5 across every hybe)
             # is deliberately NOT called here -- it's only ever read by the
-            # legacy Jupyter-widget classes in segmentation/segment.py,
-            # alignment/chain.py, localization/localization.py
+            # legacy Jupyter-widget classes now in legacy/segment_widgets.py,
+            # legacy/chain_widget.py, legacy/localization_widget.py
             # (SegmentWidget, AlignmentWidget, LocalizationWidget,
             # CellbarcodeWidget), none of which this GUI ever instantiates.
             # The real pipeline (segment_fov, align_same_modality,

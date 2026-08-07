@@ -25,7 +25,7 @@ def _composite_multi(images, lb=0.3, ub=0.9999):
     sequential red-cyan color (reference hybe = red, last readout = cyan,
     everything else interpolated between), pixelwise-max across all of them
     -- same composites.max(-1) pattern already used in
-    codelab_pipeline/segmentation/segment.py's legacy CellbarcodeWidget.
+    legacy/segment_widgets.py's CellbarcodeWidget.
     Gives one combined image showing every readout simultaneously, instead
     of the 2-color pairwise composite -- the pairwise view can't show
     whether alignment succeeded overall across many hybes at once.

@@ -19,7 +19,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
 
     Shows the reference image beside the labeled mask overlay (boundary
     scatter + ID text at each cell's centroid -- ports the plotting from
-    codelab_pipeline/segmentation/segment.py's SegmentWidget, cleaned up).
+    legacy/segment_widgets.py's SegmentWidget, cleaned up).
     A "remove cell ID(s)" field lets the user null out bad detections from
     the mask before it's staged/saved.
 
