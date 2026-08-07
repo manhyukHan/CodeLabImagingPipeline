@@ -26,26 +26,38 @@ localizer run on the untouched image.
 """
 
 
-def _resolve_matrix(hybe, fov_matrices, cell=None):
+def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     """
     The single 3x3 'yx' matrix mapping `hybe`'s own native (raw) frame to
-    the reference frame for this coordinate. If `cell` is given and has a
-    matrix for this hybe, use it -- compute_cell_alignment's H_yx already
-    composes the FOV-level (and, for DNA, cross-modal) correction with this
-    cell's own residual refinement. Otherwise fall back to fov_matrices,
-    which the caller is expected to have already composed with H_across
-    when applicable (see main_window._composed_fov_matrices_for_cell_alignment)
-    -- this function never re-derives or infers that composition itself.
+    the reference frame for this coordinate. If `cell` is given, that
+    reference frame is cell.reference_hybe's own frame (the frame
+    cell.area/spot.coordinate live in) -- ACell.matrix_to resolves this
+    from cell.matrices, which itself targets a shared FOV frame rather
+    than cell.reference_hybe directly (see compute_cell_alignment's
+    docstring), composing through it with graceful identity fallback for
+    either leg per "no no-alignment". Without a cell, the reference frame
+    is whatever fov_matrices itself targets, which the caller is expected
+    to have already composed with H_across when applicable (see
+    main_window._composed_fov_matrices_for_cell_alignment) -- this
+    function never re-derives or infers that composition itself.
+
+    modality: which modality `hybe` belongs to -- required to look up
+    cell.matrices correctly, since it's keyed by (hybe, modality), not
+    bare hybe (the cross-modal bridge hybe, e.g. Hyb_130, is a real,
+    distinct file in both modalities and would otherwise collide).
+    Defaults to cell.modality when cell is given and modality is omitted
+    -- correct for the common case of a same-modality lookup.
     """
-    if cell is not None and hybe in cell.matrices:
-        return cell.matrices[hybe]['yx']
+    if cell is not None:
+        key_modality = modality if modality is not None else cell.modality
+        return cell.matrix_to(hybe, key_modality)
     if hybe not in fov_matrices:
         raise KeyError(f"No alignment matrix for hybe '{hybe}' -- pass a fov_matrices entry "
-                        f"(or a cell with its own residual for this hybe)")
+                        f"(or a cell with its own residual for this hybe/modality)")
     return fov_matrices[hybe]
 
 
-def raw_to_reference(coordinate, hybe, fov_matrices, cell=None):
+def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None):
     """
     coordinate: (x, y) in `hybe`'s own native/raw pixel frame -- e.g.
     exactly where a spot was localized on that hybe's own unmodified image.
@@ -53,12 +65,12 @@ def raw_to_reference(coordinate, hybe, fov_matrices, cell=None):
     ref_point = H @ raw_point. Only the coordinate moves.
     """
     x, y = coordinate
-    H = _resolve_matrix(hybe, fov_matrices, cell)
+    H = _resolve_matrix(hybe, fov_matrices, modality, cell)
     rx, ry, _ = H @ np.array([x, y, 1.0])
     return float(rx), float(ry)
 
 
-def reference_to_raw(coordinate, hybe, fov_matrices, cell=None):
+def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None):
     """
     Inverse of raw_to_reference: coordinate is a point already known in the
     shared reference frame (e.g. a fiducial spot selected once on a single
@@ -67,7 +79,7 @@ def reference_to_raw(coordinate, hybe, fov_matrices, cell=None):
     frame, so a crop can be taken there for localization.
     """
     x, y = coordinate
-    H = _resolve_matrix(hybe, fov_matrices, cell)
+    H = _resolve_matrix(hybe, fov_matrices, modality, cell)
     rx, ry, _ = la.inv(H) @ np.array([x, y, 1.0])
     return float(rx), float(ry)
 

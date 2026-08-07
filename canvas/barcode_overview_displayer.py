@@ -1,6 +1,8 @@
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.cm import ScalarMappable
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
@@ -119,10 +121,45 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         fig = self.canvas.figure
         saved_view = zoom_pan.capture_view(fig) if keep_view else None
         fig.clear()
-        ax = fig.subplots(1, 1)
+        # Explicit axes rectangles (figure-fraction coords), not fig.
+        # subplots()+fig.colorbar(ax=...) -- chaining colorbar() calls on
+        # the same ax repeatedly shrinks that ax and appends each new
+        # colorbar right next to whatever was added last, so its own
+        # `pad` ends up relative to the PREVIOUS colorbar's edge, not a
+        # fixed reference -- there is no separate knob for "gap between
+        # the image and the first colorbar" vs "gap BETWEEN colorbars".
+        # Placing every axes explicitly gives two independent gaps.
+        n = len(self.images_by_channel)
+        main_left, main_width = 0.05, 0.55
+        img_to_cb_gap = 0.05      # image -> first colorbar
+        cb_gap = 0.14             # BETWEEN colorbars (bigger, per explicit request)
+        cb_width = 0.035
+        ax = fig.add_axes([main_left, 0.05, main_width, 0.9])
         ax.imshow(composite)
         ax.axis('off')
-        fig.tight_layout()
+        # One colorbar PER channel, not a single shared one -- the main
+        # image is an RGB max-composite (no single scalar mappable exists
+        # for it), and each channel genuinely has its own color AND its
+        # own independently-adjustable [vmin, vmax] (see the per-channel
+        # ScaleControlWidget rows above). Each colorbar goes from black to
+        # that channel's own color over ITS OWN range, so it reads
+        # correctly as "how bright does this channel have to be to show
+        # up," not a shared/misleading scale.
+        x = main_left + main_width + img_to_cb_gap
+        for i, (bch, img) in enumerate(self.images_by_channel.items()):
+            color = _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
+            control = self._scale_controls.get(bch)
+            vmin, vmax = control.vmin_vmax(img) if control is not None else (float(np.nanmin(img)), float(np.nanmax(img)))
+            cmap = LinearSegmentedColormap.from_list(f'barcode_ch{i}', [(0, 0, 0), color])
+            sm = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap=cmap)
+            cax = fig.add_axes([x, 0.15, cb_width, 0.7])
+            cb = fig.colorbar(sm, cax=cax)
+            # title (top), not set_label (which puts a rotated label along
+            # the side and reads poorly at this width) -- per explicit
+            # request to move the label to the top of each colorbar.
+            cb.ax.set_title(self.labels_by_channel.get(bch, str(bch)), fontsize=7, pad=6)
+            cb.ax.tick_params(labelsize=6)
+            x += cb_width + cb_gap
         zoom_pan.restore_view(fig, saved_view)
         self.canvas.draw()
         self._legend_label.setText('  '.join(legend_parts))

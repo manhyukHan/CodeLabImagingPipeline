@@ -141,6 +141,7 @@ class CelltypeDeterminationPanelUI(object):
         self.LowerBoundValueDoubleSpinBox = QtWidgets.QDoubleSpinBox()
         self.LowerBoundValueDoubleSpinBox.setRange(0, 1e9)
         self.LowerBoundValueDoubleSpinBox.setDecimals(4)
+        self.LowerBoundValueDoubleSpinBox.setSingleStep(0.001)
         self.LowerBoundValueDoubleSpinBox.setValue(0.3)
         lowerRow = QtWidgets.QWidget()
         lowerLayout = QtWidgets.QHBoxLayout(lowerRow)
@@ -154,6 +155,7 @@ class CelltypeDeterminationPanelUI(object):
         self.UpperBoundValueDoubleSpinBox = QtWidgets.QDoubleSpinBox()
         self.UpperBoundValueDoubleSpinBox.setRange(0, 1e9)
         self.UpperBoundValueDoubleSpinBox.setDecimals(4)
+        self.UpperBoundValueDoubleSpinBox.setSingleStep(0.001)
         self.UpperBoundValueDoubleSpinBox.setValue(0.999)
         upperRow = QtWidgets.QWidget()
         upperLayout = QtWidgets.QHBoxLayout(upperRow)
@@ -178,9 +180,19 @@ class CelltypeDeterminationPanelUI(object):
         return page
 
     def populate_hybe_choices(self, hybe_records):
-        self._hybe_records = list(hybe_records)
+        """
+        Restricted to datatype == 'B' (ExperimentLayout's own barcode-
+        readout classification, e.g. Hyb_130/Hyb_131 in the DNA layout)
+        -- a barcode channel is specifically a barcode-type readout, not
+        just any active hybe. hybe_records is already scoped to the
+        currently active modality (see MainWindow._refresh_active_hybe_
+        lists); switching the (mirrored) ModalityComboBox to whichever
+        modality actually has 'B' hybes is how those become available
+        here -- this panel doesn't re-derive modality on its own.
+        """
+        self._hybe_records = [r for r in hybe_records if r.get('datatype') == 'B']
         self.BarcodeHybeComboBox.clear()
-        self.BarcodeHybeComboBox.addItems([r['folder'] for r in hybe_records])
+        self.BarcodeHybeComboBox.addItems([r['folder'] for r in self._hybe_records])
         self.BarcodeHybeComboBox.currentIndexChanged.connect(self._on_barcode_hybe_changed)
         self._on_barcode_hybe_changed()
 
@@ -193,6 +205,16 @@ class CelltypeDeterminationPanelUI(object):
         self.BarcodeChannelComboBox.clear()
         if record is not None:
             self.BarcodeChannelComboBox.addItems([str(c) for c in record['channels']])
+            # default to the readout channel, not the fiducial one --
+            # same convention as ui/spot_localization_panel.py's own
+            # _on_hybe_changed (a barcode channel is a signal channel,
+            # fiducial is only ever used for alignment/segmentation).
+            fiducial = record.get('fiducial_channel')
+            readout_channels = [c for c in record['channels'] if c != fiducial]
+            if readout_channels:
+                idx = self.BarcodeChannelComboBox.findText(str(readout_channels[0]))
+                if idx >= 0:
+                    self.BarcodeChannelComboBox.setCurrentIndex(idx)
         self.BarcodeChannelComboBox.blockSignals(False)
         self.BarcodeChannelComboBox.currentIndexChanged.emit(self.BarcodeChannelComboBox.currentIndex())
 
@@ -221,6 +243,27 @@ class CelltypeDeterminationPanelUI(object):
             'upper_is_quantile': self.UpperBoundModeComboBox.currentText() == 'Quantile',
             'upper_value': self.UpperBoundValueDoubleSpinBox.value(),
         }
+
+    def ensure_celltype_names(self, names):
+        """
+        Adds any of `names` not already present as items -- used to seed
+        the shared celltype identity list from a loaded config's default
+        names and/or real classified celltypes already found in vlinks.h5
+        (see MainWindow._refresh_celltype_names_from_vlinks), without
+        clobbering anything the user already typed in this session
+        (existing items are never removed or reordered). If nothing is
+        currently selected, selects the first item afterward so the list
+        is immediately usable (e.g. Set FOV Ranges) without requiring a
+        manual click first -- per explicit request, the listview should
+        already be "active" the moment real data justifies it.
+        """
+        existing = set(self.celltype_names())
+        for name in names:
+            if name and name not in existing:
+                self.CelltypeNamesListWidget.addItem(name)
+                existing.add(name)
+        if self.CelltypeNamesListWidget.currentItem() is None and self.CelltypeNamesListWidget.count() > 0:
+            self.CelltypeNamesListWidget.setCurrentRow(0)
 
     def _add_celltype_name(self):
         name = self.NewCelltypeNameLineEdit.text().strip()

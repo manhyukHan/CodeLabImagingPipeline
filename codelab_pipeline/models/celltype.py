@@ -27,10 +27,10 @@ raw-frame (x, y) across channels from different hybes would silently mix
 coordinate frames -- exactly the class of bug the FOV/cross-modal/cell
 alignment-chain fixes earlier in this project were about. So both
 functions take PER-CHANNEL, already-frame-correct coordinates (the caller
-transforms once via cell.matrices[hybe]['yx'] / spot_mapper, per
-codelab_pipeline/alignment/spot_mapper.py's "cell-matrices are the final,
-already-composed matrix for a spot once cell-based alignment has run"
-convention) instead of one shared x, y reused blindly across channels.
+transforms once via ACell.matrix_to / spot_mapper, which relate a hybe's
+own entry back to cell.reference_hybe's frame -- see compute_cell_
+alignment's docstring for why that's not a direct cell.matrices lookup)
+instead of one shared x, y reused blindly across channels.
 """
 
 
@@ -90,9 +90,9 @@ def classify_cell_barcode(area_by_channel, fov, images, celltype_determination, 
     the SAME length and SAME point order (index i is the same physical
     point in every channel's array, just expressed in that channel's own
     hybe-native pixel frame). The caller builds this once per cell, e.g.
-    by applying cell.matrices[hybe]['yx'] (inverted) to cell.area for each
-    distinct hybe among the barcode channels -- a plain per-point matrix
-    multiply, deliberately NOT cell.get_area_in_readout's masking/
+    by applying cell.matrix_to(hybe, modality) (inverted) to cell.area for
+    each distinct hybe among the barcode channels -- a plain per-point
+    matrix multiply, deliberately NOT cell.get_area_in_readout's masking/
     morphological-closing machinery, which can change point count/order
     and would break the "same index i across channels" guarantee this
     function depends on.
