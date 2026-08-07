@@ -1,10 +1,10 @@
-import os
 import numpy as np
-import h5py
 from skimage import filters as skimage_filters, morphology as skimage_morphology, segmentation as skimage_segmentation
 from skimage.feature import peak_local_max
 from scipy import ndimage as scind
 import warnings
+
+from ..io import vlinks_store
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
 
@@ -21,20 +21,21 @@ def get_model_cyto():
 def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_size=1000, max_size=10000):
     """
     Bulk (non-interactive) cell segmentation for one FOV -- reads the
-    reference MIP straight from that hybe's per-hybe H5 file (the current
-    ingestion convention: {storage_path}/FOV{fov:02d}/{hybe}_stack.h5,
-    /mip/ch{channel}), not the old vlinks.h5-based layout SegmentWidget used.
+    reference MIP from vlinks.h5 (vlinks_store.read_hybe_mip), a real copy
+    written by ingestion, not the raw per-hybe {hybe}_stack.h5 -- per
+    explicit principle, segmentation is display/2D-analysis, not ingestion
+    or 3D localization, so it should never need the raw stack file.
     Returns (mask, reference_image); doesn't display or save anything itself
     -- matches localize_cells_2d's separation of computation from I/O, so the
     GUI can run this off the main thread and review the result before saving.
 
     Core Cellpose-call + size-filter + relabel logic mirrors
-    SegmentWidget.create_mask_in_reference_hybe below, minus its
-    Jupyter/plotting/H5-write scaffolding.
+    legacy/segment_widgets.py's SegmentWidget.create_mask_in_reference_hybe,
+    minus its Jupyter/plotting/H5-write scaffolding.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        reference_image = f[f'/mip/ch{channel}'][:]
+    reference_image = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, channel)
+    if reference_image is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
 
     # eval()'s return tuple length varies by cellpose version/model class
     # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
@@ -82,9 +83,8 @@ def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='ot
                           absolute_cutoff=None, min_distance=7, min_size=1000, max_size=10000):
     """
     Bulk (non-interactive) classical threshold+watershed cell segmentation
-    for one FOV -- same I/O contract as segment_fov (reads
-    {storage_path}/FOV{fov:02d}/{reference_hybe}_stack.h5's /mip/ch{channel},
-    returns (mask, reference_image)). Ports
+    for one FOV -- same I/O contract as segment_fov (reads reference_hybe's
+    MIP from vlinks.h5, returns (mask, reference_image)). Ports
     CellClassifier/canvas/main_image_canvas.py::_runCellSegment's classical
     branch (method in {'otsu','yen','li','triangle','manual'}), minus its
     pyqtgraph/live-canvas coupling. 'manual' there meant "type an absolute
@@ -99,9 +99,9 @@ def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='ot
     passes indices=). The boolean marker mask is rebuilt manually from the
     returned peak coordinates instead.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        reference_image = f[f'/mip/ch{channel}'][:]
+    reference_image = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, channel)
+    if reference_image is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
 
     if method == 'absolute':
         cutoff = float(absolute_cutoff)

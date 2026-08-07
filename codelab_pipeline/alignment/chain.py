@@ -5,6 +5,7 @@ import numpy.linalg as la
 import h5py
 
 from ..io import preprocess
+from ..io import vlinks_store
 import cv2
 
 def align_cell(yx, H, shape):
@@ -256,55 +257,47 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
     Persists an already-computed {hybe: matrix} dict (from
     align_same_modality(..., write=False), or a manual-mode staged
-    result the user just accepted) into each hybe's own H5 /matrix/{hybe},
+    result the user just accepted) into vlinks.h5's /FOV##/matrix/{hybe},
     plus reference_sequence/steps provenance attrs -- split out from
     align_same_modality so the write step can be deferred (manual
     review mode) or run standalone.
+
+    Delegates to vlinks_store rather than writing into each hybe's own raw
+    {hybe}_stack.h5 (the previous behavior) -- per explicit principle,
+    vlinks.h5 must be the pipeline's authoritative store for this, not N
+    scattered raw per-hybe files that require heavy I/O (opening every
+    stack file) just to answer "has this FOV been aligned." Outside
+    ingestion and 3D localization, the raw stack files should not need to
+    be touched at all.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
-    for hybe, H in matrices.items():
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
-        with h5py.File(h5path, 'r+') as f:
-            f['/matrix'][hybe][:] = H
-            f['/matrix'][hybe].attrs['reference_sequence'] = np.array([f'{hybe}->{reference_hybe}'], dtype='S')
-            f['/matrix'][hybe].attrs['steps'] = H[None, ...].astype('float32')
+    vlinks_store.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
 
 
 def read_same_modality_matrices(storage_path, fov, hybe_records):
     """
-    Reads back whatever's already on disk in each hybe's own H5
-    /matrix/{hybe} (self-keyed dataset -- see write_same_modality_matrices)
-    without requiring align_same_modality to be re-run. preprocess.py's
-    ingestion always seeds this dataset to identity for every hybe, so a
-    hybe whose H5 DOES exist but has no /matrix/{hybe} yet still legitimately
-    gets an identity default here. A hybe whose H5 doesn't exist AT ALL,
-    though, was simply never ingested -- it's silently SKIPPED (no entry in
-    the returned dict at all), never given a fake identity default. This
-    matters: hybe_records passed in here can be the full parsed
-    ExperimentLayout (declaring far more hybes than were ever actually
-    converted to H5), and a fake identity entry for a non-ingested hybe
-    used to leak into self.fov_matrices, making it look like a real,
-    processable hybe to downstream code (e.g. cell-based alignment), which
-    then crashed trying to open a stack file that genuinely doesn't exist.
-    This is the read-back half of "activation": self.fov_matrices in the
-    GUI should reflect whatever alignment has already been computed and
-    written, without the user needing to re-run alignment just to see it
-    again.
+    Reads back whatever's already in vlinks.h5's /FOV##/matrix/{hybe} (see
+    write_same_modality_matrices) without requiring align_same_modality to
+    be re-run. A hybe already ingested (real MIP present in vlinks.h5) but
+    with no matrix entry yet still legitimately gets an identity default.
+    A hybe never ingested at all is silently SKIPPED (no entry in the
+    returned dict), never given a fake identity default. This matters:
+    hybe_records passed in here can be the full parsed ExperimentLayout
+    (declaring far more hybes than were ever actually ingested), and a
+    fake identity entry for a non-ingested hybe used to leak into
+    self.fov_matrices, making it look like a real, processable hybe to
+    downstream code (e.g. cell-based alignment), which then crashed trying
+    to open a stack file that genuinely doesn't exist. This is the
+    read-back half of "activation": self.fov_matrices in the GUI should
+    reflect whatever alignment has already been computed and written,
+    without the user needing to re-run alignment just to see it again.
+
+    Delegates to vlinks_store (see that module's ingested_hybes_for_fov /
+    read_same_modality_matrices) instead of opening each hybe's own raw
+    {hybe}_stack.h5 -- this is now a single vlinks.h5 open, not N raw file
+    opens, so callers can refresh this freely.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
-    matrices = {}
-    for record in hybe_records:
-        hybe = record['folder']
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                if f'/matrix/{hybe}' in f:
-                    matrices[hybe] = f[f'/matrix/{hybe}'][:]
-                else:
-                    matrices[hybe] = np.eye(3)
-        except OSError:
-            continue
-    return matrices
+    hybe_list = [record['folder'] for record in hybe_records]
+    return vlinks_store.read_same_modality_matrices(storage_path, fov, hybe_list)
 
 
 def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999, write=True,

@@ -74,6 +74,23 @@ class IngestionWorker(QtCore.QThread):
             for i, (fov, record) in enumerate(tasks):
                 fov_r, hybe_r, err = preprocess.convert_dax_to_h5_worker(
                     fov, record, self.dax_directory, self.storage_path, self.modality, overwrite=self.overwrite)
+                if err is None:
+                    # Ingestion is one of the two places this app is allowed
+                    # to touch the raw per-hybe stack file directly (see
+                    # vlinks_store.write_hybe_mip's own docstring) -- the
+                    # file's already just been written, so this MIP copy is
+                    # cheap. Everything downstream (ingestion-status checks,
+                    # displayers, "has this FOV been aligned") should read
+                    # vlinks.h5 from here on, never re-open this stack file
+                    # just to check whether it's usable.
+                    try:
+                        h5path = os.path.join(self.storage_path, f'FOV{fov_r:02d}', f'{hybe_r}_stack.h5')
+                        with h5py.File(h5path, 'r') as f:
+                            channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in record['channels']}
+                        vlinks_store.write_hybe_mip(self.storage_path, fov_r, hybe_r, channel_mips,
+                                                    fiducial_channel=record['fiducial_channel'])
+                    except Exception as e:
+                        err = f'ingested but failed to write vlinks.h5 MIP: {e}'
                 status = 'OK' if err is None else f'ERROR: {err}'
                 if err is not None:
                     error_lines.append(f'FOV{fov_r:02d} {hybe_r}: {err}')
@@ -1202,27 +1219,26 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _ingested_hybes_for_fov(storage_path, fov, hybe_records):
         """
-        Per-hybe readiness for one FOV: does {storage_path}/FOV{fov:02d}/
-        {hybe}_stack.h5 exist, and does it actually contain /mip/ch{c} and
-        /stack/ch{c} for every channel that hybe's own ExperimentLayout
-        record declares? File-exists alone isn't enough to trust -- a
-        partially-written or corrupted H5 (e.g. an interrupted ingestion
-        run) would otherwise look "ready" and fail confusingly later, deep
-        inside segmentation/alignment instead of here where it's obvious
-        what's missing. Returns (ready, missing, invalid) hybe-folder lists.
+        Per-hybe readiness for one FOV, read from vlinks.h5 alone (never
+        opens a raw {hybe}_stack.h5) -- a single cheap file open instead of
+        N heavy ones, since IngestionWorker now writes a real MIP copy into
+        vlinks.h5 (vlinks_store.write_hybe_mip) right after each hybe's raw
+        conversion succeeds. "Ready" means that hybe's vlinks.h5 MIP has
+        every channel its own ExperimentLayout record declares -- a hybe
+        with a MIP group but a missing channel (e.g. write_hybe_mip
+        interrupted mid-loop) is INCOMPLETE, not silently trusted, same
+        distinction the old raw-file-based version made. Returns (ready,
+        missing, invalid) hybe-folder lists.
         """
         ready, missing, invalid = [], [], []
         for record in hybe_records:
             hybe = record['folder']
-            h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-            if not os.path.exists(h5path):
+            channels_present = vlinks_store.mip_channels_present(storage_path, fov, hybe)
+            if channels_present is None:
                 missing.append(hybe)
-                continue
-            try:
-                with h5py.File(h5path, 'r') as f:
-                    complete = all(f'/mip/ch{c}' in f and f'/stack/ch{c}' in f for c in record['channels'])
-                (ready if complete else invalid).append(hybe)
-            except Exception:
+            elif all(str(c) in channels_present for c in record['channels']):
+                ready.append(hybe)
+            else:
                 invalid.append(hybe)
         return ready, missing, invalid
 
@@ -1412,13 +1428,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         fov = ip.ViewerFovSpinBox.value()
         channel = int(channel_text)
-        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+        # Reads vlinks.h5, not the raw stack file -- per explicit principle,
+        # display code should rely on vlinks, not raw/stacked data. This
+        # does mean a bug in write_hybe_mip's own copy step wouldn't be
+        # caught by this viewer anymore; Check Ingestion Status (which
+        # verifies vlinks.h5 has every declared channel, see
+        # _ingested_hybes_for_fov) is the tool for that now.
         try:
-            with h5py.File(h5path, 'r') as f:
-                mip = f[f'/mip/ch{channel}'][:]
+            mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+            if mip is None:
+                raise ValueError(f'FOV{fov:02d} {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
         except Exception as e:
             if not silent:
-                QtWidgets.QMessageBox.critical(self, 'Show MIP Viewer', f'Could not read {h5path}:\n{type(e).__name__}: {e}')
+                QtWidgets.QMessageBox.critical(self, 'Show MIP Viewer', f'{type(e).__name__}: {e}')
             return
         self.mip_viewer.set_data(mip, title=f'FOV{fov:02d} {hybe} ch{channel}')
         self.mip_viewer.show()
@@ -1557,15 +1579,12 @@ class MainWindow(QtWidgets.QMainWindow):
         append = cp.AppendModeCheckBox.isChecked()
 
         if method == 'manual':
-            # nothing to compute -- a single small H5 read on the GUI
+            # nothing to compute -- a single small vlinks.h5 read on the GUI
             # thread, not the multi-second Cellpose/watershed compute the
             # other two methods hide behind a QThread for.
-            h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-            try:
-                with h5py.File(h5path, 'r') as f:
-                    reference_image = f[f'/mip/ch{channel}'][:]
-            except Exception as e:
-                self._on_cell_segment_failed(str(e))
+            reference_image = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, channel)
+            if reference_image is None:
+                self._on_cell_segment_failed(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 return
             mask = np.zeros(reference_image.shape, dtype=np.uint8)
             cp.LogTextEdit.append(f'Manual mode: opened empty mask for FOV{fov:02d} ({reference_hybe}, ch{channel}).')
@@ -1710,12 +1729,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_path or not reference_hybe or not channel_text:
             return
         channel = int(channel_text)
-        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                reference_image = f[f'/mip/ch{channel}'][:]
-        except Exception as e:
-            cp.LogTextEdit.append(f'Could not load {reference_hybe} ch{channel} for FOV{fov:02d}: {type(e).__name__}: {e}')
+        reference_image = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, channel)
+        if reference_image is None:
+            cp.LogTextEdit.append(f'{reference_hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
 
         # activate whatever's persisted for this FOV (disk or already in
@@ -1978,13 +1994,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # exist under the CURRENT storage_path at all. Resolve from the
         # cell's own segmentation modality first.
         cell_storage_path = self.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
-        h5path = os.path.join(cell_storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                channel = int(f.attrs['fiducial_channel'])
-                reference_image = f[f'/mip/ch{channel}'][:]
-        except Exception as e:
-            cp.LogTextEdit.append(f'Could not load a reference image for existing FOV{fov:02d} cells: {type(e).__name__}: {e}')
+        reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
+        if reference_image is None:
+            cp.LogTextEdit.append(f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d} -- cannot show existing cells.')
             return False
 
         # same uint8 label convention segment_fov/segment_fov_classical
@@ -2285,9 +2297,10 @@ class MainWindow(QtWidgets.QMainWindow):
         height, width = cell.frame_shape
         rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
         rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
-        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-        with h5py.File(h5path, 'r') as f:
-            mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
+        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        if mip is None:
+            return None
+        mip_crop = mip[rymin:rymax, rxmin:rxmax]
         mask = np.zeros((rymax - rymin, rxmax - rxmin), dtype=bool)
         local_y, local_x = y_area - rymin, x_area - rxmin
         valid = (local_y >= 0) & (local_y < mask.shape[0]) & (local_x >= 0) & (local_x < mask.shape[1])
@@ -2347,12 +2360,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_path or fov is None or not hybe or not channel_text:
             return
         channel = int(channel_text)
-        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                mip = f[f'/mip/ch{channel}'][:]
-        except Exception as e:
-            sp.LogTextEdit.append(f"Can't load {hybe} ch{channel}: {type(e).__name__}: {e}")
+        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        if mip is None:
+            sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
         unassigned_points = [(float(s.raw_coordinate[0]), float(s.raw_coordinate[1]))
                              for s in self.fov_unassigned_spots.get((storage_path, fov), [])
@@ -2855,9 +2865,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # ownership is only decided later, at Save View time (see
             # _save_fov_view) -- per explicit request, identification is
             # deferred to save, not done eagerly at detect time.
-            h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-            with h5py.File(h5path, 'r') as f:
-                mip = f[f'/mip/ch{channel}'][:]
+            mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+            if mip is None:
+                sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
+                return
             threshold_abs = sp.threshold_abs(mip.max())
             coords = peak_local_max(mip, min_distance=min_distance, exclude_border=1, threshold_abs=threshold_abs)
             new_spots = []
@@ -2941,12 +2952,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._barcode_calibration['lower_bound'].setdefault(bch, {})
         self._barcode_calibration['upper_bound'].setdefault(bch, {})
         for fov in fovs:
-            h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-            try:
-                with h5py.File(h5path, 'r') as f:
-                    img = f[f'/mip/ch{channel}'][:]
-            except Exception as e:
-                ctp.LogTextEdit.append(f'FOV{fov:02d}: could not read {hybe} ch{channel} -- {e}')
+            img = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+            if img is None:
+                ctp.LogTextEdit.append(f'FOV{fov:02d}: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
             lower = np.quantile(img, inputs['lower_value']) if inputs['lower_is_quantile'] else inputs['lower_value']
             upper = np.quantile(img, inputs['upper_value']) if inputs['upper_is_quantile'] else inputs['upper_value']
@@ -3013,12 +3021,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if bch is None:
                 continue
             hybe, channel = bch
-            h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-            try:
-                with h5py.File(h5path, 'r') as f:
-                    img = f[f'/mip/ch{channel}'][:]
-            except Exception as e:
-                ctp.LogTextEdit.append(f'Overview: could not read {hybe} ch{channel} -- {e}')
+            img = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+            if img is None:
+                ctp.LogTextEdit.append(f'Overview: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
             if hybe in fmats:
                 height, width = img.shape
@@ -3142,12 +3147,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     image_cache[fov_key] = {}
                     for bch in barcode_channel:
                         hybe, channel_id = bch
-                        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-                        try:
-                            with h5py.File(h5path, 'r') as f:
-                                image_cache[fov_key][bch] = f[f'/mip/ch{channel_id}'][:]
-                        except Exception:
-                            image_cache[fov_key][bch] = None
+                        image_cache[fov_key][bch] = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel_id)
 
                 # calibration is per-(hybe,channel)-per-FOV (Apply Calibration
                 # only covers whichever FOV(s) were explicitly calibrated) --
@@ -3298,13 +3298,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # cell's OWN segmentation modality instead, falling back to the
         # current one only if that modality's own path isn't configured.
         cell_storage_path = self.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
-        h5path = os.path.join(cell_storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                channel = int(f.attrs['fiducial_channel'])
-                reference_image = f[f'/mip/ch{channel}'][:]
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, 'Show Celltype Result', f'{type(e).__name__}: {e}')
+        reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
+        if reference_image is None:
+            QtWidgets.QMessageBox.critical(self, 'Show Celltype Result',
+                                           f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d}.')
             return
 
         mask = np.zeros(frame_shape, dtype=np.uint8)

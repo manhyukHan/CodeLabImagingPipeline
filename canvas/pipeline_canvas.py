@@ -1,9 +1,8 @@
-import os
 import numpy as np
-import h5py
 import cv2
 
 from codelab_pipeline.io import preprocess
+from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
 
 def _sequential_color(i, n):
@@ -313,7 +312,7 @@ class PipelineCanvas():
         if reference_final_matrix is None:
             reference_final_matrix = reference_fov_matrix
 
-        ref_mip = _read_mip(_h5_path(reference_storage_path, fov, reference_hybe), reference_channel)
+        ref_mip = _read_mip(reference_storage_path, fov, reference_hybe, reference_channel)
         # Per explicit request: the reference/red side needs its OWN
         # matrix per column, not one shared across raw/FOV/final -- raw is
         # H=identity (cell.area taken literally, matching the target's own
@@ -332,7 +331,7 @@ class PipelineCanvas():
         reference_fov_zx = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, reference_fov_bounds)
         reference_final_zx = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, reference_final_bounds)
 
-        target_mip = _read_mip(_h5_path(target_storage_path, fov, target_hybe), target_channel)
+        target_mip = _read_mip(target_storage_path, fov, target_hybe, target_channel)
         # cell mask's OWN coords, no transform at all
         raw_crop, _, raw_bounds = crop_via(target_mip, np.eye(3))
         fov_crop, _, fov_bounds = crop_via(target_mip, fov_only_matrix)
@@ -410,7 +409,7 @@ class PipelineCanvas():
         """
         record_by_folder = {r['folder']: r for r in hybe_records}
         ref_channel = alignment.pick_channel_by_type(record_by_folder[reference_hybe], channel_type)
-        ref_mip = _read_mip(_h5_path(storage_path, fov, reference_hybe), ref_channel)
+        ref_mip = _read_mip(storage_path, fov, reference_hybe, ref_channel)
         height, width = ref_mip.shape
 
         before_images = {reference_hybe: ref_mip}
@@ -420,7 +419,7 @@ class PipelineCanvas():
             if hybe == reference_hybe or hybe not in matrices:
                 continue
             channel = alignment.pick_channel_by_type(record, channel_type)
-            mip = _read_mip(_h5_path(storage_path, fov, hybe), channel)
+            mip = _read_mip(storage_path, fov, hybe, channel)
             before_images[hybe] = mip
             after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), matrices[hybe][:2], (width, height))
 
@@ -534,7 +533,7 @@ class PipelineCanvas():
                 padded[k] = a2
             return padded, h, w
 
-        ref_mip = _read_mip(_h5_path(reference_storage_path, fov, reference_hybe), reference_channel)
+        ref_mip = _read_mip(reference_storage_path, fov, reference_hybe, reference_channel)
         # Per explicit request: raw is ALWAYS true H=identity (cell.area
         # taken literally, matching every target's own raw column),
         # regardless of reference_matrix. FOV/cross-modal uses reference_
@@ -570,7 +569,7 @@ class PipelineCanvas():
             # present in cell.matrices.
             modality = spec.get('modality')
             label = f'{hybe} ({modality})' if modality else hybe
-            mip = _read_mip(_h5_path(sp, fov, hybe), spec['channel'])
+            mip = _read_mip(sp, fov, hybe, spec['channel'])
             raw_crop, _, raw_b = crop_via(mip, np.eye(3))
             fov_crop, _, fov_b = crop_via(mip, spec['fov_only_matrix'])
             final_crop, _, final_b = crop_via(mip, spec['final_matrix'])
@@ -644,10 +643,8 @@ class PipelineCanvas():
         channel (from ExperimentLayout, never assumed uniform).
         matrices: {hybe: 3x3} -- from alignment.align_same_modality.
         """
-        ref_path = _h5_path(storage_path, fov, reference_hybe)
-        target_path = _h5_path(storage_path, fov, target_hybe)
-        reference_mip = _read_mip(ref_path, fiducial_channels[reference_hybe])
-        moving_mip = _read_mip(target_path, fiducial_channels[target_hybe])
+        reference_mip = _read_mip(storage_path, fov, reference_hybe, fiducial_channels[reference_hybe])
+        moving_mip = _read_mip(storage_path, fov, target_hybe, fiducial_channels[target_hybe])
         self.draw_alignment_preview(reference_mip, moving_mip, matrices[target_hybe],
                                     f'{target_hybe} -> {reference_hybe} (fiducial)')
 
@@ -666,11 +663,9 @@ class PipelineCanvas():
         Omitting either dict (back-compat) falls back to identity, same as
         link_cross_modal's own .get(hybe, identity) default.
         """
-        mip_fn = alignment._fiducial_channel_mip if channel_type == 'fiducial' else alignment._readout_channel_mip
-        rna_path = _h5_path(rna_storage_path, fov, rna_reference_hybe)
-        dna_path = _h5_path(dna_storage_path, fov, dna_reference_hybe)
-        rna_mip = mip_fn(rna_path)
-        dna_mip = mip_fn(dna_path)
+        mip_fn = vlinks_store.fiducial_channel_mip if channel_type == 'fiducial' else vlinks_store.readout_channel_mip
+        rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
+        dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
 
         h, w = rna_mip.shape
         H_rna_within = (rna_fov_matrices or {}).get(rna_reference_hybe, np.eye(3))
@@ -683,10 +678,13 @@ class PipelineCanvas():
                                     save_path=save_path)
 
 
-def _h5_path(storage_path, fov, hybe):
-    return os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-
-
-def _read_mip(h5path, channel):
-    with h5py.File(h5path, 'r') as f:
-        return f[f'/mip/ch{channel}'][:]
+def _read_mip(storage_path, fov, hybe, channel):
+    """
+    This hybe's MIP straight from vlinks.h5 (see
+    vlinks_store.write_hybe_mip) -- previously opened the raw
+    {hybe}_stack.h5 directly. Per explicit principle, display/preview code
+    should never need the raw stack file; only ingestion (which just wrote
+    it) and 3D localization (which needs the full Z-stack, not just the
+    MIP) are allowed to touch it.
+    """
+    return vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)

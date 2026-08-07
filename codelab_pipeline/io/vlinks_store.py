@@ -354,6 +354,220 @@ def read_fov_params(storage_path, fov):
         return dict(f[grp_path].attrs)
 
 
+def _mip_group_path(fov, hybe):
+    return f'/FOV{fov:02d}/mip/{hybe}'
+
+
+def _fov_matrix_group_path(fov):
+    return f'/FOV{fov:02d}/matrix'
+
+
+def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None):
+    """
+    Real (non-virtual) copy of one hybe's MIP, one dataset per channel,
+    into vlinks.h5 at /FOV##/mip/{hybe}/ch{channel} -- the fix for
+    principle 4 ("store MIP in vlinks"): the old aggregate vlinks builder
+    (legacy/preprocess_legacy.py's dax_vlinks_h5/vlinks_h5, dead code) only
+    ever wrote h5py.VirtualSource entries here, which still require the
+    original per-hybe {hybe}_stack.h5 files to physically exist at the
+    SAME absolute path recorded at creation time -- not self-contained,
+    and silently broken the moment a data folder moves (confirmed on real
+    data: every existing vlinks.h5's /mip and /stack are_virtual=True,
+    pointing at an absolute path). This writes an actual copy of the pixel
+    data instead, so vlinks.h5 alone is enough to visualize/inspect a
+    hybe's MIP with no dependency on the raw stack file at all.
+
+    Deliberately keyed by hybe (/mip/{hybe}/ch{c}), not a single aggregate
+    per-FOV array indexed by hybe position the way the old builder's
+    /mip/ch{c} (shape (n_hybes, h, w)) was -- self-contained per hybe, no
+    dependency on a shared hybe_list ordering being correct or even
+    present, and no need to rewrite every other hybe's entry when one new
+    hybe is ingested.
+
+    Also seeds /FOV##/matrix/{hybe} = identity here if nothing is written
+    there yet, mirroring preprocess.convert_dax_to_h5_worker's own
+    per-hybe-stack-file convention of seeding /matrix/{hybe} to identity at
+    ingestion time -- "no alignment run yet" must default to identity,
+    never be treated as an error or a missing hybe (see
+    read_same_modality_matrices below).
+
+    channel_mips: {channel (int or str): 2D ndarray}. fiducial_channel
+    (optional): that hybe's own fiducial channel (from its ExperimentLayout
+    record), stashed as a group attr so fiducial_channel_mip/
+    readout_channel_mip below can resolve "which channel is fiducial" from
+    vlinks.h5 alone -- the same per-hybe attr chain.py's
+    _fiducial_channel_mip/_readout_channel_mip read directly off the raw
+    stack file's own .attrs, now mirrored here so display code never needs
+    that raw file just to answer this.
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_mip_group_path(fov, hybe))
+        for ch, mip in channel_mips.items():
+            name = f'ch{ch}'
+            if name in grp:
+                del grp[name]
+            grp.create_dataset(name, data=np.asarray(mip))
+        if fiducial_channel is not None:
+            grp.attrs['fiducial_channel'] = int(fiducial_channel)
+        mgrp = f.require_group(_fov_matrix_group_path(fov))
+        if hybe not in mgrp:
+            mgrp.create_dataset(hybe, data=np.eye(3, dtype='float32'))
+
+
+def read_hybe_mip(storage_path, fov, hybe, channel):
+    """The vlinks.h5-stored MIP for one hybe/channel (see write_hybe_mip),
+    or None if this hybe hasn't been ingested yet / no vlinks.h5 yet."""
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return None
+    grp_path = _mip_group_path(fov, hybe)
+    with h5py.File(vlinks_path, 'r') as f:
+        name = f'ch{channel}'
+        if grp_path not in f or name not in f[grp_path]:
+            return None
+        return f[grp_path][name][:]
+
+
+def fiducial_channel_mip(storage_path, fov, hybe):
+    """
+    The fiducial channel's MIP for a hybe, read entirely from vlinks.h5 --
+    vlinks-based counterpart to codelab_pipeline.alignment.chain's
+    _fiducial_channel_mip, which reads the raw stack file's own .attrs to
+    resolve the channel. Returns None if this hybe (or its fiducial_channel
+    attr -- only present for hybes ingested after write_hybe_mip started
+    stashing it) isn't in vlinks.h5 yet.
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return None
+    grp_path = _mip_group_path(fov, hybe)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
+            return None
+        channel = int(f[grp_path].attrs['fiducial_channel'])
+        name = f'ch{channel}'
+        return f[grp_path][name][:] if name in f[grp_path] else None
+
+
+def readout_channel_mip(storage_path, fov, hybe):
+    """
+    The one non-fiducial channel's MIP for a hybe, read entirely from
+    vlinks.h5 -- vlinks-based counterpart to
+    codelab_pipeline.alignment.chain's _readout_channel_mip. Returns None
+    if this hybe/its fiducial_channel attr isn't in vlinks.h5 yet, or if it
+    genuinely has no non-fiducial channel.
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return None
+    grp_path = _mip_group_path(fov, hybe)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
+            return None
+        fiducial_ch = int(f[grp_path].attrs['fiducial_channel'])
+        channels = [name[2:] for name in f[grp_path].keys() if name.startswith('ch')]
+        readout = [c for c in channels if c != str(fiducial_ch)]
+        name = f'ch{readout[0]}' if readout else f'ch{fiducial_ch}'
+        return f[grp_path][name][:] if name in f[grp_path] else None
+
+
+def mip_channels_present(storage_path, fov, hybe):
+    """
+    {channel(str): True} for whatever channels this hybe's MIP actually has
+    in vlinks.h5 right now, or None if this hybe was never ingested at all
+    (no /FOV##/mip/{hybe} group whatsoever) -- lets a caller distinguish
+    "never ingested" from "ingested but incomplete" (e.g. write_hybe_mip
+    was interrupted partway through its channel loop), the same
+    distinction windows/main_window.py's ingestion-status check already
+    surfaces to the user (MISSING vs INCOMPLETE/UNREADABLE).
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return None
+    grp_path = _mip_group_path(fov, hybe)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f:
+            return None
+        return {name[2:]: True for name in f[grp_path].keys() if name.startswith('ch')}
+
+
+def ingested_hybes_for_fov(storage_path, fov, hybe_list):
+    """
+    Which of hybe_list have a real MIP already in vlinks.h5 for this FOV --
+    the vlinks-only replacement for opening every per-hybe {hybe}_stack.h5
+    just to check completeness (see windows/main_window.py's old
+    _ingested_hybes_for_fov, which did exactly that). A hybe counts as
+    ingested once write_hybe_mip has run for it at least once; this never
+    opens a raw stack file, so it's cheap enough to call on every refresh,
+    not just at special trigger moments -- "free refresh" per explicit
+    request, rather than active_hybe_list being gated to rare moments
+    because recomputing it used to be expensive.
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return []
+    with h5py.File(vlinks_path, 'r') as f:
+        return [hybe for hybe in hybe_list
+                if _mip_group_path(fov, hybe) in f and len(f[_mip_group_path(fov, hybe)]) > 0]
+
+
+def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
+    """
+    Persists an already-computed {hybe: matrix} dict into vlinks.h5's
+    /FOV##/matrix/{hybe} (real datasets, with reference_sequence/steps
+    provenance attrs mirroring the per-hybe-stack-file convention this
+    replaces) -- the vlinks-based counterpart to
+    codelab_pipeline.alignment.chain's identically-named function, which
+    now delegates here instead of writing into each hybe's own raw
+    {hybe}_stack.h5. vlinks.h5 must be the authoritative store for this,
+    not scattered across N raw per-hybe files, so that "has this FOV been
+    aligned" is answerable -- cheaply, and correctly -- from vlinks.h5
+    alone (matches how write_cross_modal_matrix below already mirrors the
+    cross-modal case into vlinks.h5, for the same reason).
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_fov_matrix_group_path(fov))
+        for hybe, H in matrices.items():
+            if hybe in grp:
+                del grp[hybe]
+            ds = grp.create_dataset(hybe, data=np.asarray(H, dtype='float32'))
+            ds.attrs['reference_sequence'] = np.array([f'{hybe}->{reference_hybe}'], dtype='S')
+            ds.attrs['steps'] = np.asarray(H, dtype='float32')[None, ...]
+
+
+def read_same_modality_matrices(storage_path, fov, hybe_list):
+    """
+    Reads back whatever's in vlinks.h5's /FOV##/matrix/{hybe} for each hybe
+    in hybe_list -- the vlinks-based counterpart to
+    codelab_pipeline.alignment.chain's identically-named function.
+
+    A hybe already ingested (real MIP present, see ingested_hybes_for_fov)
+    but with no matrix entry yet legitimately gets an identity default
+    (write_hybe_mip seeds this at ingestion time, so in practice this only
+    matters for a vlinks.h5 written before this seeding existed). A hybe
+    not yet ingested at all is silently SKIPPED, never given a fake
+    identity entry -- same "don't claim a non-existent hybe is processable"
+    contract the old per-file-based version had (see that function's own
+    docstring in chain.py for why this distinction matters downstream).
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return {}
+    matrices = {}
+    with h5py.File(vlinks_path, 'r') as f:
+        matrix_grp_path = _fov_matrix_group_path(fov)
+        for hybe in hybe_list:
+            if _mip_group_path(fov, hybe) not in f:
+                continue  # not ingested yet
+            if matrix_grp_path in f and hybe in f[matrix_grp_path]:
+                matrices[hybe] = f[matrix_grp_path][hybe][:]
+            else:
+                matrices[hybe] = np.eye(3)
+    return matrices
+
+
 def write_cross_modal_matrix(storage_path, fov, H):
     """
     Mirrors an already-computed H_across (see
