@@ -51,6 +51,9 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         self.resize(760, 760)
         self.crop_image = None
         self.spot_points = []
+        self.crop_mask = None
+        self.spot_color = 'red'
+        self.readonly_points = []
         self._axes = None
         self._manual_mode = False
         self._mpl_cids = []
@@ -93,9 +96,35 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
 
         self.RemoveSpotPushButton.clicked.connect(self._remove_by_index)
 
-    def set_data(self, crop_image, spot_points):
+    def set_data(self, crop_image, spot_points, mask=None, color='red', readonly_points=None):
+        """
+        mask: optional boolean cell-boundary array, same shape as
+        crop_image -- drawn as a yellow contour (same convention as
+        pipeline_canvas.py's cell-boundary overlays), for the Cell view's
+        "unmasked crop + boundary line" display. None (the FOV view's raw
+        MIP, which has no single cell boundary) leaves the image exactly
+        as before.
+
+        color: marker color for spot_points -- the EDITABLE list (manual
+        click add/remove and spots_edited both only ever touch
+        spot_points). Cell view passes the default 'red'; FOV view passes
+        'yellow' for its unassigned-spot pool, so the two are visually
+        distinct wherever they might appear side by side.
+
+        readonly_points: optional second list of crop-local (x, y),
+        drawn for CONTEXT only -- always red, never affected by clicks/
+        removal/spots_edited. FOV view uses this for already-identified,
+        cell-owned spots: showing them without making them part of the
+        editable pool avoids a manual edit's full-replace semantics
+        (spots_edited hands back the whole current spot_points list)
+        silently turning already-identified spots back into unassigned
+        ones.
+        """
         self.crop_image = crop_image
         self.spot_points = list(spot_points)
+        self.crop_mask = mask
+        self.spot_color = color
+        self.readonly_points = list(readonly_points) if readonly_points else []
         self._redraw(keep_view=False)
 
     def _redraw(self, keep_view=True):
@@ -106,12 +135,34 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         fig.clear()
         ax = fig.subplots(1, 1)
         vmin, vmax = self.ScaleControl.vmin_vmax(self.crop_image)
-        ax.imshow(self.crop_image, cmap=cm.gray, vmin=vmin, vmax=vmax)
-        ax.set_title(f'{len(self.spot_points)} spot(s)', fontsize=10)
+        im = ax.imshow(self.crop_image, cmap=cm.gray, vmin=vmin, vmax=vmax)
+        fig.colorbar(im, ax=ax, fraction=0.05, pad=0.02)
+        if self.crop_mask is not None:
+            ax.contour(self.crop_mask.astype(np.uint8), levels=[0.5], colors='yellow', linewidths=1)
+        if self.readonly_points:
+            title = f'{len(self.spot_points)} spot(s) + {len(self.readonly_points)} other'
+        else:
+            title = f'{len(self.spot_points)} spot(s)'
+        ax.set_title(title, fontsize=10)
         ax.axis('off')
-        for i, (x, y) in enumerate(self.spot_points, start=1):
-            ax.scatter([x], [y], edgecolor='red', facecolor='none', s=60, linewidth=1.2)
-            ax.text(x + 2, y - 2, str(i), color='red', fontsize=8)
+        # A single batched scatter call regardless of point count -- one
+        # ax.scatter([x],[y]) + one ax.text() PER POINT was fine for a
+        # handful of manually-clicked spots, but is ruinously slow (each
+        # Text artist does real font-layout work) once a view can
+        # legitimately carry thousands of real detected spots (see
+        # fov_unassigned_spots). Per-point index labels are only useful
+        # at a glance for small counts anyway, so they're skipped above
+        # LABEL_LIMIT rather than rendered unreadably on top of each other.
+        LABEL_LIMIT = 300
+        if self.readonly_points:
+            xs, ys = zip(*self.readonly_points)
+            ax.scatter(xs, ys, edgecolor='red', facecolor='none', s=60, linewidth=1.2)
+        if self.spot_points:
+            xs, ys = zip(*self.spot_points)
+            ax.scatter(xs, ys, edgecolor=self.spot_color, facecolor='none', s=60, linewidth=1.2)
+            if len(self.spot_points) <= LABEL_LIMIT:
+                for i, (x, y) in enumerate(self.spot_points, start=1):
+                    ax.text(x + 2, y - 2, str(i), color=self.spot_color, fontsize=8)
         fig.tight_layout()
         zoom_pan.restore_view(fig, saved_view)
         self._axes = ax

@@ -22,9 +22,18 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
     - Cross-modal: 0/1 or 1/1 -- is this FOV's storage path paired with
       another modality (via the Alignment tab's Cross-Modal RNA/DNA
       fields) and, if so, has that cross-modal matrix been computed.
-    - Cell: (#cells with cell-based alignment computed) / (#cells total).
-    - Spot: (#spots with linked=True, i.e. celltype determination has run)
-      / (#spots total).
+    - Cell align: (#cells with cell-based alignment computed) / (#cells
+      total) -- alignment, NOT celltype.
+    - Cell celltype / Spot celltype: (#cells or #spots with linked=True,
+      i.e. celltype determination has actually run and set .celltype) /
+      total. Two separate columns since celltype determination can (and
+      often does) classify cells and spots to different completion
+      levels -- FOV mode always keeps them in lockstep (every spot
+      inherits its cell's celltype), but Barcode mode classifies each
+      independently, so a cell being classified doesn't guarantee every
+      one of its spots also got classified (e.g. if a spot's own barcode-
+      channel position couldn't be resolved for one of the required
+      hybes).
 
     Freely resizable, matching this app's own convention that dynamic
     content gets a real pop-up window rather than a fixed-size embedded
@@ -44,9 +53,10 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(self.RefreshPushButton)
 
         self.Table = QtWidgets.QTableWidget()
-        self.Table.setColumnCount(8)
+        self.Table.setColumnCount(9)
         self.Table.setHorizontalHeaderLabels(
-            ['Storage Path', 'FOV', 'Saved At', 'FOV align', 'Cross-modal', 'Cell align', 'Spot linked', 'Spots'])
+            ['Storage Path', 'FOV', 'Saved At', 'FOV align', 'Cross-modal', 'Cell align',
+             'Cell celltype', 'Spot celltype', 'Spots'])
         self.Table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.Table.verticalHeader().setVisible(False)
         layout.addWidget(self.Table)
@@ -56,7 +66,8 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
         rows: list of dicts, one per (storage_path, fov) -- keys
         storage_path, fov, saved_at, n_spots,
         fov_computed, fov_total, cross_computed, cross_total,
-        cell_computed, cell_total, spot_computed, spot_total.
+        cell_computed, cell_total, cell_celltype_computed, cell_celltype_total,
+        spot_computed, spot_total.
         """
         self.Table.setRowCount(len(rows))
         for i, row in enumerate(rows):
@@ -67,6 +78,7 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
                 f"{row['fov_computed']}/{row['fov_total']}",
                 f"{row['cross_computed']}/{row['cross_total']}" if row['cross_total'] else 'n/a',
                 f"{row['cell_computed']}/{row['cell_total']}",
+                f"{row['cell_celltype_computed']}/{row['cell_celltype_total']}",
                 f"{row['spot_computed']}/{row['spot_total']}",
                 str(row['n_spots']),
             ]

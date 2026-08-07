@@ -10,6 +10,10 @@ def _cells_group_path(fov):
     return f'/FOV{fov:02d}/cells'
 
 
+def _unassigned_spots_group_path(fov):
+    return f'/FOV{fov:02d}/unassigned_spots'
+
+
 def write_cells(storage_path, fov, cell_container):
     """
     Real, on-disk persistence for one FOV's cells (with their nested spots
@@ -40,6 +44,43 @@ def write_cells(storage_path, fov, cell_container):
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_cells'] = len(cells)
         grp.attrs['n_spots'] = sum(len(c.spots) for c in cells)
+
+
+def write_single_cell(storage_path, fov, cell):
+    """
+    Merges exactly one cell's current save() state into this FOV's
+    on-disk cell list, leaving every other cell's persisted data
+    untouched. Unlike write_cells (which always serializes the FULL
+    in-memory cell_container.data[fov] and overwrites the whole blob),
+    this reads the existing disk list first, replaces the matching
+    cell.id entry (or appends it, if this cell was never saved before),
+    and writes that back -- the narrow "just this one cell" persistence
+    "Save Current Spot" needs, since the transient container otherwise
+    holds every cell in the FOV and a full-container write would
+    silently also push out whatever's currently in memory for all of
+    them.
+    """
+    existing, modality = read_cells(storage_path, fov)
+    if existing is None:
+        existing = []
+    cell_dict = cell.save()
+    for i, d in enumerate(existing):
+        if d.get('id') == cell.id:
+            existing[i] = cell_dict
+            break
+    else:
+        existing.append(cell_dict)
+    payload = {'modality': modality or cell.modality, 'cells': existing}
+    blob = np.void(pickle.dumps(payload))
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_cells_group_path(fov))
+        if 'blob' in grp:
+            del grp['blob']
+        grp.create_dataset('blob', data=blob)
+        grp.attrs['saved_at'] = datetime.now().isoformat()
+        grp.attrs['n_cells'] = len(existing)
+        grp.attrs['n_spots'] = sum(len(d.get('spots', [])) for d in existing)
 
 
 def read_cells(storage_path, fov):
@@ -96,6 +137,70 @@ def mirror_write_cells(storage_paths, fov, cell_container):
         write_cells(path, fov, cell_container)
 
 
+def mirror_write_single_cell(storage_paths, fov, cell):
+    """write_single_cell into every distinct storage path given -- the
+    narrow-write counterpart to mirror_write_cells, same dual-modality
+    mirroring rationale (a cell's spots span whichever hybes/modalities
+    were actually localized for it)."""
+    seen = set()
+    for path in storage_paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        write_single_cell(path, fov, cell)
+
+
+def write_fov_spots(storage_path, fov, spots):
+    """
+    Persists Whole FOV auto-detect spots that don't belong to any cell
+    (ASpot.cell left at its model default, -1 -- no cell to link to) at
+    a separate top-level location from /FOV##/cells, so this write can
+    never collide with or clobber write_cells/write_single_cell's own
+    per-cell blob. Full-replace of the whole FOV's unassigned-spot list
+    (the caller, _replace_fov_unassigned_spots, already merges per-
+    (hybe, channel) in memory before this is called) -- same shape as
+    write_cells itself, just a plain list of ASpot.save() dicts instead
+    of a {'modality', 'cells'} payload (there's no per-cell modality to
+    carry here).
+    """
+    payload = [spot.save() for spot in spots]
+    blob = np.void(pickle.dumps(payload))
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_unassigned_spots_group_path(fov))
+        if 'blob' in grp:
+            del grp['blob']
+        grp.create_dataset('blob', data=blob)
+        grp.attrs['saved_at'] = datetime.now().isoformat()
+        grp.attrs['n_spots'] = len(spots)
+
+
+def read_fov_spots(storage_path, fov):
+    """Returns a list of ASpot.save()-shaped dicts (feed to ASpot().set_metadata(**d)),
+    or [] if nothing's been persisted for this FOV yet."""
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return []
+    grp_path = _unassigned_spots_group_path(fov)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f or 'blob' not in f[grp_path]:
+            return []
+        raw = bytes(f[grp_path]['blob'][()])
+    return pickle.loads(raw)
+
+
+def mirror_write_fov_spots(storage_paths, fov, spots):
+    """write_fov_spots into every distinct storage path given -- same
+    dual-modality mirroring rationale as mirror_write_cells/
+    mirror_write_single_cell."""
+    seen = set()
+    for path in storage_paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        write_fov_spots(path, fov, spots)
+
+
 def _params_group_path():
     return '/params'
 
@@ -146,6 +251,75 @@ def read_global_params(storage_path):
         if grp_path not in f:
             return {}
         return dict(f[grp_path].attrs)
+
+
+def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration,
+                          barcode_method=None):
+    """
+    Persists Celltype Determination's ENTIRE setup work -- FOV mode's
+    {celltype: range_string} map, Barcode mode's {celltype: (hybe,
+    channel)} assignment, the actual computed {'scale'/'lower_bound'/
+    'upper_bound': {(hybe,channel): {fov: value}}} calibration (real
+    per-FOV bound values, not just the input widget settings that
+    produced them), and the classification method (Vote/Median) -- so a
+    later session can reconstruct all of it and run/view results
+    without re-running Set FOV Ranges / Assign to Selected Celltype /
+    Apply Calibration from scratch, same "just usable, no extra step"
+    standard cells/spots/alignment matrices already meet elsewhere in
+    this app. A single pickled blob at /params/celltype_config_blob
+    (same "no HDF5-native schema, nothing else reads this" reasoning as
+    write_cells/write_fov_spots) -- (hybe, channel) tuple keys aren't
+    representable as plain HDF5 attrs the way write_global_params's flat
+    scalars are.
+    """
+    payload = {
+        'fov_ranges_by_celltype': dict(fov_ranges_by_celltype),
+        'barcode_channel_by_celltype': dict(barcode_channel_by_celltype),
+        'calibration': calibration,
+        'barcode_method': barcode_method,
+    }
+    blob = np.void(pickle.dumps(payload))
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_params_group_path())
+        if 'celltype_config_blob' in grp:
+            del grp['celltype_config_blob']
+        grp.create_dataset('celltype_config_blob', data=blob)
+
+
+def read_celltype_config(storage_path):
+    """
+    (fov_ranges_by_celltype, barcode_channel_by_celltype, calibration,
+    barcode_method) as written by write_celltype_config, or ({}, {},
+    {'scale': {}, 'lower_bound': {}, 'upper_bound': {}}, None) if
+    nothing's been persisted for this storage path yet.
+    """
+    empty_calibration = {'scale': {}, 'lower_bound': {}, 'upper_bound': {}}
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return {}, {}, empty_calibration, None
+    grp_path = _params_group_path()
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f or 'celltype_config_blob' not in f[grp_path]:
+            return {}, {}, empty_calibration, None
+        raw = bytes(f[grp_path]['celltype_config_blob'][()])
+    payload = pickle.loads(raw)
+    return (payload.get('fov_ranges_by_celltype', {}), payload.get('barcode_channel_by_celltype', {}),
+            payload.get('calibration', empty_calibration), payload.get('barcode_method'))
+
+
+def mirror_write_celltype_config(storage_paths, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration,
+                                 barcode_method=None):
+    """write_celltype_config into every distinct storage path given --
+    same dual-modality mirroring rationale as mirror_write_cells (a
+    celltype's barcode channel can belong to either modality, so the
+    whole config belongs in both)."""
+    seen = set()
+    for path in storage_paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        write_celltype_config(path, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration, barcode_method)
 
 
 def write_fov_params(storage_path, fov, **params):

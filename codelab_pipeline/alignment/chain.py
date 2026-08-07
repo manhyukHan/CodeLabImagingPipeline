@@ -42,8 +42,34 @@ fontdict_title = {'fontname': 'arial',
 red_to_cyan_cmap = mcolors.LinearSegmentedColormap.from_list('custom_cmap', ['#FF0000', '#FFFFFF', '#00FFFF'], N=256)
 
 def align_cell(yx, H, shape):
+    """
+    Transforms mask coordinates yx=(y,x) into H's target frame. Checks
+    the MATRIX, not any caller's notion of "is this a special hybe" --
+    every caller (get_area_in_readout, compute_cell_alignment, etc.)
+    should always just call this with whatever H applies, never branch
+    on hybe/modality identity first: H itself already carries the
+    information needed to decide whether any real transform is
+    happening (H == identity, checked here, once, for ANY caller) or
+    not, and hybe-name-based special-casing scattered across callers is
+    exactly the pattern that kept reintroducing real bugs this session
+    (the cross-modal bridge hybe collision, the double-counted FOV
+    correction) by comparing names instead of the actual math.
+
+    When H is (numerically) identity, skips the morphological closing
+    below entirely -- confirmed on real data that closing is NOT a true
+    no-op even at H=identity (up to +15px silently ADDED to a cell's own
+    mask across 12/66 real cells, from the closing kernel alone, no real
+    transform involved). Closing exists to bridge small rounding gaps a
+    REAL (non-identity) transform can leave between adjacent points;
+    applying it when there's provably no transform at all just corrupts
+    the mask for no reason.
+    """
     y,x = yx
     height,width = shape
+    if np.allclose(H, np.eye(3)):
+        cx,cy = x.astype(int), y.astype(int)
+        bad = (cx < 0) | (cy < 0) | (cx >= width) | (cy >= height)
+        return cy[~bad], cx[~bad]
     cx,cy = (H[:2]@np.array([x,y,np.ones_like(x)])).astype(int)
     bad = (cx < 0) | ( cy < 0) | (cx >= width) | (cy >= height)
     cx,cy = cx[~bad],cy[~bad]
@@ -63,6 +89,49 @@ def compose_chain(matrices):
     fine-alignment step (applied after segmentation/localization) exists.
     """
     return reduce(np.matmul, reversed(matrices))
+
+def hybe_to_cellref_matrix(fov_matrices, H_cellref_to_within, hybe):
+    """
+    hybe's own native frame -> cell.reference_hybe's own native frame.
+    fov_matrices: {hybe: 3x3}, hybe's own frame -> whatever within-
+    experiment shared frame align_same_modality used -- see that
+    function. H_cellref_to_within: cell.reference_hybe's OWN transform
+    into that SAME shared frame -- an EXPLICIT parameter, deliberately
+    never looked up from fov_matrices[cell.reference_hybe] internally,
+    because a cross-modal caller's fov_matrices (the OTHER modality's own
+    hybes) never contains cell.reference_hybe as a key at all (it's a
+    same-modality-only hybe name) -- callers must resolve
+    H_cellref_to_within from whichever fov_matrices dict cell.reference_
+    hybe ACTUALLY lives in (almost always the cell's own, same-modality
+    one) and pass it through explicitly, never assume it's a key in the
+    SAME dict `hybe` itself is being looked up in.
+
+    This is the ONE place this conversion should ever be computed --
+    every caller that needs to relate cell.area's coordinates (always
+    native to cell.reference_hybe) to some OTHER hybe's own native frame
+    must go through this, rather than using fov_matrices[hybe] directly.
+    fov_matrices' own shared frame is an internal implementation detail of
+    align_same_modality (whichever hybe the FOV-alignment step used as
+    ITS reference), which has no reason to coincide with
+    cell.reference_hybe (the segmentation hybe) -- and in general does
+    not. Using fov_matrices[hybe] directly wrongly assumes those two
+    frames are the same thing; real data confirmed this produced both a
+    genuine double-counted correction in compute_cell_alignment's own
+    fit AND a matching-but-independently-wrong "FOV/cross-modal" preview
+    column, whenever the two reference hybes actually differed.
+
+    Composing this consistently everywhere is also what makes the whole
+    alignment process invariant to which hybe happens to be chosen as
+    reference_hybe for FOV-alignment or for cell-alignment's own fitting
+    anchor: those choices only ever affect where phase correlation
+    anchors ITS OWN comparison, never what coordinate frame a result is
+    allowed to end up expressed in, and never make the process require
+    prior alignment to have "succeeded" -- fov_matrices.get(..., identity)
+    means a hybe/layer with no alignment computed yet contributes nothing
+    (identity), not a missing-data error.
+    """
+    H_hybe_to_within = fov_matrices.get(hybe, np.eye(3))
+    return compose_chain([H_hybe_to_within, la.inv(H_cellref_to_within)])
 
 def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.5, signal_threshold=10):
     """
@@ -240,12 +309,21 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
     Reads back whatever's already on disk in each hybe's own H5
     /matrix/{hybe} (self-keyed dataset -- see write_same_modality_matrices)
     without requiring align_same_modality to be re-run. preprocess.py's
-    ingestion always seeds this dataset to identity for every hybe, so in
-    the normal case this never needs the identity fallback below -- it's
-    only there for a hybe H5 that predates that seeding. This is the
-    read-back half of "activation": self.fov_matrices in the GUI should
-    reflect whatever alignment has already been computed and written,
-    without the user needing to re-run alignment just to see it again.
+    ingestion always seeds this dataset to identity for every hybe, so a
+    hybe whose H5 DOES exist but has no /matrix/{hybe} yet still legitimately
+    gets an identity default here. A hybe whose H5 doesn't exist AT ALL,
+    though, was simply never ingested -- it's silently SKIPPED (no entry in
+    the returned dict at all), never given a fake identity default. This
+    matters: hybe_records passed in here can be the full parsed
+    ExperimentLayout (declaring far more hybes than were ever actually
+    converted to H5), and a fake identity entry for a non-ingested hybe
+    used to leak into self.fov_matrices, making it look like a real,
+    processable hybe to downstream code (e.g. cell-based alignment), which
+    then crashed trying to open a stack file that genuinely doesn't exist.
+    This is the read-back half of "activation": self.fov_matrices in the
+    GUI should reflect whatever alignment has already been computed and
+    written, without the user needing to re-run alignment just to see it
+    again.
     """
     fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
     matrices = {}
@@ -259,7 +337,7 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
                 else:
                     matrices[hybe] = np.eye(3)
         except OSError:
-            matrices[hybe] = np.eye(3)
+            continue
     return matrices
 
 
@@ -466,7 +544,8 @@ def pick_channel_by_type(record, channel_type):
 
 def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            reference_hybe=None, channel_type='readout',
-                           pad=10, lb=0.3, ub=0.9999, including_z=True):
+                           pad=10, lb=0.3, ub=0.9999, including_z=True,
+                           cell_reference_hybe_matrix=None, modality=None):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -503,22 +582,88 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     a cross-modal cell) -- always an explicit input; this function never
     re-derives or infers them.
 
-    Writes cell.matrices[hybe] = {'yx': H_within_or_across @ ... composed
-    with the cell's own residual, 'zx': depth correction} and
-    cell.matrix_provenance[hybe] for traceability, mirroring the FOV-level
-    /matrix/{hybe} provenance from Phase 1.
+    cell_reference_hybe_matrix: cell.reference_hybe's own transform into
+    fov_matrices' shared within-experiment frame, i.e. what
+    fov_matrices.get(cell.reference_hybe, identity) would give IF
+    cell.reference_hybe were a key in fov_matrices. Defaults to exactly
+    that lookup, which is correct whenever fov_matrices is the SAME
+    modality cell.reference_hybe belongs to (the common, same-modality
+    call). Pass this EXPLICITLY for a cross-modal call (fov_matrices =
+    the OTHER modality's own matrices): cell.reference_hybe is a same-
+    modality-only hybe name and is never a real key in the other
+    modality's own fov_matrices dict, so the default lookup would
+    silently resolve to identity there regardless of the real value --
+    the caller must resolve it from the SAME-MODALITY fov_matrices it
+    already has in scope and pass it through explicitly instead.
+
+    modality: which modality hybe_records/fov_matrices/storage_path belong
+    to for THIS call -- cell.matrices/cell.matrix_provenance are keyed by
+    (hybe, modality), never bare hybe, because the cross-modal "bridge"
+    hybe (e.g. Hyb_130) is a real, distinct file in BOTH modalities; a
+    bare-string key would collide the two calls (same-modality and
+    cross-modal) this function is meant to be invoked with once each per
+    cell, silently dropping whichever one runs second. Defaults to
+    cell.modality (the common, same-modality call); the cross-modal call
+    MUST pass the other modality's own name explicitly.
+
+    Writes cell.matrices[(hybe, modality)] = {'yx': H_within_or_across @
+    ... composed with the cell's own residual, 'zx': depth correction}
+    and cell.matrix_provenance[(hybe, modality)] for traceability,
+    mirroring the FOV-level /matrix/{hybe} provenance from Phase 1.
+
+    cell.matrices[(hybe, modality)]['yx'] maps hybe's own native frame
+    into THIS RUN's own reference_hybe's frame -- not fov_matrices' own
+    shared frame, and not cell.reference_hybe's frame either. This means
+    cell.reference_hybe is not privileged here: it goes through this
+    exact per-hybe loop like any other hybe (no identity shortcut),
+    because it genuinely has its own real, uncorrected FOV drift
+    relative to reference_hybe, same as any other hybe -- forcing it
+    to identity would silently discard that real correction rather
+    than apply it.
+
+    cell.matrix_anchors[modality] is ALSO written here (once per call) --
+    reference_hybe's own transform into fov_matrices' shared frame
+    (what used to be folded into every cell.matrices entry). A consumer
+    that needs a hybe's position relative to THIS cell's own native
+    frame (where cell.area actually lives), or relative to some OTHER
+    hybe/modality entirely, goes through ACell.matrix_to/matrix_between,
+    which bridge through matrix_anchors only when the two entries being
+    related come from different modalities/runs -- same-modality
+    composition never needs the shared frame at all, since both sides
+    already share this run's own reference_hybe by construction.
     """
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
+    modality = modality if modality is not None else cell.modality
     x_ref, y_ref = cell.area  # always native to cell.reference_hybe's own frame
+    if cell_reference_hybe_matrix is None:
+        cell_reference_hybe_matrix = fov_matrices.get(cell.reference_hybe, np.eye(3))
 
     def _native_crop(hybe, channel):
-        if hybe == cell.reference_hybe:
-            x, y = x_ref, y_ref
-        else:
-            H_to_shared = fov_matrices[hybe]
-            cy, cx = align_cell((y_ref, x_ref), la.inv(H_to_shared), (height, width))
-            x, y = cx, cy
+        # cell.reference_hybe's frame -> hybe's own native frame, via
+        # hybe_to_cellref_matrix (see its own docstring) -- always the
+        # SAME general formula, no "is this hybe special" branch. When
+        # hybe IS cell.reference_hybe (same modality too), this
+        # mathematically reduces to exactly identity on its own (both
+        # legs of the composition become the same fov_matrices lookup
+        # and cancel) -- align_cell itself checks the MATRIX for that,
+        # once, and skips its own resampling machinery accordingly, so
+        # there's no need (and no precision cost) to special-case it
+        # here too. Previously this used fov_matrices[hybe] directly,
+        # silently assuming cell.reference_hybe's frame WAS fov_matrices'
+        # own shared frame -- true only when segmentation and FOV/cell
+        # alignment share the same reference hybe. When they don't,
+        # every non-cell.reference_hybe crop -- including THIS RUN'S OWN
+        # reference_hybe crop -- was mispositioned by cell.reference_hybe's
+        # own real FOV correction, so phase correlation rediscovered that
+        # same correction as a "residual" and it got applied AGAIN on top
+        # of the already-correct FOV matrix (observed on real data: a
+        # real -3.2px FOV correction plus a "residual" phase correlation
+        # found by comparing crops that never had that correction applied
+        # -> -6.2px total applied, when ~0px residual was correct).
+        H_to_hybe = la.inv(hybe_to_cellref_matrix(fov_matrices, cell_reference_hybe_matrix, hybe))
+        cy, cx = align_cell((y_ref, x_ref), H_to_hybe, (height, width))
+        x, y = cx, cy
         if len(x) == 0:
             return None  # cell doesn't overlap this hybe's frame at all
         ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
@@ -537,41 +682,111 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     reference_crop, (rymin, rymax, rxmin, rxmax) = ref_result
     # relative transform FROM reference_hybe's native frame TO the shared
     # FOV frame -- identity when reference_hybe is also the FOV-alignment's
-    # own reference hybe (the previously-only-supported case; fov_matrices
-    # always carries a real entry per hybe, see read_same_modality_matrices)
+    # own reference hybe (fov_matrices always carries a real entry per
+    # hybe, see read_same_modality_matrices). Stashed on the cell (not
+    # composed into every entry below) -- see this function's own
+    # docstring for why, and ACell.matrix_to/matrix_between for how a
+    # consumer uses it to bridge across modalities when needed.
     H_ref_to_shared = fov_matrices.get(reference_hybe, np.eye(3))
+    cell.matrix_anchors[modality] = H_ref_to_shared
 
     for record in hybe_records:
         hybe = record['folder']
+        # This run is the sole source of truth for every hybe in
+        # hybe_records -- clear any stale entry up front (both branches
+        # below) so a hybe that fails further down (out-of-frame or
+        # rejected), or that changed roles between runs (e.g. was a
+        # regular target hybe with a real residual in a previous run but
+        # IS this run's reference_hybe), ends up with exactly what this
+        # run computed, never a leftover from a previous call on this
+        # same (real, persisted-to-disk) cell object with different
+        # params or before the reject bound existed. Re-added below only
+        # on success.
+        key = (hybe, modality)
+        cell.matrices.pop(key, None)
+        cell.matrix_provenance.pop(key, None)
+
         if hybe == reference_hybe:
-            # reference_hybe's own transform back into cell.reference_hybe's
-            # frame (everything in cell.matrices is always expressed
-            # relative to cell.reference_hybe -- get_area_in_readout/get_mip
-            # depend on that unconditionally) -- identity only in the
-            # original, common case where reference_hybe IS cell.reference_hybe.
-            cell.matrices[hybe] = {'yx': H_ref_to_shared, 'zx': np.eye(3)}
+            # hybe's own transform into ITSELF (this run's reference_hybe)
+            # is trivially identity -- no fitting to do (a frame's position
+            # relative to itself isn't a fitting question; the phase-
+            # correlation "residual" that would come out of comparing
+            # reference_hybe's crop against itself is pure noise, observed
+            # on real data at ~0.9px). This covers cell.reference_hybe too
+            # when it happens to also be this run's reference_hybe -- no
+            # separate identity shortcut is needed for cell.reference_hybe
+            # on its own, since it has real, uncorrected FOV drift like any
+            # other hybe whenever it ISN'T this run's reference_hybe, and
+            # forcing it to identity in that case would silently discard
+            # that real correction rather than compute it.
+            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3)}
             continue
+
+        # H1 (hybe's native frame -> shared frame -> reference_hybe's
+        # native frame -> cell.reference_hybe's frame) is pure matrix
+        # algebra from fov_matrices -- it never needs any image data, so
+        # it's always computable regardless of whether a crop can be
+        # built below.
+        H1 = compose_chain([fov_matrices[hybe], la.inv(H_ref_to_shared)])
 
         target_channel = pick_channel_by_type(record, channel_type)
         result = _native_crop(hybe, target_channel)
         if result is None:
+            # Cell doesn't overlap this hybe's frame at all -- no crop
+            # exists to fit a cell-level residual against. Per the same
+            # "no no-alignment" principle as the reject bound below: this
+            # is NOT a reason to omit the hybe from cell.matrices (that
+            # was this code's own earlier, WRONG behavior) -- H1 above is
+            # still fully valid, so fall back to H1-only (H2=identity)
+            # exactly like a rejected residual does.
+            H_yx = H1
+            cell.matrices[key] = {'yx': H_yx, 'zx': np.eye(3)}
+            cell.matrix_provenance[key] = {
+                'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe} '
+                                      f'[cell-level residual SKIPPED: cell does not overlap this hybe\'s frame, '
+                                      f'fell back to FOV/cross-modal only]',
+                'steps': np.stack([H1, np.eye(3)]),
+            }
             continue
         target_crop, (cymin, cymax, cxmin, cxmax) = result
 
-        H2 = np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
-                        np.array([0, 0, 1])])
-        # hybe's native frame -> shared frame -> reference_hybe's native
-        # frame (H_ref_to_shared is identity in the original, common case,
-        # so this reduces to plain fov_matrices[hybe] exactly as before),
+        H2_fitted = np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
+                               np.array([0, 0, 1])])
+        # This residual is a FINE-TUNING correction on top of an already-
+        # good FOV/cross-modal alignment -- the crop itself only extends
+        # `pad` px beyond the cell's expected position, so the true
+        # matching content for any real correction can only ever lie
+        # within `pad` px of center. A returned shift bigger than that
+        # isn't a real correction (the crop couldn't contain the content
+        # needed to justify it) -- it's cv2.phaseCorrelate locking onto
+        # noise/padding on a low-signal crop (observed on real data: up to
+        # several thousand px on crops only ~80px wide).
+        #
+        # Reject rather than clamp -- but per explicit principle, "reject"
+        # NEVER means "no alignment data at all" for this hybe (that was
+        # this code's own earlier, WRONG behavior: a `continue` here left
+        # hybe out of cell.matrices entirely, indistinguishable from a
+        # hybe that never overlapped this frame at all -- silently
+        # dropping a hybe from the Results/Overlay cell counts, and
+        # discarding the perfectly good FOV/cross-modal alignment along
+        # with the untrustworthy refinement). Rejecting the cell-level
+        # residual means falling back to identity for H2 specifically --
+        # the FOV/cross-modal layer this refinement was built on top of
+        # is still valid and must still be written.
+        rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        H2 = np.eye(3) if rejected else H2_fitted
         # H2 outermost (this cell's own residual refinement measured
-        # against reference_hybe's own crop) -- then back OUT to
-        # cell.reference_hybe's frame via H_ref_to_shared once more, since
-        # cell.matrices must stay expressed relative to cell.reference_hybe
-        # regardless of which hybe this refinement anchored to.
-        H1 = compose_chain([fov_matrices[hybe], la.inv(H_ref_to_shared)])
-        H_yx = compose_chain([H1, H2, H_ref_to_shared])
+        # against reference_hybe's own crop) -- H1@H2 lands directly in
+        # reference_hybe's own frame, this run's natural resting place;
+        # no further push to a shared frame (see this function's own
+        # docstring for why that's a consumer-side concern now, via
+        # matrix_anchors).
+        H_yx = compose_chain([H1, H2])
 
         H_zx = np.eye(3)
+        zx_rejected = False
+        secondary_x_shift = 0.0
+        z_shift = 0.0
         if including_z:
             # z-depth correction stays fiducial-based regardless of
             # channel_type -- structural (bead/fiducial) depth alignment,
@@ -580,15 +795,60 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                                         rymin, rymax, rxmin, rxmax, lb, ub)
             target_zx = hybe_zx_projection(storage_path, fov, hybe, record['fiducial_channel'],
                                            cymin, cymax, cxmin, cxmax, lb, ub)
-            # apply the just-computed yx residual to the target's projection so it's
-            # in the same orientation as the reference's before comparing depth
-            target_zx_aligned = cv2.warpAffine(target_zx, H2[:2], (target_zx.shape[1], target_zx.shape[0]))
+            # hybe_zx_projection returns (width, depth), not (height,
+            # width) like every other crop in this module -- H2 (a YX-
+            # plane matrix) can't be applied to it directly via
+            # cv2.warpAffine: cv2's own (col,row) convention would put
+            # H2's X/width component on this array's DEPTH axis and its
+            # Y/height component on its WIDTH axis, backwards on both
+            # counts (verified via a synthetic single-pixel test). Only
+            # the X/width component is meaningful here (pre-aligning this
+            # projection's width position with the reference's, matching
+            # the same window the YX fit used) -- place H2[0,2] on axis0
+            # (width, this array's M[1]/"row" slot) and leave axis1
+            # (depth) untouched.
+            H2_to_zx = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, H2[0, 2]]])
+            target_zx_aligned = cv2.warpAffine(target_zx, H2_to_zx, (target_zx.shape[1], target_zx.shape[0]))
             A3 = preprocess.find_translation_via_phase_correlation(target_zx_aligned, ref_zx)
-            H_zx = np.vstack([A3[:2], np.array([0, 0, 1])])
+            # Same (width, depth) convention as above: A3[0,2] is this
+            # array's axis1 (depth) shift -- the real z-correction.
+            # A3[1,2] is axis0 (width) -- a SECOND, independent
+            # measurement of the x-shift left over after H2's own x-shift
+            # was already applied above, not a depth value. A confidently-
+            # reported large leftover x-shift here is the same "locked
+            # onto noise, not real content" signal H2's own reject bound
+            # guards against -- distrust BOTH this z-correction and the
+            # x-refinement together when that happens, rather than
+            # keeping one and discarding the other.
+            secondary_x_shift = float(A3[1, 2])
+            z_shift = float(A3[0, 2])
+            zx_rejected = abs(secondary_x_shift) > 3
+            if not zx_rejected:
+                # This leftover x-shift is a second, independent
+                # measurement of the SAME physical x-drift H2 already
+                # estimated -- fold it into H_yx as an additive
+                # refinement, making this the cell's real, final x-
+                # position. H_zx carries the z-correction alone; its own
+                # x-component is intentionally zeroed here, not double-
+                # applied on top of the x already folded into H_yx.
+                H_yx[0, 2] += secondary_x_shift
+                H_zx[0, 2] = z_shift
 
-        cell.matrices[hybe] = {'yx': H_yx, 'zx': H_zx}
-        cell.matrix_provenance[hybe] = {
-            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}',
+        zx_note = ''
+        if including_z:
+            if zx_rejected:
+                zx_note = (f' [z-alignment REJECTED: secondary x-shift {secondary_x_shift:.1f}px > 3px, '
+                          f'z left uncorrected]')
+            else:
+                zx_note = f' [z-alignment applied: z={z_shift:.1f}px, yx x refined by {secondary_x_shift:.1f}px]'
+
+        cell.matrices[key] = {'yx': H_yx, 'zx': H_zx}
+        cell.matrix_provenance[key] = {
+            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}'
+                                  + (f' [cell-level residual REJECTED: '
+                                     f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}, '
+                                     f'fell back to FOV/cross-modal only]' if rejected else '')
+                                  + zx_note,
             'steps': np.stack([H1, H2]),
         }
 

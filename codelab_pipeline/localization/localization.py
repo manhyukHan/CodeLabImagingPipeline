@@ -515,7 +515,7 @@ def localize_spots_worker(fov, hybe, hybe_list, cell_parameter_dict,
     else:
         return np.zeros((0,7), dtype=float), (img,bimg,np.zeros((0,7), dtype=float)), hybe
 
-def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad):
+def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None):
     """
     Shared crop-building logic for localize_cell_2d_worker/3d_worker AND
     the interactive spot localization panel's "Current Cell" scope --
@@ -531,19 +531,20 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad):
     contiguous/ascending) and the cell-mask fancy indexing done on the
     resulting in-memory array instead.
 
-    Returns None if the cell has no area overlapping this hybe's frame
-    (either get_area_in_readout raised KeyError -- no alignment matrix for
-    this hybe yet -- or the transformed area is simply empty), otherwise
-    a dict: {'img': (h,w) MIP crop (NaN outside cell), 'stacks': (h,w,depth)
-    Z-stack crop (NaN outside cell), 'bimg': (w,depth) Z-profile per column
-    (nanmax over y), 'rxmin': int, 'rymin': int, 'H': cell's yx matrix for
-    this hybe (identity if none), 'Hz': cell's zx matrix for this hybe
-    (identity if none)}.
+    Returns None only if the transformed area is genuinely empty (e.g.
+    the cell has no mask pixels at all) -- get_area_in_readout itself
+    never raises: no alignment matrix yet for (hybe, modality) means
+    identity (no correction), never an error, per the same "no no-
+    alignment case" principle compute_cell_alignment's own fallbacks
+    already implement. Otherwise returns a dict: {'img': (h,w) MIP crop
+    (NaN outside cell), 'stacks': (h,w,depth) Z-stack crop (NaN outside
+    cell), 'bimg': (w,depth) Z-profile per column (nanmax over y),
+    'rxmin': int, 'rymin': int, 'H': cell's yx matrix for this hybe
+    (identity if none), 'Hz': cell's zx matrix for this hybe (identity
+    if none)}.
     """
-    try:
-        x_area, y_area = cell.get_area_in_readout(hybe)
-    except KeyError:
-        return None
+    modality = modality if modality is not None else cell.modality
+    x_area, y_area = cell.get_area_in_readout(hybe, modality)
     if len(x_area) == 0:
         return None
     x_area, y_area = x_area.astype(int), y_area.astype(int)
@@ -564,8 +565,14 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad):
     stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
     bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth) -- Z-profile per column
 
-    H = cell.matrices.get(hybe, {}).get('yx', np.eye(3))
-    Hz = cell.matrices.get(hybe, {}).get('zx', np.eye(3))
+    # matrix_to (not a direct cell.matrices lookup): cell.matrices entries
+    # target the shared FOV frame, not cell.reference_hybe's frame -- see
+    # compute_cell_alignment's docstring -- and the caller below applies H
+    # forward to a raw point to land in cell.reference_hybe's frame
+    # (matching spot_mapper.raw_to_reference's own convention), which
+    # matrix_to is what actually resolves.
+    H = cell.matrix_to(hybe, modality)
+    Hz = cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3))
 
     return {'img': img, 'stacks': stacks, 'bimg': bimg, 'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
 
