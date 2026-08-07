@@ -1,5 +1,9 @@
+import contextlib
+import io
 import os
 import re
+import sys
+import traceback
 from copy import deepcopy
 from datetime import datetime
 
@@ -431,6 +435,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.ui.actionLoad_Config.triggered.connect(self._load_config_dialog)
         self.ui.actionSave_Config.triggered.connect(self._save_config_dialog)
+
+        anp = self.ui.AnalysisPanel
+        anp.RunPushButton.clicked.connect(self._run_analysis_code)
+        anp.ClearOutputPushButton.clicked.connect(anp.OutputDisplay.clear)
+        anp.ClearCodePushButton.clicked.connect(anp.CodeEditor.clear)
 
     # -- modality setup / switching --
 
@@ -3387,3 +3396,72 @@ class MainWindow(QtWidgets.QMainWindow):
                     seen.add(fov)
                     fovs.append(fov)
         return fovs
+
+    # -- interactive analysis console --
+
+    def _build_analysis_namespace(self):
+        """
+        Return a dict that is used as the global/local namespace when the
+        user runs code in the Analysis tab.  It exposes the most-used
+        pipeline objects plus the standard scientific libraries so that
+        typical one-liners (print, plt.show, pd.DataFrame, …) work without
+        any imports.
+        """
+        import numpy as np   # noqa: F401 – re-imported here so the name
+        import pandas as pd  # noqa: F401   is always in the returned dict
+        try:
+            import matplotlib.pyplot as plt  # noqa: F401
+        except Exception:
+            plt = None
+
+        ns = {
+            '__builtins__': __builtins__,
+            'window': self,
+            'cell_container': self.cell_container,
+            'cell_container_permanent': self.cell_container_permanent,
+            'fov_matrices': self.fov_matrices,
+            'modality_data': self.modality_data,
+            'modality_names': self.modality_names,
+            'hybe_records': self.hybe_records,
+            'cross_modal_result': self.cross_modal_result,
+            'np': np,
+            'pd': pd,
+            'plt': plt,
+        }
+        return ns
+
+    def _run_analysis_code(self):
+        """
+        Execute whatever is in the Analysis tab's code editor.
+        If text is selected, only the selection is run.
+        stdout/stderr are captured and appended to the output display.
+        """
+        anp = self.ui.AnalysisPanel
+        cursor = anp.CodeEditor.textCursor()
+        code = cursor.selectedText() if cursor.hasSelection() else anp.CodeEditor.toPlainText()
+        # QPlainTextEdit uses the Unicode paragraph separator (U+2029) as a
+        # line break inside selected text – normalise it to '\n' so exec()
+        # sees a syntactically valid multi-line block.
+        code = code.replace('\u2029', '\n').strip()
+        if not code:
+            return
+
+        ns = self._build_analysis_namespace()
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout_capture), \
+             contextlib.redirect_stderr(stderr_capture):
+            try:
+                exec(compile(code, '<analysis>', 'exec'), ns)  # noqa: S102 – intentional interactive console
+            except Exception:
+                traceback.print_exc(file=stderr_capture)
+
+        output = stdout_capture.getvalue()
+        errors = stderr_capture.getvalue()
+        combined = (output + errors).rstrip('\n')
+        if combined:
+            anp.OutputDisplay.appendPlainText(combined)
+        else:
+            anp.OutputDisplay.appendPlainText('(no output)')
+

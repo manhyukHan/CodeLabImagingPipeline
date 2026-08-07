@@ -5,6 +5,7 @@ from ui.alignment_panel import AlignmentPanelUI
 from ui.cell_segment_panel import CellSegmentPanelUI
 from ui.spot_localization_panel import SpotLocalizationPanelUI
 from ui.celltype_determination_panel import CelltypeDeterminationPanelUI
+from ui.analysis_panel import AnalysisPanelUI
 
 
 class MainWindowUI(object):
@@ -53,6 +54,11 @@ class MainWindowUI(object):
         self.CelltypeDeterminationPanel = CelltypeDeterminationPanelUI()
         self.CelltypeDeterminationPanel.setupUi(self.CelltypeDeterminationPanelWidget)
         self.tabWidget.addTab(self._scrollable(self.CelltypeDeterminationPanelWidget), 'Celltype Determination')
+
+        self.AnalysisPanelWidget = QtWidgets.QWidget()
+        self.AnalysisPanel = AnalysisPanelUI()
+        self.AnalysisPanel.setupUi(self.AnalysisPanelWidget)
+        self.tabWidget.addTab(self.AnalysisPanelWidget, 'Analysis')
 
         MainWindow.setCentralWidget(self.centralwidget)
 
