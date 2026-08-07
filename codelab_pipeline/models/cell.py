@@ -5,6 +5,7 @@ import h5py
 import scipy.spatial.distance as ssd
 
 from ..alignment import chain as alignment
+from ..io import vlinks_store
 
 
 class ACell():
@@ -159,10 +160,11 @@ class ACell():
 
     def get_mip(self, hybe, storage_path, fov, modality, channel=None, pad=5, use_stack=False):
         """
-        Crop this cell's region directly out of `hybe`'s raw H5 data --
-        /mip/ch{channel} by default, or /stack/ch{channel} (full Z-stack,
-        (height,width,depth)) if use_stack=True. channel defaults to that
-        hybe's own fiducial channel if not given.
+        Crop this cell's region out of `hybe`'s data -- vlinks.h5's real MIP
+        copy by default, or the raw stack file's full Z-stack
+        (height,width,depth) if use_stack=True (the 3D exception: MIP-only
+        reads never need the raw stack file, per explicit principle).
+        channel defaults to that hybe's own fiducial channel if not given.
         """
         x, y = self.get_area_in_readout(hybe, modality)
         if len(x) == 0:
@@ -171,12 +173,18 @@ class ACell():
         xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
         ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
 
+        if not use_stack:
+            mip = (vlinks_store.fiducial_channel_mip(storage_path, fov, hybe) if channel is None
+                   else vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel))
+            if mip is None:
+                raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+            return mip[ymin:ymax, xmin:xmax]
+
         h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
         with h5py.File(h5path, 'r') as f:
             if channel is None:
                 channel = int(f.attrs['fiducial_channel'])
-            dataset = f'/stack/ch{channel}' if use_stack else f'/mip/ch{channel}'
-            return f[dataset][ymin:ymax, xmin:xmax]
+            return f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax]
 
     def save(self):
         return {'id': int(self.id),

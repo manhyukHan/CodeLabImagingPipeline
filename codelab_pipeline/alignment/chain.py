@@ -323,22 +323,26 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
     function's docstring. Both default to no-op (0 / None), so existing
     callers see no behavior change unless they opt in.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
     record_by_folder = {r['folder']: r for r in hybe_records}
     ref_record = record_by_folder[reference_hybe]
 
-    with h5py.File(os.path.join(fov_path, f'{reference_hybe}_stack.h5'), 'r') as f:
-        reference_mip = f[f'/mip/ch{ref_record["fiducial_channel"]}'][:]
+    # FOV-level (same-modality) alignment is not one of the 3D exceptions
+    # (3D spot localization, 3D cell-based alignment, 3D spot-based
+    # alignment) -- reads vlinks.h5's real MIP copy, never the raw stack
+    # file.
+    reference_mip = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, ref_record['fiducial_channel'])
+    if reference_mip is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} not in vlinks.h5 -- ingest it first.')
 
     matrices = {}
     for record in hybe_records:
         hybe = record['folder']
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
         if hybe == reference_hybe:
             H = np.eye(3)
         else:
-            with h5py.File(h5path, 'r') as f:
-                moving_mip = f[f'/mip/ch{record["fiducial_channel"]}'][:]
+            moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, record['fiducial_channel'])
+            if moving_mip is None:
+                raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
             H = align_readout_to_reference(moving_mip, reference_mip, lb, ub, border_trim=border_trim, max_shift=max_shift)
         matrices[hybe] = H
 
@@ -346,20 +350,6 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
         write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
 
     return matrices
-
-def _readout_channel_mip(h5path):
-    """The one non-fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
-    with h5py.File(h5path, 'r') as f:
-        channels = [int(c.decode()) for c in f.attrs['channel_list']]
-        fiducial_ch = int(f.attrs['fiducial_channel'])
-        readout_ch = [c for c in channels if c != fiducial_ch][0]
-        return f[f'/mip/ch{readout_ch}'][:]
-
-def _fiducial_channel_mip(h5path):
-    """The fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
-    with h5py.File(h5path, 'r') as f:
-        fiducial_ch = int(f.attrs['fiducial_channel'])
-        return f[f'/mip/ch{fiducial_ch}'][:]
 
 def link_cross_modal(rna_storage_path, dna_storage_path, fov,
                       rna_fov_matrices, dna_fov_matrices,
@@ -408,11 +398,14 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     align_readout_to_reference for the actual DNA->RNA correlation step --
     see that function's docstring. Both default to no-op (0 / None).
     """
-    mip_fn = _fiducial_channel_mip if channel_type == 'fiducial' else _readout_channel_mip
-    rna_h5path = os.path.join(rna_storage_path, f'FOV{fov:02d}', f'{rna_reference_hybe}_stack.h5')
-    dna_h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    rna_mip = mip_fn(rna_h5path)
-    dna_mip = mip_fn(dna_h5path)
+    # Cross-modality alignment is not one of the 3D exceptions -- reads
+    # vlinks.h5's real MIP copies, never the raw stack file.
+    mip_fn = vlinks_store.fiducial_channel_mip if channel_type == 'fiducial' else vlinks_store.readout_channel_mip
+    rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
+    dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
+    if rna_mip is None or dna_mip is None:
+        raise ValueError(f'FOV{fov:02d}: {rna_reference_hybe} (RNA) and/or {dna_reference_hybe} (DNA) '
+                         f'not in vlinks.h5 -- ingest them first.')
 
     h, w = rna_mip.shape
     H_rna_within = rna_fov_matrices.get(rna_reference_hybe, np.eye(3))
@@ -627,8 +620,12 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             return None  # cell doesn't overlap this hybe's frame at all
         ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
         xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
-        with h5py.File(os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5'), 'r') as f:
-            mip = f[f'/mip/ch{channel}'][:]
+        # YX (2D) residual fit -- not one of the 3D exceptions (only the
+        # ZX/depth leg below, via hybe_zx_projection, genuinely needs the
+        # raw Z-stack) -- reads vlinks.h5's real MIP copy.
+        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        if mip is None:
+            return None  # not ingested -- same graceful "no crop" path as no-overlap
         crop = preprocess.normalize_to_uint8(mip[ymin:ymax, xmin:xmax], lb, ub)
         return crop, (ymin, ymax, xmin, xmax)
 

@@ -21,7 +21,12 @@ Moved out of the active tree on 2026-08-07 as part of a codebase cleanup pass (s
   - `convert_dax_to_h5_main`/`align_mips_main` -- batch-loop wrappers superseded by the GUI's
     own per-item `QThread` worker loops in `windows/main_window.py`.
   - `dax_vlinks_h5`/`vlinks_h5` -- an aggregate single-vlinks.h5 builder never called by the GUI
-    (the real pipeline reads each hybe's own `{hybe}_stack.h5` directly, and cell/spot/param
-    persistence into vlinks.h5 goes through `codelab_pipeline/io/vlinks_store.py` instead).
-  - `find_best_alignment` -- an MSD-only alignment combinator superseded by
-    `compute_features_affinelike_matrix` (ORB+RANSAC, with MSD as its own fallback).
+    (the real pipeline reads each hybe's own `{hybe}_stack.h5` directly at ingestion time only,
+    and cell/spot/param/MIP/matrix persistence into vlinks.h5 goes through
+    `codelab_pipeline/io/vlinks_store.py` instead -- see 2026-08-08's vlinks-MIP-storage pass).
+
+  Correction (2026-08-08): `find_best_alignment`/`msd_cost_function` were *not* dead -- they were
+  moved here in the original 2026-08-07 pass on a same-file-reference-only grep that missed
+  `compute_msd_homography_matrix` (still live in `preprocess.py`) calling `find_best_alignment`
+  internally. Caught when `align_same_modality` broke on real data (`NameError:
+  find_best_alignment`). Moved back to `codelab_pipeline/io/preprocess.py`.

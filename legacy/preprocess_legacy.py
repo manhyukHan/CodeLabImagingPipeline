@@ -19,7 +19,6 @@ import numpy as np
 import tifffile as tf
 import h5py
 import cv2
-from scipy.optimize import minimize
 
 import matplotlib.pyplot as plt
 
@@ -367,71 +366,6 @@ def vlinks_h5(storage_path, fov_list, filename='vlinks.h5', overwrite=False):
         vlink_file.close()
 
     return vlink_path
-
-def msd_cost_function(params, moving_image, reference_image, fixed_scale=1.0, fixed_angle=False):
-    """
-    fixed_angle: False (default) -- angle is a free Powell parameter, same
-    as always. True -- angle fixed at 0 (translation-only), the original
-    behavior. A number -- angle fixed at that exact degree value (Powell
-    still optimizes dx/dy under it); used to independently confirm a
-    translation under a rotation estimated elsewhere (e.g. ORB's own
-    angle), without letting Powell re-guess rotation (which it can't
-    reliably do anyway -- see compute_msd_homography_matrix's docstring).
-    """
-    dx, dy, angle = params
-
-    # Pad images
-    moving_padded, reference_padded, _, _ = pad_to_same_size(moving_image, reference_image)
-    h, w = moving_padded.shape[:2]
-    center = (w // 2, h // 2)
-
-    angle_to_use = angle if fixed_angle is False else (0.0 if fixed_angle is True else float(fixed_angle))
-    M = cv2.getRotationMatrix2D(center, angle_to_use, fixed_scale)
-    M[0, 2] += dx
-    M[1, 2] += dy
-
-    # Warp image and mask
-    transformed_image = cv2.warpAffine(moving_padded, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    valid_mask = cv2.warpAffine(np.ones_like(moving_padded, dtype=np.uint8), M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-    # Compute MSD where both mask and reference are valid
-    overlap_mask = (valid_mask > 0) & (reference_padded > 0)
-    if np.count_nonzero(overlap_mask) == 0:
-        return np.inf
-
-    diff = (transformed_image.astype(np.float32) - reference_padded.astype(np.float32)) ** 2
-    msd = diff[overlap_mask].mean()
-
-    return msd
-
-def find_best_alignment(moving_image, reference_image, fixed_scale=1.0,
-                        fixed_angle=False, initial_guess=[0,0,0], method='Powell',verbose=False):
-    # Initial guess: [dx, dy, angle]
-
-    # Minimize the cost function
-    result = minimize(msd_cost_function, initial_guess, args=(moving_image, reference_image, fixed_scale, fixed_angle), method=method)
-    if verbose:
-        print(f"Optimization Result: {result}")
-        print(f"Success: {result.success}, Message: {result.message}")
-
-    # Extract optimal parameters
-    dx, dy, angle = result.x
-
-    # Compute final transformation matrix with fixed scale. angle here is
-    # whatever msd_cost_function actually used -- Powell's free-angle guess,
-    # 0 (fixed_angle=True), or the caller's fixed numeric angle -- not the
-    # raw (possibly-unused) optimizer parameter.
-    angle_to_use = angle if fixed_angle is False else (0.0 if fixed_angle is True else float(fixed_angle))
-    if abs(angle_to_use) > 1/2:
-        h, w = moving_image.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle_to_use, fixed_scale)
-    else:
-        M = np.eye(3)[:2].astype(float)
-    M[0, 2] += dx
-    M[1, 2] += dy
-
-    return M
 
 def align_mips_worker(storage_path, fov, hybe, reference_hybe, reference_mip, reference_channel, lb=0.3, up=0.9999):
     """

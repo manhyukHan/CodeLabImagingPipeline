@@ -3,6 +3,8 @@ import numpy as np
 import numpy.linalg as la
 import h5py
 
+from ..io import vlinks_store
+
 """
 Generic single-coordinate mapper between a hybe's own native (raw,
 unmodified) pixel frame and the shared reference frame -- the same "H @
@@ -87,10 +89,12 @@ def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None):
 def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, pad=5, use_stack=False):
     """
     native_coordinate: (x, y) already in `hybe`'s own raw frame (typically
-    from reference_to_raw). Reads that hybe's own H5 file and returns a
-    small crop centered there -- the "crop nearby" step, ready for a
-    localizer to run on as-is. use_stack=True reads the full (height,
-    width, depth) Z-stack instead of the 2D MIP.
+    from reference_to_raw). Returns a small crop centered there -- the
+    "crop nearby" step, ready for a localizer to run on as-is. use_stack=
+    False (default, 2D localization) reads vlinks.h5's real MIP copy, never
+    the raw stack file. use_stack=True (3D localization -- the legitimate
+    exception) reads the full (height, width, depth) Z-stack from the raw
+    stack file instead.
 
     Returns (crop, (ymin, xmin)): the offset lets a caller convert a
     within-crop peak back to `hybe`'s native frame (raw_x = x + xmin,
@@ -98,11 +102,20 @@ def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, p
     before handing it to raw_to_reference.
     """
     x, y = native_coordinate
+    if not use_stack:
+        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        if mip is None:
+            raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+        height, width = mip.shape[0], mip.shape[1]
+        ymin, ymax = max(0, int(round(y)) - pad), min(height, int(round(y)) + pad + 1)
+        xmin, xmax = max(0, int(round(x)) - pad), min(width, int(round(x)) + pad + 1)
+        return mip[ymin:ymax, xmin:xmax], (ymin, xmin)
+
     h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
     with h5py.File(h5path, 'r') as f:
-        dataset = f[f'/stack/ch{channel}'] if use_stack else f[f'/mip/ch{channel}']
+        dataset = f[f'/stack/ch{channel}']
         height, width = dataset.shape[0], dataset.shape[1]
         ymin, ymax = max(0, int(round(y)) - pad), min(height, int(round(y)) + pad + 1)
         xmin, xmax = max(0, int(round(x)) - pad), min(width, int(round(x)) + pad + 1)
-        crop = dataset[ymin:ymax, xmin:xmax, :] if use_stack else dataset[ymin:ymax, xmin:xmax]
+        crop = dataset[ymin:ymax, xmin:xmax, :]
     return crop, (ymin, xmin)
