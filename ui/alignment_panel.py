@@ -30,9 +30,6 @@ class AlignmentPanelUI(object):
         # -- within-experiment (FOV) --
         sameModalityGroup = QtWidgets.QGroupBox('1. Same-Modality (FOV) Alignment')
         sameModalityLayout = QtWidgets.QFormLayout(sameModalityGroup)
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        self.ModalityComboBox.addItems(['DNA', 'RNA'])
-        sameModalityLayout.addRow('Modality:', self.ModalityComboBox)
         self.SameModalityFovSpinBox = QtWidgets.QSpinBox()
         self.SameModalityFovSpinBox.setRange(1, 100000)
         self.SameModalityFovSpinBox.setValue(1)
@@ -287,20 +284,113 @@ class AlignmentPanelUI(object):
         row_layout.addWidget(browse_button)
         return line_edit, row
 
-    def populate_reference_hybe_choices(self, hybe_records):
-        self.ReferenceHybeComboBox.clear()
-        self.ReferenceHybeComboBox.addItems([r['folder'] for r in hybe_records])
+    def populate_reference_hybe_choices(self, total_active_hybe_list):
+        """
+        total_active_hybe_list: [(hybe_record, modality_name), ...] --
+        the union of every configured modality's active hybes, NOT one
+        modality's own list -- there's no Modality selector on this panel
+        any more; picking a reference hybe from ANY modality is enough,
+        since actually running same-modality alignment only ever touches
+        hybes within that SAME hybe's own modality (resolved from the
+        pick itself, see current_reference_modality/MainWindow._run_fov_
+        alignment). Each combo item's data is the (record, modality)
+        pair, same pattern MainWindow._refresh_cell_preview_reference_
+        choices already uses for CellPreviewReferenceHybeComboBox.
 
-    def populate_cell_reference_hybe_choices(self, hybe_records):
+        Preserves the current selection across a refresh by matching
+        (folder, modality) -- picking a DNA hybe today and a RNA one
+        tomorrow no longer requires touching a modality switch in
+        between, and this refresh (now driven by Parse Layout, not a
+        modality switch) never resets what's already selected.
+        """
+        current = self.current_reference_hybe_key()
+        self.ReferenceHybeComboBox.blockSignals(True)
+        self.ReferenceHybeComboBox.clear()
+        for record, modality in total_active_hybe_list:
+            self.ReferenceHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
+        if self.ReferenceHybeComboBox.count():
+            restore_index = next((i for i in range(self.ReferenceHybeComboBox.count())
+                                  if self._reference_hybe_item_key(i) == current), 0)
+            self.ReferenceHybeComboBox.setCurrentIndex(restore_index)
+        self.ReferenceHybeComboBox.blockSignals(False)
+
+    def _reference_hybe_item_key(self, index):
+        data = self.ReferenceHybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_reference_hybe_key(self):
+        data = self.ReferenceHybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_reference_hybe(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.ReferenceHybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_reference_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.ReferenceHybeComboBox.currentData()
+        return data[1] if data is not None else None
+
+    def select_reference_hybe(self, folder, modality):
+        """Finds and selects the combo item matching (folder, modality) exactly. No-op if not found."""
+        for i in range(self.ReferenceHybeComboBox.count()):
+            if self._reference_hybe_item_key(i) == (folder, modality):
+                self.ReferenceHybeComboBox.setCurrentIndex(i)
+                return
+
+    def populate_cell_reference_hybe_choices(self, total_active_hybe_list):
         """
         Separate from populate_reference_hybe_choices (which only ever
         reflects the single currently-active modality) -- cell-based
-        alignment now processes hybes from BOTH modalities (see
-        MainWindow._other_modality_cell_alignment_inputs), so its own
-        anchor-hybe combo needs to offer choices from both too, not just
-        whichever one happens to be current.
+        alignment processes hybes from BOTH modalities (see MainWindow.
+        _other_modality_cell_alignment_inputs), so its own anchor-hybe
+        combo needs to offer choices from both, not just whichever one
+        happens to be current. Same itemData-tagged (record, modality)
+        pattern as populate_reference_hybe_choices -- a bare folder-name
+        string here would let the SAME name (e.g. a real cross-modal
+        bridge hybe) be picked without knowing which modality's hybe_
+        records/storage_path it actually belongs to. Every cell-alignment
+        call site resolves its own storage_path/hybe_records from THIS
+        combo's own picked modality, never from IngestionPanel's current
+        selection -- explicit user choice, by request, not an auto-
+        derived default.
         """
-        self._repopulate_editable_combo(self.CellReferenceHybeComboBox, [r['folder'] for r in hybe_records])
+        current = self.current_cell_reference_hybe_key()
+        self.CellReferenceHybeComboBox.blockSignals(True)
+        self.CellReferenceHybeComboBox.clear()
+        for record, modality in total_active_hybe_list:
+            self.CellReferenceHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
+        if self.CellReferenceHybeComboBox.count():
+            restore_index = next((i for i in range(self.CellReferenceHybeComboBox.count())
+                                  if self._cell_reference_hybe_item_key(i) == current), 0)
+            self.CellReferenceHybeComboBox.setCurrentIndex(restore_index)
+        self.CellReferenceHybeComboBox.blockSignals(False)
+
+    def _cell_reference_hybe_item_key(self, index):
+        data = self.CellReferenceHybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_cell_reference_hybe_key(self):
+        data = self.CellReferenceHybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_cell_reference_hybe(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.CellReferenceHybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_cell_reference_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.CellReferenceHybeComboBox.currentData()
+        return data[1] if data is not None else None
+
+    def select_cell_reference_hybe(self, folder, modality):
+        """Finds and selects the combo item matching (folder, modality) exactly. No-op if not found."""
+        for i in range(self.CellReferenceHybeComboBox.count()):
+            if self._cell_reference_hybe_item_key(i) == (folder, modality):
+                self.CellReferenceHybeComboBox.setCurrentIndex(i)
+                return
 
     def populate_rna_reference_hybe_choices(self, hybe_records):
         self._repopulate_editable_combo(self.RnaReferenceHybeComboBox, [r['folder'] for r in hybe_records])

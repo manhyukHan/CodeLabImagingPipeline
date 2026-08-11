@@ -22,10 +22,6 @@ class CellSegmentPanelUI(object):
         form = QtWidgets.QFormLayout()
         layout.addLayout(form)
 
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        self.ModalityComboBox.addItems(['DNA', 'RNA'])
-        form.addRow('Modality:', self.ModalityComboBox)
-
         self.FovSpinBox = QtWidgets.QSpinBox()
         self.FovSpinBox.setRange(1, 100000)
         self.FovSpinBox.setValue(1)
@@ -92,7 +88,6 @@ class CellSegmentPanelUI(object):
         self.LogTextEdit.setReadOnly(True)
         layout.addWidget(self.LogTextEdit)
 
-        self._hybe_records = []
         self.ReferenceHybeComboBox.currentIndexChanged.connect(self._on_reference_hybe_changed)
 
     def _build_cellpose_page(self):
@@ -151,18 +146,53 @@ class CellSegmentPanelUI(object):
         layout.addStretch()
         return page
 
-    def populate_reference_hybe_choices(self, hybe_records):
-        self._hybe_records = list(hybe_records)
+    def populate_reference_hybe_choices(self, total_active_hybe_list):
+        """
+        total_active_hybe_list: [(hybe_record, modality_name), ...] --
+        the union of every configured modality's active hybes, NOT one
+        modality's own list -- no Modality selector on this panel any
+        more. Same itemData-tagged pattern as SpotLocalizationPanel.
+        populate_hybe_choices/AlignmentPanel.populate_reference_hybe_
+        choices; see either for the full rationale. Preserves the
+        current selection across a refresh by (folder, modality).
+        """
+        current = self.current_reference_hybe_key()
+        self.ReferenceHybeComboBox.blockSignals(True)
         self.ReferenceHybeComboBox.clear()
-        self.ReferenceHybeComboBox.addItems([r['folder'] for r in hybe_records])
+        for record, modality in total_active_hybe_list:
+            self.ReferenceHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
+        if self.ReferenceHybeComboBox.count():
+            restore_index = next((i for i in range(self.ReferenceHybeComboBox.count())
+                                  if self._reference_hybe_item_key(i) == current), 0)
+            self.ReferenceHybeComboBox.setCurrentIndex(restore_index)
+        self.ReferenceHybeComboBox.blockSignals(False)
+        self._on_reference_hybe_changed()
+
+    def _reference_hybe_item_key(self, index):
+        data = self.ReferenceHybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_reference_hybe_key(self):
+        data = self.ReferenceHybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_reference_hybe(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.ReferenceHybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_reference_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.ReferenceHybeComboBox.currentData()
+        return data[1] if data is not None else None
 
     def current_method(self):
         """'cellpose' / 'classical' / 'manual' -- lowercase, matches segment.py's own method kwarg casing."""
         return self.MethodComboBox.currentText().lower()
 
     def _on_reference_hybe_changed(self):
-        folder = self.ReferenceHybeComboBox.currentText()
-        record = next((r for r in self._hybe_records if r['folder'] == folder), None)
+        data = self.ReferenceHybeComboBox.currentData()
+        record = data[0] if data is not None else None
         # blockSignals so clear()+addItems() reads as one atomic "channel
         # list changed" update, not a transient empty-then-refilled state
         # any downstream listener could observe mid-update

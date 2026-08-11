@@ -141,6 +141,34 @@ class ACell():
         """
         return self.matrix_between(hybe, modality, self.reference_hybe, self.modality)
 
+    def matrix_to_shared(self, hybe, modality):
+        """
+        The 3x3 matrix mapping `hybe`'s own native (raw) frame into the
+        pipeline's ONE shared reference frame -- RNA's own same-modality
+        reference hybe (e.g. Hyb_101). NOT self.reference_hybe's frame
+        (contrast with matrix_to above): self.reference_hybe is an
+        arbitrary, per-segmentation-run choice (can even vary cell-group
+        to cell-group under append-mode segmentation), whereas the shared
+        frame here is the one stable, already-well-defined anchor every
+        OTHER layer of this pipeline (FOV alignment, cross-modal
+        alignment) is already built around.
+
+        matrix_anchors[modality] already IS that modality's own
+        reference_hybe's transform into this shared frame -- for a DNA
+        hybe, compute_cell_alignment computed it against fov_matrices
+        that was already H_across-composed (see _composed_fov_matrices_
+        for_cell_alignment / _other_modality_cell_alignment_inputs), so
+        matrix_anchors['DNA'] already lands in RNA's own frame. There is
+        no separate "DNA's own shared frame" -- any hybe from either
+        modality resolved through this method lands in the exact same
+        frame once a cross-modal link exists, no further bridging needed
+        (unlike matrix_to/matrix_between, which additionally re-anchor to
+        self.reference_hybe).
+        """
+        H_to_anchor = self.matrices.get((hybe, modality), {}).get('yx', np.eye(3))
+        A = self.matrix_anchors.get(modality, np.eye(3))
+        return A @ H_to_anchor
+
     def get_area_in_readout(self, hybe, modality):
         """
         This cell's mask coordinates (x, y), transformed into `hybe`'s own

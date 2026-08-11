@@ -258,19 +258,28 @@ def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_
     """
     Persists Celltype Determination's ENTIRE setup work -- FOV mode's
     {celltype: range_string} map, Barcode mode's {celltype: (hybe,
-    channel)} assignment, the actual computed {'scale'/'lower_bound'/
-    'upper_bound': {(hybe,channel): {fov: value}}} calibration (real
-    per-FOV bound values, not just the input widget settings that
-    produced them), and the classification method (Vote/Median) -- so a
-    later session can reconstruct all of it and run/view results
-    without re-running Set FOV Ranges / Assign to Selected Celltype /
-    Apply Calibration from scratch, same "just usable, no extra step"
-    standard cells/spots/alignment matrices already meet elsewhere in
-    this app. A single pickled blob at /params/celltype_config_blob
-    (same "no HDF5-native schema, nothing else reads this" reasoning as
-    write_cells/write_fov_spots) -- (hybe, channel) tuple keys aren't
-    representable as plain HDF5 attrs the way write_global_params's flat
-    scalars are.
+    channel, modality)} assignment, the actual computed {'scale'/
+    'lower_bound'/'upper_bound': {(hybe,channel,modality): {fov: value}}}
+    calibration (real per-FOV bound values, not just the input widget
+    settings that produced them), and the classification method (Vote/
+    Median) -- so a later session can reconstruct all of it and run/view
+    results without re-running Set FOV Ranges / Assign to Selected
+    Celltype / Apply Calibration from scratch, same "just usable, no
+    extra step" standard cells/spots/alignment matrices already meet
+    elsewhere in this app. A single pickled blob at /params/
+    celltype_config_blob (same "no HDF5-native schema, nothing else
+    reads this" reasoning as write_cells/write_fov_spots) -- (hybe,
+    channel, modality) tuple keys aren't representable as plain HDF5
+    attrs the way write_global_params's flat scalars are.
+
+    The modality element is what lets a barcode channel be identified
+    unambiguously even when two modalities happen to share a hybe folder
+    name -- read_celltype_config's own caller is responsible for
+    dropping any OLDER-format 2-tuple (hybe, channel) entry it encounters
+    (no modality tag to recover, same "drop rather than guess wrong"
+    policy codelab_pipeline.models.cell_container's own
+    _drop_legacy_matrix_keys uses for its analogous pre-tuple-key
+    format); this function itself just round-trips whatever it's given.
     """
     payload = {
         'fov_ranges_by_celltype': dict(fov_ranges_by_celltype),

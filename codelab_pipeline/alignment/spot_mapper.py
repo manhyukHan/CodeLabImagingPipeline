@@ -32,16 +32,17 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     """
     The single 3x3 'yx' matrix mapping `hybe`'s own native (raw) frame to
     the reference frame for this coordinate. If `cell` is given, that
-    reference frame is cell.reference_hybe's own frame (the frame
-    cell.area/spot.coordinate live in) -- ACell.matrix_to resolves this
-    from cell.matrices, which itself targets a shared FOV frame rather
-    than cell.reference_hybe directly (see compute_cell_alignment's
-    docstring), composing through it with graceful identity fallback for
-    either leg per "no no-alignment". Without a cell, the reference frame
-    is whatever fov_matrices itself targets, which the caller is expected
-    to have already composed with H_across when applicable (see
-    main_window._composed_fov_matrices_for_cell_alignment) -- this
-    function never re-derives or infers that composition itself.
+    reference frame is the pipeline's ONE shared reference frame (RNA's
+    own same-modality reference hybe -- see ACell.matrix_to_shared's own
+    docstring for why this, not cell.reference_hybe, is the destination
+    every spot coordinate should land in) -- ACell.matrix_to_shared
+    resolves this from cell.matrices/matrix_anchors, with graceful
+    identity fallback for either leg per "no no-alignment". Without a
+    cell, the reference frame is whatever fov_matrices itself targets,
+    which the caller is expected to have already composed with H_across
+    when applicable (see main_window._composed_fov_matrices_for_cell_
+    alignment) -- this function never re-derives or infers that
+    composition itself.
 
     modality: which modality `hybe` belongs to -- required to look up
     cell.matrices correctly, since it's keyed by (hybe, modality), not
@@ -52,7 +53,7 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     """
     if cell is not None:
         key_modality = modality if modality is not None else cell.modality
-        return cell.matrix_to(hybe, key_modality)
+        return cell.matrix_to_shared(hybe, key_modality)
     if hybe not in fov_matrices:
         raise KeyError(f"No alignment matrix for hybe '{hybe}' -- pass a fov_matrices entry "
                         f"(or a cell with its own residual for this hybe/modality)")

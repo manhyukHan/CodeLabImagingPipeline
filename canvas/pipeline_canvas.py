@@ -20,25 +20,136 @@ def _sequential_color(i, n):
 
 def _composite_multi(images, lb=0.3, ub=0.9999):
     """
-    images: {label: 2D array}. Normalizes each, maps it through a
-    sequential red-cyan color (reference hybe = red, last readout = cyan,
-    everything else interpolated between), pixelwise-max across all of them
-    -- same composites.max(-1) pattern already used in
+    images: {label: 2D array}. Normalizes each (NaN-aware: percentiles and
+    the final normalized value are computed only over each image's own
+    real, non-NaN pixels -- normalize_to_uint8's plain uint8 cast turns a
+    NaN into undefined garbage otherwise), maps it through a sequential
+    red-cyan color (reference hybe = red, last readout = cyan, everything
+    else interpolated between), pixelwise-max across all of them -- same
+    composites.max(-1) pattern already used in
     legacy/segment_widgets.py's CellbarcodeWidget.
     Gives one combined image showing every readout simultaneously, instead
     of the 2-color pairwise composite -- the pairwise view can't show
     whether alignment succeeded overall across many hybes at once.
+    A pixel where NO hybe has real data (every one NaN there -- true-
+    extent crops of different true sizes, see _true_bounds) renders as
+    flat neutral gray rather than black, so "nothing here" reads as
+    distinct from "real signal, just dark".
     """
     labels = list(images.keys())
     shape = next(iter(images.values())).shape
     composite = np.zeros((*shape, 3), dtype=float)
+    valid_any = np.zeros(shape, dtype=bool)
     n = len(labels)
     for i, label in enumerate(labels):
         color = _sequential_color(i, n)
-        norm = preprocess.normalize_to_uint8(images[label], lb, ub).astype(float) / 255
+        img = images[label]
+        valid = np.isfinite(img)
+        norm = np.zeros(shape, dtype=float)
+        if valid.any():
+            norm[valid] = preprocess.normalize_to_uint8(img[valid], lb, ub).astype(float)
+        norm /= 255
         layer = np.stack([norm * c for c in color], axis=-1)
         composite = np.maximum(composite, layer)
+        valid_any |= valid
+    composite[~valid_any] = 90 / 255
     return composite
+
+
+def _true_bounds(H_eff, x, y, pad):
+    """
+    Unclamped mask bounding box (+ pad margin) in H_eff's target frame --
+    NOT run through align_cell's own drop-out-of-frame-points step, so a
+    cell near a real frame edge gets its TRUE extent (possibly negative
+    ymin/xmin, or ymax/xmax beyond the real frame) instead of a silently
+    truncated one.
+
+    Why this matters: two hybes' own crops, built from their own
+    independently-fitted H_eff, can end up different sizes purely because
+    one hybe's own warped mask sits closer to the real frame edge than
+    the other's -- clamping each independently BEFORE comparing them (the
+    old approach) baked that disagreement into an arbitrary crop-window
+    offset with nothing to do with real image content. That's what made a
+    real, already-fitted cell-level correction ("cyan should move up by
+    1px") invisible for any cell whose mask reaches a real frame edge:
+    the correction shifted the true window, but clamping silently
+    absorbed the shift into the window's size instead of its position.
+    Keeping the window at its true (possibly out-of-frame) extent and
+    NaN-filling the missing part (see _nan_native_crop) instead preserves
+    the shift as an actual, visible change in where the real data sits
+    within the crop.
+    """
+    cx, cy = (H_eff[:2] @ np.array([x, y, np.ones_like(x)])).astype(int)
+    ymin, ymax = int(cy.min()) - pad, int(cy.max()) + pad + 1
+    xmin, xmax = int(cx.min()) - pad, int(cx.max()) + pad + 1
+    return ymin, ymax, xmin, xmax
+
+
+def _nan_native_crop(mip, bounds, height, width):
+    """
+    mip sliced to `bounds` (ymin,ymax,xmin,xmax from _true_bounds, may
+    extend past the real [0,height)x[0,width) frame on any side) -- NaN
+    fills whatever part of that window has no real pixel data, real
+    pixel data everywhere else. Two hybes' own crops, each built this way
+    from their own (possibly differently-clamped) true bounds, are then
+    directly comparable position-for-position: overlaying them at a
+    shared top-left origin (see _draw_three_way's own composite)
+    reproduces exactly the correspondence the alignment fit itself
+    assumes (target_crop[i,j] <-> reference_crop[i,j]), whether or not
+    either side got real-frame-edge-clipped -- NOT an absolute-frame-
+    position alignment, which would reintroduce the two hybes' own
+    (real, but visualization-irrelevant) FOV-level offset as a spurious
+    extra shift in the overlay.
+    """
+    ymin, ymax, xmin, xmax = bounds
+    out = np.full((ymax - ymin, xmax - xmin), np.nan, dtype=np.float32)
+    ry0, ry1 = max(ymin, 0), min(ymax, height)
+    rx0, rx1 = max(xmin, 0), min(xmax, width)
+    if ry1 > ry0 and rx1 > rx0:
+        out[ry0 - ymin:ry1 - ymin, rx0 - xmin:rx1 - xmin] = mip[ry0:ry1, rx0:rx1]
+    return out
+
+
+def _nan_mask_crop(cy, cx, bounds, height, width):
+    """
+    Same true-extent placement as _nan_native_crop, for the boolean
+    cell-mask overlay. cy/cx are align_cell's own already-frame-clamped
+    mask points (a mask point that doesn't exist in the real frame has
+    no meaningful position to plot), so this never needs NaN -- just
+    False outside both the mask and the real frame.
+    """
+    ymin, ymax, xmin, xmax = bounds
+    mask_full = np.zeros((height, width), dtype=bool)
+    mask_full[cy, cx] = True
+    out = np.zeros((ymax - ymin, xmax - xmin), dtype=bool)
+    ry0, ry1 = max(ymin, 0), min(ymax, height)
+    rx0, rx1 = max(xmin, 0), min(xmax, width)
+    if ry1 > ry0 and rx1 > rx0:
+        out[ry0 - ymin:ry1 - ymin, rx0 - xmin:rx1 - xmin] = mask_full[ry0:ry1, rx0:rx1]
+    return out
+
+
+def _nan_zx_crop(storage_path, fov, hybe, channel, bounds, height, width, lb, ub):
+    """
+    ZX (depth) projection at the SAME true x-extent as the YX row's own
+    crop from the same `bounds`, so the two rows stay column-aligned
+    (see _draw_three_way's sharex='col'). Only x needs true-extent/NaN
+    handling here -- y disappears entirely in hybe_zx_projection's own
+    max-projection, so it only needs clamping to stay a valid slice,
+    never NaN-tracking; y and x are both clamped before the read since
+    a negative index would otherwise silently wrap (h5py/numpy's own
+    negative-index convention) instead of raising.
+    """
+    ymin, ymax, xmin, xmax = bounds
+    ry0, ry1 = max(ymin, 0), min(ymax, height)
+    rx0, rx1 = max(xmin, 0), min(xmax, width)
+    if ry1 <= ry0 or rx1 <= rx0:
+        return None
+    projection = alignment.hybe_zx_projection(storage_path, fov, hybe, channel,
+                                              ry0, ry1, rx0, rx1, lb, ub, normalize=False)
+    out = np.full((xmax - xmin, projection.shape[1]), np.nan, dtype=np.float32)
+    out[rx0 - xmin:rx1 - xmin, :] = projection
+    return out
 
 
 class PipelineCanvas():
@@ -129,20 +240,38 @@ class PipelineCanvas():
         be the same shape -- pad each pair (and the mask) to their shared
         max shape before compositing, purely for display.
         """
-        def norm(a):
-            return preprocess.normalize_to_uint8(a, lb, ub)
+        def pad_to_nan(a, h, w):
+            a2 = np.full((h, w), np.nan, dtype=np.float32)
+            a2[:a.shape[0], :a.shape[1]] = a
+            return a2
 
-        def pad_to(a, h, w):
+        def pad_to_zero(a, h, w):
             a2 = np.zeros((h, w), dtype=a.dtype)
             a2[:a.shape[0], :a.shape[1]] = a
             return a2
 
         def composite(a, b):
+            # a/b are true-extent crops (see _true_bounds/_nan_native_crop)
+            # -- NaN wherever that hybe's own true window has no real
+            # pixel data. A composited pixel is only "real" if BOTH sides
+            # have data there; otherwise it renders as one flat neutral
+            # marker, never a blend against a fake fallback value in the
+            # missing channel (that blend previously created false-
+            # colored lines exactly at each hybe's own frame-edge
+            # boundary, misreadable as real shifted content).
             h, w = max(a.shape[0], b.shape[0]), max(a.shape[1], b.shape[1])
-            c = np.zeros((h, w, 3), dtype=float)
-            c[..., 0] = norm(pad_to(a, h, w))
-            c[..., 1] = norm(pad_to(b, h, w))
-            c[..., 2] = norm(pad_to(b, h, w))
+            pa, pb = pad_to_nan(a, h, w), pad_to_nan(b, h, w)
+            both_valid = np.isfinite(pa) & np.isfinite(pb)
+            def norm(x):
+                out = np.zeros((h, w), dtype=float)
+                if both_valid.any():
+                    out[both_valid] = preprocess.normalize_to_uint8(x[both_valid], lb, ub)
+                return out
+            c = np.full((h, w, 3), 90, dtype=float)
+            na, nb = norm(pa), norm(pb)
+            c[both_valid, 0] = na[both_valid]
+            c[both_valid, 1] = nb[both_valid]
+            c[both_valid, 2] = nb[both_valid]
             return c / 255, h, w
 
         ncols = max(len(labeled_images) for _, _, labeled_images in rows)
@@ -175,7 +304,7 @@ class PipelineCanvas():
                 # read as one consistent 3D view.
                 a.imshow(rgb, aspect='auto')
                 if ref_mask is not None and ref_mask.any():
-                    a.contour(pad_to(ref_mask.astype(np.uint8), h, w), levels=[0.5], colors='yellow', linewidths=1)
+                    a.contour(pad_to_zero(ref_mask.astype(np.uint8), h, w), levels=[0.5], colors='yellow', linewidths=1)
                 a.set_title(f'{row_label}: {label}' if multi_row else label, fontsize=10)
                 a.axis('off')
         fig.suptitle(f'{title} (red=ref, cyan=moving, yellow=cell boundary)', fontsize=10, wrap=True)
@@ -186,11 +315,11 @@ class PipelineCanvas():
 
     def draw_cell_alignment_preview_3col(self, cell, fov,
                                          reference_storage_path, reference_hybe, reference_channel,
-                                         reference_fiducial_channel, reference_fov_matrix,
-                                         target_storage_path, target_hybe, target_channel, target_fiducial_channel,
+                                         reference_fov_matrix,
+                                         target_storage_path, target_hybe, target_channel,
                                          fov_only_matrix, final_matrix,
                                          pad=30, lb=0.3, ub=0.9999, save_path=None, target_modality=None,
-                                         reference_final_matrix=None):
+                                         reference_final_matrix=None, mask_anchor_fov_matrix=None):
         """
         3-way comparison for one target hybe against this cell, per
         explicit request, drawn as TWO rows -- YX plane and ZX plane
@@ -218,29 +347,25 @@ class PipelineCanvas():
            through final_matrix -- fov_only_matrix refined by this cell's
            own residual (cell.matrices[target_hybe]['yx']). Reference
            cropped via reference_final_matrix -- the SAME KIND of matrix
-           (_matrix_to_cellref, not reference_fov_matrix's _fov_only_
-           matrix_for_hybe) applied to reference_hybe, computed
-           independently rather than reusing column 2's crop. This is NOT
-           a cosmetic choice: cell.reference_hybe (the segmentation hybe)
-           is itself just another hybe in the same alignment run, and
-           generally has its OWN nonzero cell-level residual -- _matrix_
-           to_cellref's composition through cell.reference_hybe folds
-           that residual in for ANY hybe being expressed in cell.
-           reference_hybe's frame, target included. Reusing column 2's
-           (purely FOV-only, residual-blind) crop for the reference's
+           (_matrix_to_shared, not reference_fov_matrix's plain FOV
+           lookup) applied to reference_hybe, computed independently
+           rather than reusing column 2's crop. This is NOT a cosmetic
+           choice: reference_hybe generally has its OWN nonzero cell-
+           level residual (see ACell.matrix_to_shared) -- reusing column
+           2's (purely FOV-only, residual-blind) crop for the reference's
            'final' column would silently disagree with the target's own
            'final' column by exactly that residual, even when target_hybe
-           == reference_hybe -- confirmed on real data (cell 7, Hyb_101 vs
-           Hyb_101: reference_fov_matrix and reference_final_matrix
-           differed by ~0.9px purely from cell.reference_hybe's own
-           residual, breaking the same-hybe-perfect-overlay invariant in
-           this column only). Defaults to reference_fov_matrix (the old
-           behavior) when not given.
+           == reference_hybe (confirmed on real data: differed by ~0.9px
+           purely from the reference hybe's own residual, breaking the
+           same-hybe-perfect-overlay invariant in this column only).
+           Defaults to reference_fov_matrix (the old behavior) when not
+           given.
 
         The ZX row uses the SAME crop windows (in ymin/ymax/xmin/xmax) as
-        the YX row, per column -- via hybe_zx_projection, the same
-        fiducial-channel Z-stack max-projection compute_cell_alignment's
-        own z-depth refinement is built from -- so the ZX 'raw'/'FOV/
+        the YX row, per column -- via hybe_zx_projection, on the SAME
+        channel_type-resolved channel as the YX row (reference_channel/
+        target_channel), matching compute_cell_alignment's own z-depth
+        refinement -- so the ZX 'raw'/'FOV/
         cross-modal' columns show exactly the state compute_cell_
         alignment measured its Z-offset against, and 'final' additionally
         applies cell.matrices[target_hybe]['zx'] (a translation on top of
@@ -254,17 +379,37 @@ class PipelineCanvas():
         no matching spatial mask).
 
         reference_fov_matrix: the matrix mapping reference_hybe's own
-        native frame to cell.reference_hybe's frame (fov_matrices.get
-        (reference_hybe, identity) at compute time) -- reference_hybe is
-        whatever ACTUALLY anchored this target_hybe's phase-correlation,
-        which is only cell.reference_hybe itself in the common case;
-        cell.area's coordinates are native to cell.reference_hybe, so
-        positioning the reference crop correctly needs the same inverse-
-        warp treatment as every other hybe, not a direct, untransformed
-        use of cell.area (which was this function's bug in its first
-        version -- silently mispositioning the reference crop, and
-        therefore both other crops relative to it, whenever the compute-
-        time anchor differed from the segmentation hybe).
+        native frame to the pipeline's ONE shared reference frame (RNA's
+        own same-modality reference hybe -- fov_matrices.get(reference_
+        hybe, identity) at compute time). cell.area's coordinates are
+        native to cell.reference_hybe (the segmentation hybe), moved once
+        into that same shared frame (see this method's own mask_to_shared
+        step) -- positioning the reference crop correctly needs the same
+        inverse-warp treatment as every other hybe, not a direct,
+        untransformed use of cell.area (which was this function's bug in
+        its first version -- silently mispositioning the reference crop,
+        and therefore both other crops relative to it).
+
+        mask_anchor_fov_matrix: cell.reference_hybe's own native frame ->
+        the shared frame, via ONLY the FOV/cross-modal matrix (fov_
+        matrices.get(cell.reference_hybe, identity)) -- NO cell-level
+        residual. Used as THE anchor for every non-literal column ('FOV/
+        cross-modal' AND 'final' alike), never cell.matrix_to_shared
+        (cell.reference_hybe, ...) (which includes cell.reference_hybe's
+        own fitted residual). Per explicit request: the reference side
+        should never move between columns ("red not moved, only cyan
+        moved") -- since the reference hybe's OWN matrix is always
+        identity (it's this run's own anchor), using the residual-
+        bearing anchor made the reference crop's window silently drift
+        with cell.reference_hybe's unrelated fit result, confirmed on
+        real data both as a visible bug (switching only the cell-level
+        fit method moved the reference crop) and as NOT a real spot-
+        mapping dependency (perturbing cell.reference_hybe's own fitted
+        residual leaves matrix_to_shared(any other hybe, ...) completely
+        unchanged -- this was always a display-only artifact). Falls back
+        to cell.matrix_to_shared(cell.reference_hybe, ...) (the OLD, pre-
+        fix behavior) when not given, rather than crashing -- a caller
+        that hasn't been updated yet just doesn't get this fix.
 
         pad (default 30, user-configurable): pixels of margin included
         around the cell's own bounding box in every crop, so there's
@@ -283,31 +428,68 @@ class PipelineCanvas():
         storage_path/hybe_records the way the older 2-column version did.
         """
         height, width = cell.frame_shape
-        x_ref, y_ref = cell.area
+        x_lit, y_lit = cell.area
+        # ONE anchor for every non-literal column -- FOV-only, never the
+        # cell-residual-bearing version. Per explicit request: the
+        # reference side should never move at all between columns ("red
+        # not moved, only cyan moved" -- the most intuitive registration
+        # convention, and also the one a spot's own coordinate transform
+        # actually uses: matrix_to_shared(hybe, modality) never routes
+        # through cell.reference_hybe for any hybe other than the
+        # segmentation hybe itself, confirmed by directly perturbing
+        # cell.reference_hybe's own fitted residual on real data and
+        # finding matrix_to_shared(target_hybe, ...) completely
+        # unchanged -- so this was always a display-only artifact, not a
+        # real spot-mapping dependency). Previously this function used
+        # mask_to_shared_final (cell.matrix_to_shared(cell.reference_hybe,
+        # ...), residual-included) as the anchor for 'final' -- since the
+        # reference hybe's OWN matrix is always identity (it's this run's
+        # own anchor), the reference crop's apparent movement between
+        # 'FOV/cross-modal' and 'final' came ENTIRELY from cell.reference_
+        # hybe's own residual leaking in through the anchor, not from any
+        # real correction to the reference hybe itself. Fixed by using
+        # the FOV-only anchor unconditionally: the reference side's crop
+        # window is now identical across every non-literal column,
+        # exactly matching what a spot's own transform already does.
+        mask_anchor = (mask_anchor_fov_matrix if mask_anchor_fov_matrix is not None
+                      else cell.matrix_to_shared(cell.reference_hybe, cell.modality))
 
-        def bounds_via(H):
-            cy, cx = alignment.align_cell((y_ref, x_ref), np.linalg.inv(H), (height, width))
+        def bounds_via(H, basis='final'):
+            # Compose the anchor and this column's own H into ONE matrix
+            # and apply it to cell.area (x_lit,y_lit) in a SINGLE
+            # align_cell call, rather than pre-transforming the anchor
+            # via its own align_cell call and feeding that (already
+            # int-truncated) result into a second one -- align_cell
+            # truncates to int internally, so doing this in two hops
+            # accumulates a different (and confirmed, on real data, a
+            # real ~1px different) truncation than compute_cell_
+            # alignment's own _native_crop, which always composes its
+            # two matrices algebraically first and truncates once. Two
+            # code paths computing "the same" crop window should not be
+            # able to disagree by a pixel merely from HOW MANY steps the
+            # composition took.
+            if basis == 'literal':
+                H_eff = np.linalg.inv(H)
+            else:
+                H_eff = np.linalg.inv(H) @ mask_anchor
+            cy, cx = alignment.align_cell((y_lit, x_lit), H_eff, (height, width))
             if len(cx) == 0:
                 return None
-            ymin, ymax = max(0, int(cy.min()) - pad), min(height, int(cy.max()) + pad + 1)
-            xmin, xmax = max(0, int(cx.min()) - pad), min(width, int(cx.max()) + pad + 1)
-            return cy, cx, ymin, ymax, xmin, xmax
+            return cy, cx, _true_bounds(H_eff, x_lit, y_lit, pad)
 
-        def crop_via(mip, H):
-            b = bounds_via(H)
+        def crop_via(mip, H, basis='final'):
+            b = bounds_via(H, basis=basis)
             if b is None:
-                return np.zeros((1, 1), dtype=mip.dtype), np.zeros((1, 1), dtype=bool), None
-            cy, cx, ymin, ymax, xmin, xmax = b
-            mask_full = np.zeros((height, width), dtype=bool)
-            mask_full[cy, cx] = True
-            return mip[ymin:ymax, xmin:xmax], mask_full[ymin:ymax, xmin:xmax], (ymin, ymax, xmin, xmax)
+                return np.full((1, 1), np.nan, dtype=np.float32), np.zeros((1, 1), dtype=bool), None
+            cy, cx, true_bounds = b
+            return (_nan_native_crop(mip, true_bounds, height, width),
+                    _nan_mask_crop(cy, cx, true_bounds, height, width), true_bounds)
 
-        def zx_via(storage_path, hybe, fiducial_channel, bounds):
+        def zx_via(storage_path, hybe, channel, bounds):
             if bounds is None:
-                return np.zeros((1, 1), dtype=np.uint8)
-            ymin, ymax, xmin, xmax = bounds
-            return alignment.hybe_zx_projection(storage_path, fov, hybe, fiducial_channel,
-                                                ymin, ymax, xmin, xmax, lb, ub)
+                return np.full((1, 1), np.nan, dtype=np.float32)
+            crop = _nan_zx_crop(storage_path, fov, hybe, channel, bounds, height, width, lb, ub)
+            return crop if crop is not None else np.full((1, 1), np.nan, dtype=np.float32)
 
         if reference_final_matrix is None:
             reference_final_matrix = reference_fov_matrix
@@ -324,27 +506,32 @@ class PipelineCanvas():
         # into ANY hybe expressed in its frame, target included, so
         # reusing the residual-blind FOV crop for reference's own final
         # column would silently disagree with the target's.
-        reference_raw_crop, reference_raw_mask, reference_raw_bounds = crop_via(ref_mip, np.eye(3))
-        reference_fov_crop, reference_fov_mask, reference_fov_bounds = crop_via(ref_mip, reference_fov_matrix)
-        reference_final_crop, reference_final_mask, reference_final_bounds = crop_via(ref_mip, reference_final_matrix)
-        reference_raw_zx = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, reference_raw_bounds)
-        reference_fov_zx = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, reference_fov_bounds)
-        reference_final_zx = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, reference_final_bounds)
+        reference_raw_crop, reference_raw_mask, reference_raw_bounds = crop_via(ref_mip, np.eye(3), basis='literal')
+        reference_fov_crop, reference_fov_mask, reference_fov_bounds = crop_via(ref_mip, reference_fov_matrix, basis='fov')
+        reference_final_crop, reference_final_mask, reference_final_bounds = crop_via(
+            ref_mip, reference_final_matrix)
+        reference_raw_zx = zx_via(reference_storage_path, reference_hybe, reference_channel, reference_raw_bounds)
+        reference_fov_zx = zx_via(reference_storage_path, reference_hybe, reference_channel, reference_fov_bounds)
+        reference_final_zx = zx_via(reference_storage_path, reference_hybe, reference_channel, reference_final_bounds)
 
         target_mip = _read_mip(target_storage_path, fov, target_hybe, target_channel)
         # cell mask's OWN coords, no transform at all
-        raw_crop, _, raw_bounds = crop_via(target_mip, np.eye(3))
-        fov_crop, _, fov_bounds = crop_via(target_mip, fov_only_matrix)
+        raw_crop, _, raw_bounds = crop_via(target_mip, np.eye(3), basis='literal')
+        fov_crop, _, fov_bounds = crop_via(target_mip, fov_only_matrix, basis='fov')
         final_crop, _, final_bounds = crop_via(target_mip, final_matrix)
 
-        raw_zx = zx_via(target_storage_path, target_hybe, target_fiducial_channel, raw_bounds)
-        fov_zx = zx_via(target_storage_path, target_hybe, target_fiducial_channel, fov_bounds)
-        final_zx_precorrection = zx_via(target_storage_path, target_hybe, target_fiducial_channel, final_bounds)
+        raw_zx = zx_via(target_storage_path, target_hybe, target_channel, raw_bounds)
+        fov_zx = zx_via(target_storage_path, target_hybe, target_channel, fov_bounds)
+        final_zx_precorrection = zx_via(target_storage_path, target_hybe, target_channel, final_bounds)
         H_zx = cell.matrices.get((target_hybe, target_modality if target_modality is not None else cell.modality), {}).get('zx', np.eye(3))
         # H_zx was computed (compute_cell_alignment) against hybe_zx_projection's
         # native (width, depth) orientation -- warp BEFORE transposing for display.
+        # borderValue=NaN (not the default 0): a pixel warped in from
+        # outside this crop's own true extent has no real data either,
+        # same as everywhere else NaN marks "no data" in this preview.
         final_zx = cv2.warpAffine(final_zx_precorrection, H_zx[:2],
-                                  (final_zx_precorrection.shape[1], final_zx_precorrection.shape[0]))
+                                  (final_zx_precorrection.shape[1], final_zx_precorrection.shape[0]),
+                                  borderValue=float('nan'))
 
         # hybe_zx_projection returns (width, depth) -- transpose here, at
         # display time only, so X (shared with the YX row above, same
@@ -427,8 +614,9 @@ class PipelineCanvas():
         self.draw_all_readouts_overlay(before_images, after_images, title, save_path)
 
     def draw_cell_all_readouts_overlay(self, cell, fov, reference_hybe, reference_storage_path, reference_channel,
-                                       reference_fiducial_channel, target_specs, pad=10, lb=0.3, ub=0.9999,
-                                       save_path=None, reference_matrix=None, reference_final_matrix=None):
+                                       target_specs, pad=10, lb=0.3, ub=0.9999,
+                                       save_path=None, reference_matrix=None, reference_final_matrix=None,
+                                       mask_anchor_fov_matrix=None):
         """
         Multi-hybe "did this cell's alignment succeed overall" composite,
         rebuilt to match everything the single-hybe preview
@@ -440,7 +628,7 @@ class PipelineCanvas():
         showed 2 fiducial-channel panels (before/after) for one modality.
 
         target_specs: [{'hybe', 'storage_path', 'channel',
-        'fiducial_channel', 'fov_only_matrix', 'final_matrix',
+        'fov_only_matrix', 'final_matrix',
         'zx_matrix'}, ...] -- one entry per hybe in cell.matrices (both
         modalities), pre-resolved by the caller
         (MainWindow._cell_overlay_target_specs) since resolving which
@@ -449,78 +637,101 @@ class PipelineCanvas():
         to. Every target here shares ONE fixed reference -- unlike the
         single-hybe preview, there's no per-target anchor to resolve.
 
-        reference_matrix: reference_hybe's own native frame -> cell.
-        reference_hybe's frame, FOV-LEVEL ONLY -- no cell-level residual
-        (the same shape/meaning as each target spec's own
-        'fov_only_matrix', resolved by the caller via MainWindow.
-        _fov_only_matrix_for_hybe). Used for the FOV/cross-modal column;
-        the raw column always uses true H=identity regardless of this
-        argument. Defaults to identity, which is only equivalent to the
-        real FOV-only matrix when reference_hybe IS cell.reference_hybe
-        (that composition mathematically cancels to identity by
-        construction -- see _fov_only_matrix_for_hybe's own docstring) --
-        pass the real matrix whenever reference_hybe is some other hybe
-        (e.g. the cell-alignment run's own anchor hybe), so the FOV
-        column's crop window is positioned at the cell's TRUE FOV-level
-        location in that hybe's own raw image rather than assuming
-        H=identity there too.
+        reference_matrix: reference_hybe's own native frame -> the
+        pipeline's ONE shared reference frame (RNA's own same-modality
+        reference hybe), FOV-LEVEL ONLY -- no cell-level residual (the
+        same shape/meaning as each target spec's own 'fov_only_matrix',
+        resolved by the caller as a plain fov_matrices lookup -- see
+        MainWindow._matrix_to_shared's own docstring for the fallback
+        this mirrors). Used for the FOV/cross-modal column; the raw
+        column always uses true H=identity regardless of this argument.
+        Defaults to identity.
 
-        reference_final_matrix: reference_hybe's own native frame ->
-        cell.reference_hybe's frame, the SAME KIND of matrix each target
-        spec's own 'final_matrix' is (resolved by the caller via
-        MainWindow._matrix_to_cellref) -- used for the final column,
-        computed INDEPENDENTLY from reference_matrix, NOT reused from the
-        FOV/cross-modal column. This matters because cell.reference_hybe
+        reference_final_matrix: reference_hybe's own native frame -> the
+        same shared frame, the SAME KIND of matrix each target spec's own
+        'final_matrix' is (resolved by the caller via MainWindow.
+        _matrix_to_shared) -- used for the final column, computed
+        INDEPENDENTLY from reference_matrix, NOT reused from the FOV/
+        cross-modal column. This matters because the reference hybe
         generally has its own nonzero cell-level residual from this same
-        alignment run, and _matrix_to_cellref's composition (bridging
-        through cell.reference_hybe) folds that residual into ANY hybe
-        expressed in its frame, target included -- reusing the residual-
-        blind reference_matrix crop for the reference's own final column
-        would silently disagree with the target's final column by exactly
-        that residual, even when reference_hybe == a target hybe
-        (confirmed on real data: differed by ~0.9px from reference_matrix
-        purely from cell.reference_hybe's own residual, breaking the
-        same-hybe-perfect-overlay invariant in this column only).
-        Defaults to reference_matrix when not given.
+        alignment run (see ACell.matrix_to_shared) -- reusing the
+        residual-blind reference_matrix crop for the reference's own
+        final column would silently disagree with the target's final
+        column by exactly that residual, even when reference_hybe == a
+        target hybe. Defaults to reference_matrix when not given.
 
         Unlike _composite_multi's other caller (draw_fov_all_readouts_overlay,
         which warps whole same-shape images), each hybe's own native crop
         here can be a different pixel size (different H per hybe/stage) --
         pad every image in a given panel to that panel's own shared max
         shape before compositing, same technique _draw_three_way uses.
+
+        mask_anchor_fov_matrix: same meaning as draw_cell_alignment_
+        preview_3col's own parameter of the same name -- cell.reference_
+        hybe's own native frame -> shared frame via ONLY the FOV/cross-
+        modal matrix, no cell-level residual. Needed so the 'FOV/cross-
+        modal' column's own crop window doesn't silently depend on
+        cell.reference_hybe's cell-level fit result (confirmed as a real
+        bug on real data -- see that function's own docstring). Falls
+        back to the 'final' column's own (residual-bearing) anchor when
+        not given, matching the pre-fix behavior rather than crashing.
         """
         height, width = cell.frame_shape
-        x_ref, y_ref = cell.area
+        # ONE anchor for every non-literal column, always FOV-only -- see
+        # draw_cell_alignment_preview_3col's own bounds_via for the full
+        # rationale (same fix, same function pair, verified on real data
+        # both ways: perturbing cell.reference_hybe's own fitted residual
+        # has zero effect on any spot's actual matrix_to_shared coordinate,
+        # so this was always display-only). 'raw' (Q1): cell.area
+        # literally, no transform at all. Every other column: the SAME
+        # FOV-only anchor -- the reference panel's own crop window is now
+        # identical across every column (its own matrix is always
+        # identity, being this run's anchor), matching "red never moves,
+        # only the target moves" exactly.
+        x_lit, y_lit = cell.area
+        mask_anchor = (mask_anchor_fov_matrix if mask_anchor_fov_matrix is not None
+                      else cell.matrix_to_shared(cell.reference_hybe, cell.modality))
         if reference_matrix is None:
             reference_matrix = np.eye(3)
         if reference_final_matrix is None:
             reference_final_matrix = reference_matrix
 
-        def bounds_via(H):
-            cy, cx = alignment.align_cell((y_ref, x_ref), np.linalg.inv(H), (height, width))
+        def bounds_via(H, basis='final'):
+            # Single composed-matrix, single-truncation approach -- see
+            # draw_cell_alignment_preview_3col's own bounds_via for the
+            # full rationale (same fix, same function pair): two
+            # sequential align_cell calls (anchor, then H) truncate
+            # twice and can disagree by a real pixel with
+            # compute_cell_alignment's own single-truncation _native_crop.
+            if basis == 'literal':
+                H_eff = np.linalg.inv(H)
+            else:
+                H_eff = np.linalg.inv(H) @ mask_anchor
+            cy, cx = alignment.align_cell((y_lit, x_lit), H_eff, (height, width))
             if len(cx) == 0:
                 return None
-            ymin, ymax = max(0, int(cy.min()) - pad), min(height, int(cy.max()) + pad + 1)
-            xmin, xmax = max(0, int(cx.min()) - pad), min(width, int(cx.max()) + pad + 1)
-            return cy, cx, ymin, ymax, xmin, xmax
+            return cy, cx, _true_bounds(H_eff, x_lit, y_lit, pad)
 
-        def crop_via(mip, H):
-            b = bounds_via(H)
+        def crop_via(mip, H, basis='final'):
+            b = bounds_via(H, basis=basis)
             if b is None:
                 return None, None, None
-            cy, cx, ymin, ymax, xmin, xmax = b
-            mask_full = np.zeros((height, width), dtype=bool)
-            mask_full[cy, cx] = True
-            return mip[ymin:ymax, xmin:xmax], mask_full[ymin:ymax, xmin:xmax], (ymin, ymax, xmin, xmax)
+            cy, cx, true_bounds = b
+            return (_nan_native_crop(mip, true_bounds, height, width),
+                    _nan_mask_crop(cy, cx, true_bounds, height, width), true_bounds)
 
-        def zx_via(storage_path, hybe, fiducial_channel, bounds):
+        def zx_via(storage_path, hybe, channel, bounds):
             if bounds is None:
                 return None
-            ymin, ymax, xmin, xmax = bounds
-            return alignment.hybe_zx_projection(storage_path, fov, hybe, fiducial_channel,
-                                                ymin, ymax, xmin, xmax, lb, ub)
+            return _nan_zx_crop(storage_path, fov, hybe, channel, bounds, height, width, lb, ub)
 
         def pad_group(d):
+            # NaN-fill (not zero-fill): see _nan_native_crop -- a hybe
+            # with no real data at a given pixel (either its own true
+            # extent doesn't reach there, or it's shorter than another
+            # hybe in this group) must stay distinguishable from real,
+            # dark signal. _composite_multi treats NaN as "this hybe
+            # doesn't contribute here" per-pixel, not "contributes zero".
             imgs = {k: v for k, v in d.items() if v is not None}
             if not imgs:
                 return {}, 1, 1
@@ -528,28 +739,31 @@ class PipelineCanvas():
             w = max(a.shape[1] for a in imgs.values())
             padded = {}
             for k, a in imgs.items():
-                a2 = np.zeros((h, w), dtype=a.dtype)
+                a2 = np.full((h, w), np.nan, dtype=np.float32)
                 a2[:a.shape[0], :a.shape[1]] = a
                 padded[k] = a2
             return padded, h, w
 
         ref_mip = _read_mip(reference_storage_path, fov, reference_hybe, reference_channel)
-        # Per explicit request: raw is ALWAYS true H=identity (cell.area
-        # taken literally, matching every target's own raw column),
-        # regardless of reference_matrix. FOV/cross-modal uses reference_
-        # matrix; final uses reference_final_matrix, computed
-        # INDEPENDENTLY (not reused from FOV) -- cell.reference_hybe
-        # generally has its own nonzero cell-level residual, which
-        # _matrix_to_cellref's composition folds into ANY hybe expressed
-        # in its frame, target included, so reusing the residual-blind
-        # FOV crop for reference's own final column would silently
-        # disagree with the target's.
-        ref_raw_crop, ref_raw_mask, ref_raw_bounds = crop_via(ref_mip, np.eye(3))
-        ref_fov_crop, ref_fov_mask, ref_fov_bounds = crop_via(ref_mip, reference_matrix)
+        # Per explicit request: raw is ALWAYS true H=identity (the shared-
+        # frame mask taken literally, matching every target's own raw
+        # column), regardless of reference_matrix. FOV/cross-modal uses
+        # reference_matrix; final uses reference_final_matrix, computed
+        # INDEPENDENTLY (not reused from FOV) -- the reference hybe
+        # generally has its own nonzero cell-level residual (see
+        # ACell.matrix_to_shared), so reusing the residual-blind FOV crop
+        # for reference's own final column would silently disagree with
+        # the target's. The reference panel is otherwise no longer
+        # special-cased: it uses the exact same H = matrix_to_shared(...)
+        # formula every target hybe does (see MainWindow._matrix_to_
+        # shared), just resolved for reference_hybe/reference_modality
+        # by the caller instead of a loop.
+        ref_raw_crop, ref_raw_mask, ref_raw_bounds = crop_via(ref_mip, np.eye(3), basis='literal')
+        ref_fov_crop, ref_fov_mask, ref_fov_bounds = crop_via(ref_mip, reference_matrix, basis='fov')
         ref_final_crop, ref_final_mask, ref_final_bounds = crop_via(ref_mip, reference_final_matrix)
-        ref_raw_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, ref_raw_bounds)
-        ref_fov_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, ref_fov_bounds)
-        ref_final_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_fiducial_channel, ref_final_bounds)
+        ref_raw_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_channel, ref_raw_bounds)
+        ref_fov_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_channel, ref_fov_bounds)
+        ref_final_zx_raw = zx_via(reference_storage_path, reference_hybe, reference_channel, ref_final_bounds)
         ref_raw_zx = ref_raw_zx_raw.T if ref_raw_zx_raw is not None else None
         ref_fov_zx = ref_fov_zx_raw.T if ref_fov_zx_raw is not None else None
         ref_final_zx = ref_final_zx_raw.T if ref_final_zx_raw is not None else None
@@ -570,21 +784,26 @@ class PipelineCanvas():
             modality = spec.get('modality')
             label = f'{hybe} ({modality})' if modality else hybe
             mip = _read_mip(sp, fov, hybe, spec['channel'])
-            raw_crop, _, raw_b = crop_via(mip, np.eye(3))
-            fov_crop, _, fov_b = crop_via(mip, spec['fov_only_matrix'])
+            raw_crop, _, raw_b = crop_via(mip, np.eye(3), basis='literal')
+            fov_crop, _, fov_b = crop_via(mip, spec['fov_only_matrix'], basis='fov')
+            if fov_crop is None:
+                continue
             final_crop, _, final_b = crop_via(mip, spec['final_matrix'])
-            if raw_crop is None or fov_crop is None or final_crop is None:
+            if raw_crop is None or final_crop is None:
                 continue
             raw_yx[label], fov_yx[label], final_yx[label] = raw_crop, fov_crop, final_crop
 
-            raw_zx_raw = zx_via(sp, hybe, spec['fiducial_channel'], raw_b)
-            fov_zx_raw = zx_via(sp, hybe, spec['fiducial_channel'], fov_b)
-            final_zx_precorrection = zx_via(sp, hybe, spec['fiducial_channel'], final_b)
+            raw_zx_raw = zx_via(sp, hybe, spec['channel'], raw_b)
+            fov_zx_raw = zx_via(sp, hybe, spec['channel'], fov_b)
+            final_zx_precorrection = zx_via(sp, hybe, spec['channel'], final_b)
             if raw_zx_raw is None or fov_zx_raw is None or final_zx_precorrection is None:
                 continue
             H_zx = spec.get('zx_matrix', np.eye(3))
+            # borderValue=NaN -- see draw_cell_alignment_preview_3col's
+            # own identical warpAffine call for the rationale.
             final_zx_raw = cv2.warpAffine(final_zx_precorrection, H_zx[:2],
-                                          (final_zx_precorrection.shape[1], final_zx_precorrection.shape[0]))
+                                          (final_zx_precorrection.shape[1], final_zx_precorrection.shape[0]),
+                                          borderValue=float('nan'))
             raw_zx[label] = raw_zx_raw.T
             fov_zx[label] = fov_zx_raw.T
             final_zx[label] = final_zx_raw.T
@@ -624,13 +843,15 @@ class PipelineCanvas():
             a.axis('off')
 
         n_readouts = 1 + len(target_specs)
-        # "vs {reference_hybe}" would misleadingly read as "the cell-
-        # alignment reference hybe" -- reference_hybe here is
-        # cell.reference_hybe, the SEGMENTATION hybe (a different concept,
-        # see _cell_overlay_target_specs' own docstring): the shared
-        # coordinate frame every hybe is warped into, not necessarily
-        # what any hybe's own residual was computed against.
-        fig.suptitle(f'cell {cell.id}: {n_readouts} readout(s), frame={reference_hybe} (segmentation hybe) '
+        # reference_hybe here is just which hybe is shown as the
+        # left-most/"reference" panel (the alignment run's own anchor,
+        # now always that modality's own same-modality reference hybe --
+        # see MainWindow._run_cell_alignment's own comment) -- NOT the
+        # coordinate frame itself. Every column, reference panel included,
+        # is warped into the pipeline's ONE shared frame (RNA's own same-
+        # modality reference hybe, see ACell.matrix_to_shared), regardless
+        # of which hybe reference_hybe happens to be.
+        fig.suptitle(f'cell {cell.id}: {n_readouts} readout(s), reference panel={reference_hybe} '
                     f'(sequential color, red=frame, yellow=cell boundary)', fontsize=10, wrap=True)
         fig.tight_layout(rect=[0, 0, 1, 0.93])
         self.preview_canvas.draw()

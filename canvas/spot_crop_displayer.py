@@ -2,6 +2,8 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 import matplotlib.cm as cm
+import matplotlib.patheffects as path_effects
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
@@ -35,8 +37,30 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
     crop-local point list after every add/remove so the caller can rebuild
     cell.spots from scratch each time (simplest way to stay in sync,
     mirrors mask_edited's "hand back the whole current state" pattern).
+
+    Every point -- both the editable spot_points AND the read-only
+    readonly_points -- is labeled with a DISPLAY index supplied by the
+    caller (spot_indices/readonly_indices in set_data), not one computed
+    here: the caller (MainWindow) assigns GLOBAL, FOV-wide index numbers
+    (stable across which cell/view happens to be open -- selecting cell
+    65 shows that cell's own spots at whatever numbers they already have
+    in the full-FOV count, e.g. 145,146,147..., not renumbered 1,2,3
+    every time you switch views), this class just draws whatever numbers
+    it's given. Falls back to local continuous numbering (1..N over
+    spot_points, then continuing over readonly_points) when the caller
+    doesn't pass them, so it still works standalone. Only color
+    distinguishes editable vs read-only. readonly_points can be removed
+    too (by typed index or right-click, same as spot_points) --
+    "read-only" only ever meant "not part of spots_edited's full-replace
+    payload" (so a manual FOV-view edit can't accidentally turn an
+    already-identified cell spot back into an unassigned one), never
+    "cannot be deleted." Removing one emits readonly_point_removed with
+    whatever opaque tag the caller attached to it (see set_data), so the
+    caller can find and remove the matching real spot on its own side;
+    this class still never touches ACell/ASpot itself.
     """
     spots_edited = QtCore.pyqtSignal(object)  # list of (x, y) crop-local coordinates
+    readonly_point_removed = QtCore.pyqtSignal(object, float, float)  # (tag, x, y)
     NEAREST_REMOVE_RADIUS = 4.0  # crop-local pixels
 
     def __init__(self):
@@ -51,10 +75,16 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         self.resize(760, 760)
         self.crop_image = None
         self.spot_points = []
+        self.spot_indices = []
         self.crop_mask = None
         self.spot_color = 'red'
         self.readonly_points = []
+        self.readonly_indices = []
+        self.context_image = None
+        self.context_masks = None
+        self.context_title = ''
         self._axes = None
+        self._context_axes = None
         self._manual_mode = False
         self._mpl_cids = []
 
@@ -88,7 +118,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         removeLayout = QtWidgets.QHBoxLayout(removeRow)
         removeLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveSpotIndexLineEdit = QtWidgets.QLineEdit()
-        self.RemoveSpotIndexLineEdit.setPlaceholderText('spot index to remove (1-based), e.g. 3')
+        self.RemoveSpotIndexLineEdit.setPlaceholderText('spot index to remove (as shown on screen), e.g. 146')
         self.RemoveSpotPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveSpotIndexLineEdit)
         removeLayout.addWidget(self.RemoveSpotPushButton)
@@ -96,8 +126,16 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
 
         self.RemoveSpotPushButton.clicked.connect(self._remove_by_index)
 
-    def set_data(self, crop_image, spot_points, mask=None, color='red', readonly_points=None):
+    def set_data(self, crop_image, spot_points, mask=None, color='red', readonly_points=None,
+                 context_image=None, context_masks=None, context_title='',
+                 spot_indices=None, readonly_indices=None):
         """
+        spot_indices/readonly_indices: optional lists of DISPLAY index
+        numbers, parallel (same length/order) to spot_points/
+        readonly_points -- the caller's GLOBAL, FOV-wide numbering (see
+        class docstring). Falls back to local continuous 1..N numbering
+        (spot_points first, then readonly_points) when omitted.
+
         mask: optional boolean cell-boundary array, same shape as
         crop_image -- drawn as a yellow contour (same convention as
         pipeline_canvas.py's cell-boundary overlays), for the Cell view's
@@ -111,20 +149,46 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         'yellow' for its unassigned-spot pool, so the two are visually
         distinct wherever they might appear side by side.
 
-        readonly_points: optional second list of crop-local (x, y),
-        drawn for CONTEXT only -- always red, never affected by clicks/
-        removal/spots_edited. FOV view uses this for already-identified,
-        cell-owned spots: showing them without making them part of the
-        editable pool avoids a manual edit's full-replace semantics
-        (spots_edited hands back the whole current spot_points list)
-        silently turning already-identified spots back into unassigned
-        ones.
+        readonly_points: optional list of (x, y, tag) -- tag is whatever
+        opaque identifier the caller wants echoed back via
+        readonly_point_removed (e.g. a cell id) AND shown next to that
+        point's index as "{index} | {tag}" (e.g. "152 | 4"). NOT excluded
+        from spots_edited's full-replace payload (that's still
+        spot_points-only, see class docstring), but IS removable, by
+        index or right-click, same as spot_points.
+
+        context_image: optional 2D array for a LEFT-hand panel -- the
+        broader raw hybe image (Cell view: that cell's own hybe MIP, wider
+        than the tight spot crop; FOV view: the whole FOV's hybe MIP)
+        giving spatial context for where the crop/cell actually sits.
+        None (the default) skips the left panel entirely and renders the
+        single-panel layout exactly as before -- this class still never
+        computes anything cell/alignment-related itself, the caller
+        (windows/main_window.py) is responsible for building this array
+        via the appropriate vlinks MIP read.
+
+        context_masks: optional list of (label, x_array, y_array) --
+        one entry per cell to outline on the LEFT panel, already
+        transformed into the CURRENT hybe's own frame by the caller (via
+        ACell.get_area_in_readout), same "this class only draws plain
+        arrays" separation as mask/crop_image above. Cell view passes just
+        the one selected cell; FOV view passes every cell in the FOV.
+        Ignored when context_image is None.
+
+        context_title: optional title string for the LEFT panel.
         """
         self.crop_image = crop_image
         self.spot_points = list(spot_points)
+        self.spot_indices = list(spot_indices) if spot_indices is not None else list(range(1, len(self.spot_points) + 1))
         self.crop_mask = mask
         self.spot_color = color
         self.readonly_points = list(readonly_points) if readonly_points else []
+        start = len(self.spot_points) + 1
+        self.readonly_indices = (list(readonly_indices) if readonly_indices is not None
+                                 else list(range(start, start + len(self.readonly_points))))
+        self.context_image = context_image
+        self.context_masks = list(context_masks) if context_masks else []
+        self.context_title = context_title
         self._redraw(keep_view=False)
 
     def _redraw(self, keep_view=True):
@@ -133,10 +197,31 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         fig = self.canvas.figure
         saved_view = zoom_pan.capture_view(fig) if keep_view else None
         fig.clear()
-        ax = fig.subplots(1, 1)
+        if self.context_image is not None:
+            ax_ctx, ax = fig.subplots(1, 2)
+            self._draw_context(ax_ctx)
+            self._context_axes = ax_ctx
+        else:
+            ax = fig.subplots(1, 1)
+            self._context_axes = None
         vmin, vmax = self.ScaleControl.vmin_vmax(self.crop_image)
         im = ax.imshow(self.crop_image, cmap=cm.gray, vmin=vmin, vmax=vmax)
-        fig.colorbar(im, ax=ax, fraction=0.05, pad=0.02)
+        # make_axes_locatable + append_axes, not fig.colorbar(im, ax=ax,
+        # fraction=..., pad=...) -- the fraction/pad form only ever
+        # shrinks THIS axes to make room for the colorbar, so with a
+        # left context panel present (same fig.subplots(1,2) split as
+        # this one) the two panels silently render at different widths
+        # once only the right one loses space to its own colorbar. A
+        # same-size blank axes appended to the LEFT panel via the same
+        # divider mechanism (see below) keeps both panels' actual image
+        # area equal instead.
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes('right', size='5%', pad=0.05)
+        fig.colorbar(im, cax=cax)
+        if self._context_axes is not None:
+            left_divider = make_axes_locatable(self._context_axes)
+            blank_cax = left_divider.append_axes('right', size='5%', pad=0.05)
+            blank_cax.axis('off')
         if self.crop_mask is not None:
             ax.contour(self.crop_mask.astype(np.uint8), levels=[0.5], colors='yellow', linewidths=1)
         if self.readonly_points:
@@ -154,19 +239,71 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         # at a glance for small counts anyway, so they're skipped above
         # LABEL_LIMIT rather than rendered unreadably on top of each other.
         LABEL_LIMIT = 300
+        total = len(self.spot_points) + len(self.readonly_points)
         if self.readonly_points:
-            xs, ys = zip(*self.readonly_points)
+            xs = [p[0] for p in self.readonly_points]
+            ys = [p[1] for p in self.readonly_points]
             ax.scatter(xs, ys, edgecolor='red', facecolor='none', s=60, linewidth=1.2)
+            if total <= LABEL_LIMIT:
+                for i, p in enumerate(self.readonly_points):
+                    x, y = p[0], p[1]
+                    # "{index} | {tag}" (e.g. "146 | 4") -- compact, per
+                    # explicit request; "152 (cell 4)" took too much space.
+                    # index is the caller's GLOBAL number, not a local i+1.
+                    disp = self.readonly_indices[i] if i < len(self.readonly_indices) else i + 1
+                    tag_text = f' | {p[2]}' if len(p) > 2 and p[2] is not None else ''
+                    ax.text(x + 2, y - 2, f'{disp}{tag_text}', color='red', fontsize=8)
         if self.spot_points:
             xs, ys = zip(*self.spot_points)
             ax.scatter(xs, ys, edgecolor=self.spot_color, facecolor='none', s=60, linewidth=1.2)
-            if len(self.spot_points) <= LABEL_LIMIT:
-                for i, (x, y) in enumerate(self.spot_points, start=1):
-                    ax.text(x + 2, y - 2, str(i), color=self.spot_color, fontsize=8)
+            if total <= LABEL_LIMIT:
+                for i, (x, y) in enumerate(self.spot_points):
+                    disp = self.spot_indices[i] if i < len(self.spot_indices) else i + 1
+                    ax.text(x + 2, y - 2, str(disp), color=self.spot_color, fontsize=8)
         fig.tight_layout()
         zoom_pan.restore_view(fig, saved_view)
         self._axes = ax
         self.canvas.draw()
+
+    def _draw_context(self, ax):
+        """
+        LEFT panel: the broader raw hybe image with cell mask boundary(ies)
+        overlaid, for orienting where the crop/cell actually sits (see
+        set_data's context_image/context_masks docstring). Plain arrays
+        only -- no ACell/ASpot/alignment knowledge here, matching the rest
+        of this class.
+        """
+        vmin, vmax = self.ScaleControl.vmin_vmax(self.context_image)
+        ax.imshow(self.context_image, cmap=cm.gray, vmin=vmin, vmax=vmax)
+        # One combined boolean raster + one contour call, not a filled
+        # scatter per cell (per explicit preference for a contour/boundary
+        # look, matching crop_mask's own convention in _redraw) and not
+        # one contour call per cell either -- real segmentation masks
+        # don't touch/overlap, so a single raster's contour still draws
+        # one closed boundary per cell, at a fraction of the per-cell cost
+        # a FOV view's ~100 cells would otherwise incur.
+        if self.context_masks:
+            combined = np.zeros(self.context_image.shape, dtype=np.uint8)
+            for _, xs, ys in self.context_masks:
+                if len(xs) == 0:
+                    continue
+                ix, iy = np.asarray(xs).astype(int), np.asarray(ys).astype(int)
+                valid = (iy >= 0) & (iy < combined.shape[0]) & (ix >= 0) & (ix < combined.shape[1])
+                combined[iy[valid], ix[valid]] = 1
+            ax.contour(combined, levels=[0.5], colors='yellow', linewidths=1)
+            for label, xs, ys in self.context_masks:
+                if label is None or len(xs) == 0:
+                    continue
+                # a thin black stroke keeps the label legible over both
+                # the bright cell interior and the dark background now
+                # that the mask itself is just a boundary line, not a
+                # solid fill to sit on top of.
+                txt = ax.text(float(np.mean(xs)), float(np.mean(ys)), str(label),
+                              color='yellow', fontsize=8, fontweight='bold', ha='center', va='center')
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='black')])
+        if self.context_title:
+            ax.set_title(self.context_title, fontsize=10)
+        ax.axis('off')
 
     def _set_manual_mode(self, on):
         self._manual_mode = on
@@ -188,28 +325,68 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
             self._remove_nearest(event.xdata, event.ydata)
 
     def _remove_nearest(self, x, y):
-        if not self.spot_points:
+        """Nearest point across BOTH spot_points and readonly_points --
+        removes from whichever list it's actually in (see _remove_at_local)."""
+        candidates = [(False, i, px, py) for i, (px, py) in enumerate(self.spot_points)]
+        candidates += [(True, i, p[0], p[1]) for i, p in enumerate(self.readonly_points)]
+        if not candidates:
             return
-        dists = [((px - x) ** 2 + (py - y) ** 2) ** 0.5 for px, py in self.spot_points]
+        dists = [((px - x) ** 2 + (py - y) ** 2) ** 0.5 for _, _, px, py in candidates]
         i = int(np.argmin(dists))
         if dists[i] <= self.NEAREST_REMOVE_RADIUS:
-            self.spot_points.pop(i)
-            self._redraw()
-            self.spots_edited.emit(list(self.spot_points))
+            in_readonly, local_pos, _, _ = candidates[i]
+            self._remove_at_local(in_readonly, local_pos)
 
     def _remove_by_index(self):
+        """
+        text is a DISPLAY index -- whatever's actually printed on screen
+        (the caller's global numbering, see class docstring), not a local
+        list position -- resolved back to a local position via
+        spot_indices/readonly_indices before removing.
+        """
         text = self.RemoveSpotIndexLineEdit.text().strip()
         if not text:
             return
         try:
-            index = int(text)
+            display_index = int(text)
         except ValueError:
-            QtWidgets.QMessageBox.warning(self, 'Remove spot', 'Enter a single 1-based integer spot index.')
+            QtWidgets.QMessageBox.warning(self, 'Remove spot', 'Enter a single spot index (as shown on screen).')
             return
-        if not (1 <= index <= len(self.spot_points)):
-            QtWidgets.QMessageBox.warning(self, 'Remove spot', f'Index out of range (1-{len(self.spot_points)}).')
+        if display_index in self.spot_indices:
+            self.RemoveSpotIndexLineEdit.clear()
+            self._remove_at_local(False, self.spot_indices.index(display_index))
             return
-        self.spot_points.pop(index - 1)
-        self.RemoveSpotIndexLineEdit.clear()
-        self._redraw()
-        self.spots_edited.emit(list(self.spot_points))
+        if display_index in self.readonly_indices:
+            self.RemoveSpotIndexLineEdit.clear()
+            self._remove_at_local(True, self.readonly_indices.index(display_index))
+            return
+        QtWidgets.QMessageBox.warning(self, 'Remove spot', f'Spot index {display_index} not found in the current view.')
+
+    def _remove_at_local(self, in_readonly, local_pos):
+        """
+        local_pos: 0-based position within spot_points (in_readonly=False)
+        or readonly_points (in_readonly=True) -- NOT a display index (see
+        _remove_by_index/_remove_nearest, the only two callers, for how
+        each resolves a click/typed display index down to this). Routes
+        to the right list and fires the matching signal -- spots_edited
+        (full spot_points payload) for an editable point,
+        readonly_point_removed (tag, x, y) for a read-only one, so the
+        caller can find and remove the corresponding real spot on its own
+        side (this class still never touches ACell/ASpot).
+        """
+        if not in_readonly:
+            if 0 <= local_pos < len(self.spot_points):
+                self.spot_points.pop(local_pos)
+                if local_pos < len(self.spot_indices):
+                    self.spot_indices.pop(local_pos)
+                self._redraw()
+                self.spots_edited.emit(list(self.spot_points))
+            return
+        if 0 <= local_pos < len(self.readonly_points):
+            p = self.readonly_points.pop(local_pos)
+            if local_pos < len(self.readonly_indices):
+                self.readonly_indices.pop(local_pos)
+            x, y = p[0], p[1]
+            tag = p[2] if len(p) > 2 else None
+            self._redraw()
+            self.readonly_point_removed.emit(tag, x, y)

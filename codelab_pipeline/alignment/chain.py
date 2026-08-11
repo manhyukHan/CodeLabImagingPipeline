@@ -3,6 +3,8 @@ from functools import reduce
 import numpy as np
 import numpy.linalg as la
 import h5py
+from skimage import filters as skimage_filters
+from skimage.feature import peak_local_max
 
 from ..io import preprocess
 from ..io import vlinks_store
@@ -149,6 +151,143 @@ def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.
     if valid.sum() == 0:
         return np.inf  # no real reference signal at all -- nothing meaningful to score
     return float(((warped[valid] - reference_norm[valid].astype(np.float32)) ** 2).mean())
+
+def _clip_background(crop, method='yen'):
+    """
+    Soft background suppression for a cell-level crop, BEFORE it's handed
+    to phase correlation and the reconstruction-residual quality gate --
+    subtracts this crop's own Otsu/Yen threshold and clips below zero,
+    rather than binarizing to 0/1. A hard binary mask would discard the
+    intensity gradient sub-pixel phase correlation actually relies on for
+    its own accuracy; this keeps that gradient intact above threshold
+    while suppressing the diffuse background that can otherwise pull
+    cv2.phaseCorrelate toward a confident-but-wrong correspondence (the
+    same "background dilutes/hides the discriminating signal" failure
+    mode _reconstruction_residual's own docstring identifies for MSD
+    scoring -- addressed here one step earlier, in the FIT itself, not
+    just at scoring time).
+
+    method: 'yen' (default) or 'otsu' -- same two skimage.filters
+    threshold functions already used for cell segmentation (segment.py),
+    kept consistent rather than introducing a third convention.
+
+    Falls back to the crop unchanged (float32) if thresholding fails
+    (skimage raises on a degenerate, e.g. all-constant, crop) -- a
+    pathological crop is exactly the case with no meaningful background
+    to separate out, not a reason to error the whole alignment.
+    """
+    crop_f = crop.astype(np.float32)
+    try:
+        threshold = float(skimage_filters.threshold_yen(crop) if method == 'yen'
+                          else skimage_filters.threshold_otsu(crop))
+    except ValueError:
+        return crop_f
+    return np.clip(crop_f - threshold, 0, None)
+
+def _multi_peak_translation(target_crop, reference_crop, half=12, min_distance=15,
+                            num_peaks=4, threshold_rel=0.3):
+    """
+    Alternative to a single whole-crop phase-correlation fit: finds
+    several DISTINCT bright peaks in reference_crop (mild Gaussian blur
+    first, so a single hot pixel can't register as its own peak), fits
+    translation independently at each via phase correlation on a small
+    window around it, then takes the MEDIAN shift across peaks as the
+    consensus H2.
+
+    Motivation, confirmed on real data (cell 3, Hyb_105 vs Hyb_101): a
+    whole-crop fit pools every pixel together, so it can get pulled
+    toward whichever region is brightest -- but "brightest" isn't the
+    same as "representative." On that real cell, 3 of 4 distinct peaks
+    independently agreed on dy=0, while the single brightest, most
+    isolated peak (a lone fiducial bead, visually distinct from the
+    diffuse chromatin/cell body signal) wanted dy=-2 -- and the whole-
+    crop fit landed near that ONE outlier peak, not the 3-peak majority.
+    Taking the median across several independently-fit peaks is robust
+    to exactly this: one outlier peak can't drag the consensus the way
+    it drags a single pooled fit, without at least half the peaks
+    agreeing with it.
+
+    Falls back to a single whole-crop phase-correlation fit when fewer
+    than 2 peaks are found -- a median of 0 or 1 values has no
+    consensus/robustness benefit over just fitting the whole crop
+    directly, and a low-signal crop legitimately might not have that
+    many distinct bright features to key off of.
+
+    Each peak's OWN fit is gated exactly like the whole-crop fit is
+    gated one level up in compute_cell_alignment -- per explicit
+    feedback, a peak here is just as capable of a bad phase-correlation
+    lock as the whole crop is, and un-gated peaks can drag the median
+    toward a wrong answer as surely as a single un-gated whole-crop fit
+    can. TWO gates per peak: (1) magnitude > half of the peak's own
+    small window -- a shift that size couldn't be real content within
+    that window, only noise/padding (confirmed on real data: cell 49,
+    Hyb_131 vs Hyb_101 -- one peak's fit hit 15px in a half=12 window,
+    clearly a lock onto nothing); (2) _reconstruction_residual doesn't
+    improve on that peak's own small crop -- catches the more common
+    case where the shift is small enough to pass (1) but still makes the
+    local match WORSE, not better (confirmed on the same real cell: the
+    other 3 of 4 peaks all passed the magnitude gate at ~11px < half=12,
+    but EVERY one of the 4 failed the quality gate -- residual got worse
+    at every single peak, correctly signaling this hybe pair has no real
+    correspondence in this crop at all, not just one bad peak among
+    several good ones). Rejected peaks are dropped entirely, not zeroed
+    (a zero would itself bias the median toward "no shift", a claim this
+    function has no basis to make about a peak whose own fit failed).
+    Falls back to identity (dx=dy=0) if EVERY peak is rejected -- same
+    "no no-alignment" principle as the whole-crop reject bound: reject
+    means "no correction found", never a value derived from data the
+    gates themselves flagged as untrustworthy.
+    """
+    height, width = reference_crop.shape
+    ref_smooth = cv2.GaussianBlur(reference_crop.astype(np.float32), (5, 5), 0)
+    peaks = peak_local_max(ref_smooth, min_distance=min_distance, num_peaks=num_peaks,
+                           threshold_rel=threshold_rel)
+    if len(peaks) < 2:
+        return np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
+                          np.array([0, 0, 1])])
+    shifts = []
+    for py, px in peaks:
+        ymin, ymax = max(0, py - half), min(height, py + half + 1)
+        xmin, xmax = max(0, px - half), min(width, px + half + 1)
+        small_ref = reference_crop[ymin:ymax, xmin:xmax]
+        small_tgt = target_crop[ymin:ymax, xmin:xmax]
+        H_peak = preprocess.find_translation_via_phase_correlation(small_tgt, small_ref)
+        dx, dy = H_peak[0, 2], H_peak[1, 2]
+        H_peak3 = np.vstack([H_peak, np.array([0, 0, 1])])
+        magnitude_rejected = np.hypot(dx, dy) > half
+        residual_before = _reconstruction_residual(small_tgt, small_ref, np.eye(3))
+        residual_after = _reconstruction_residual(small_tgt, small_ref, H_peak3)
+        quality_rejected = not (residual_after < residual_before)
+        if not (magnitude_rejected or quality_rejected):
+            shifts.append((dx, dy))
+    if not shifts:
+        return np.eye(3)
+    shifts = np.array(shifts)
+    dx, dy = float(np.median(shifts[:, 0])), float(np.median(shifts[:, 1]))
+    return np.array([[1., 0., dx], [0., 1., dy], [0., 0., 1.]])
+
+def _find_z_shift(target_profile, ref_profile):
+    """
+    1D cross-correlation shift estimate between two depth profiles
+    (already collapsed down to a single Z-axis signal each -- see
+    compute_cell_alignment's own Z-alignment leg). NOT cv2.phaseCorrelate:
+    that's built for 2D images and its internal FFT/Hann-window machinery
+    errors on a genuinely 1D (width-1) array (confirmed on real data --
+    cv2.error out of cv2.phaseCorrelate on a (depth,1)-shaped input). A
+    plain 1D cross-correlation is both the simpler and the more correct
+    tool once X has already been collapsed out of the problem entirely.
+
+    Returns the shift such that target_profile, moved by this amount,
+    best matches ref_profile (same sign convention as
+    find_translation_via_phase_correlation's own translation output).
+    """
+    t = target_profile.astype(np.float64).ravel()
+    r = ref_profile.astype(np.float64).ravel()
+    t = t - t.mean()
+    r = r - r.mean()
+    corr = np.correlate(r, t, mode='full')
+    best_k = int(np.argmax(corr))
+    return float(best_k - (len(t) - 1))
 
 def _h_rotation_angle_degrees(H):
     """
@@ -461,7 +600,7 @@ def read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe):
         return None
 
 
-def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub):
+def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     """
     A cell-region Z-stack crop, max-projected along the height (Y) axis to
     give an (width, depth) "X-by-Z" image usable for a 1D phase-correlation
@@ -471,6 +610,24 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     AlignmentWidget.cell_based_align uses; conceptually the same idea
     (project out one in-plane axis, compare what's left via phase
     correlation), just adapted to this project's own stack shape.
+
+    ymin/ymax/xmin/xmax must already be valid (real, non-negative,
+    in-frame) slice bounds -- this never clamps them itself. A caller
+    building a true (possibly out-of-frame) window -- e.g. pipeline_
+    canvas.py's true-extent cell crops -- must clip to the real frame
+    before calling this, then place the result into its own larger
+    canvas; passing a negative index straight through would silently
+    wrap via Python/h5py's own negative-index convention instead of
+    raising, corrupting the read.
+
+    normalize=True (default): returns a uint8 image, unchanged behavior
+    for every existing caller. normalize=False returns the raw float32
+    projection instead -- for a caller (pipeline_canvas.py) that needs
+    to place this into a NaN-padded true-extent canvas and defer
+    normalization until final compositing, matching how the YX crops
+    it's paired with are handled (normalizing a uint8-already image a
+    second time, or baking in a fixed 0-255 range before it's known
+    which pixels end up NaN-masked, would double-stretch contrast).
 
     Public (not module-private) since canvas/pipeline_canvas.py's
     draw_cell_alignment_preview_3col reuses it directly to show the ZX
@@ -482,7 +639,7 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     with h5py.File(h5path, 'r') as f:
         stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
     projection = stack.max(axis=0)  # (width, depth)
-    return preprocess.normalize_to_uint8(projection, lb, ub)
+    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
 
 def pick_channel_by_type(record, channel_type):
     """'readout' -> that hybe's one non-fiducial channel (falls back to
@@ -497,7 +654,9 @@ def pick_channel_by_type(record, channel_type):
 def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            reference_hybe=None, channel_type='readout',
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
-                           cell_reference_hybe_matrix=None, modality=None):
+                           cell_reference_hybe_matrix=None, modality=None,
+                           background_clip=None, fit_method='phase_correlation',
+                           integer_shift=False):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -548,6 +707,37 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     the caller must resolve it from the SAME-MODALITY fov_matrices it
     already has in scope and pass it through explicitly instead.
 
+    background_clip: None (default, no behavior change), 'yen', or 'otsu'
+    -- soft-subtracts each crop's own background threshold (see
+    _clip_background) before the phase-correlation fit AND the
+    reconstruction-residual quality gate, on EVERY hybe's target crop and
+    once on the shared reference crop. Never affects `reference_crop`/
+    `target_crop` themselves (matrix_provenance, callers) -- only the
+    fitting/scoring inputs. Opt-in: still experimental, not yet the
+    pipeline's own default.
+
+    fit_method: 'phase_correlation' (default, no behavior change -- one
+    whole-crop cv2.phaseCorrelate fit, as before) or 'multi_peak' (see
+    _multi_peak_translation) -- fits several distinct bright peaks
+    independently and takes their median as a consensus H2, robust to a
+    single unusually bright/isolated feature dominating a whole-crop fit.
+    Opt-in: still experimental, not yet the pipeline's own default.
+
+    integer_shift: False (default, no behavior change) or True -- rounds
+    H2 to the nearest whole pixel immediately after fitting (either
+    method), BEFORE both reject gates score it. Per explicit request,
+    this cell-level step is meant to be a small translation-only
+    REFINEMENT, not a free continuous optimization -- rounding keeps it
+    "no sub-pixel" the same way it's already "no rotation". Also closes a
+    confirmed real gap: the preview functions never resample pixel
+    content, only reposition an integer-rounded crop window, so a
+    sub-pixel H2 the gate scores via true bilinear interpolation
+    (_reconstruction_residual's own warpAffine) can render as anywhere
+    from invisible to a blunt 1px snap once displayed -- rounding here
+    makes the gate score exactly the operation the preview can actually
+    perform. Opt-in: still experimental, not yet the pipeline's own
+    default.
+
     modality: which modality hybe_records/fov_matrices/storage_path belong
     to for THIS call -- cell.matrices/cell.matrix_provenance are keyed by
     (hybe, modality), never bare hybe, because the cross-modal "bridge"
@@ -572,6 +762,18 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     relative to reference_hybe, same as any other hybe -- forcing it
     to identity would silently discard that real correction rather
     than apply it.
+
+    The cell-level residual (H2, fitted via phase correlation between the
+    target and reference crops) is rejected -- falls back to identity,
+    keeping the FOV/cross-modal-only alignment -- under TWO independent
+    gates: (1) its magnitude exceeds `pad` (the crop couldn't have
+    contained real content that far out), and (2) it doesn't actually
+    improve the crop match (_reconstruction_residual after applying H2
+    isn't strictly better than before, both measured on the same target/
+    reference crops this residual was fitted from) -- phase correlation
+    can converge to a local minimum that's a worse match than no
+    correction at all, which the magnitude bound alone doesn't catch
+    since the bad shift can still be small.
 
     cell.matrix_anchors[modality] is ALSO written here (once per call) --
     reference_hybe's own transform into fov_matrices' shared frame
@@ -630,12 +832,29 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         return crop, (ymin, ymax, xmin, xmax)
 
     record_by_folder = {r['folder']: r for r in hybe_records}
+    if reference_hybe not in record_by_folder:
+        # A bare dict lookup here raised an opaque KeyError -- e.g. when a
+        # caller's reference_hybe belongs to a different modality than the
+        # hybe_records passed in (this project's own same-modality vs.
+        # cross-modal hybe_records are always modality-specific, never
+        # mixed). Surface the actual mismatch instead.
+        raise ValueError(f"reference_hybe '{reference_hybe}' is not in the {len(hybe_records)} "
+                         f"hybe_records passed to compute_cell_alignment (modality={modality or cell.modality}) -- "
+                         f"it likely belongs to a different modality.")
     ref_record = record_by_folder[reference_hybe]
     ref_channel = pick_channel_by_type(ref_record, channel_type)
     ref_result = _native_crop(reference_hybe, ref_channel)
     if ref_result is None:
         raise ValueError(f"Cell {cell.id} doesn't overlap reference hybe {reference_hybe}'s frame")
     reference_crop, (rymin, rymax, rxmin, rxmax) = ref_result
+    # Optional background suppression, computed ONCE for reference_crop
+    # (fixed for the whole call) -- see _clip_background's own docstring.
+    # Only affects the phase-correlation fit and the quality gate below;
+    # never applied to `reference_crop`/`target_crop` themselves, which
+    # stay the plain quantile-normalized crops everywhere else (matrix_
+    # provenance, callers) that might reasonably expect them.
+    reference_crop_for_fit = (_clip_background(reference_crop, background_clip)
+                              if background_clip else reference_crop)
     # relative transform FROM reference_hybe's native frame TO the shared
     # FOV frame -- identity when reference_hybe is also the FOV-alignment's
     # own reference hybe (fov_matrices always carries a real entry per
@@ -705,9 +924,57 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             }
             continue
         target_crop, (cymin, cymax, cxmin, cxmax) = result
+        target_crop_for_fit = (_clip_background(target_crop, background_clip)
+                               if background_clip else target_crop)
 
-        H2_fitted = np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
-                               np.array([0, 0, 1])])
+        if fit_method == 'multi_peak':
+            H2_fitted = _multi_peak_translation(target_crop_for_fit, reference_crop_for_fit)
+        else:
+            H2_fitted = np.vstack([preprocess.find_translation_via_phase_correlation(
+                                       target_crop_for_fit, reference_crop_for_fit),
+                                   np.array([0, 0, 1])])
+        if integer_shift:
+            # Snap to a WHOLE pixel, before gating -- per explicit
+            # request: this cell-level step is meant as a small
+            # translation-only REFINEMENT (no rotation already; this
+            # keeps it "no sub-pixel" too), not a free continuous
+            # optimization. Also closes a real, confirmed gap between
+            # what the quality gate scores and what the preview can
+            # actually show: cv2.phaseCorrelate returns a sub-pixel
+            # shift, _reconstruction_residual evaluates it via a genuine
+            # bilinear-interpolated warpAffine, but the preview crops
+            # never resample pixel content -- they only reposition an
+            # INTEGER-rounded crop window. A sub-pixel H2 the gate scores
+            # as an improvement can render as anywhere from no visible
+            # change to a blunt, un-interpolated 1px snap once displayed.
+            #
+            # NOT plain round() -- confirmed on real data (cell 3, Hyb_105
+            # vs Hyb_101) that nearest-integer rounding can land on the
+            # WRONG side of a close call: the continuous fit found
+            # dx=0.91, which rounds to 1, but an exhaustive integer sweep
+            # found dx=0 scores meaningfully better (reconstruction
+            # residual 310 vs 357) -- round() only ever asks "which whole
+            # pixel is numerically closest," never "which whole pixel
+            # actually reconstructs the reference better," and those two
+            # questions can have different answers near a 0.5 boundary.
+            # Instead, evaluate all 4 combinations of floor/ceil per axis
+            # (the immediate integer neighborhood around the continuous
+            # estimate -- exactly where a close call like this lives) via
+            # the SAME _reconstruction_residual the outer gate already
+            # trusts, and keep whichever actually wins. This is a local
+            # search around the continuous fit's own estimate, not a
+            # blind wide grid search -- the continuous fit still supplies
+            # the neighborhood to search, just not the final answer
+            # within it.
+            fx, fy = H2_fitted[0, 2], H2_fitted[1, 2]
+            candidates = {(dx, dy) for dx in (np.floor(fx), np.ceil(fx))
+                                   for dy in (np.floor(fy), np.ceil(fy))}
+            best_dx, best_dy = min(
+                candidates,
+                key=lambda dxdy: _reconstruction_residual(
+                    target_crop_for_fit, reference_crop_for_fit,
+                    np.array([[1., 0., dxdy[0]], [0., 1., dxdy[1]], [0., 0., 1.]])))
+            H2_fitted = np.array([[1., 0., best_dx], [0., 1., best_dy], [0., 0., 1.]])
         # This residual is a FINE-TUNING correction on top of an already-
         # good FOV/cross-modal alignment -- the crop itself only extends
         # `pad` px beyond the cell's expected position, so the true
@@ -729,7 +996,30 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # residual means falling back to identity for H2 specifically --
         # the FOV/cross-modal layer this refinement was built on top of
         # is still valid and must still be written.
-        rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        magnitude_rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        # Second, independent gate: phase correlation can lock onto a
+        # local minimum that's a worse match than doing nothing at all
+        # (a real cv2.phaseCorrelate failure mode -- it doesn't return
+        # 0,0 when the target crop is already well-aligned, it can return
+        # a small, pad-bound-passing shift that still makes the overlap
+        # WORSE). The pad-magnitude bound above only catches wildly wrong
+        # shifts; it says nothing about whether a small, plausible-looking
+        # shift actually helped. Directly compare image match quality
+        # before (H2=identity, i.e. the FOV/cross-modal crop as-is) vs
+        # after (H2_fitted applied) on the SAME target_crop/reference_crop
+        # this residual was fitted from -- via _reconstruction_residual
+        # (the same signal-gated, overlap-guarded metric align_readout_
+        # to_reference already uses to pick between candidate transforms,
+        # see its own docstring), not a naive nonzero-background MSD --
+        # background-to-background pixels are the majority of a real
+        # crop and dilute exactly the handful of pixels that would show a
+        # bad shift. Reject (fall back to H2=identity) whenever it didn't
+        # strictly improve the reconstruction of the reference's real
+        # content.
+        residual_before = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, np.eye(3))
+        residual_after = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, H2_fitted)
+        quality_rejected = not (residual_after < residual_before)
+        rejected = magnitude_rejected or quality_rejected
         H2 = np.eye(3) if rejected else H2_fitted
         # H2 outermost (this cell's own residual refinement measured
         # against reference_hybe's own crop) -- H1@H2 lands directly in
@@ -740,16 +1030,15 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         H_yx = compose_chain([H1, H2])
 
         H_zx = np.eye(3)
-        zx_rejected = False
-        secondary_x_shift = 0.0
         z_shift = 0.0
         if including_z:
-            # z-depth correction stays fiducial-based regardless of
-            # channel_type -- structural (bead/fiducial) depth alignment,
-            # not signal-dependent, so the yx channel choice doesn't apply here
-            ref_zx = hybe_zx_projection(storage_path, fov, reference_hybe, ref_record['fiducial_channel'],
+            # z-depth correction uses the same channel_type-resolved
+            # channel as the YX fit (ref_channel/target_channel) -- a
+            # readout-channel Z crop should show the readout signal, not
+            # silently fall back to fiducial regardless of channel_type.
+            ref_zx = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
                                         rymin, rymax, rxmin, rxmax, lb, ub)
-            target_zx = hybe_zx_projection(storage_path, fov, hybe, record['fiducial_channel'],
+            target_zx = hybe_zx_projection(storage_path, fov, hybe, target_channel,
                                            cymin, cymax, cxmin, cxmax, lb, ub)
             # hybe_zx_projection returns (width, depth), not (height,
             # width) like every other crop in this module -- H2 (a YX-
@@ -765,45 +1054,85 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # (depth) untouched.
             H2_to_zx = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, H2[0, 2]]])
             target_zx_aligned = cv2.warpAffine(target_zx, H2_to_zx, (target_zx.shape[1], target_zx.shape[0]))
-            A3 = preprocess.find_translation_via_phase_correlation(target_zx_aligned, ref_zx)
-            # Same (width, depth) convention as above: A3[0,2] is this
-            # array's axis1 (depth) shift -- the real z-correction.
-            # A3[1,2] is axis0 (width) -- a SECOND, independent
-            # measurement of the x-shift left over after H2's own x-shift
-            # was already applied above, not a depth value. A confidently-
-            # reported large leftover x-shift here is the same "locked
-            # onto noise, not real content" signal H2's own reject bound
-            # guards against -- distrust BOTH this z-correction and the
-            # x-refinement together when that happens, rather than
-            # keeping one and discarding the other.
-            secondary_x_shift = float(A3[1, 2])
-            z_shift = float(A3[0, 2])
-            zx_rejected = abs(secondary_x_shift) > 3
-            if not zx_rejected:
-                # This leftover x-shift is a second, independent
-                # measurement of the SAME physical x-drift H2 already
-                # estimated -- fold it into H_yx as an additive
-                # refinement, making this the cell's real, final x-
-                # position. H_zx carries the z-correction alone; its own
-                # x-component is intentionally zeroed here, not double-
-                # applied on top of the x already folded into H_yx.
-                H_yx[0, 2] += secondary_x_shift
-                H_zx[0, 2] = z_shift
+            # Per explicit request: restrict this leg to Z ONLY,
+            # algorithmically -- not by fitting a full 2D (x,z) shift and
+            # discarding/gating an unwanted x-component after the fact
+            # (that was this code's own earlier design: a real x-shift
+            # could still slip through whenever it stayed under the 3px
+            # reject bound, silently overriding a correctly-chosen H2 --
+            # confirmed on real data, cell 3 Hyb_105 vs Hyb_101, where a
+            # gate-verified best H2 of (0,-1) still ended up displaced to
+            # (1,-1) by this leg's own independent x measurement). X
+            # alignment is already H2's own job; collapsing the WIDTH
+            # axis away entirely (max-project) before correlating leaves
+            # no axis left for an x-shift to exist on, not just one that
+            # gets checked and possibly rejected afterward.
+            ref_z_profile = ref_zx.max(axis=0)
+            target_z_profile = target_zx_aligned.max(axis=0)
+            z_shift_fitted = _find_z_shift(target_z_profile, ref_z_profile)
+            if integer_shift:
+                # Same "no sub-pixel" constraint as H2 -- this leg is a
+                # small, whole-pixel-only depth refinement, not a free
+                # continuous fit.
+                z_shift_fitted = round(z_shift_fitted)
+            # Same two-gate treatment as H2 just above, ported to the Z
+            # leg -- _find_z_shift is a raw np.correlate(mode='full')
+            # argmax with no rejection path of its own, so it was free to
+            # lock onto noise exactly the way phase correlation on a
+            # low-signal H2 crop was (see that gate's own comment above).
+            # Confirmed on real data: cell 16, Hyb_130 vs Hyb_101, where
+            # H2 was correctly quality-rejected (residual 1840.3 >= 1840.3,
+            # no improvement) on this SAME crop, yet the ungated Z leg
+            # still applied z=-35.0px -- a shift nowhere near physically
+            # plausible for one hybridization round's worth of Z drift.
+            #
+            # Magnitude gate: half of H2's own `> pad` bound -- per
+            # explicit request, `pad` itself was still too permissive for
+            # Z (Z drift between hybridization rounds should be smaller
+            # than the XY search radius this refinement crop was built
+            # with). Same underlying reasoning as H2's bound: the
+            # 'full'-mode correlation can return anything up to the whole
+            # profile length as its "best" lag, which is exactly the
+            # noise-locking failure mode, not a real registration.
+            z_magnitude_rejected = abs(z_shift_fitted) > pad / 2
+            # Quality gate: mirrors H2's own reconstruction-residual check,
+            # applied on the SAME (width, depth) ZX crops the shift was
+            # fitted from -- reject unless the shift strictly improves the
+            # reconstruction of the reference's real content over doing
+            # nothing.
+            H_zx_fitted = np.array([[1., 0., z_shift_fitted], [0., 1., 0.], [0., 0., 1.]])
+            z_residual_before = _reconstruction_residual(target_zx_aligned, ref_zx, np.eye(3))
+            z_residual_after = _reconstruction_residual(target_zx_aligned, ref_zx, H_zx_fitted)
+            z_quality_rejected = not (z_residual_after < z_residual_before)
+            z_rejected = z_magnitude_rejected or z_quality_rejected
+            # Reject rather than clamp, same as H2 -- "reject" here just
+            # means z=0 (identity), never dropping the hybe.
+            z_shift = 0.0 if z_rejected else z_shift_fitted
+            H_zx[0, 2] = z_shift
 
-        zx_note = ''
-        if including_z:
-            if zx_rejected:
-                zx_note = (f' [z-alignment REJECTED: secondary x-shift {secondary_x_shift:.1f}px > 3px, '
-                          f'z left uncorrected]')
+        if not including_z:
+            zx_note = ''
+        elif z_rejected:
+            if z_magnitude_rejected:
+                z_reject_reason = f'{abs(z_shift_fitted):.1f}px > pad/2={pad / 2}'
             else:
-                zx_note = f' [z-alignment applied: z={z_shift:.1f}px, yx x refined by {secondary_x_shift:.1f}px]'
+                z_reject_reason = (f'reconstruction residual {z_residual_after:.1f} >= {z_residual_before:.1f} '
+                                   f'(no improvement over FOV/cross-modal)')
+            zx_note = f' [z-alignment REJECTED: {z_reject_reason}, fell back to z=0.0px]'
+        else:
+            zx_note = f' [z-alignment applied: z={z_shift:.1f}px]'
 
+        if rejected:
+            if magnitude_rejected:
+                reject_reason = (f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}')
+            else:
+                reject_reason = (f'reconstruction residual {residual_after:.1f} >= {residual_before:.1f} '
+                                 f'(no improvement over FOV/cross-modal)')
+            reject_note = f' [cell-level residual REJECTED: {reject_reason}, fell back to FOV/cross-modal only]'
+        else:
+            reject_note = ''
         cell.matrices[key] = {'yx': H_yx, 'zx': H_zx}
         cell.matrix_provenance[key] = {
-            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}'
-                                  + (f' [cell-level residual REJECTED: '
-                                     f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}, '
-                                     f'fell back to FOV/cross-modal only]' if rejected else '')
-                                  + zx_note,
+            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}' + reject_note + zx_note,
             'steps': np.stack([H1, H2]),
         }

@@ -18,6 +18,15 @@ class ASpot():
      size: float
      brightness: float
      neighbors: tuple (variable size)
+     mixture_centroids: tuple of (x, y, z, amplitude) -- set only when this
+       spot's own Z was refined via the multi-Gaussian mixture path (see
+       localization.refine_spot_z) and the crop held more than one real
+       component. Holds EVERY accepted component's own real/shared-frame
+       coordinate (same frame as `coordinate`), including this spot's own
+       (its entry is whichever one is brightest -- see refine_spot_z), so
+       the sibling positions survive even though they no longer spawn
+       separate ASpot records. Empty tuple otherwise (single-component fit,
+       or Z never refined).
     """
     def __init__(self):
         self.id = 0
@@ -33,6 +42,7 @@ class ASpot():
         self.neighbors = ()
         self.linked = False
         self.linked_at = None
+        self.mixture_centroids = ()
 
     def set_metadata(self, **kwargs):
         if 'id' in kwargs: self.id = int(kwargs['id'])
@@ -48,6 +58,7 @@ class ASpot():
         if 'neighbors' in kwargs: self.neighbors = tuple(kwargs['neighbors'])
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
+        if 'mixture_centroids' in kwargs: self.mixture_centroids = tuple(kwargs['mixture_centroids'])
 
     def save(self):
         return {'id': int(self.id),
@@ -62,4 +73,5 @@ class ASpot():
                 'brightness': float(self.brightness),
                 'neighbors': tuple(self.neighbors),
                 'linked': bool(self.linked),
-                'linked_at': self.linked_at}
+                'linked_at': self.linked_at,
+                'mixture_centroids': tuple(self.mixture_centroids)}

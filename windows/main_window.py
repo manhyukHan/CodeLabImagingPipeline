@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from copy import deepcopy
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from ui.main_window_ui import MainWindowUI
 from canvas.pipeline_canvas import PipelineCanvas
 from canvas.cell_displayer import CellDisplayer
 from canvas.spot_crop_displayer import SpotCropDisplayer
+from canvas.localize_3d_displayer import Localize3DDisplayer
 from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
 from canvas.celltype_result_displayer import CelltypeResultDisplayer
 from canvas.mip_viewer import MipViewerDisplayer
@@ -383,7 +385,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.spot_crop_displayer = SpotCropDisplayer()
         self.spot_crop_displayer.spots_edited.connect(self._on_spot_crop_edited)
+        self.spot_crop_displayer.readonly_point_removed.connect(self._on_readonly_spot_removed)
         self._spot_crop_context = None  # {'cell': ACell, 'hybe': str, 'channel': int, 'rxmin': int, 'rymin': int}
+        self._spot_undo_stack = []  # list of snapshots, see _snapshot_scopes/_push_spot_undo
+        self._spot_redo_stack = []
+        self._current_view_spot_refs = []  # [(ASpot, ACell-or-None), ...] -- see _refresh_localize_3d_spot_choices
+
+        self.localize_3d_displayer = Localize3DDisplayer()
+        self.localize_3d_displayer.run_requested.connect(self._run_3d_localize)
+        self.localize_3d_displayer.view_requested.connect(self._view_3d_localize)
 
         self.mip_viewer = MipViewerDisplayer()
         self.memory_viewer = MemoryViewerDisplayer()
@@ -392,8 +402,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.barcode_overview_displayer = BarcodeOverviewDisplayer()
         self.celltype_result_displayer = CelltypeResultDisplayer()
         self._fov_ranges_by_celltype = {}       # {celltype(str): range_string}
-        self._barcode_channel_by_celltype = {}  # {celltype(str): (hybe,channel)}
-        self._barcode_calibration = {'scale': {}, 'lower_bound': {}, 'upper_bound': {}}  # each {(hybe,channel): {fov(int): float}}
+        self._barcode_channel_by_celltype = {}  # {celltype(str): (hybe,channel,modality)}
+        self._barcode_calibration = {'scale': {}, 'lower_bound': {}, 'upper_bound': {}}  # each {(hybe,channel,modality): {fov(int): float}}
 
         # single shared pop-up + canvas for every alignment preview (FOV,
         # cross-modal, cell) -- nothing is embedded in the docked panel, see
@@ -433,10 +443,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.SetNumModalitiesPushButton.clicked.connect(self._on_set_num_modalities)
         ip.ActivateModalitiesPushButton.clicked.connect(self._on_activate_modalities)
         ip.ModalityComboBox.currentTextChanged.connect(self._switch_current_modality)
-        cp.ModalityComboBox.currentTextChanged.connect(self._switch_current_modality)
-        ap.ModalityComboBox.currentTextChanged.connect(self._switch_current_modality)
-        sp.ModalityComboBox.currentTextChanged.connect(self._switch_current_modality)
-        ctp.ModalityComboBox.currentTextChanged.connect(self._switch_current_modality)
 
         ip.ParseLayoutPushButton.clicked.connect(self._parse_layout)
         ip.DaxDirectoryLineEdit.editingFinished.connect(
@@ -465,6 +471,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ap.RunFovAlignmentPushButton.clicked.connect(self._run_fov_alignment)
         ap.RunAllFovAlignmentPushButton.clicked.connect(self._run_fov_alignment_all)
+        # Results list refreshes live as either changes -- since
+        # _refresh_same_modality_results_list is itself scoped to
+        # whichever reference hybe (and FOV list) is currently picked.
+        ap.SameModalityFovSpinBox.valueChanged.connect(lambda _: self._refresh_same_modality_results_list())
+        ap.ReferenceHybeComboBox.currentIndexChanged.connect(lambda _: self._refresh_same_modality_results_list())
         ap.SameModalityResultsListWidget.itemClicked.connect(self._show_same_modality_preview)
         ap.SameModalityShowOverlayPushButton.clicked.connect(self._show_same_modality_all_readouts_overlay)
         ap.SameModalityAcceptPushButton.clicked.connect(self._accept_same_modality_alignment)
@@ -497,14 +508,18 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.RefreshCellListPushButton.clicked.connect(self._refresh_spot_cell_list)
         sp.FovSpinBox.valueChanged.connect(lambda _: self._refresh_spot_cell_list())
         sp.CellListWidget.itemClicked.connect(self._on_spot_cell_selected)
+        sp.FovListWidget.itemClicked.connect(self._on_fov_list_item_clicked)
         sp.HybeComboBox.currentIndexChanged.connect(self._show_spot_displayer)
         sp.ChannelComboBox.currentIndexChanged.connect(self._show_spot_displayer)
         sp.AutoDetectPushButton.clicked.connect(self._run_spot_auto_detect)
         sp.ShowDisplayerPushButton.toggled.connect(self._toggle_spot_crop_displayer)
+        sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
         sp.RemoveSpotsInViewPushButton.clicked.connect(self._remove_all_spots_in_view)
         sp.RemoveAllSpotsPushButton.clicked.connect(self._remove_all_spots_in_fov)
-        sp.SaveViewPushButton.clicked.connect(self._save_view)
+        sp.UndoPushButton.clicked.connect(self._undo_spot_action)
+        sp.RedoPushButton.clicked.connect(self._redo_spot_action)
+        sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
         sp.ThresholdPercentLineEdit.editingFinished.connect(self._sync_threshold_from_percent)
         sp.ThresholdAbsoluteLineEdit.editingFinished.connect(self._sync_threshold_from_absolute)
 
@@ -522,31 +537,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _blank_modality_state():
-        return {'layout_path': '', 'dax_directory': '', 'storage_path': '', 'reference_hybe': '', 'same_modality_channel_type': '',
-                'active_hybe_list': []}
-
-    def _all_modality_combo_boxes(self):
-        boxes = [self.ui.IngestionPanel.ModalityComboBox]
-        for attr in ('CellSegmentPanel', 'AlignmentPanel', 'SpotLocalizationPanel', 'CelltypeDeterminationPanel'):
-            boxes.append(getattr(self.ui, attr).ModalityComboBox)
-        return boxes
-
-    def _sync_modality_combo_items(self, names):
-        for combo in self._all_modality_combo_boxes():
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(names)
-            combo.blockSignals(False)
-
-    def _sync_modality_combo_text(self, name):
-        for combo in self._all_modality_combo_boxes():
-            if combo.currentText() != name:
-                combo.blockSignals(True)
-                combo.setCurrentText(name)
-                combo.blockSignals(False)
+        return {'layout_path': '', 'dax_directory': '', 'storage_path': '', 'active_hybe_list': []}
 
     def _save_current_modality_fields(self):
-        ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
+        ip = self.ui.IngestionPanel
         # update() in place, not a wholesale dict replacement -- this
         # modality's own active_hybe_list (and anything else computed
         # separately, e.g. by _refresh_active_hybe_lists) must survive a
@@ -557,24 +551,32 @@ class MainWindow(QtWidgets.QMainWindow):
             'layout_path': ip.LayoutPathLineEdit.text().strip(),
             'dax_directory': ip.DaxDirectoryLineEdit.text().strip(),
             'storage_path': ip.StoragePathLineEdit.text().strip(),
-            'reference_hybe': ap.ReferenceHybeComboBox.currentText(),
-            'same_modality_channel_type': ap.SameModalityChannelTypeComboBox.currentText(),
         })
 
     def _switch_current_modality(self, name):
         """
-        The single "current modality" driving the Ingestion tab's per-
-        modality fields (layout/dax/storage path, hybes-to-ingest,
-        ingestion status) plus every downstream panel's own mirrored
-        ModalityComboBox (Cell Segmentation, within-experiment Alignment,
-        Spot Localization, Celltype Determination) -- changing any one of
-        those combos calls this and every other combo follows, since
-        there's exactly one active modality app-wide at a time. fov_list
-        and the other global config fields are untouched by this switch.
+        The single "current modality" -- Ingestion tab's own selector,
+        and NOTHING else. Affects exactly four things: LayoutPathLineEdit,
+        DaxDirectoryLineEdit, StoragePathLineEdit, and the Hybes-to-Ingest
+        checkbox list (HybeListWidget, rebuilt via _parse_layout below).
+        fov_list and every other global config field are untouched, same
+        as before.
+
+        Every OTHER panel (Cell Segmentation, Same-Modality Alignment,
+        Spot Localization, Celltype Determination) used to mirror this
+        same selector via its own ModalityComboBox, resetting whatever
+        hybe/reference-hybe combo it owned on every switch -- that's what
+        caused a real bug (in-progress Spot Localization picks silently
+        disappearing from view on a modality switch, nothing was actually
+        deleted). Those panels now offer choices from
+        self.total_active_hybe_list (every modality's hybes at once, each
+        tagged with its own modality) instead, refreshed by Parse Layout/
+        ingestion completing -- see _refresh_active_hybe_lists -- not by
+        this switch, so they're untouched here.
         """
         if not name:
             return
-        ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
+        ip = self.ui.IngestionPanel
         if self.current_modality is not None and self.current_modality != name:
             self._save_current_modality_fields()
         self.current_modality = name
@@ -587,27 +589,15 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.hybe_records = []
             ip.HybeListWidget.clear()
-            ip.populate_viewer_hybe_choices([])
-            ap.populate_reference_hybe_choices([])
-            ap.populate_cell_reference_hybe_choices(self._all_modality_hybe_records())
-            self.ui.CellSegmentPanel.populate_reference_hybe_choices([])
-            self.ui.SpotLocalizationPanel.populate_hybe_choices([])
-            self.ui.CelltypeDeterminationPanel.populate_hybe_choices([])
             ip.IngestionStatusTextEdit.clear()
-        if data['reference_hybe']:
-            idx = ap.ReferenceHybeComboBox.findText(data['reference_hybe'])
-            if idx >= 0:
-                ap.ReferenceHybeComboBox.setCurrentIndex(idx)
-        if data['same_modality_channel_type']:
-            ap.SameModalityChannelTypeComboBox.setCurrentText(data['same_modality_channel_type'])
         if data['storage_path'] and data['storage_path'] not in self._vlinks_refreshed_paths:
             # vlinks-actual values (whatever was really computed and
             # accepted) always win over a stale config default -- runs
-            # LAST, after layout parsing/combo population above, so every
-            # choice-dependent combo it touches (reference hybes, cell-
-            # alignment anchor) already has real items to match against.
-            # May itself trigger a first-time _parse_layout() if layout_path
-            # was blank above and only vlinks has it.
+            # LAST, after layout parsing above, so every choice-dependent
+            # combo it touches (cell-alignment anchor, etc.) already has
+            # real items to match against. May itself trigger a first-
+            # time _parse_layout() if layout_path was blank above and
+            # only vlinks has it.
             #
             # Only ever done ONCE per storage_path per session (tracked via
             # _vlinks_refreshed_paths): this reconciles a stale config
@@ -617,14 +607,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # with whatever vlinks still has on disk from a prior run.
             self._refresh_params_from_vlinks(data['storage_path'])
             self._vlinks_refreshed_paths.add(data['storage_path'])
-        # active_hybe_list/total_active_hybe_list refresh -- unlike the
-        # params backfill above, this is never gated by
-        # _vlinks_refreshed_paths (see _refresh_active_hybe_lists' own
-        # docstring for why): every modality switch stands in for "the
-        # vlink was just parsed" for that modality, per explicit design.
-        self._refresh_active_hybe_lists()
-        self._sync_modality_combo_text(name)
-        self._refresh_same_modality_results_list()
 
     def _refresh_params_from_vlinks(self, storage_path):
         """
@@ -665,22 +647,21 @@ class MainWindow(QtWidgets.QMainWindow):
             ip.LayoutPathLineEdit.setText(layout_path)
             self._parse_layout()
 
+        # this storage_path's own persisted reference hybe -- select it in
+        # the combo (now shared across every modality, tagged by
+        # itemData) via (folder, modality), not a bare findText, so it
+        # resolves to the right item even if another modality happens to
+        # have a same-named hybe folder.
         reference_hybe = params.get('same_modality_reference_hybe')
         if reference_hybe:
-            if data is not None:
-                data['reference_hybe'] = reference_hybe
-            idx = ap.ReferenceHybeComboBox.findText(reference_hybe)
-            if idx >= 0:
-                ap.ReferenceHybeComboBox.setCurrentIndex(idx)
+            ap.select_reference_hybe(reference_hybe, self.current_modality)
         channel_type = params.get('same_modality_channel_type')
         if channel_type:
-            if data is not None:
-                data['same_modality_channel_type'] = channel_type
             ap.SameModalityChannelTypeComboBox.setCurrentText(channel_type)
 
         cell_reference_hybe = params.get('cell_alignment_reference_hybe')
-        if cell_reference_hybe:
-            ap.CellReferenceHybeComboBox.setCurrentText(cell_reference_hybe)
+        if cell_reference_hybe and not ap.current_cell_reference_hybe():
+            ap.select_cell_reference_hybe(cell_reference_hybe, self._modality_for_storage_path(storage_path))
         cell_channel_type = params.get('cell_alignment_channel_type')
         if cell_channel_type:
             ap.CellChannelTypeComboBox.setCurrentText(cell_channel_type)
@@ -710,10 +691,6 @@ class MainWindow(QtWidgets.QMainWindow):
             other_params = vlinks_store.read_global_params(paired_path)
             if not other_data['layout_path'] and other_params.get('layout_path'):
                 other_data['layout_path'] = other_params['layout_path']
-            if not other_data['reference_hybe'] and other_params.get('same_modality_reference_hybe'):
-                other_data['reference_hybe'] = other_params['same_modality_reference_hybe']
-            if not other_data['same_modality_channel_type'] and other_params.get('same_modality_channel_type'):
-                other_data['same_modality_channel_type'] = other_params['same_modality_channel_type']
             if other_name not in self.modality_names:
                 self.modality_names = list(self.modality_names) + [other_name]
 
@@ -757,9 +734,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _activate_modalities(self, names, modality_fields=None):
         """
         names: ordered list[str] becoming the live modality set. modality_
-        fields: optional {name: {layout_path/dax_directory/storage_path/
-        reference_hybe/same_modality_channel_type}} to pre-seed from (e.g. a
-        loaded config's 'modalities' dict) -- omitted fields default blank.
+        fields: optional {name: {layout_path/dax_directory/storage_path}}
+        to pre-seed from (e.g. a loaded config's 'modalities' dict) --
+        omitted fields default blank. A config saved before this app's
+        modality decoupling may still carry old reference_hybe/
+        same_modality_channel_type keys here too -- the state.update
+        filter below (`if k in state`) already drops anything that isn't
+        one of _blank_modality_state's current keys, so those are
+        silently ignored rather than erroring.
         """
         modality_fields = modality_fields or {}
         self.modality_names = names
@@ -769,7 +751,14 @@ class MainWindow(QtWidgets.QMainWindow):
             state.update({k: v for k, v in modality_fields.get(name, {}).items() if k in state})
             self.modality_data[name] = state
         self.current_modality = None
-        self._sync_modality_combo_items(names)
+        # only the Ingestion tab's own combo is a real modality selector
+        # any more (see _switch_current_modality's own docstring) -- no
+        # other panel has one left to sync.
+        ip = self.ui.IngestionPanel
+        ip.ModalityComboBox.blockSignals(True)
+        ip.ModalityComboBox.clear()
+        ip.ModalityComboBox.addItems(names)
+        ip.ModalityComboBox.blockSignals(False)
         self._switch_current_modality(names[0])
 
     def _active_hybe_records_for_modality(self, name):
@@ -813,24 +802,6 @@ class MainWindow(QtWidgets.QMainWindow):
             ingested_folders.update(ready)
         return [r for r in records if r['folder'] in ingested_folders]
 
-    def _all_modality_hybe_records(self):
-        """
-        Every configured modality's own active_hybe_list, deduped by
-        folder name -- for combos that need choices spanning BOTH
-        modalities regardless of which one is "current" (e.g.
-        CellReferenceHybeComboBox, now that cell-based alignment
-        processes both). See _active_hybe_records_for_modality for the
-        actual ingestion-filtering.
-        """
-        merged = []
-        seen = set()
-        for name in self.modality_names:
-            for r in self._active_hybe_records_for_modality(name):
-                if r['folder'] not in seen:
-                    seen.add(r['folder'])
-                    merged.append(r)
-        return merged
-
     def _refresh_active_hybe_lists(self):
         """
         Recomputes active_hybe_list for every configured modality (real,
@@ -866,13 +837,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     total.append((r, name))
         self.total_active_hybe_list = total  # [(hybe_record, modality_name), ...]
 
-        ap = self.ui.AlignmentPanel
-        current_active = self.modality_data.get(self.current_modality, {}).get('active_hybe_list', [])
-        ap.populate_reference_hybe_choices(current_active)
-        self.ui.CellSegmentPanel.populate_reference_hybe_choices(current_active)
-        self.ui.SpotLocalizationPanel.populate_hybe_choices(current_active)
-        self.ui.CelltypeDeterminationPanel.populate_hybe_choices(current_active)
-        ap.populate_cell_reference_hybe_choices([r for r, _ in self.total_active_hybe_list])
+        ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
+        # every one of these now gets the FULL cross-modality union, not
+        # just self.current_modality's own slice -- none of them have
+        # their own modality selector any more (see _switch_current_
+        # modality's own docstring); each combo item carries its own
+        # modality tag instead.
+        ap.populate_reference_hybe_choices(self.total_active_hybe_list)
+        self.ui.CellSegmentPanel.populate_reference_hybe_choices(self.total_active_hybe_list)
+        self.ui.SpotLocalizationPanel.populate_hybe_choices(self.total_active_hybe_list)
+        self.ui.CelltypeDeterminationPanel.populate_hybe_choices(self.total_active_hybe_list)
+        ip.populate_viewer_hybe_choices(self.total_active_hybe_list)
+        ap.populate_cell_reference_hybe_choices(self.total_active_hybe_list)
         for name, populate in (('RNA', ap.populate_rna_reference_hybe_choices),
                                ('DNA', ap.populate_dna_reference_hybe_choices)):
             populate(self.modality_data.get(name, {}).get('active_hybe_list', []))
@@ -926,7 +902,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # config file.
             vlinks_store.write_global_params(storage_path, layout_path=layout_path)
         ip.populate_hybe_list(self.hybe_records, dax_directory=ip.DaxDirectoryLineEdit.text().strip())
-        ip.populate_viewer_hybe_choices(self.hybe_records)
         ip.RunIngestionPushButton.setEnabled(True)
         ip.LogTextEdit.append(f'Parsed {len(self.hybe_records)} hybe(s) from {layout_path}')
         self._check_ingestion_status(silent=True)
@@ -959,23 +934,43 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_paths = self._all_vlinks_storage_paths()
         if not storage_paths:
             return
+        n_dropped_legacy = 0
         for storage_path in storage_paths:
             fov_ranges, barcode_channels, calibration, barcode_method = vlinks_store.read_celltype_config(storage_path)
             for name, range_string in fov_ranges.items():
                 if name not in self._fov_ranges_by_celltype:
                     self._fov_ranges_by_celltype[name] = range_string
             for name, bch in barcode_channels.items():
+                bch = tuple(bch)
+                # a config saved before barcode channels carried their own
+                # modality tag has bare (hybe, channel) 2-tuples -- there's
+                # no way to safely recover which modality one of those
+                # belonged to (a wrong guess would silently misclassify),
+                # same "drop, don't guess" policy
+                # _drop_legacy_matrix_keys already uses for cell.matrices'
+                # own pre-tuple-key format. Dropped means this celltype's
+                # barcode channel needs re-assigning, not that it crashes.
+                if len(bch) != 3:
+                    n_dropped_legacy += 1
+                    continue
                 if name not in self._barcode_channel_by_celltype:
-                    self._barcode_channel_by_celltype[name] = tuple(bch)
+                    self._barcode_channel_by_celltype[name] = bch
             for key in ('scale', 'lower_bound', 'upper_bound'):
                 for bch, per_fov in calibration.get(key, {}).items():
                     bch = tuple(bch)
+                    if len(bch) != 3:
+                        n_dropped_legacy += 1
+                        continue
                     dest = self._barcode_calibration[key].setdefault(bch, {})
                     for fov, val in per_fov.items():
                         dest.setdefault(int(fov), val)
             if barcode_method:
                 ctp.BarcodeMethodComboBox.setCurrentText(
                     'Median' if barcode_method == 'median' else 'Vote (200-sample)')
+        if n_dropped_legacy:
+            ctp.LogTextEdit.append(f'{n_dropped_legacy} barcode-channel/calibration entr(ies) from an older '
+                                   f'saved config had no modality tag -- dropped rather than guessed. '
+                                   f'Re-assign/re-calibrate the affected celltype(s) if needed.')
         # any celltype named only via a barcode assignment/FOV range
         # (not yet reflected in any real classified cell) should still
         # show up in the shared identity list.
@@ -1058,18 +1053,20 @@ class MainWindow(QtWidgets.QMainWindow):
         alignment yet.
         """
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
-        reference_hybe = ap.ReferenceHybeComboBox.currentText()
+        reference_hybe = ap.current_reference_hybe()
+        modality = ap.current_reference_modality()
+        storage_path = self._storage_path_for_modality(modality)
+        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         ap.SameModalityResultsListWidget.clear()
-        if not storage_path or not reference_hybe or not fov_list or not self.hybe_records:
+        if not storage_path or not reference_hybe or not fov_list or not hybe_records:
             return
         disk_results = {}
         for fov in fov_list:
-            ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, self.hybe_records)
+            ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, hybe_records)
             if not ready:
                 continue
-            ready_records = [r for r in self.hybe_records if r['folder'] in ready]
+            ready_records = [r for r in hybe_records if r['folder'] in ready]
             matrices = alignment.read_same_modality_matrices(storage_path, fov, ready_records)
             if matrices:
                 disk_results[fov] = matrices
@@ -1087,7 +1084,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pending_fovs.add(fov)
         if not display_results:
             return
-        self._same_modality_context = {'storage_path': storage_path, 'hybe_records': self.hybe_records, 'reference_hybe': reference_hybe}
+        self._same_modality_context = {'storage_path': storage_path, 'hybe_records': hybe_records, 'reference_hybe': reference_hybe}
         for fov in sorted(display_results.keys()):
             matrices = display_results[fov]
             suffix = ' [pending]' if fov in pending_fovs else ''
@@ -1298,13 +1295,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return []
 
     def _reference_hybe_for_storage_path(self, storage_path):
-        ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
-        if storage_path == ip.StoragePathLineEdit.text().strip():
-            return ap.ReferenceHybeComboBox.currentText()
-        for data in self.modality_data.values():
-            if data['storage_path'] == storage_path:
-                return data['reference_hybe']
-        return ''
+        """
+        The real, persisted same-modality reference hybe for this
+        storage_path -- read straight from that path's own vlinks.h5
+        global params (written whenever a same-modality alignment run is
+        accepted), not from live UI state. Used in a loop over MULTIPLE
+        storage paths at once (Memory Status viewer), so it genuinely
+        needs each path's own independently-persisted fact, not "whatever
+        the single Reference Hybe combo happens to show right now" --
+        that combo no longer even has a notion of "per modality" since it
+        stopped being reset by a modality switch.
+        """
+        params = vlinks_store.read_global_params(storage_path)
+        return (params or {}).get('same_modality_reference_hybe', '')
 
     def _refresh_memory_viewer(self):
         """
@@ -1418,8 +1421,13 @@ class MainWindow(QtWidgets.QMainWindow):
         user-facing error.
         """
         ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
-        hybe = ip.ViewerHybeComboBox.currentText()
+        hybe = ip.current_viewer_hybe()
+        # storage_path comes from the SELECTED hybe's own modality, not
+        # from whatever the Ingestion tab's own combo happens to be
+        # showing -- ViewerHybeComboBox can now offer any parsed
+        # modality's hybes at once (see populate_viewer_hybe_choices), so
+        # those two can genuinely differ.
+        storage_path = self._storage_path_for_modality(ip.current_viewer_modality())
         channel_text = ip.ViewerChannelComboBox.currentText()
         if not storage_path or not hybe or not channel_text:
             if not silent:
@@ -1490,7 +1498,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_fov_spinbox_bounds()
         self.hybe_records = job['hybe_records']
         ip.populate_hybe_list(self.hybe_records)
-        self.ui.AlignmentPanel.populate_reference_hybe_choices(self.hybe_records)
+        self.ui.AlignmentPanel.populate_reference_hybe_choices([(r, job['modality']) for r in self.hybe_records])
         selected_folders = {r['folder'] for r in job['selected_records']}
         for i in range(ip.HybeListWidget.count()):
             it = ip.HybeListWidget.item(i)
@@ -1562,16 +1570,19 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- cell segmentation --
 
     def _run_cell_segmentation(self):
-        ip = self.ui.IngestionPanel
         cp = self.ui.CellSegmentPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        reference_hybe = cp.current_reference_hybe()
+        modality = cp.current_reference_modality()
+        if not reference_hybe or not modality:
+            QtWidgets.QMessageBox.warning(self, 'Run Segmentation', 'Parse a layout and select a reference hybe/channel first.')
+            return
+        storage_path = self._storage_path_for_modality(modality)
         if not storage_path:
             QtWidgets.QMessageBox.warning(self, 'Run Segmentation', 'Set storage path in the Ingestion tab first.')
             return
         fov = cp.FovSpinBox.value()
-        reference_hybe = cp.ReferenceHybeComboBox.currentText()
         channel_text = cp.ChannelComboBox.currentText()
-        if not reference_hybe or not channel_text:
+        if not channel_text:
             QtWidgets.QMessageBox.warning(self, 'Run Segmentation', 'Parse a layout and select a reference hybe/channel first.')
             return
         channel = int(channel_text)
@@ -1588,7 +1599,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             mask = np.zeros(reference_image.shape, dtype=np.uint8)
             cp.LogTextEdit.append(f'Manual mode: opened empty mask for FOV{fov:02d} ({reference_hybe}, ch{channel}).')
-            self._on_cell_segment_finished(mask, reference_image, fov, reference_hybe, append=append)
+            self._on_cell_segment_finished(mask, reference_image, fov, reference_hybe, modality, append=append)
             self.cell_displayer.ManualAddModeCheckBox.setChecked(True)
             return
 
@@ -1610,7 +1621,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._segment_worker = ClassicalSegmentWorker(storage_path, fov, reference_hybe, channel,
                                                            classical_method, absolute_cutoff, min_distance, min_size, max_size)
         self._segment_worker.finished_ok.connect(
-            lambda mask, ref_img: self._on_cell_segment_finished(mask, ref_img, fov, reference_hybe, append=append))
+            lambda mask, ref_img: self._on_cell_segment_finished(mask, ref_img, fov, reference_hybe, modality, append=append))
         self._segment_worker.failed.connect(self._on_cell_segment_failed)
         self._segment_worker.start()
 
@@ -1653,10 +1664,10 @@ class MainWindow(QtWidgets.QMainWindow):
         keep = ids[(ids > 0) & (counts >= min_size)]
         return np.where(np.isin(mask, keep), mask, 0).astype(mask.dtype)
 
-    def _on_cell_segment_finished(self, mask, reference_image, fov, reference_hybe, append=False):
+    def _on_cell_segment_finished(self, mask, reference_image, fov, reference_hybe, modality, append=False):
         cp = self.ui.CellSegmentPanel
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=self.current_modality)
+            self.cell_container = CellContainer([fov], modality=modality)
         self.cell_container.data.setdefault(fov, [])
 
         if append and self._last_segment_context is not None and self._last_segment_context['fov'] == fov \
@@ -1721,10 +1732,10 @@ class MainWindow(QtWidgets.QMainWindow):
         worst, shown raw/approximate) so the mask is never just hidden.
         """
         cp = self.ui.CellSegmentPanel
-        ip = self.ui.IngestionPanel
         fov = cp.FovSpinBox.value()
-        storage_path = ip.StoragePathLineEdit.text().strip()
-        reference_hybe = cp.ReferenceHybeComboBox.currentText()
+        reference_hybe = cp.current_reference_hybe()
+        modality = cp.current_reference_modality()
+        storage_path = self._storage_path_for_modality(modality)
         channel_text = cp.ChannelComboBox.currentText()
         if not storage_path or not reference_hybe or not channel_text:
             return
@@ -1757,7 +1768,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cells = self.cell_container_permanent.data[fov]
 
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=self.current_modality)
+            self.cell_container = CellContainer([fov], modality=modality)
         self.cell_container.data.setdefault(fov, [])
 
         # cells always show, regardless of which hybe/channel the panel is
@@ -1777,14 +1788,14 @@ class MainWindow(QtWidgets.QMainWindow):
             approximate = False
             height, width = mask.shape
             for cell in cells:
-                # reference_hybe belongs to whichever modality is current
-                # (it's drawn from the Cell Segmentation panel's own live
-                # hybe context) -- NOT necessarily this cell's own
-                # segmentation modality, since cells here can come from
-                # either modality.
-                if (reference_hybe, self.current_modality) not in cell.matrices:
+                # reference_hybe's own modality (resolved directly from
+                # the Cell Segmentation panel's ReferenceHybeComboBox
+                # selection, see current_reference_modality) -- NOT
+                # necessarily this cell's own segmentation modality, since
+                # cells here can come from either modality.
+                if (reference_hybe, modality) not in cell.matrices:
                     approximate = True
-                x, y = cell.get_area_in_readout(reference_hybe, self.current_modality)
+                x, y = cell.get_area_in_readout(reference_hybe, modality)
                 xi, yi = x.astype(int), y.astype(int)
                 valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
                 mask[yi[valid], xi[valid]] = cell.id
@@ -2132,8 +2143,6 @@ class MainWindow(QtWidgets.QMainWindow):
         single-cell scope must never narrow that batch down to one cell.
         """
         ap = self.ui.AlignmentPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
         cell = None
         if self.cell_container_permanent is not None:
             cell = next((c for c in self.cell_container_permanent.data.get(fov, []) if c.id == cell_id), None)
@@ -2145,15 +2154,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cell_per_hybe_context = None
             return
 
-        this_modality = self._modality_for_storage_path(storage_path)
-        # Same fallback the actual alignment run itself uses (see
-        # _run_cell_alignment_for_selected_cell/compute_cell_alignment's
-        # own reference_hybe=None default): an empty combo means "anchor
-        # to the cell's own segmentation hybe."
-        cell_reference_hybe = ap.CellReferenceHybeComboBox.currentText().strip() or cell.reference_hybe
+        # Modality/storage_path resolved from the combo's OWN itemData tag,
+        # never from IngestionPanel's current selection -- see
+        # populate_cell_reference_hybe_choices' own docstring for why that
+        # used to crash. An empty combo falls back to the cell's own
+        # (segmentation) modality/reference_hybe -- same fallback the
+        # actual alignment run itself uses (compute_cell_alignment's own
+        # reference_hybe=None default).
+        this_modality = ap.current_cell_reference_modality() or cell.modality
+        storage_path = self._storage_path_for_modality(this_modality)
+        cell_reference_hybe = ap.current_cell_reference_hybe() or cell.reference_hybe
         reference_key = (cell_reference_hybe, this_modality)
         self._cell_per_hybe_context = {'fov': fov, 'cell': cell, 'storage_path': storage_path,
-                                       'hybe_records': self.hybe_records, 'reference_key': reference_key}
+                                       'hybe_records': self._active_hybe_records_for_modality(this_modality),
+                                       'reference_key': reference_key}
         for hybe, modality in sorted(cell.matrices.keys()):
             item = QtWidgets.QListWidgetItem(self._cell_hybe_result_label(cell, fov, hybe, modality, reference_key))
             item.setData(QtCore.Qt.UserRole, (fov, cell.id, hybe, modality))
@@ -2219,6 +2233,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for hybe, channel in sorted(counts.keys()):
             n_spots, cell_ids = counts[(hybe, channel)]
             item = QtWidgets.QListWidgetItem(f'{hybe} ch{channel}: {n_spots} spot(s) across {len(cell_ids)} cell(s)')
+            item.setData(QtCore.Qt.UserRole, (hybe, channel))
             sp.FovListWidget.addItem(item)
         storage_path = ip.StoragePathLineEdit.text().strip()
         unassigned = self.fov_unassigned_spots.get((storage_path, fov), [])
@@ -2228,7 +2243,50 @@ class MainWindow(QtWidgets.QMainWindow):
         for hybe, channel in sorted(unassigned_counts.keys()):
             item = QtWidgets.QListWidgetItem(
                 f'{hybe} ch{channel}: {unassigned_counts[(hybe, channel)]} spot(s) unassigned (no cell)')
+            item.setData(QtCore.Qt.UserRole, (hybe, channel))
             sp.FovListWidget.addItem(item)
+
+    def _modality_owning_hybe(self, hybe):
+        """Which configured modality's own active_hybe_list actually
+        contains this hybe folder, or None if it's not in any of them."""
+        for name in self.modality_names:
+            records = self.modality_data.get(name, {}).get('active_hybe_list', [])
+            if any(r['folder'] == hybe for r in records):
+                return name
+        return None
+
+    def _on_fov_list_item_clicked(self, item):
+        """
+        Jumps HybeComboBox/ChannelComboBox to this row's (hybe, channel) --
+        per explicit request, a shortcut from "see all spots in FOV" straight
+        to that (hybe, channel)'s own view, without touching CellListWidget's
+        current cell/FOV-view selection (that's a SEPARATE axis: which cell
+        vs which hybe/channel).
+
+        This list aggregates spots across every cell in the FOV, and a
+        cell's own spots can span BOTH modalities (cell-based alignment
+        processes both, see _other_modality_cell_alignment_inputs) -- a
+        row's hybe is therefore not guaranteed to belong to whichever
+        modality this row's data happens to resolve to. sp.HybeComboBox
+        now offers every modality's hybes at once (see
+        SpotLocalizationPanel.populate_hybe_choices), so jumping to it is
+        a direct select_hybe(hybe, modality) call -- no need to switch
+        any modality selector first the way this used to (there's no
+        longer a modality selector on this panel at all).
+        """
+        data = item.data(QtCore.Qt.UserRole)
+        if data is None:
+            return
+        hybe, channel = data
+        sp = self.ui.SpotLocalizationPanel
+        owning_modality = self._modality_owning_hybe(hybe)
+        sp.select_hybe(hybe, owning_modality)
+        # _on_hybe_changed (triggered above if the hybe actually changed)
+        # already repopulates ChannelComboBox from that hybe's own channel
+        # list -- only set the channel index after, and only if needed.
+        cidx = sp.ChannelComboBox.findText(str(channel))
+        if cidx >= 0 and sp.ChannelComboBox.currentIndex() != cidx:
+            sp.ChannelComboBox.setCurrentIndex(cidx)
 
     def _refresh_spot_breakdown(self):
         """
@@ -2305,31 +2363,77 @@ class MainWindow(QtWidgets.QMainWindow):
         local_y, local_x = y_area - rymin, x_area - rxmin
         valid = (local_y >= 0) & (local_y < mask.shape[0]) & (local_x >= 0) & (local_x < mask.shape[1])
         mask[local_y[valid], local_x[valid]] = True
-        return {'img': mip_crop, 'mask': mask, 'rxmin': rxmin, 'rymin': rymin}
+        # full_mip/mask_x/mask_y (whole-FOV frame, pre-crop) are for the
+        # displayer's LEFT context panel (see _load_spot_crop_for_display)
+        # -- returned here rather than re-read/re-computed by the caller,
+        # since both are already in hand from the work just done above.
+        return {'img': mip_crop, 'mask': mask, 'rxmin': rxmin, 'rymin': rymin,
+                'full_mip': mip, 'mask_x': x_area, 'mask_y': y_area}
+
+    def _global_spot_order(self, storage_path, fov, hybe, channel):
+        """
+        Canonical, FOV-WIDE ordering for one (hybe, channel): the
+        unassigned pool first (in its own list order), then every cell's
+        own spots, cells visited in ascending cell.id order -- same
+        "editable list first, then cell-owned" convention the FOV view
+        already uses (see _load_fov_spot_display's docstring), just
+        extended to span every cell in the FOV rather than one view's
+        worth. Position i (0-based) in the returned list is global index
+        i+1 -- see _global_spot_index_map.
+
+        Recomputed fresh on every call, not a persisted per-spot id: a
+        spot's global index is its CURRENT position in this ordering, so
+        it can shift if spots are added/removed elsewhere in the FOV
+        between calls. What's guaranteed is that opening any ONE view
+        (a single cell, or the unassigned pool) never renumbers starting
+        from 1 just because that view happens to be the one open --
+        selecting cell 65 shows its spots at whatever numbers they
+        already hold in the full-FOV count (e.g. 145,146,147...).
+        """
+        ordered = [(s, None) for s in self.fov_unassigned_spots.get((storage_path, fov), [])
+                  if s.hybe == hybe and s.channel == channel]
+        cells = self.cell_container.data.get(fov, []) if self.cell_container is not None else []
+        for cell in sorted(cells, key=lambda c: c.id):
+            for s in cell.spots:
+                if s.hybe == hybe and s.channel == channel:
+                    ordered.append((s, cell))
+        return ordered
+
+    def _global_spot_index_map(self, storage_path, fov, hybe, channel):
+        """{id(spot): global_index(1-based)} -- see _global_spot_order."""
+        return {id(s): i + 1 for i, (s, _) in enumerate(self._global_spot_order(storage_path, fov, hybe, channel))}
 
     def _load_spot_crop_for_display(self, *_args):
         sp = self.ui.SpotLocalizationPanel
-        ip = self.ui.IngestionPanel
         cell = self._selected_spot_cell()
-        hybe = sp.HybeComboBox.currentText()
+        hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if cell is None or not hybe or not channel_text:
             return
         channel = int(channel_text)
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
         fov = self._current_spot_fov()
         pad = sp.PadSpinBox.value()
-        crop = self._build_cell_display_crop(cell, hybe, channel, storage_path, fov, pad, modality=self.current_modality)
+        crop = self._build_cell_display_crop(cell, hybe, channel, storage_path, fov, pad, modality=sp.current_hybe_modality())
         if crop is None:
             sp.LogTextEdit.append(f'Cell {cell.id} has no alignment/overlap for {hybe} yet -- '
                                   f'run cell-based alignment for this hybe first.')
             return
         rxmin, rymin = crop['rxmin'], crop['rymin']
         self._spot_crop_context = {'kind': 'cell', 'cell': cell, 'hybe': hybe, 'channel': channel,
-                                   'rxmin': rxmin, 'rymin': rymin}
-        existing_points = [(s.raw_coordinate[0] - rxmin, s.raw_coordinate[1] - rymin)
-                           for s in cell.spots if s.hybe == hybe and s.channel == channel]
-        self.spot_crop_displayer.set_data(crop['img'], existing_points, mask=crop['mask'])
+                                   'modality': sp.current_hybe_modality(), 'rxmin': rxmin, 'rymin': rymin}
+        scoped_spots = [s for s in cell.spots if s.hybe == hybe and s.channel == channel]
+        existing_points = [(s.raw_coordinate[0] - rxmin, s.raw_coordinate[1] - rymin) for s in scoped_spots]
+        context_masks = [(cell.id, crop['mask_x'], crop['mask_y'])]
+        gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
+        spot_indices = [gmap[id(s)] for s in scoped_spots]
+        self.spot_crop_displayer.set_data(
+            crop['img'], existing_points, mask=crop['mask'],
+            context_image=crop['full_mip'], context_masks=context_masks,
+            context_title=f'FOV{fov:02d} {hybe} ch{channel} (full)',
+            spot_indices=spot_indices)
+        self._current_view_spot_refs = [(s, cell) for s in scoped_spots]
+        self._refresh_localize_3d_spot_choices()
 
     def _load_fov_spot_display(self):
         """
@@ -2352,10 +2456,10 @@ class MainWindow(QtWidgets.QMainWindow):
         genuinely edit fov_unassigned_spots via _on_spot_crop_edited.
         """
         sp = self.ui.SpotLocalizationPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        modality = sp.current_hybe_modality()
+        storage_path = self._storage_path_for_modality(modality)
         fov = self._current_spot_fov()
-        hybe = sp.HybeComboBox.currentText()
+        hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if not storage_path or fov is None or not hybe or not channel_text:
             return
@@ -2364,18 +2468,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if mip is None:
             sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
-        unassigned_points = [(float(s.raw_coordinate[0]), float(s.raw_coordinate[1]))
-                             for s in self.fov_unassigned_spots.get((storage_path, fov), [])
-                             if s.hybe == hybe and s.channel == channel]
+        unassigned_spots = [s for s in self.fov_unassigned_spots.get((storage_path, fov), [])
+                           if s.hybe == hybe and s.channel == channel]
+        unassigned_points = [(float(s.raw_coordinate[0]), float(s.raw_coordinate[1])) for s in unassigned_spots]
         cell_owned_points = []
+        cell_owned_refs = []
+        context_masks = []
         if self.cell_container is not None:
             for cell in self.cell_container.data.get(fov, []):
                 for s in cell.spots:
                     if s.hybe == hybe and s.channel == channel:
-                        cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1])))
+                        cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1]), cell.id))
+                        cell_owned_refs.append((s, cell))
+                x_area, y_area = cell.get_area_in_readout(hybe, modality)
+                if len(x_area):
+                    context_masks.append((cell.id, x_area, y_area))
         self._spot_crop_context = {'kind': 'fov', 'storage_path': storage_path, 'fov': fov,
-                                   'hybe': hybe, 'channel': channel, 'rxmin': 0, 'rymin': 0}
-        self.spot_crop_displayer.set_data(mip, unassigned_points, color='yellow', readonly_points=cell_owned_points)
+                                   'hybe': hybe, 'channel': channel, 'modality': modality, 'rxmin': 0, 'rymin': 0}
+        gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
+        spot_indices = [gmap[id(s)] for s in unassigned_spots]
+        readonly_indices = [gmap[id(s)] for s, _ in cell_owned_refs]
+        self.spot_crop_displayer.set_data(
+            mip, unassigned_points, color='yellow', readonly_points=cell_owned_points,
+            context_image=mip, context_masks=context_masks,
+            context_title=f'FOV{fov:02d} {hybe} ch{channel} -- cell masks',
+            spot_indices=spot_indices, readonly_indices=readonly_indices)
+        # same "editable list numbered first, then readonly" order
+        # SpotCropDisplayer itself already draws (see its class docstring)
+        # -- keeps the 3D-localization popup's row numbering identical to
+        # what's actually on screen.
+        self._current_view_spot_refs = [(s, None) for s in unassigned_spots] + cell_owned_refs
+        self._refresh_localize_3d_spot_choices()
 
     def _show_spot_displayer(self, *_args):
         """
@@ -2412,6 +2535,216 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spot_crop_displayer.raise_()
         else:
             self.spot_crop_displayer.hide()
+
+    def _toggle_localize_3d_displayer(self, checked):
+        if checked:
+            self._refresh_localize_3d_spot_choices()
+            self.localize_3d_displayer.show()
+            self.localize_3d_displayer.raise_()
+        else:
+            self.localize_3d_displayer.hide()
+
+    @staticmethod
+    def _z_status_text(spot):
+        """
+        'Z-accepted'/'Z-rejected'/'Z-not run' -- spot._z_status is a
+        plain, SESSION-transient Python attribute (not part of ASpot's
+        persisted schema/set_metadata/save()), set directly by
+        _run_3d_localize the moment a spot goes through refine_spot_z,
+        whichever way the fit came out. Deliberately not persisted: it's
+        a "have I looked at this spot's Z this session" note, not real
+        localization data (that's coordinate/raw_coordinate themselves).
+        """
+        status = getattr(spot, '_z_status', None)
+        return {'accepted': 'Z-accepted', 'rejected': 'Z-rejected'}.get(status, 'Z-not run')
+
+    def _refresh_localize_3d_spot_choices(self):
+        """
+        Repopulates the 3D-localization popup's spot list from
+        self._current_view_spot_refs -- the SAME ordered (ASpot,
+        ACell-or-None) list _load_spot_crop_for_display/_load_fov_spot_
+        display just built the crop displayer's own points from, so row
+        N here always corresponds to the crop displayer's own point #N.
+        Cheap enough to call unconditionally every time either of those
+        two run, whether or not the popup is currently visible.
+
+        Labels use the SAME global, FOV-wide index _load_spot_crop_for_
+        display/_load_fov_spot_display pass to the crop displayer (see
+        _global_spot_index_map) -- not a 1..N recount over just this
+        view -- so a spot's number matches between the two windows and
+        stays put across a cell/view switch.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
+        fov = self._current_spot_fov()
+        hybe = sp.current_hybe_folder()
+        channel_text = sp.ChannelComboBox.currentText()
+        if not storage_path or fov is None or not hybe or not channel_text:
+            self.localize_3d_displayer.set_spot_choices([])
+            return
+        gmap = self._global_spot_index_map(storage_path, fov, hybe, int(channel_text))
+        labels = [f'Spot {gmap.get(id(spot), "?")} | Cell {"unassigned" if cell is None else cell.id} '
+                 f'| {self._z_status_text(spot)}'
+                 for spot, cell in self._current_view_spot_refs]
+        self.localize_3d_displayer.set_spot_choices(labels)
+
+    def _resolve_selected_3d_targets(self):
+        """
+        Shared by Run and View: current storage_path/fov/hybe/modality/
+        channel + whichever (ASpot, ACell-or-None) pairs are SELECTED in
+        the popup's list, resolved back from row indices via
+        self._current_view_spot_refs. Returns (storage_path, fov, hybe,
+        modality, channel, targets) or None (after showing the relevant
+        warning dialog itself) if anything's missing/empty/stale.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        modality = sp.current_hybe_modality()
+        storage_path = self._storage_path_for_modality(modality)
+        fov = self._current_spot_fov()
+        hybe = sp.current_hybe_folder()
+        channel_text = sp.ChannelComboBox.currentText()
+        if not storage_path or fov is None or not hybe or not channel_text:
+            QtWidgets.QMessageBox.warning(self, '3D Localization', 'Set storage path/FOV/hybe/channel first.')
+            return None
+        channel = int(channel_text)
+
+        indices = self.localize_3d_displayer.selected_indices()
+        if not indices:
+            QtWidgets.QMessageBox.warning(self, '3D Localization', 'Select at least one spot from the list first.')
+            return None
+        targets = [self._current_view_spot_refs[i] for i in indices if i < len(self._current_view_spot_refs)]
+        if not targets:
+            QtWidgets.QMessageBox.warning(self, '3D Localization',
+                                          'Selected spot(s) are no longer in the current view -- refresh and try again.')
+            return None
+        return storage_path, fov, hybe, modality, channel, targets
+
+    def _spot_grid_title(self, storage_path, fov, hybe, channel, spot, cell):
+        gidx = self._global_spot_index_map(storage_path, fov, hybe, channel).get(id(spot), '?')
+        tag = 'unassigned' if cell is None else cell.id
+        return f'Spot {gidx} | Cell {tag}'
+
+    def _run_3d_localize(self):
+        """
+        Adds/refines Z on whichever spots are SELECTED in the popup's own
+        list -- never a fresh detection pass (2D auto-detect finds spots;
+        this only refines spots that already exist), and never silently
+        every spot in view (per explicit request: Run only touches what's
+        selected).
+
+        Works from either view -- refine_spot_z itself already accepts
+        cell=None for an unassigned FOV-pool spot (coordinate stays ==
+        raw_coordinate, no transform applies), so a selection can freely
+        mix cell-owned and unassigned rows; each is refined with the
+        right cell= for its own row.
+
+        Pure action, no visualization -- per explicit request to keep
+        Run and View fully separate concerns, this never touches the
+        fit-status grid at all (that's View's job now, not an optional
+        side effect gated by a checkbox).
+
+        A crop that resolves to more than one real component (mixture
+        mode only -- see localize_3d_displayer's MultiModeCheckBox and
+        localization.refine_spot_z's use_mixture) is saved onto THIS ONE
+        spot, never spawned as separate ASpot records -- per explicit
+        request: spot.coordinate/raw_coordinate become the BRIGHTEST
+        accepted component's position, and spot.mixture_centroids records
+        every accepted component's own (x, y, z, amplitude), representative
+        first, for later reference/display (canvas/spot_fit_status.py
+        draws the representative yellow, the rest blue). Cleared back to
+        () on a spot whose crop only ever had one component this run.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        resolved = self._resolve_selected_3d_targets()
+        if resolved is None:
+            return
+        storage_path, fov, hybe, modality, channel, targets = resolved
+        params = self.localize_3d_displayer.params()
+
+        affected_cell_ids = sorted({cell.id for _, cell in targets if cell is not None})
+        has_unassigned = any(cell is None for _, cell in targets)
+        self._push_spot_undo(fov=fov, cell_ids=affected_cell_ids,
+                             fov_key=(storage_path, fov) if has_unassigned else None)
+
+        n_refined = 0
+        n_mixture = 0
+        claimed_positions = []  # (abs_x, abs_y) of already-refined spots in THIS batch, so
+                                # two distinct spots sharing an ambiguous crop don't collapse
+                                # onto the same blob -- see refine_spot_z's own docstring
+        t0 = time.perf_counter()
+        for spot, cell in targets:
+            new_coordinate, new_raw, _cubic, _centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
+                spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
+                spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
+                max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
+                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'])
+            if new_coordinate is not None:
+                spot.coordinate = new_coordinate
+                spot.raw_coordinate = new_raw
+                spot._z_status = 'accepted'
+                spot.mixture_centroids = mixture_centroids
+                n_refined += 1
+                if mixture_centroids:
+                    n_mixture += 1
+                claimed_positions.append((new_raw[0], new_raw[1]))
+            else:
+                spot._z_status = 'rejected'
+        elapsed = time.perf_counter() - t0
+
+        mode_label = 'mixture' if params['multi_mode'] else 'single'
+        mixture_msg = f', {n_mixture} with >1 real component saved as mixture_centroids' if n_mixture else ''
+        self.localize_3d_displayer.StatusLabel.setText(
+            f'{hybe} ch{channel}: {n_refined}/{len(targets)} selected spot(s) refined with real Z '
+            f'({len(targets) - n_refined} rejected -- z left as-is){mixture_msg}. '
+            f'[{mode_label} mode, {elapsed:.2f}s for {len(targets)} spot(s)]')
+        self._refresh_spot_cell_list()
+        if sp.current_view() == 'cell':
+            self._load_spot_crop_for_display()
+        else:
+            self._load_fov_spot_display()
+
+    def _view_3d_localize(self):
+        """
+        Preview-only counterpart to Run -- fits the SAME selection but
+        never writes spot.coordinate/raw_coordinate, never pushes undo,
+        never marks _z_status. This is the ONLY action that renders the
+        fit-status grid -- always, unconditionally (no checkbox): viewing
+        the crop/fit IS the whole point of this button.
+        """
+        resolved = self._resolve_selected_3d_targets()
+        if resolved is None:
+            return
+        storage_path, fov, hybe, modality, channel, targets = resolved
+        params = self.localize_3d_displayer.params()
+
+        n_would_accept = 0
+        n_would_be_mixture = 0
+        grid_results = []
+        claimed_positions = []  # see _run_3d_localize's own comment on this
+        t0 = time.perf_counter()
+        for spot, cell in targets:
+            title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
+            _, new_raw, cubic, centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
+                spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
+                spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
+                max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
+                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'])
+            if cubic is not None:
+                grid_results.append((cubic, centroid, title))
+            if new_raw is not None:
+                n_would_accept += 1
+                claimed_positions.append((new_raw[0], new_raw[1]))
+            if mixture_centroids:
+                n_would_be_mixture += 1
+        elapsed = time.perf_counter() - t0
+
+        self.localize_3d_displayer.show_fit_status_grid(grid_results)
+        mode_label = 'mixture' if params['multi_mode'] else 'single'
+        mixture_msg = f', {n_would_be_mixture} would save >1 component as mixture_centroids' if n_would_be_mixture else ''
+        self.localize_3d_displayer.StatusLabel.setText(
+            f'{hybe} ch{channel}: PREVIEW ONLY, nothing saved -- {n_would_accept}/{len(targets)} '
+            f'selected spot(s) would be accepted{mixture_msg}. '
+            f'[{mode_label} mode, {elapsed:.2f}s for {len(targets)} spot(s)]')
 
     def _current_spot_scope_max(self):
         """Best-effort max intensity of whatever's currently shown in the
@@ -2468,9 +2801,9 @@ class MainWindow(QtWidgets.QMainWindow):
         last save is discarded.
         """
         sp = self.ui.SpotLocalizationPanel
-        storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip()
+        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
         fov = self._current_spot_fov()
-        hybe = sp.HybeComboBox.currentText()
+        hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if not storage_path or fov is None or not hybe or not channel_text:
             return
@@ -2488,6 +2821,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     spot = ASpot()
                     spot.set_metadata(**d)
                     permanent.append(spot)
+            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
             self._replace_cell_spots(cell, hybe, channel, permanent)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent spot(s) (transient discarded).')
@@ -2499,6 +2833,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     spot = ASpot()
                     spot.set_metadata(**d)
                     permanent.append(spot)
+            self._push_spot_undo(fov_key=(storage_path, fov))
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, permanent)
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent unassigned spot(s) (transient discarded).')
@@ -2510,16 +2845,17 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         Clears the current view's current (hybe, channel) outright --
         both permanent and transient. Nothing is deleted on disk by this
-        alone; the emptied state only reaches vlinks.h5 once Save View is
-        clicked afterward, same as any other in-memory edit here. Not to
+        alone; the emptied state only reaches vlinks.h5 once Save Current
+        Spots is clicked afterward, same as any other in-memory edit
+        here. Not to
         be confused with _remove_all_spots_in_fov (the FOV-view-only,
         immediately-persisted, whole-FOV wipe behind the separate
         "Remove All Spots" button at the very bottom of the panel).
         """
         sp = self.ui.SpotLocalizationPanel
-        storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip()
+        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
         fov = self._current_spot_fov()
-        hybe = sp.HybeComboBox.currentText()
+        hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if not storage_path or fov is None or not hybe or not channel_text:
             return
@@ -2527,12 +2863,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if sp.current_view() == 'cell':
             cell = self._selected_spot_cell()
             if cell is None:
-                QtWidgets.QMessageBox.warning(self, 'Remove spots in view', 'Select a cell first.')
+                QtWidgets.QMessageBox.warning(self, 'Remove Unassigned spots', 'Select a cell first.')
                 return
+            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
             self._replace_cell_spots(cell, hybe, channel, [])
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: all spots removed from view '
                                   f'(not yet saved).')
         else:
+            self._push_spot_undo(fov_key=(storage_path, fov))
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, [])
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: all unassigned spots removed from '
                                   f'view (not yet saved).')
@@ -2543,102 +2881,133 @@ class MainWindow(QtWidgets.QMainWindow):
     def _remove_all_spots_in_fov(self):
         """
         FOV view only (guarded here too, not just via the button's
-        setEnabled state) -- a COMPLETE wipe of every spot in this FOV:
-        the unassigned pool AND every cell's own spots, across every
-        hybe/channel (not just whatever's currently selected in the
-        Hybe/Channel comboboxes). Confirmed via a warning dialog first.
+        setEnabled state) -- clears BOTH the unassigned pool AND every
+        cell's own spots, but only for the CURRENT (hybe, channel)
+        selection, not every hybe/channel across the whole FOV (per
+        explicit correction -- that was this button's earlier, too-broad
+        scope). "Remove Unassigned spots" already covers the narrower
+        single-category case (just the unassigned pool, or just one
+        selected cell); this is its FOV-view, all-categories-at-once
+        counterpart, still scoped to one (hybe, channel).
 
-        Unlike every other edit in this panel, this is immediately
-        persisted as part of the same click, not staged for a later Save
-        View -- Save View's own FOV-view branch (_save_fov_view) only
-        ever writes cells it just identified NEW spots into, never a
-        cell that's merely being emptied out, so a plain in-memory clear
-        here wouldn't actually reach already-saved cells on disk the way
-        every other "edit then Save View" flow does.
+        In-memory only, same "Save Current Spots to persist" convention
+        every other edit in this panel follows -- per explicit
+        correction, this used to write to vlinks.h5 immediately, which is
+        no longer correct. Save Current Spots (unlike the old view-scoped
+        Save View) covers every affected cell in one click regardless of
+        which view is open, so there's no longer a "go back to each
+        cell's own Cell view first" gap here. Confirmed via a warning
+        dialog first, since it still touches every cell with spots in
+        this (hybe, channel) at once.
         """
         sp = self.ui.SpotLocalizationPanel
         if sp.current_view() != 'fov':
             return
         fov = self._current_spot_fov()
-        storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip()
-        storage_paths = self._all_vlinks_storage_paths()
-        if not storage_path or fov is None or not storage_paths:
+        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
+        hybe = sp.current_hybe_folder()
+        channel_text = sp.ChannelComboBox.currentText()
+        if not storage_path or fov is None or not hybe or not channel_text:
             return
+        channel = int(channel_text)
         key = (storage_path, fov)
-        n_unassigned = len(self.fov_unassigned_spots.get(key, []))
+        n_unassigned = sum(1 for s in self.fov_unassigned_spots.get(key, []) if s.hybe == hybe and s.channel == channel)
         cells = self.cell_container.data.get(fov, []) if self.cell_container else []
-        n_cell_spots = sum(c.total_num_spots for c in cells)
+        affected_cells = [c for c in cells if any(s.hybe == hybe and s.channel == channel for s in c.spots)]
+        n_cell_spots = sum(sum(1 for s in c.spots if s.hybe == hybe and s.channel == channel) for c in affected_cells)
         if n_unassigned == 0 and n_cell_spots == 0:
-            QtWidgets.QMessageBox.information(self, 'Remove All Spots', f'FOV{fov:02d} has no spots to remove.')
+            QtWidgets.QMessageBox.information(self, 'Remove all spots',
+                                              f'FOV{fov:02d}, {hybe} ch{channel} has no spots to remove.')
             return
         reply = QtWidgets.QMessageBox.warning(
-            self, 'Remove All Spots',
-            f'This will permanently clear ALL spots for FOV{fov:02d} -- {n_unassigned} unassigned '
-            f'spot(s) and {n_cell_spots} spot(s) across {len(cells)} cell(s) -- and save the '
-            f'emptied state to vlinks.h5 immediately. This cannot be undone. Continue?',
+            self, 'Remove all spots',
+            f'This will clear all spots for FOV{fov:02d}, {hybe} ch{channel} -- {n_unassigned} unassigned '
+            f'spot(s) and {n_cell_spots} spot(s) across {len(affected_cells)} cell(s). Not yet saved to '
+            f'disk (click Save Current Spots afterward to persist). Continue?',
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
         if reply != QtWidgets.QMessageBox.Yes:
             return
-        self.fov_unassigned_spots[key] = []
-        for cell in cells:
-            cell.spots = []
-            cell.num_spots = {}
-            cell.total_num_spots = 0
-            vlinks_store.mirror_write_single_cell(storage_paths, fov, cell)
-        vlinks_store.mirror_write_fov_spots(storage_paths, fov, [])
-        sp.LogTextEdit.append(f'FOV{fov:02d}: ALL spots removed ({n_unassigned} unassigned + '
-                              f'{n_cell_spots} across {len(cells)} cell(s)) and saved to vlinks.h5.')
+        self._push_spot_undo(fov=fov, cell_ids=[c.id for c in affected_cells], fov_key=(storage_path, fov))
+        self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, [])
+        for cell in affected_cells:
+            self._replace_cell_spots(cell, hybe, channel, [])
+        sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: all spots removed from view '
+                              f'({n_unassigned} unassigned + {n_cell_spots} across {len(affected_cells)} '
+                              f'cell(s), not yet saved).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
 
-    def _save_view(self):
+    def _save_current_spots(self):
         """
-        Cell view: identical to the old narrow single-cell save -- writes
-        ONLY the currently selected cell to vlinks.h5 (vlinks_store.
-        write_single_cell reads the existing on-disk cell list, replaces
-        just this cell's own entry by id, and writes that back -- every
-        other cell's persisted data is untouched).
-
-        FOV view: there's no single cell to scope to, so this instead
-        triages the FOV's pending unassigned-spot pool (see
-        _save_fov_view) -- identification against the current cell mask
-        happens HERE, not at detect/click time (per explicit request).
+        Saves EVERY cell's current in-memory spots for this FOV in one
+        pass -- not scoped to whichever cell/view happens to be open --
+        plus identifies+saves the FOV-level unassigned pool against the
+        current cell mask. Replaces the old view-scoped "Save View"
+        (Cell view: only the selected cell; FOV view: only the
+        unassigned pool), which had a real, confirmed bug: pick spots
+        across many cells in Cell view, switch to FOV view, click Save --
+        nothing for any of those cells ever reached disk, because the
+        FOV-view branch only ever looked at the unassigned pool. Uses
+        vlinks_store.write_cells (one full-blob write per storage_path,
+        not N separate per-cell read-modify-write round trips) since this
+        is now always "the whole FOV", not "one cell" -- guarded by the
+        on-disk-count check below so a merely-partial in-memory container
+        can never silently drop cells that exist on disk but aren't
+        currently loaded.
         """
         sp = self.ui.SpotLocalizationPanel
         fov = self._current_spot_fov()
         storage_paths = self._all_vlinks_storage_paths()
         if not storage_paths:
-            QtWidgets.QMessageBox.warning(self, 'Save View', 'No storage path available.')
+            QtWidgets.QMessageBox.warning(self, 'Save Current Spots', 'No storage path available.')
             return
-        if sp.current_view() == 'cell':
-            cell = self._selected_spot_cell()
-            if cell is None or self.cell_container is None:
-                QtWidgets.QMessageBox.warning(self, 'Save View', 'Select a cell first.')
-                return
-            vlinks_store.mirror_write_single_cell(storage_paths, fov, cell)
-            sp.LogTextEdit.append(f'Cell {cell.id} (FOV{fov:02d}): {cell.total_num_spots} spot(s) saved to vlinks.h5 '
-                                  f'(this cell only, other cells on disk untouched).')
-            QtWidgets.QMessageBox.information(self, 'Save View', f'Cell {cell.id} saved to vlinks.h5.')
-        else:
-            self._save_fov_view(fov, storage_paths)
+        if self.cell_container is None or not self.cell_container.data.get(fov):
+            QtWidgets.QMessageBox.warning(self, 'Save Current Spots',
+                                          'No cells loaded in memory for this FOV -- refresh the cell list first.')
+            return
 
-    def _save_fov_view(self, fov, storage_paths):
+        primary_storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip() or storage_paths[0]
+        on_disk_dicts, _ = vlinks_store.read_cells(primary_storage_path, fov)
+        n_on_disk = len(on_disk_dicts) if on_disk_dicts else 0
+        n_in_memory = len(self.cell_container.data[fov])
+        if n_in_memory < n_on_disk:
+            QtWidgets.QMessageBox.critical(
+                self, 'Save Current Spots',
+                f'{n_in_memory} cell(s) in memory but {n_on_disk} already on disk for FOV{fov:02d} -- '
+                f'refusing to save (a bulk write would silently drop the missing cell(s) from vlinks.h5). '
+                f'Refresh the cell list so every cell is loaded, then try again.')
+            return
+
+        n_identified, n_identified_cells = self._identify_fov_unassigned_spots(fov, storage_paths)
+
+        n_spots = sum(c.total_num_spots for c in self.cell_container.data[fov])
+        for storage_path in storage_paths:
+            vlinks_store.write_cells(storage_path, fov, self.cell_container)
+
+        sp.LogTextEdit.append(f'FOV{fov:02d}: {len(self.cell_container.data[fov])} cell(s), {n_spots} total spot(s) '
+                              f'saved to vlinks.h5 ({n_identified} unassigned spot(s) newly identified into '
+                              f'{n_identified_cells} cell(s) first).')
+        QtWidgets.QMessageBox.information(
+            self, 'Save Current Spots',
+            f'{len(self.cell_container.data[fov])} cell(s), {n_spots} total spot(s) saved.')
+        self._refresh_spot_cell_list()
+        if sp.ShowDisplayerPushButton.isChecked():
+            self._show_spot_displayer()
+
+    def _identify_fov_unassigned_spots(self, fov, storage_paths):
         """
         Identifies each pending FOV-level unassigned spot (ACROSS every
         hybe/channel ever accumulated in fov_unassigned_spots for this
         FOV, not just the one currently selected in the Hybe/Channel
-        comboboxes -- Save View commits the whole pending pool, matching
-        "Save View... saves spots for the view") against the current
-        cell mask. Newly-identified spots are APPENDED onto their owning
-        cell's own spots (not a full replace -- this is one spot at a
-        time joining whatever that cell already has), and that cell is
-        written to disk narrowly (write_single_cell, same as a Cell-view
-        save). Anything that still can't be identified (no segmented
-        mask for this FOV, or genuinely outside every cell) stays in
-        fov_unassigned_spots and is explicitly saved too, via
-        write_fov_spots, per explicit request ("remember to save the
-        unassigned spots too").
+        comboboxes) against the current cell mask. Newly-identified
+        spots are APPENDED onto their owning cell's own spots in memory
+        (the caller, _save_current_spots, is what actually persists
+        them, via its own bulk write_cells call -- this method only
+        persists the LEFTOVER unassigned pool itself, via
+        mirror_write_fov_spots, since that lives in a separate vlinks.h5
+        group write_cells doesn't touch). Returns (n_identified,
+        n_identified_cells).
 
         The mask lives in the SEGMENTATION's own reference hybe frame
         (cell.reference_hybe), which is NOT necessarily the same hybe as
@@ -2653,63 +3022,162 @@ class MainWindow(QtWidgets.QMainWindow):
         REFERENCE-frame coordinate elsewhere in this app; using the
         latter here would silently look up the mask at the wrong pixel
         whenever those two reference hybes differ.
+
+        fov_unassigned_spots is keyed by (storage_path, fov), and
+        storage_path is now each hybe's OWN modality's storage path (see
+        _load_fov_spot_display/_run_spot_auto_detect_body), not one
+        single Ingestion-tab-derived value -- so this FOV can have more
+        than one non-empty pending pool at once (one per modality that's
+        had spots picked in it), all needing identification against the
+        SAME cell mask. Loops over every configured modality's own key
+        rather than assuming just one.
         """
-        sp = self.ui.SpotLocalizationPanel
-        storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip()
-        key = (storage_path, fov)
-        pending = self.fov_unassigned_spots.get(key, [])
         mask = self.cell_displayer.mask
         mask_matches_fov = bool(self._last_segment_context is not None and self._last_segment_context['fov'] == fov)
         cells = self.cell_container.data.get(fov, []) if self.cell_container else []
         cells_by_id = {c.id: c for c in cells}
         can_identify = mask is not None and mask_matches_fov and bool(cells_by_id)
         ref_cell = cells[0] if can_identify else None
-        spot_modality = self._modality_for_storage_path(storage_path) if can_identify else None
-        mask_lookup_matrix_cache = {}
 
-        still_unassigned = []
-        newly_identified_cells = {}
-        for spot in pending:
-            owning_cell = None
-            if can_identify:
-                H = mask_lookup_matrix_cache.get(spot.hybe)
-                if H is None and spot.hybe not in mask_lookup_matrix_cache:
-                    H = self._fov_only_matrix_for_hybe(spot.hybe, spot_modality, ref_cell, fov)
-                    mask_lookup_matrix_cache[spot.hybe] = H
-                if H is not None:
-                    rx, ry, _ = H @ np.array([spot.raw_coordinate[0], spot.raw_coordinate[1], 1.0])
-                    iry, irx = int(round(ry)), int(round(rx))
-                    if 0 <= iry < mask.shape[0] and 0 <= irx < mask.shape[1]:
-                        label = int(mask[iry, irx])
-                        owning_cell = cells_by_id.get(label) if label != 0 else None
-            if owning_cell is not None:
-                cx, cy = spot_mapper.raw_to_reference(
-                    (spot.raw_coordinate[0], spot.raw_coordinate[1]), spot.hybe, {},
-                    modality=spot_modality, cell=owning_cell)
-                spot.set_metadata(cell=owning_cell.id, coordinate=(cx, cy, 0.0))
-                owning_cell.spots.append(spot)
-                owning_cell.num_spots[spot.hybe] = sum(1 for s in owning_cell.spots if s.hybe == spot.hybe)
-                owning_cell.total_num_spots = len(owning_cell.spots)
-                newly_identified_cells[owning_cell.id] = owning_cell
-            else:
-                still_unassigned.append(spot)
+        total_identified = 0
+        identified_cell_ids = set()
+        for modality_name in self.modality_names:
+            modality_storage_path = self._storage_path_for_modality(modality_name)
+            if not modality_storage_path:
+                continue
+            key = (modality_storage_path, fov)
+            pending = self.fov_unassigned_spots.get(key, [])
+            if not pending:
+                continue
+            mask_lookup_matrix_cache = {}
+            still_unassigned = []
+            for spot in pending:
+                owning_cell = None
+                if can_identify:
+                    H = mask_lookup_matrix_cache.get(spot.hybe)
+                    if H is None and spot.hybe not in mask_lookup_matrix_cache:
+                        H = self._fov_only_matrix_for_hybe(spot.hybe, modality_name, ref_cell, fov)
+                        mask_lookup_matrix_cache[spot.hybe] = H
+                    if H is not None:
+                        rx, ry, _ = H @ np.array([spot.raw_coordinate[0], spot.raw_coordinate[1], 1.0])
+                        iry, irx = int(round(ry)), int(round(rx))
+                        if 0 <= iry < mask.shape[0] and 0 <= irx < mask.shape[1]:
+                            label = int(mask[iry, irx])
+                            owning_cell = cells_by_id.get(label) if label != 0 else None
+                if owning_cell is not None:
+                    cx, cy = spot_mapper.raw_to_reference(
+                        (spot.raw_coordinate[0], spot.raw_coordinate[1]), spot.hybe, {},
+                        modality=modality_name, cell=owning_cell)
+                    spot.set_metadata(cell=owning_cell.id, coordinate=(cx, cy, 0.0))
+                    owning_cell.spots.append(spot)
+                    owning_cell.num_spots[spot.hybe] = sum(1 for s in owning_cell.spots if s.hybe == spot.hybe)
+                    owning_cell.total_num_spots = len(owning_cell.spots)
+                    identified_cell_ids.add(owning_cell.id)
+                    total_identified += 1
+                else:
+                    still_unassigned.append(spot)
+            self.fov_unassigned_spots[key] = still_unassigned
+            vlinks_store.mirror_write_fov_spots(storage_paths, fov, still_unassigned)
 
-        self.fov_unassigned_spots[key] = still_unassigned
-        for cell in newly_identified_cells.values():
-            vlinks_store.mirror_write_single_cell(storage_paths, fov, cell)
-        vlinks_store.mirror_write_fov_spots(storage_paths, fov, still_unassigned)
+        return total_identified, len(identified_cell_ids)
 
-        n_identified = len(pending) - len(still_unassigned)
-        note = '' if can_identify else ' (no matching cell mask for this FOV -- nothing could be identified)'
-        sp.LogTextEdit.append(f'FOV{fov:02d}: {n_identified} spot(s) identified into '
-                              f'{len(newly_identified_cells)} cell(s), {len(still_unassigned)} remain '
-                              f'unassigned{note}. All saved to vlinks.h5.')
-        QtWidgets.QMessageBox.information(self, 'Save View',
-                                          f'{n_identified} spot(s) assigned to cells, '
-                                          f'{len(still_unassigned)} still unassigned.')
+    # -- spot-list undo/redo --
+    #
+    # Generalized snapshot stack, not a per-add/remove diff: every
+    # mutating spot action calls _push_spot_undo(...) with whichever
+    # scopes it's ABOUT to touch (one or more cells' .spots lists, and/or
+    # one fov_unassigned_spots key), captured BEFORE the mutation runs.
+    # Undo restores that snapshot and pushes the scope's CURRENT (about
+    # to be overwritten) state onto the redo stack; Redo is the mirror.
+    # Starting any new undo-able action clears the redo stack -- standard
+    # linear undo/redo, not branching.
+    #
+    # Cells are identified by (fov, cell.id) -- plain numeric data, same
+    # as ASpot.cell itself -- not by holding the ACell object reference.
+    # A snapshot only ever needs a spot list plus "which cell does this
+    # belong to", and re-resolving that id against self.cell_container at
+    # APPLY time (not push time) means a snapshot stays valid even if
+    # cell_container itself gets rebuilt from scratch in between (e.g. a
+    # re-run of segmentation creates entirely new ACell objects with the
+    # same ids) -- an id-keyed snapshot still finds the right cell; a
+    # stale object-reference key would silently point at an orphaned
+    # object and undo would do nothing.
+
+    def _find_cell_by_id(self, fov, cell_id):
+        if self.cell_container is None:
+            return None
+        return next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+
+    def _snapshot_scopes(self, fov=None, cell_ids=None, fov_key=None):
+        cells_state = {}
+        for cell_id in (cell_ids or []):
+            cell = self._find_cell_by_id(fov, cell_id)
+            if cell is not None:
+                cells_state[cell_id] = deepcopy(cell.spots)
+        return {'fov': fov, 'cells': cells_state, 'fov_key': fov_key,
+                'fov_spots': deepcopy(self.fov_unassigned_spots.get(fov_key, [])) if fov_key is not None else None}
+
+    def _push_spot_undo(self, fov=None, cell_ids=None, fov_key=None):
+        self._spot_undo_stack.append(self._snapshot_scopes(fov=fov, cell_ids=cell_ids, fov_key=fov_key))
+        self._spot_redo_stack.clear()
+        self._update_undo_redo_buttons()
+
+    def _apply_spot_snapshot(self, snapshot):
+        missing = []
+        for cell_id, spots in snapshot['cells'].items():
+            cell = self._find_cell_by_id(snapshot['fov'], cell_id)
+            if cell is None:
+                missing.append(cell_id)  # cell no longer exists (e.g. cell_container rebuilt) -- nothing sane to restore
+                continue
+            cell.spots = deepcopy(spots)
+            # num_spots keys are never deleted elsewhere in this app (see
+            # _replace_cell_spots) -- recomputing over the union of
+            # existing keys and the restored spots' own hybes correctly
+            # zeroes out a hybe the restore emptied, without needing a
+            # separate "before" reference.
+            for h in set(cell.num_spots.keys()) | {s.hybe for s in cell.spots}:
+                cell.num_spots[h] = sum(1 for s in cell.spots if s.hybe == h)
+            cell.total_num_spots = len(cell.spots)
+        if snapshot['fov_key'] is not None:
+            self.fov_unassigned_spots[snapshot['fov_key']] = deepcopy(snapshot['fov_spots'])
+        return missing
+
+    def _undo_spot_action(self):
+        if not self._spot_undo_stack:
+            return
+        snapshot = self._spot_undo_stack.pop()
+        redo_snapshot = self._snapshot_scopes(fov=snapshot['fov'], cell_ids=list(snapshot['cells'].keys()),
+                                              fov_key=snapshot['fov_key'])
+        missing = self._apply_spot_snapshot(snapshot)
+        self._spot_redo_stack.append(redo_snapshot)
+        self._after_spot_undo_redo('Undo', missing)
+
+    def _redo_spot_action(self):
+        if not self._spot_redo_stack:
+            return
+        snapshot = self._spot_redo_stack.pop()
+        undo_snapshot = self._snapshot_scopes(fov=snapshot['fov'], cell_ids=list(snapshot['cells'].keys()),
+                                              fov_key=snapshot['fov_key'])
+        missing = self._apply_spot_snapshot(snapshot)
+        self._spot_undo_stack.append(undo_snapshot)
+        self._after_spot_undo_redo('Redo', missing)
+
+    def _after_spot_undo_redo(self, label, missing=None):
+        sp = self.ui.SpotLocalizationPanel
+        self._update_undo_redo_buttons()
         self._refresh_spot_cell_list()
-        if sp.ShowDisplayerPushButton.isChecked():
-            self._show_spot_displayer()
+        if missing:
+            sp.LogTextEdit.append(f'{label}: cell(s) {missing} no longer exist -- their spot state could not be restored.')
+        if sp.current_view() == 'cell':
+            self._load_spot_crop_for_display()
+        else:
+            self._load_fov_spot_display()
+        sp.LogTextEdit.append(f'{label}: spot state restored.')
+
+    def _update_undo_redo_buttons(self):
+        sp = self.ui.SpotLocalizationPanel
+        sp.UndoPushButton.setEnabled(bool(self._spot_undo_stack))
+        sp.RedoPushButton.setEnabled(bool(self._spot_redo_stack))
 
     def _replace_cell_spots(self, cell, hybe, channel, new_spots, append=False):
         """
@@ -2735,8 +3203,8 @@ class MainWindow(QtWidgets.QMainWindow):
         unassigned-spot pool -- same replace-not-append semantics (and
         the same append=True escape hatch) as _replace_cell_spots, just
         keyed by (storage_path, fov) instead of living on a cell (there
-        is no owning cell for these by definition -- see _save_fov_view
-        for when that gets decided).
+        is no owning cell for these by definition -- see
+        _identify_fov_unassigned_spots for when that gets decided).
         """
         key = (storage_path, fov)
         existing = self.fov_unassigned_spots.get(key, [])
@@ -2754,8 +3222,8 @@ class MainWindow(QtWidgets.QMainWindow):
         real cell-owned ASpots (cell=cell.id, coordinate via cell.matrix_to);
         FOV view builds unassigned ASpots (cell stays at its -1 default,
         coordinate == raw_coordinate, same as FOV-view auto-detect) --
-        identification is deferred to Save View either way, matching FOV
-        auto-detect's own deferred design.
+        identification is deferred to Save Current Spots either way,
+        matching FOV auto-detect's own deferred design.
         """
         ctx = self._spot_crop_context
         if ctx is None:
@@ -2778,7 +3246,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # already exist to have gotten a crop at all (_build_cell_crop's
                 # own precondition), and spot_mapper._resolve_matrix always
                 # prefers cell.matrices over fov_matrices when a cell is given.
-                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=self.current_modality, cell=cell)
+                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=ctx['modality'], cell=cell)
                 spot.set_metadata(fov=cell.fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=brightness)
@@ -2791,20 +3259,72 @@ class MainWindow(QtWidgets.QMainWindow):
         sp = self.ui.SpotLocalizationPanel
         if ctx['kind'] == 'cell':
             cell = ctx['cell']
+            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
             self._replace_cell_spots(cell, hybe, channel, new_spots)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) after manual edit.')
         else:
+            self._push_spot_undo(fov_key=(ctx['storage_path'], ctx['fov']))
             self._replace_fov_unassigned_spots(ctx['storage_path'], ctx['fov'], hybe, channel, new_spots)
             sp.LogTextEdit.append(f'FOV{ctx["fov"]:02d}, {hybe} ch{channel}: {len(new_spots)} unassigned '
                                   f'spot(s) after manual edit.')
         self._refresh_spot_cell_list()
+        # re-derives global display indices and the 3D-localization
+        # popup's spot list from the just-mutated state -- without this,
+        # a freshly manually-added point would show a local fallback
+        # number instead of its real global one until some LATER action
+        # happened to trigger a refresh (see SpotCropDisplayer's own
+        # spot_indices fallback).
+        if ctx['kind'] == 'cell':
+            self._load_spot_crop_for_display()
+        else:
+            self._load_fov_spot_display()
+
+    def _on_readonly_spot_removed(self, cell_id, x, y):
+        """
+        A cell-owned spot was removed via the FOV-view crop displayer's
+        readonly (red) list -- by index or right-click, see
+        SpotCropDisplayer.readonly_point_removed. tag is that spot's
+        owning cell.id (see _load_fov_spot_display, which is the only
+        place readonly_points is built); x/y are its raw coordinates
+        (FOV view has no crop offset, so crop-local == raw here). Finds
+        the exact matching spot on that cell (hybe/channel/raw_coordinate)
+        and removes it -- same in-memory-only, Save-Current-Spots-to-
+        persist convention every other edit in this panel already
+        follows; this does NOT touch vlinks.h5 by itself.
+        """
+        ctx = self._spot_crop_context
+        if ctx is None or ctx['kind'] != 'fov' or self.cell_container is None:
+            return
+        fov = ctx['fov']
+        hybe, channel = ctx['hybe'], ctx['channel']
+        cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+        if cell is None:
+            return
+        match = next((s for s in cell.spots if s.hybe == hybe and s.channel == channel
+                     and abs(s.raw_coordinate[0] - x) < 0.5 and abs(s.raw_coordinate[1] - y) < 0.5), None)
+        if match is None:
+            return
+        self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
+        cell.spots.remove(match)
+        cell.num_spots[hybe] = sum(1 for s in cell.spots if s.hybe == hybe)
+        cell.total_num_spots = len(cell.spots)
+        sp = self.ui.SpotLocalizationPanel
+        # in-memory only, same "Save Current Spots to persist" convention
+        # as every other edit here -- Save Current Spots now covers this
+        # cell too regardless of which view is open (see its own
+        # docstring), no need to switch back to Cell {cell.id}'s own view
+        # first the way the old view-scoped Save View required.
+        sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: removed 1 spot from FOV view '
+                              f'(not yet saved -- click Save Current Spots to persist).')
+        self._refresh_spot_cell_list()
+        self._load_fov_spot_display()  # re-derives global indices + 3D-localization popup list
 
     def _run_spot_auto_detect(self):
         sp = self.ui.SpotLocalizationPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        modality = sp.current_hybe_modality()
+        storage_path = self._storage_path_for_modality(modality)
         fov = self._current_spot_fov()
-        hybe = sp.HybeComboBox.currentText()
+        hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if not storage_path or fov is None or not hybe or not channel_text:
             QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect',
@@ -2814,7 +3334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         min_distance = sp.MinDistanceSpinBox.value()
         pad = sp.PadSpinBox.value()
         try:
-            self._run_spot_auto_detect_body(sp, storage_path, fov, hybe, channel, min_distance, pad)
+            self._run_spot_auto_detect_body(sp, storage_path, fov, hybe, modality, channel, min_distance, pad)
         except ValueError as e:
             # threshold_abs()'s own parse errors -- bad text in the
             # threshold fields, a real user-input mistake, not a bug.
@@ -2828,14 +3348,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # was reported ("still didn't appear"). Surface it for real.
             QtWidgets.QMessageBox.critical(self, 'Run Auto-Detect error', f'{type(e).__name__}: {e}')
 
-    def _run_spot_auto_detect_body(self, sp, storage_path, fov, hybe, channel, min_distance, pad):
+    def _run_spot_auto_detect_body(self, sp, storage_path, fov, hybe, modality, channel, min_distance, pad):
         append = sp.AppendModeCheckBox.isChecked()
         if sp.current_view() == 'cell':
             cell = self._selected_spot_cell()
             if cell is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', 'Select a cell first (Cell view).')
                 return
-            crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=self.current_modality)
+            crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality)
             if crop is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', f'Cell {cell.id} has no alignment/overlap for {hybe} yet.')
                 return
@@ -2845,12 +3365,13 @@ class MainWindow(QtWidgets.QMainWindow):
             new_spots = []
             for y, x in coords:
                 raw_x, raw_y = int(x) + rxmin, int(y) + rymin
-                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=self.current_modality, cell=cell)
+                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=modality, cell=cell)
                 spot = ASpot()
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(img[y, x]))
                 new_spots.append(spot)
+            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
             self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) detected '
                                   f'(Cell view{", appended" if append else ""}).')
@@ -2862,9 +3383,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # a plain peak search over the raw MIP, full stop. Every
             # detected peak becomes an unassigned spot (ASpot.cell stays
             # at its model default, -1) in fov_unassigned_spots; cell
-            # ownership is only decided later, at Save View time (see
-            # _save_fov_view) -- per explicit request, identification is
-            # deferred to save, not done eagerly at detect time.
+            # ownership is only decided later, at save time (see
+            # _identify_fov_unassigned_spots) -- per explicit request,
+            # identification is deferred to save, not done eagerly at
+            # detect time.
             mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
             if mip is None:
                 sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
@@ -2879,9 +3401,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                   coordinate=(float(raw_x), float(raw_y), 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))
                 new_spots.append(spot)
+            self._push_spot_undo(fov_key=(storage_path, fov))
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, new_spots, append=append)
             sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {len(new_spots)} peak(s) detected '
-                                  f'(unassigned{", appended" if append else ""} -- run Save View to identify cell ownership).')
+                                  f'(unassigned{", appended" if append else ""} -- run Save Current Spots to identify cell ownership).')
             self._refresh_spot_cell_list()
             self._load_fov_spot_display()
             self.spot_crop_displayer.show()
@@ -2918,12 +3441,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Assign Barcode Channel', 'Select a celltype first.')
             return
         inputs = ctp.get_barcode_calibration_inputs()
-        hybe, channel = inputs['hybe'], inputs['channel']
-        if not hybe or channel is None:
+        hybe, channel, modality = inputs['hybe'], inputs['channel'], inputs['modality']
+        if not hybe or channel is None or not modality:
             QtWidgets.QMessageBox.warning(self, 'Assign Barcode Channel', 'Pick a barcode hybe/channel first.')
             return
-        self._barcode_channel_by_celltype[celltype_name] = (hybe, channel)
-        ctp.LogTextEdit.append(f'{celltype_name} <- {hybe} ch{channel}')
+        self._barcode_channel_by_celltype[celltype_name] = (hybe, channel, modality)
+        ctp.LogTextEdit.append(f'{celltype_name} <- {hybe} ch{channel} ({modality})')
         self._refresh_celltype_summaries()
         self._apply_barcode_calibration()
 
@@ -2936,8 +3459,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                           'Select a celltype with an assigned barcode channel first (Assign to Selected Celltype).')
             return
         bch = self._barcode_channel_by_celltype[celltype_name]
-        hybe, channel = bch
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        hybe, channel, modality = bch
+        storage_path = self._storage_path_for_modality(modality)
         if not storage_path:
             QtWidgets.QMessageBox.warning(self, 'Apply Calibration', 'Set storage path in the Ingestion tab first.')
             return
@@ -2997,39 +3520,41 @@ class MainWindow(QtWidgets.QMainWindow):
         ctp.FovRangesSummaryTextEdit.setPlainText('\n'.join(fov_lines))
         cal_lines = []
         for name, bch in self._barcode_channel_by_celltype.items():
-            hybe, channel = bch
+            hybe, channel, modality = bch
             n_fovs = len(self._barcode_calibration['scale'].get(bch, {}))
-            cal_lines.append(f'{name}: {hybe} ch{channel} (calibrated for {n_fovs} FOV(s))')
+            cal_lines.append(f'{name}: {hybe} ch{channel} ({modality}) (calibrated for {n_fovs} FOV(s))')
         ctp.CalibrationSummaryTextEdit.setPlainText('\n'.join(cal_lines))
 
     def _show_barcode_overview(self):
         ctp = self.ui.CelltypeDeterminationPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
         fov_text = ctp.OverviewFovLineEdit.text().strip()
         fov = int(fov_text) if fov_text else self._current_spot_fov()
-        if not storage_path or fov is None:
-            QtWidgets.QMessageBox.warning(self, 'Show Barcode Overview', 'Set storage path (Ingestion tab) and an FOV.')
+        if fov is None:
+            QtWidgets.QMessageBox.warning(self, 'Show Barcode Overview', 'Set an FOV.')
             return
-        # warp each channel into a common frame for visualization ONLY
-        # (never for stored/analyzed data) -- same established exception
-        # used by every alignment preview in canvas/pipeline_canvas.py
-        fmats = self.fov_matrices.get((storage_path, fov), {})
         images_by_channel, labels_by_channel = {}, {}
         for name in ctp.celltype_names():
             bch = self._barcode_channel_by_celltype.get(name)
             if bch is None:
                 continue
-            hybe, channel = bch
+            hybe, channel, modality = bch
+            storage_path = self._storage_path_for_modality(modality)
+            if not storage_path:
+                continue
             img = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
             if img is None:
                 ctp.LogTextEdit.append(f'Overview: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
+            # warp each channel into a common frame for visualization ONLY
+            # (never for stored/analyzed data) -- same established
+            # exception used by every alignment preview in canvas/
+            # pipeline_canvas.py
+            fmats = self.fov_matrices.get((storage_path, fov), {})
             if hybe in fmats:
                 height, width = img.shape
                 img = cv2.warpAffine(img.astype(np.float32), fmats[hybe][:2], (width, height))
             images_by_channel[bch] = img
-            labels_by_channel[bch] = f'{name}: {hybe} ch{channel}'
+            labels_by_channel[bch] = f'{name}: {hybe} ch{channel} ({modality})'
         if not images_by_channel:
             QtWidgets.QMessageBox.warning(self, 'Show Barcode Overview', 'Assign at least one celltype to a barcode channel first.')
             return
@@ -3048,8 +3573,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _run_celltype_determination(self):
         ctp = self.ui.CelltypeDeterminationPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
         containers = self._celltype_cell_containers()
         if not containers:
             QtWidgets.QMessageBox.warning(self, 'Run Celltype Determination',
@@ -3068,7 +3591,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Running celltype determination...')
         QtWidgets.QApplication.processEvents()
         try:
-            self._run_celltype_determination_body(ctp, storage_path, containers, names, now)
+            self._run_celltype_determination_body(ctp, containers, names, now)
         except Exception as e:
             # this loop used to have NO error handling at all -- a real,
             # reproducible KeyError (calibration missing for one FOV) was
@@ -3081,7 +3604,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().clearMessage()
             QtWidgets.QMessageBox.critical(self, 'Celltype determination error', f'{type(e).__name__}: {e}')
 
-    def _run_celltype_determination_body(self, ctp, storage_path, containers, names, now):
+    def _run_celltype_determination_body(self, ctp, containers, names, now):
         if ctp.mode() == 'fov':
             range_strings = {n: self._fov_ranges_by_celltype[n] for n in names
                              if self._fov_ranges_by_celltype.get(n)}
@@ -3133,7 +3656,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'upper_bound': self._barcode_calibration['upper_bound'],
         }}
 
-        image_cache = {}  # {fov(str): {(hybe,channel): ndarray or None}}
+        image_cache = {}  # {fov(str): {(hybe,channel,modality): ndarray or None}}
         n_cells, n_spots, n_cells_skipped = 0, 0, 0
         last_fov = None
         permanent_fovs_touched = set()
@@ -3146,8 +3669,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if fov_key not in image_cache:
                     image_cache[fov_key] = {}
                     for bch in barcode_channel:
-                        hybe, channel_id = bch
-                        image_cache[fov_key][bch] = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel_id)
+                        hybe, channel_id, bch_modality = bch
+                        # each celltype's own barcode channel can belong
+                        # to a DIFFERENT modality than the others --
+                        # resolve each one's real storage path
+                        # independently rather than assuming they all
+                        # share one.
+                        bch_storage_path = self._storage_path_for_modality(bch_modality)
+                        image_cache[fov_key][bch] = (vlinks_store.read_hybe_mip(bch_storage_path, fov, hybe, channel_id)
+                                                     if bch_storage_path else None)
 
                 # calibration is per-(hybe,channel)-per-FOV (Apply Calibration
                 # only covers whichever FOV(s) were explicitly calibrated) --
@@ -3172,23 +3702,30 @@ class MainWindow(QtWidgets.QMainWindow):
                     x_ref, y_ref = cell.area
                     area_by_channel = {}
                     for bch in barcode_channel:
-                        hybe, channel_id = bch
+                        hybe, channel_id, modality = bch
                         img = image_cache[fov_key].get(bch)
                         if img is None:
                             continue
-                        # barcode hybes always belong to self.current_modality
-                        # (BarcodeHybeComboBox's own scope). _matrix_to_cellref
-                        # prefers a real, cell-level-refined entry when
-                        # compute_cell_alignment has run for (hybe, self.
-                        # current_modality) -- including cell.reference_hybe's
-                        # own entry, which is no longer forced to identity --
-                        # falling back to the FOV/cross-modal-only matrix
-                        # otherwise, exactly like compute_cell_alignment's own
-                        # reject/out-of-frame fallbacks do. A plain per-point
-                        # inverse transform, not cell.get_area_in_readout's
+                        # modality comes straight from the stored (hybe,
+                        # channel, modality) triple this celltype was
+                        # assigned with (see _assign_barcode_channel) --
+                        # not a live "current modality" guess, so a
+                        # selection mixing RNA- and DNA-owned barcode
+                        # channels across different celltypes resolves
+                        # each one correctly regardless of what's
+                        # currently showing anywhere in the UI.
+                        # _matrix_to_cellref prefers a real, cell-level-
+                        # refined entry when compute_cell_alignment has
+                        # run for (hybe, modality) -- including cell.
+                        # reference_hybe's own entry, which is no longer
+                        # forced to identity -- falling back to the FOV/
+                        # cross-modal-only matrix otherwise, exactly like
+                        # compute_cell_alignment's own reject/out-of-frame
+                        # fallbacks do. A plain per-point inverse
+                        # transform, not cell.get_area_in_readout's
                         # masking/closing machinery, so point order/count
                         # stays identical across every channel.
-                        H = self._matrix_to_cellref(hybe, self.current_modality, cell, cell.fov)
+                        H = self._matrix_to_cellref(hybe, modality, cell, cell.fov)
                         if H is None:
                             continue
                         pts = la.inv(H) @ np.vstack([x_ref, y_ref, np.ones_like(x_ref, dtype=float)])
@@ -3208,10 +3745,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     for spot in cell.spots:
                         xy_by_channel = {}
                         for bch in barcode_channel:
-                            hybe, channel_id = bch
-                            # same "best available, no no-alignment" resolution
-                            # as the cell-area loop above.
-                            H = self._matrix_to_cellref(hybe, self.current_modality, cell, cell.fov)
+                            hybe, channel_id, modality = bch
+                            # spot.coordinate lives in the pipeline's shared
+                            # frame (ACell.matrix_to_shared), NOT cell.
+                            # reference_hybe's frame like cell.area above --
+                            # _matrix_to_shared is the matching "best
+                            # available, no no-alignment" resolver for it.
+                            H = self._matrix_to_shared(hybe, modality, cell, cell.fov)
                             if H is None:
                                 continue
                             sx, sy, _ = la.inv(H) @ np.array([spot.coordinate[0], spot.coordinate[1], 1.0])
@@ -3322,12 +3862,12 @@ class MainWindow(QtWidgets.QMainWindow):
         Accept. Run All FOV Alignment below (_run_fov_alignment_all) is the
         always-auto-save, no-staging counterpart for every FOV at once."""
         ap = self.ui.AlignmentPanel
-        ip = self.ui.IngestionPanel
-        if not self.hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first.')
+        reference_hybe = ap.current_reference_hybe()
+        modality = ap.current_reference_modality()
+        if not reference_hybe or not modality:
+            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first, then pick a reference hybe.')
             return
-        reference_hybe = ap.ReferenceHybeComboBox.currentText()
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        storage_path = self._storage_path_for_modality(modality)
         fov = ap.SameModalityFovSpinBox.value()
         if not storage_path:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path in the Ingestion tab first.')
@@ -3339,7 +3879,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # {hybe}_stack.h5 on disk yet. Using checkbox state here let a
         # checked-but-never-ingested hybe reach align_same_modality's
         # bare h5py.File() open and crash.
-        hybe_records = self.modality_data.get(self.current_modality, {}).get('active_hybe_list', [])
+        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', [])
         if not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
                                           'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
@@ -3396,17 +3936,18 @@ class MainWindow(QtWidgets.QMainWindow):
         Alignment above first to confirm the parameters on one real FOV."""
         ap = self.ui.AlignmentPanel
         ip = self.ui.IngestionPanel
-        if not self.hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first.')
+        reference_hybe = ap.current_reference_hybe()
+        modality = ap.current_reference_modality()
+        if not reference_hybe or not modality:
+            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first, then pick a reference hybe.')
             return
-        reference_hybe = ap.ReferenceHybeComboBox.currentText()
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        storage_path = self._storage_path_for_modality(modality)
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         if not storage_path or not fov_list:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path and FOV list in the Ingestion tab first.')
             return
 
-        hybe_records = self.modality_data.get(self.current_modality, {}).get('active_hybe_list', [])
+        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', [])
         if not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
                                           'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
@@ -3512,11 +4053,12 @@ class MainWindow(QtWidgets.QMainWindow):
         already-aligned FOV.
         """
         ap = self.ui.AlignmentPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
         fov = ap.SameModalityOverlayFovSpinBox.value()
-        reference_hybe = ap.ReferenceHybeComboBox.currentText()
-        if not storage_path or not reference_hybe or not self.hybe_records:
+        reference_hybe = ap.current_reference_hybe()
+        modality = ap.current_reference_modality()
+        storage_path = self._storage_path_for_modality(modality)
+        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
+        if not storage_path or not reference_hybe or not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Show All-Readouts Overlay',
                                           'Set storage path (Ingestion tab) and reference hybe first.')
             return
@@ -3528,12 +4070,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if matrices is None:
             matrices = self.fov_matrices.get((storage_path, fov))
         if matrices is None:
-            matrices = alignment.read_same_modality_matrices(storage_path, fov, self.hybe_records)
+            matrices = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
 
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, self.hybe_records, reference_hybe, matrices,
+        self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, hybe_records, reference_hybe, matrices,
                                                   channel_type=channel_type)
 
     # -- cross-modal alignment --
@@ -3789,6 +4331,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- cell-based alignment --
 
+    def _storage_path_for_modality(self, modality):
+        """
+        Forward lookup, mirroring _modality_for_storage_path's reverse
+        one: which storage_path is configured for this modality, or ''
+        if none/not yet set. Needed once a hybe-choosing combo (Spot
+        Localization, Same-Modality Alignment, Cell Segmentation, MIP
+        Viewer) can offer hybes from ANY modality at once -- the storage
+        path to actually read from vlinks.h5 must come from the SELECTED
+        hybe's own modality, not from whatever the Ingestion tab's own
+        combo happens to be showing right now (those two can now genuinely
+        differ, unlike before this modality decoupling).
+        """
+        return self.modality_data.get(modality, {}).get('storage_path', '') if modality else ''
+
     def _modality_for_storage_path(self, storage_path):
         """
         Reverse-lookup: which configured modality name owns this storage
@@ -3898,7 +4454,13 @@ class MainWindow(QtWidgets.QMainWindow):
         other_data = self.modality_data.get(other_modality) if other_modality else None
         if not other_data or not other_data['layout_path']:
             return None
-        other_reference_hybe = other_data['reference_hybe']
+        # the real, persisted same-modality reference hybe for this
+        # storage_path -- read from vlinks.h5 global params (see
+        # _reference_hybe_for_storage_path), not modality_data, since
+        # that no longer tracks a per-modality reference hybe at all
+        # (Same-Modality Alignment's own reference-hybe combo isn't
+        # modality-switch-scoped any more).
+        other_reference_hybe = self._reference_hybe_for_storage_path(other_storage_path)
         if not other_reference_hybe:
             return None
         try:
@@ -3995,36 +4557,58 @@ class MainWindow(QtWidgets.QMainWindow):
             return cell.matrix_to(hybe, modality)
         return self._fov_only_matrix_for_hybe(hybe, modality, cell, fov)
 
+    def _matrix_to_shared(self, hybe, modality, cell, fov):
+        """
+        hybe's own raw frame -> the pipeline's ONE shared reference frame
+        (RNA's own same-modality reference hybe) -- the "best available"
+        transform every SPOT-coordinate/preview-final-column consumer
+        needs now (contrast with _matrix_to_cellref, which targets
+        cell.reference_hybe's frame and stays correct/needed for mask-
+        related work, e.g. the cell-area leg of celltype barcode
+        classification). Prefers cell.matrix_to_shared (the real, cell-
+        level-refined composition) only when hybe's own entry AND that
+        modality's own anchor are actually present; otherwise falls back
+        to a pure FOV-level lookup (no cell-level residual) via
+        _fov_matrices_for_cell_modality, so a cell that's never had cell-
+        level alignment run for a given hybe/modality still gets a real,
+        non-identity answer instead of ACell.matrix_to_shared's bare
+        identity default. Returns None only when even the FOV-only
+        fallback has nothing to work with -- simpler than _matrix_to_
+        cellref's own fallback (_fov_only_matrix_for_hybe), since there's
+        no bridge-to-cell.reference_hybe step left to compute here.
+        """
+        key = (hybe, modality)
+        if key in cell.matrices and modality in cell.matrix_anchors:
+            return cell.matrix_to_shared(hybe, modality)
+        fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
+        if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
+            return None
+        return fov_matrices_for_hybe[hybe]
+
     def _cell_overlay_target_specs(self, cell, storage_path, fov, hybe_records, channel_type):
         """
         Resolves every hybe in cell.matrices (both modalities) into what
         draw_cell_all_readouts_overlay needs to read/crop/warp it: storage
-        path, channel, fiducial channel, the FOV-level matrix (the
+        path, channel (also reused for the ZX row -- z-alignment now
+        respects channel_type, same as the yx fit), the FOV-level matrix (the
         'FOV/cross-modal' stage), and this cell's own final yx/zx
-        matrices -- both resolved into cell.reference_hybe's own frame
-        (via _fov_only_matrix_for_hybe / _matrix_to_cellref respectively),
-        which is what draw_cell_all_readouts_overlay's crop_via expects,
-        not a direct cell.matrices lookup (that targets the shared FOV
-        frame instead -- see compute_cell_alignment's docstring). Unlike
-        the single-hybe preview, every target here is warped into ONE
-        fixed shared coordinate FRAME (cell.reference_hybe, always read at
-        H=eye since cell.area is already native to it) -- that part has no
-        per-target ambiguity.
+        matrices -- both resolved into the pipeline's ONE shared frame
+        (RNA's own same-modality reference hybe; see ACell.matrix_to_
+        shared's own docstring), which is what draw_cell_all_readouts_
+        overlay's crop_via expects. fov_only_matrix is a plain fov_
+        matrices lookup (no cell involvement at all -- there's no bridge
+        step left to compute for the FOV/cross-modal stage); final_matrix
+        goes through _matrix_to_shared for the real cell-level residual.
+        Unlike the single-hybe preview, every target here is warped into
+        that ONE fixed shared frame -- that part has no per-target
+        ambiguity.
 
         Excludes hybes with NO cell.matrix_provenance entry -- these are
         the cell-alignment ANCHOR(s) (same-modality and/or other-modality,
         see compute_cell_alignment: a hybe skips provenance only when it
         IS that call's own reference_hybe param), which never got a
         residual computed against anything, so there's no meaningful raw/
-        FOV/final comparison to show for them. Deliberately NOT "hybe ==
-        cell.reference_hybe" (the segmentation hybe) -- those are two
-        different concepts that only coincide when the user happens to
-        pick the segmentation hybe as the alignment anchor too. When they
-        don't coincide (e.g. segmented on Hyb_500, aligned against
-        Hyb_101), cell.reference_hybe legitimately HAS its own provenance
-        entry and real matrices, and belongs in the target list like any
-        other hybe -- excluding it by the old, wrong criterion silently
-        dropped its own before/after comparison from the overlay.
+        FOV/final comparison to show for them.
         """
         this_modality = self._modality_for_storage_path(storage_path)
         same_record_by_folder = {r['folder']: r for r in hybe_records}
@@ -4051,16 +4635,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 target_storage_path = other_storage_path
             else:
                 continue
-            fov_only_matrix = self._fov_only_matrix_for_hybe(hybe, modality, cell, fov)
-            if fov_only_matrix is None:
+            fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
+            if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
                 continue
-            final_matrix = self._matrix_to_cellref(hybe, modality, cell, fov)
+            fov_only_matrix = fov_matrices_for_hybe[hybe]
+            final_matrix = self._matrix_to_shared(hybe, modality, cell, fov)
             if final_matrix is None:
                 continue
             specs.append({
                 'hybe': hybe, 'modality': modality, 'storage_path': target_storage_path,
                 'channel': alignment.pick_channel_by_type(record, channel_type),
-                'fiducial_channel': record['fiducial_channel'],
                 'fov_only_matrix': fov_only_matrix,
                 'final_matrix': final_matrix,
                 'zx_matrix': mats.get('zx', np.eye(3)),
@@ -4077,10 +4661,20 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ap = self.ui.AlignmentPanel
         ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        # storage_path/hybe_records/modality resolved from the picked
+        # reference hybe's OWN modality tag -- see _run_cell_alignment_
+        # for_selected_cell's own comment for why this must never come
+        # from IngestionPanel's current selection, and is an explicit
+        # user choice rather than auto-derived from the cells' own
+        # modality.
+        cell_reference_hybe = ap.current_cell_reference_hybe() or None
+        cell_modality = ap.current_cell_reference_modality()
+        storage_path = self._storage_path_for_modality(cell_modality)
+        hybe_records = self._active_hybe_records_for_modality(cell_modality) if cell_modality else []
         fov_list_all = self._parse_fov_list(ip.FovListLineEdit.text())
         if not storage_path or not fov_list_all:
-            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment', 'Set storage path and FOV list in the Ingestion tab first.')
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
+                                          'Pick a reference hybe (Cell-Based Alignment) and set the FOV list in the Ingestion tab first.')
             return
 
         fov = ap.CellFovSpinBox.value()
@@ -4107,7 +4701,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         real_cells = container.data[fov]
 
-        cell_reference_hybe = ap.CellReferenceHybeComboBox.currentText() or None
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
 
@@ -4115,18 +4708,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Computing cell alignment...')
         worker_jobs = [(fov, real_cells, self._composed_fov_matrices_for_cell_alignment(storage_path, fov),
                         self._other_modality_cell_alignment_inputs(storage_path, fov))]
-        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, storage_path, self.hybe_records,
-                                                           self._modality_for_storage_path(storage_path),
+        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, storage_path, hybe_records, cell_modality,
                                                            reference_hybe=cell_reference_hybe, channel_type=channel_type,
                                                            pad=pad)
         self._cell_alignment_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_finished(results, fov, container, storage_path,
-                                                              cell_reference_hybe, channel_type, pad))
+                                                              cell_reference_hybe, cell_modality, channel_type, pad))
         self._cell_alignment_worker.failed.connect(self._on_cell_alignment_failed)
         self._cell_alignment_worker.start()
 
-    def _on_cell_alignment_finished(self, results, fov, container, storage_path, cell_reference_hybe, channel_type, pad):
+    def _on_cell_alignment_finished(self, results, fov, container, storage_path, cell_reference_hybe, cell_modality, channel_type, pad):
         """results: [(fov, cells)] -- cells are the real objects, mutated in
         place by compute_cell_alignment. Always writes to vlinks.h5
         immediately -- no staging/Accept step."""
@@ -4154,7 +4746,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 # enough to be worth a human look; Save All Cell Overlays
                 # covers the rest on demand.
                 if self._cell_max_residual_shift(cell) > auto_save_threshold:
-                    if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad):
+                    if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad,
+                                               overlay_reference_hybe=cell_reference_hybe, modality=cell_modality):
                         n_auto_saved += 1
 
         self._refresh_cell_fov_panels(fov)
@@ -4184,21 +4777,35 @@ class MainWindow(QtWidgets.QMainWindow):
             for prov in cell.matrix_provenance.values()
         )
 
-    def _save_cell_overlay(self, cell, fov, storage_path, channel_type, pad):
-        """Draws + saves one cell's all-readouts overlay PNG. Returns False
-        (no-op) if this cell's own segmentation hybe record can't be
-        resolved from the current hybe list, matching the automatic-mode
-        skip that already existed before this was factored out."""
-        record_by_folder = {r['folder']: r for r in self.hybe_records}
-        reference_record = record_by_folder.get(cell.reference_hybe)
+    def _save_cell_overlay(self, cell, fov, storage_path, channel_type, pad, overlay_reference_hybe=None, modality=None):
+        """Draws + saves one cell's all-readouts overlay PNG. overlay_
+        reference_hybe/modality should be the SAME alignment run's own
+        anchor hybe/modality this cell was actually aligned against
+        (falls back to cell.reference_hybe/cell.modality -- the
+        segmentation hybe -- only when not given, matching compute_cell_
+        alignment's own reference_hybe=None default) -- using cell.
+        reference_hybe unconditionally here previously redrew the overlay
+        against a DIFFERENT hybe than the one actually used to compute
+        it, which crashed _read_mip whenever that hybe wasn't ingested
+        under storage_path's own modality. Returns False (no-op) if the
+        resolved reference hybe's record can't be found in that
+        modality's own hybe list, matching the automatic-mode skip that
+        already existed before this was factored out."""
+        modality = modality or cell.modality
+        overlay_reference_hybe = overlay_reference_hybe or cell.reference_hybe
+        hybe_records = self._active_hybe_records_for_modality(modality) if modality else self.hybe_records
+        record_by_folder = {r['folder']: r for r in hybe_records}
+        reference_record = record_by_folder.get(overlay_reference_hybe)
         if reference_record is None:
             return False
         save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{cell.id}_alignment_overlay.png')
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
-        target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
+        target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, hybe_records, channel_type)
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+            cell.reference_hybe, np.eye(3))
         self.preview_canvas.draw_cell_all_readouts_overlay(
-            cell, fov, cell.reference_hybe, storage_path, reference_channel,
-            reference_record['fiducial_channel'], target_specs, pad=pad, save_path=save_path)
+            cell, fov, overlay_reference_hybe, storage_path, reference_channel,
+            target_specs, pad=pad, save_path=save_path, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
         return True
 
     def _save_all_cell_overlays(self):
@@ -4206,18 +4813,25 @@ class MainWindow(QtWidgets.QMainWindow):
         PNG (self._cell_alignment_display_cells, populated by the last Run
         Cell Alignment call, manual or automatic) -- lets a user skim the
         whole run's alignment quality by eye without needing every cell to
-        have tripped the auto-save-on-large-shift threshold."""
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        have tripped the auto-save-on-large-shift threshold. Reads the
+        SAME live tier-1 controls (reference hybe/channel/pad) Run Cell
+        Alignment itself reads -- matches this button's own "reuse
+        whatever the panel currently shows" contract, not IngestionPanel's
+        current selection (see populate_cell_reference_hybe_choices'
+        docstring for why that used to crash)."""
+        ap = self.ui.AlignmentPanel
+        cell_modality = ap.current_cell_reference_modality()
+        storage_path = self._storage_path_for_modality(cell_modality)
         if not storage_path or not self._cell_alignment_display_cells:
             QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', 'Run Cell Alignment first.')
             return
-        ap = self.ui.AlignmentPanel
+        cell_reference_hybe = ap.current_cell_reference_hybe() or None
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
         n_saved = 0
         for fov, cell in self._cell_alignment_display_cells:
-            if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad):
+            if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad,
+                                       overlay_reference_hybe=cell_reference_hybe, modality=cell_modality):
                 n_saved += 1
         QtWidgets.QMessageBox.information(self, 'Save All Cell Overlays', f'{n_saved} overlay image(s) saved.')
 
@@ -4294,13 +4908,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         This works because draw_cell_alignment_preview_3col only ever
         needs target's and reference's OWN matrices independently, both
-        expressed relative to cell.reference_hybe's frame (each crops
-        cell.area via its own inverse-warp, then the two crops are
-        composited for visual comparison) -- it never needs a direct
-        target-vs-reference matrix. So both are resolved the exact same
-        way, via _fov_only_matrix_for_hybe/_matrix_to_cellref (same
-        resolvers _cell_overlay_target_specs uses), completely
-        independently of one another.
+        expressed relative to the pipeline's ONE shared reference frame
+        (each crops the shared-frame mask via its own inverse-warp, then
+        the two crops are composited for visual comparison) -- it never
+        needs a direct target-vs-reference matrix. So both are resolved
+        the exact same way, via a plain fov_matrices lookup / _matrix_to_
+        shared (same resolvers _cell_overlay_target_specs uses),
+        completely independently of one another.
         """
         pctx = getattr(self, '_cell_preview_context', None)
         if pctx is None:
@@ -4330,24 +4944,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Can't use {reference_hybe} ({reference_modality}) as reference: {err}", 8000)
             return
 
-        # fov_only_matrix/reference_fov_matrix/final_matrix all need to be
-        # expressed in cell.reference_hybe's own frame (what draw_cell_
-        # alignment_preview_3col's bounds_via expects) -- neither a raw
-        # fov_matrices lookup nor a raw cell.matrices lookup gives that
-        # directly (cell.matrices now targets each call's own
-        # reference_hybe, never a shared frame -- see compute_cell_
-        # alignment's docstring), so both go through the same resolvers
-        # _cell_overlay_target_specs uses.
-        fov_only_matrix = self._fov_only_matrix_for_hybe(target_hybe, target_modality, cell, fov)
-        reference_fov_matrix = self._fov_only_matrix_for_hybe(reference_hybe, reference_modality, cell, fov)
-        final_matrix = self._matrix_to_cellref(target_hybe, target_modality, cell, fov)
+        # fov_only_matrix/reference_fov_matrix are plain fov_matrices
+        # lookups (no cell involvement, no bridge step left to compute);
+        # final_matrix/reference_final_matrix go through _matrix_to_shared
+        # for the pipeline's ONE shared reference frame (what draw_cell_
+        # alignment_preview_3col's bounds_via now expects -- see
+        # ACell.matrix_to_shared).
+        target_fov_matrices = self._fov_matrices_for_cell_modality(target_modality, cell, fov)
+        fov_only_matrix = (target_fov_matrices or {}).get(target_hybe)
+        reference_fov_matrices = self._fov_matrices_for_cell_modality(reference_modality, cell, fov)
+        reference_fov_matrix = (reference_fov_matrices or {}).get(reference_hybe)
+        final_matrix = self._matrix_to_shared(target_hybe, target_modality, cell, fov)
         # Computed INDEPENDENTLY from reference_fov_matrix, not reused --
         # see draw_cell_alignment_preview_3col's own docstring for why
         # reference_hybe's own final column needs the SAME KIND of matrix
-        # (_matrix_to_cellref, folding in cell.reference_hybe's own real
+        # (_matrix_to_shared, folding in reference_hybe's own real
         # residual) the target's final column uses, not the residual-
         # blind FOV-only one.
-        reference_final_matrix = self._matrix_to_cellref(reference_hybe, reference_modality, cell, fov)
+        reference_final_matrix = self._matrix_to_shared(reference_hybe, reference_modality, cell, fov)
         if fov_only_matrix is None or reference_fov_matrix is None or final_matrix is None or reference_final_matrix is None:
             self.statusBar().showMessage(
                 f"Can't preview {target_hybe} ({target_modality}): no FOV-level alignment available for it "
@@ -4356,17 +4970,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
         target_channel = alignment.pick_channel_by_type(target_record, channel_type)
-        reference_fiducial_channel = reference_record['fiducial_channel']
-        target_fiducial_channel = target_record['fiducial_channel']
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+            cell.reference_hybe, np.eye(3))
 
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cell_alignment_preview_3col(
-            cell, fov, reference_storage_path, reference_hybe, reference_channel, reference_fiducial_channel,
+            cell, fov, reference_storage_path, reference_hybe, reference_channel,
             reference_fov_matrix,
-            target_storage_path, target_hybe, target_channel, target_fiducial_channel,
+            target_storage_path, target_hybe, target_channel,
             fov_only_matrix, final_matrix, pad=pad, target_modality=target_modality,
-            reference_final_matrix=reference_final_matrix)
+            reference_final_matrix=reference_final_matrix, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
 
     def _show_cell_all_readouts_overlay(self, item=None):
         """
@@ -4409,25 +5023,27 @@ class MainWindow(QtWidgets.QMainWindow):
                                           f"Can't use {reference_hybe} ({reference_modality}) as reference: {err}")
             return
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
-        # FOV-only for the FOV/cross-modal column's own crop.
-        reference_matrix = self._fov_only_matrix_for_hybe(reference_hybe, reference_modality, cell, fov)
-        if reference_matrix is None:
-            reference_matrix = np.eye(3)
+        # Plain FOV-only lookup for the FOV/cross-modal column's own crop
+        # -- no cell involvement, no bridge step left to compute.
+        reference_fov_matrices = self._fov_matrices_for_cell_modality(reference_modality, cell, fov)
+        reference_matrix = (reference_fov_matrices or {}).get(reference_hybe, np.eye(3))
         # Computed INDEPENDENTLY for the final column -- see draw_cell_
         # all_readouts_overlay's own docstring for why reference_hybe's
-        # final crop needs the SAME KIND of matrix (_matrix_to_cellref,
-        # folding in cell.reference_hybe's own real residual) the
-        # target's own final column uses, not the residual-blind FOV-only
-        # one reused.
-        reference_final_matrix = self._matrix_to_cellref(reference_hybe, reference_modality, cell, fov)
+        # final crop needs the SAME KIND of matrix (_matrix_to_shared,
+        # folding in reference_hybe's own real residual) the target's own
+        # final column uses, not the residual-blind FOV-only one reused.
+        reference_final_matrix = self._matrix_to_shared(reference_hybe, reference_modality, cell, fov)
         if reference_final_matrix is None:
             reference_final_matrix = np.eye(3)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+            cell.reference_hybe, np.eye(3))
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cell_all_readouts_overlay(
-            cell, fov, reference_hybe, reference_storage_path, reference_channel, reference_record['fiducial_channel'],
-            target_specs, pad=pad, reference_matrix=reference_matrix, reference_final_matrix=reference_final_matrix)
+            cell, fov, reference_hybe, reference_storage_path, reference_channel,
+            target_specs, pad=pad, reference_matrix=reference_matrix, reference_final_matrix=reference_final_matrix,
+            mask_anchor_fov_matrix=mask_anchor_fov_matrix)
 
     def _run_cell_alignment_for_selected_cell(self):
         """
@@ -4456,14 +5072,8 @@ class MainWindow(QtWidgets.QMainWindow):
         has no staging of its own -- it always computes and saves directly.
         """
         ap = self.ui.AlignmentPanel
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
         fov = ap.CellFovSpinBox.value()
         cell_id = ap.CellIdSpinBox.value()
-        if not storage_path or not self.hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
-                                          'Set storage path (Ingestion tab) and parse a layout first.')
-            return
         real_cell = None
         if self.cell_container_permanent is not None:
             real_cell = next((c for c in self.cell_container_permanent.data.get(fov, []) if c.id == cell_id), None)
@@ -4473,11 +5083,26 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
                                           f'No segmented cell with ID {cell_id} found in FOV{fov:02d}.')
             return
+
+        # storage_path/hybe_records/modality all resolved from the picked
+        # reference hybe's OWN modality tag -- never from IngestionPanel's
+        # current selection (see populate_cell_reference_hybe_choices'
+        # docstring for the crash this used to cause: picking a hybe from
+        # modality A while Ingestion happened to show modality B), and by
+        # explicit request an actual free choice, not auto-derived from
+        # real_cell.modality.
+        cell_reference_hybe = ap.current_cell_reference_hybe() or None
+        cell_modality = ap.current_cell_reference_modality()
+        storage_path = self._storage_path_for_modality(cell_modality)
+        hybe_records = self._active_hybe_records_for_modality(cell_modality) if cell_modality else []
+        if not storage_path or not hybe_records:
+            QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
+                                          'Pick a reference hybe (Cell-Based Alignment) and parse that modality\'s layout first.')
+            return
         if (storage_path, fov) not in self.fov_matrices:
             QtWidgets.QMessageBox.warning(self, 'Preview This Cell', 'Run (and accept) FOV alignment for this FOV first.')
             return
 
-        cell_reference_hybe = ap.CellReferenceHybeComboBox.currentText() or None
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
 
@@ -4485,8 +5110,8 @@ class MainWindow(QtWidgets.QMainWindow):
         other_ctx = self._other_modality_cell_alignment_inputs(storage_path, fov)
         staged_cell = deepcopy(real_cell)
 
-        worker = CellAlignmentWorker([(fov, [staged_cell], fov_matrices, other_ctx)], storage_path, self.hybe_records,
-                                     self._modality_for_storage_path(storage_path), reference_hybe=cell_reference_hybe,
+        worker = CellAlignmentWorker([(fov, [staged_cell], fov_matrices, other_ctx)], storage_path, hybe_records,
+                                     cell_modality, reference_hybe=cell_reference_hybe,
                                      channel_type=channel_type, pad=pad)
         result_holder = {}
         worker.finished_ok.connect(lambda results: result_holder.__setitem__('results', results))
@@ -4501,45 +5126,45 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._pending_per_cell_alignment = (real_cell, staged_cell)
         self._pending_per_cell_alignment_fov = fov
-        self._pending_per_cell_alignment_params = {'reference_hybe': cell_reference_hybe,
-                                                    'channel_type': channel_type, 'pad': pad}
+        self._pending_per_cell_alignment_params = {'reference_hybe': cell_reference_hybe, 'modality': cell_modality,
+                                                    'storage_path': storage_path, 'channel_type': channel_type, 'pad': pad}
         ap.PerCellAcceptPushButton.setEnabled(True)
         ap.PerCellRejectPushButton.setEnabled(True)
 
         # Per explicit request: the preview shown here is the ref-hybe-vs-
         # all-hybe overlay anchored at THIS RUN's own reference_hybe (the
         # alignment anchor picked above) -- not cell.reference_hybe (the
-        # segmentation hybe, e.g. Hyb_500), a different concept (see
+        # segmentation hybe), a different concept (see
         # _cell_overlay_target_specs' own docstring). draw_cell_all_
         # readouts_overlay's FOV/final columns default to assuming H=eye
-        # between the reference hybe and cell.area's own frame, which is
-        # only equivalent to the real transform when they're the same
-        # hybe -- reference_matrix (FOV-only, via _fov_only_matrix_for_
-        # hybe, the same resolver target_specs itself uses) supplies the
-        # real one whenever they differ. Tier 3's "Results (per cell, per
-        # hybe)" list -- one row per (cell, hybe) -- gives a per-hybe
-        # 2-column comparison on demand instead.
-        this_modality = self._modality_for_storage_path(storage_path)
+        # between the reference hybe and the shared mask's own frame,
+        # which is only equivalent to the real transform when they're the
+        # same hybe -- reference_matrix (a plain fov_matrices lookup, the
+        # same resolver target_specs itself uses) supplies the real one
+        # whenever they differ. Tier 3's "Results (per cell, per hybe)"
+        # list -- one row per (cell, hybe) -- gives a per-hybe 2-column
+        # comparison on demand instead.
         overlay_reference_hybe = cell_reference_hybe or staged_cell.reference_hybe
-        record_by_folder = {r['folder']: r for r in self.hybe_records}
+        record_by_folder = {r['folder']: r for r in hybe_records}
         reference_record = record_by_folder.get(overlay_reference_hybe)
         if reference_record is not None:
             reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
-            reference_matrix = self._fov_only_matrix_for_hybe(overlay_reference_hybe, this_modality, staged_cell, fov)
-            if reference_matrix is None:
-                reference_matrix = np.eye(3)
+            reference_fov_matrices = self._fov_matrices_for_cell_modality(cell_modality, staged_cell, fov)
+            reference_matrix = (reference_fov_matrices or {}).get(overlay_reference_hybe, np.eye(3))
             # Computed INDEPENDENTLY for the final column -- see draw_cell_
             # all_readouts_overlay's own docstring for why.
-            reference_final_matrix = self._matrix_to_cellref(overlay_reference_hybe, this_modality, staged_cell, fov)
+            reference_final_matrix = self._matrix_to_shared(overlay_reference_hybe, cell_modality, staged_cell, fov)
             if reference_final_matrix is None:
                 reference_final_matrix = np.eye(3)
-            target_specs = self._cell_overlay_target_specs(staged_cell, storage_path, fov, self.hybe_records, channel_type)
+            target_specs = self._cell_overlay_target_specs(staged_cell, storage_path, fov, hybe_records, channel_type)
+            mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(staged_cell.modality, staged_cell, fov) or {}).get(
+                staged_cell.reference_hybe, np.eye(3))
             self.alignment_preview_window.show()
             self.alignment_preview_window.raise_()
             self.preview_canvas.draw_cell_all_readouts_overlay(
                 staged_cell, fov, overlay_reference_hybe, storage_path, reference_channel,
-                reference_record['fiducial_channel'], target_specs, pad=pad, reference_matrix=reference_matrix,
-                reference_final_matrix=reference_final_matrix)
+                target_specs, pad=pad, reference_matrix=reference_matrix,
+                reference_final_matrix=reference_final_matrix, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
         self.statusBar().showMessage(f'Cell {cell_id} (FOV{fov:02d}) alignment previewed -- Accept to save.', 8000)
 
     def _accept_per_cell_alignment(self):
@@ -4561,8 +5186,19 @@ class MainWindow(QtWidgets.QMainWindow):
         real_cell.matrix_anchors = staged_cell.matrix_anchors
         real_cell.matrix_provenance = staged_cell.matrix_provenance
 
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
+        # Re-derive the overlay from the SAME (reference_hybe, modality,
+        # storage_path) the Preview step actually ran with (stashed in
+        # run_params) -- NOT real_cell.reference_hybe (the segmentation
+        # hybe) and NOT IngestionPanel's current selection, either of
+        # which can legitimately differ from what this run used and used
+        # to crash _read_mip with a hybe that was never ingested under
+        # the wrong modality's storage_path. Falls back to the cell's own
+        # segmentation hybe/modality only if run_params is somehow empty
+        # (matches compute_cell_alignment's own reference_hybe=None
+        # default), not as the primary source.
+        overlay_modality = run_params.get('modality') or real_cell.modality
+        overlay_reference_hybe = run_params.get('reference_hybe') or real_cell.reference_hybe
+        storage_path = run_params.get('storage_path') or self._storage_path_for_modality(overlay_modality)
         wrote = False
         if storage_path and fov is not None:
             storage_paths = self._all_vlinks_storage_paths()
@@ -4574,14 +5210,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if storage_paths and container is not None:
                 vlinks_store.mirror_write_cells(storage_paths, fov, container)
                 wrote = True
-            reference_record = {r['folder']: r for r in self.hybe_records}.get(real_cell.reference_hybe)
+            hybe_records = self._active_hybe_records_for_modality(overlay_modality) if overlay_modality else []
+            reference_record = {r['folder']: r for r in hybe_records}.get(overlay_reference_hybe)
             if reference_record is not None:
                 save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{real_cell.id}_alignment_overlay.png')
                 reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
-                target_specs = self._cell_overlay_target_specs(real_cell, storage_path, fov, self.hybe_records, channel_type)
+                target_specs = self._cell_overlay_target_specs(real_cell, storage_path, fov, hybe_records, channel_type)
+                mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(real_cell.modality, real_cell, fov) or {}).get(
+                    real_cell.reference_hybe, np.eye(3))
                 self.preview_canvas.draw_cell_all_readouts_overlay(
-                    real_cell, fov, real_cell.reference_hybe, storage_path, reference_channel,
-                    reference_record['fiducial_channel'], target_specs, pad=pad, save_path=save_path)
+                    real_cell, fov, overlay_reference_hybe, storage_path, reference_channel,
+                    target_specs, pad=pad, save_path=save_path, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
 
         self._pending_per_cell_alignment = None
         self._pending_per_cell_alignment_fov = None
@@ -4691,28 +5330,38 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.lock_modality_setup()
         self._activate_modalities(names, modality_fields=modalities)
 
-        if glob.get('cell_align_reference_hybe') and not ap.CellReferenceHybeComboBox.currentText():
+        if glob.get('cell_align_reference_hybe') and not ap.current_cell_reference_hybe():
             # Only a fallback for when vlinks (already applied by
             # _activate_modalities -> _refresh_params_from_vlinks, which
             # runs before this line) had nothing real to say -- vlinks-
             # actual values must always win over this stale config
             # default, never get overwritten by it after the fact.
-            idx = ap.CellReferenceHybeComboBox.findText(glob['cell_align_reference_hybe'])
-            if idx >= 0:
-                ap.CellReferenceHybeComboBox.setCurrentIndex(idx)
+            # Persisted as a bare folder name (pre-dates the modality tag,
+            # see cell_alignment_reference_hybe's own vlinks-side comment)
+            # -- try every configured modality in turn, first real match
+            # wins; no-op if it belonged to a modality no longer configured.
+            for name in self.modality_names:
+                ap.select_cell_reference_hybe(glob['cell_align_reference_hybe'], name)
+                if ap.current_cell_reference_hybe() == glob['cell_align_reference_hybe']:
+                    break
 
     def _save_config_dialog(self):
         """
         Builds the modality-nested config from whatever this session's UI
         currently has -- the Ingestion tab's active modality becomes one
         <modality> entry (with its full layout_path/dax_directory/
-        storage_path/reference_hybe/same_modality_channel_type), and the cross-
-        modal section's OTHER storage path (if filled in) becomes a
-        second <modality> entry (storage_path + cross_modality_reference_
-        hybe only -- this app's current UI has no live layout_path/
-        dax_directory/reference_hybe/same_modality_channel_type for a modality
-        that isn't the Ingestion tab's active one). A future N-modality UI
-        would just add more entries to the same 'modalities' dict; the
+        storage_path), and the cross-modal section's OTHER storage path
+        (if filled in) becomes a second <modality> entry (storage_path +
+        cross_modality_reference_hybe only -- this app's current UI has
+        no live layout_path/dax_directory for a modality that isn't the
+        Ingestion tab's active one). reference_hybe/same_modality_
+        channel_type are no longer per-modality state at all (Same-
+        Modality Alignment's own reference-hybe combo isn't modality-
+        switch-scoped any more), so they're never written here -- a
+        config saved by an OLDER version of this app may still have them
+        under an old <modality> entry, which _activate_modalities' own
+        state.update filter silently drops on load. A future N-modality
+        UI would just add more entries to the same 'modalities' dict; the
         file format itself already supports it.
         """
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save configuration file', self.save_path, 'configuration file (*.xml)')
@@ -4738,7 +5387,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'num_modalities': len(self.modality_names),
                 'fov_list': self._parse_fov_list(ip.FovListLineEdit.text()),
                 'cross_modality_channel_type': ap.ChannelTypeComboBox.currentText(),
-                'cell_align_reference_hybe': ap.CellReferenceHybeComboBox.currentText(),
+                'cell_align_reference_hybe': ap.current_cell_reference_hybe(),
                 'cell_align_channel_type': ap.CellChannelTypeComboBox.currentText(),
                 'cell_seg_fov': cp.FovSpinBox.value(),
                 'celltype_names': self.ui.CelltypeDeterminationPanel.celltype_names(),
