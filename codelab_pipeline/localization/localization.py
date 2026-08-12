@@ -642,6 +642,52 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             # sibling spot -- genuine ambiguity, fall back to brightest
             # rather than inventing a distinction that isn't in the data.
 
+        # Three post-fit QC gates on every OTHER accepted component,
+        # evaluated relative to the REPRESENTATIVE (whichever one
+        # actually became primary above), not to z0/the click -- a
+        # component passing fit_gaussian_mixture_3d's own per-component
+        # accept criteria (CI width, h/offset, amp/h) only proves IT is a
+        # real, well-fit peak, not that it's actually the SAME physical
+        # spot's own second blob rather than some other, unrelated real
+        # feature the crop happens to also contain:
+        # 1. Z: more than z_window from the representative's own Z.
+        #    z_window above only bounds the SEED SEARCH domain around z0
+        #    (the crop's own coarse brightest-voxel estimate, NOT
+        #    necessarily the representative's own final fitted Z) -- two
+        #    seeds can each individually land within z_window of z0 while
+        #    still being up to ~2*z_window apart from EACH OTHER (one on
+        #    either side of z0). Confirmed on real data (an unassigned
+        #    Hyb_010 spot): representative Z=130.6, sibling Z=114.0,
+        #    16.6px apart -- each within z_window=15 of a z0 near the
+        #    midpoint, but not of each other.
+        # 2. X,Y: more than spad (the crop's own half-width) from the
+        #    representative's own (x,y) -- per confirmed real bug/
+        #    screenshot: only Z was bounded, so a component clear across
+        #    the crop (a visibly different blob near the crop's own edge,
+        #    nothing to do with the representative) still passed through
+        #    as a "sibling." Real "two blobs one click landed between"
+        #    pairs are both within the SAME small crop and close to each
+        #    other by construction; spad is the same bound already used
+        #    to build that crop in the first place.
+        # 3. Amplitude: less than half the representative's own fitted
+        #    amplitude -- per explicit request, a trivial QC floor. A
+        #    real second blob worth reporting as its own mixture
+        #    component should be reasonably comparable in brightness to
+        #    the representative; something far dimmer passing the OTHER
+        #    accept criteria is more likely a marginal noise peak that
+        #    happened to also clear those thresholds.
+        if results[primary] is not None:
+            primary_amp, primary_x, primary_y, primary_z = results[primary][:4]
+            for i, r in enumerate(results):
+                if i == primary or r is None:
+                    continue
+                amp, x0f, y0f, z0f = r[:4]
+                too_far_z = abs(z0f - primary_z) > z_window
+                too_far_xy = np.hypot(x0f - primary_x, y0f - primary_y) > spad
+                too_dim = amp < 0.5 * primary_amp
+                if too_far_z or too_far_xy or too_dim:
+                    results[i] = None
+
     centroids = [(r[1], r[2], r[3]) for r in results if r is not None]
     if results[primary] is not None:
         own = (results[primary][1], results[primary][2], results[primary][3])

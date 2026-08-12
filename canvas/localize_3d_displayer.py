@@ -17,7 +17,7 @@ DEFAULT_PARAMS = {'spad': 5, 'peak_bound': 2.0, 'max_sigma': 2.5,
 
 class Localize3DDisplayer(QtWidgets.QMainWindow):
     """
-    3-column pop-up for 3D localization -- adding Z (and refining
+    2-panel pop-up for 3D localization -- adding Z (and refining
     sub-pixel x,y) onto spots that are ALREADY PLACED by 2D auto-detect
     or a manual click, never a fresh from-scratch detection pass (see
     codelab_pipeline.localization.localization.refine_spot_z). Toggled
@@ -25,49 +25,47 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
     resizable pop-up convention as every other interactive window in
     this app (CellDisplayer, SpotCropDisplayer, ...).
 
-    Left column: the 7 fit parameters (bounds/rejection thresholds, plus
-    min_sep -- how close two detected peaks in one spot's crop must be
-    before they're treated as separate components and routed to the
-    mixture fit instead of a single Gaussian; see localization.
-    find_local_peaks_3d/refine_spot_z).
+    Per explicit request, the YX/XZ fit-status grid this class used to
+    render as a 3rd column now lives in its own SEPARATE pop-up
+    (Localize3DGridDisplayer, below) -- MainWindow owns one instance of
+    each and wires this class's Run/View/Show Crop actions to populate
+    the grid window directly, rather than this window drawing it itself.
+    This class now only ever holds the two panels below, each in its own
+    QGroupBox inside a QSplitter so either can be resized independently.
 
-    Middle column: every spot currently shown in the crop displayer's
-    CURRENT view (Cell view: that cell's own spots; FOV view: BOTH the
-    unassigned pool AND every cell's readonly spots), as a multi-select
-    list: "Spot {global_index} | Cell {unassigned|cell_id} | {Z-accepted|
-    Z-rejected|Z-not run}". global_index is GLOBAL/FOV-wide, not a local
-    1..N recount of just this view (see MainWindow._global_spot_order) --
-    selecting a different cell shows its spots at whatever numbers they
-    already hold in the full-FOV count, never renumbered from 1. The
-    Z-status suffix is a plain, session-transient note (ASpot._z_status,
-    not part of the persisted schema) set the moment a spot goes through
-    Run or View. Run only ever processes the SELECTED rows, never silently every spot
-    in view -- per explicit request, since a cell/FOV can carry far more
-    spots than a user wants Z-refined in one pass. refine_spot_z itself
+    Params panel (QGroupBox): the 7 fit parameters (bounds/rejection
+    thresholds, plus min_sep -- how close two detected peaks in one
+    spot's crop must be before they're treated as separate components
+    and routed to the mixture fit instead of a single Gaussian; see
+    localization.find_local_peaks_3d/refine_spot_z).
+
+    Spots panel (QGroupBox): every spot currently shown in the crop
+    displayer's CURRENT view (Cell view: that cell's own spots; FOV
+    view: BOTH the unassigned pool AND every cell's readonly spots), as
+    a multi-select list: "Spot {global_index} | Cell {unassigned|
+    cell_id} | {Z-accepted|Z-rejected|Z-not run}". global_index is
+    GLOBAL/FOV-wide, not a local 1..N recount of just this view (see
+    MainWindow._global_spot_order) -- selecting a different cell shows
+    its spots at whatever numbers they already hold in the full-FOV
+    count, never renumbered from 1. The Z-status suffix is a plain,
+    session-transient note (ASpot._z_status, not part of the persisted
+    schema) set the moment a spot goes through Run or View. Run only
+    ever processes the SELECTED rows, never silently every spot in view
+    -- per explicit request, since a cell/FOV can carry far more spots
+    than a user wants Z-refined in one pass. refine_spot_z itself
     already accepts cell=None for an unassigned spot (coordinate stays
     == raw_coordinate, no transform), so FOV-view rows work exactly like
     Cell-view ones from this class's own point of view -- it just hands
-    back the SELECTED indices, MainWindow.-_run_3d_localize resolves
+    back the SELECTED indices, MainWindow._run_3d_localize resolves
     each one back to the real (ASpot, ACell-or-None) pair and picks the
     right cell= to pass through.
-
-    Right column: a FIXED, scrollable grid of YX+XZ pairs -- one PER
-    selected spot (up to MAX_GRID_COLUMNS=8 columns; more than 8 wraps to
-    additional row-PAIRS, not more columns), built around spot_fit_status.
-    draw_spot_fit_status unmodified, called once per spot into its own
-    nested-GridSpec-carved axes pair (an OUTER GridSpec of one cell per
-    spot, each cell holding its own INNER 2-row GridSpec for that spot's
-    YX/XZ pair) -- sharex only ever locks WITHIN one spot's own pair,
-    never across different spots that land in the same column position
-    after wrapping, and outer/inner spacing can differ (tight within a
-    pair, roomier between spots) since they're two separate GridSpecs.
 
     Run and View act on the SAME selection but are otherwise fully
     separate concerns, per explicit request -- no checkbox governs
     either: Run actually refines and SAVES the Z (mutating, undoable)
-    and never touches this grid at all; View (ViewPushButton/
+    and never touches the grid pop-up at all; View (ViewPushButton/
     view_requested) runs the identical fit but only ever DISPLAYS the
-    result here -- never touches spot.coordinate/raw_coordinate, never
+    result there -- never touches spot.coordinate/raw_coordinate, never
     pushes undo -- a pure preview for "would this spot's Z fit succeed
     and where would the peak land" before committing to Run. A spot with
     no accepted fit still renders its crop in the grid, just without the
@@ -79,10 +77,10 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
     still always runs the real fit (single or mixture) to produce its
     preview, which is exactly the expensive part someone wants to skip
     when all they want is a quick look at the raw crop before deciding
-    whether fitting it is even worth doing. This renders into the SAME
-    grid as View, just with every centroid=None (no circle at all, ever
-    -- nothing was fit, so there's nothing real to circle), and touches
-    nothing fit-related: no localization.refine_spot_z call at all.
+    whether fitting it is even worth doing. It draws whatever Z/mixture
+    result a spot ALREADY has saved (no new fit), and nothing at all for
+    a spot that's never been refined -- see MainWindow._show_3d_crop_
+    only's own docstring.
     """
     run_requested = QtCore.pyqtSignal()
     view_requested = QtCore.pyqtSignal()
@@ -91,15 +89,26 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('3D Localization')
-        self.resize(980, 560)
+        self.resize(660, 560)
 
         central = QtWidgets.QWidget()
-        outer = QtWidgets.QHBoxLayout(central)
+        outer_layout = QtWidgets.QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
         self.setCentralWidget(central)
+        # QSplitter (not a plain QHBoxLayout) holding two QGroupBox
+        # panels -- per confirmed real request, each panel needs a clear
+        # visual boundary/label AND a drag handle so either can be
+        # widened/narrowed independently (e.g. the Spots panel's own
+        # list needs more width to read long "Spot N | Cell M | Z-..."
+        # labels without truncation). Same splitter pattern already used
+        # in canvas/cell_spot_status_displayer.py's own Cells/Spots
+        # panels.
+        outer = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        outer_layout.addWidget(outer)
 
-        # -- left column: fit parameters --
-        left = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left)
+        # -- params panel --
+        paramsGroup = QtWidgets.QGroupBox('Fit Parameters')
+        left_layout = QtWidgets.QVBoxLayout(paramsGroup)
         form = QtWidgets.QFormLayout()
         left_layout.addLayout(form)
 
@@ -164,11 +173,11 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         left_layout.addWidget(self.ResetDefaultsPushButton)
 
         left_layout.addStretch(1)
-        outer.addWidget(left, stretch=0)
+        outer.addWidget(paramsGroup)
 
-        # -- middle column: spot list + actions --
-        middle = QtWidgets.QWidget()
-        middle_layout = QtWidgets.QVBoxLayout(middle)
+        # -- spots panel --
+        spotsGroup = QtWidgets.QGroupBox('Spots')
+        middle_layout = QtWidgets.QVBoxLayout(spotsGroup)
         middle_layout.addWidget(QtWidgets.QLabel('Spots in current view (select which to refine):'))
 
         self.SpotListWidget = QtWidgets.QListWidget()
@@ -204,22 +213,10 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         self.StatusLabel.setWordWrap(True)
         middle_layout.addWidget(self.StatusLabel)
 
-        outer.addWidget(middle, stretch=1)
-
-        # -- right column: fixed, scrollable YX/XZ grid --
-        right = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right)
-        self.canvas = FigureCanvasQTAgg()
-        self.canvas.setMinimumSize(320, 240)
-        # setWidgetResizable(False) + explicit canvas.resize() in
-        # show_fit_status_grid -- a many-spot grid needs real per-crop
-        # pixel size to stay readable, so it's allowed to grow past the
-        # window's own size and scroll, rather than being squeezed to fit.
-        self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(False)
-        self.scroll.setWidget(self.canvas)
-        right_layout.addWidget(self.scroll, stretch=1)
-        outer.addWidget(right, stretch=1)
+        outer.addWidget(spotsGroup)
+        outer.setStretchFactor(0, 0)
+        outer.setStretchFactor(1, 1)
+        outer.setSizes([300, 360])
 
     def params(self):
         return {'spad': self.SpadSpinBox.value(),
@@ -247,7 +244,7 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
 
     def set_spot_choices(self, labels, keep_selected=None):
         """
-        Repopulates the middle column's list from scratch -- called by
+        Repopulates the spots panel's list from scratch -- called by
         MainWindow whenever the crop displayer redraws (new cell/hybe/
         channel selected, OR spots added/removed/undone/refined within
         the SAME view). Without keep_selected, everything starts selected
@@ -281,18 +278,60 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         """0-based row indices, matching set_spot_choices' own enumeration order."""
         return sorted(self.SpotListWidget.row(item) for item in self.SpotListWidget.selectedItems())
 
+
+class Localize3DGridDisplayer(QtWidgets.QMainWindow):
+    """
+    Detached pop-up (per explicit request -- this used to be
+    Localize3DDisplayer's own 3rd column) holding the FIXED, scrollable
+    grid of YX+XZ pairs -- one PER spot most recently processed by View
+    or Show Crop (up to MAX_GRID_COLUMNS=8 columns; more than 8 wraps to
+    additional row-PAIRS, not more columns), built around spot_fit_
+    status.draw_spot_fit_status unmodified, called once per spot into
+    its own nested-GridSpec-carved axes pair (an OUTER GridSpec of one
+    cell per spot, each cell holding its own INNER 2-row GridSpec for
+    that spot's YX/XZ pair) -- sharex only ever locks WITHIN one spot's
+    own pair, never across different spots that land in the same column
+    position after wrapping, and outer/inner spacing can differ (tight
+    within a pair, roomier between spots) since they're two separate
+    GridSpecs.
+
+    MainWindow owns one instance of this alongside Localize3DDisplayer
+    and shows/raises it whenever View or Show Crop populates it -- Run
+    never touches it at all (see Localize3DDisplayer's own docstring on
+    why). Deliberately knows nothing about spots/cells/fitting itself,
+    same "pure display, caller supplies already-resolved data" separation
+    every other displayer in this app follows.
+    """
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('3D Localization -- Fit Status Grid')
+        self.resize(700, 560)
+
+        central = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(central)
+        self.setCentralWidget(central)
+
+        self.canvas = FigureCanvasQTAgg()
+        self.canvas.setMinimumSize(320, 240)
+        # setWidgetResizable(False) + explicit canvas.resize() in
+        # show_fit_status_grid -- a many-spot grid needs real per-crop
+        # pixel size to stay readable, so it's allowed to grow past the
+        # window's own size and scroll, rather than being squeezed to fit.
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setWidget(self.canvas)
+        layout.addWidget(self.scroll, stretch=1)
+
     def show_fit_status_grid(self, results):
         """
         results: list of (cubic, centroid, title) -- one entry per spot
-        just processed (Run) or previewed (View), in the SAME order as
+        just previewed (View) or shown (Show Crop), in the SAME order as
         the selection. Rejected/no-fit spots still get an entry (cubic
         given, centroid=None) so their crop still renders, just without
         the yellow centroid circle -- draw_spot_fit_status already treats
         centroid=None that way; only spots where the raw stack couldn't
         even be cropped (cubic itself is None, e.g. hybe never ingested)
-        should be left out of `results` entirely by the caller. Always
-        renders when called -- no checkbox gate (see class docstring);
-        MainWindow only ever calls this from View.
+        should be left out of `results` entirely by the caller.
 
         Max MAX_GRID_COLUMNS columns -- more than that many results wrap
         to additional YX/XZ row-PAIRS, not more columns. Each spot gets

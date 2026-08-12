@@ -15,7 +15,7 @@ from ui.main_window_ui import MainWindowUI
 from canvas.pipeline_canvas import PipelineCanvas
 from canvas.cell_displayer import CellDisplayer
 from canvas.spot_crop_displayer import SpotCropDisplayer
-from canvas.localize_3d_displayer import Localize3DDisplayer
+from canvas.localize_3d_displayer import Localize3DDisplayer, Localize3DGridDisplayer
 from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
 from canvas.celltype_result_displayer import CelltypeResultDisplayer
 from canvas.mip_viewer import MipViewerDisplayer
@@ -396,6 +396,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.localize_3d_displayer.run_requested.connect(self._run_3d_localize)
         self.localize_3d_displayer.view_requested.connect(self._view_3d_localize)
         self.localize_3d_displayer.show_crop_requested.connect(self._show_3d_crop_only)
+        # Detached fit-status grid, per explicit request -- a separate
+        # pop-up MainWindow shows/raises whenever View or Show Crop
+        # populates it, rather than an embedded 3rd column on
+        # localize_3d_displayer itself. Run never touches it (see
+        # Localize3DDisplayer's own docstring on why).
+        self.localize_3d_grid_displayer = Localize3DGridDisplayer()
 
         self.mip_viewer = MipViewerDisplayer()
         self.memory_viewer = MemoryViewerDisplayer()
@@ -435,6 +441,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # it down must never also narrow what Save All Cell Overlays sees.
         self._cell_per_hybe_context = None  # {'fov':, 'cell':, 'storage_path':, 'hybe_records':}, or None
         self._vlinks_refreshed_paths = set()  # storage_paths already reconciled from vlinks this session (see _refresh_params_from_vlinks)
+        self._activated_fovs = set()  # FOVs _try_show_existing_cells has already staged into self.cell_container this session (see _activate_fov)
 
         self._connect_signals()
         self._switch_current_modality(self.ui.IngestionPanel.ModalityComboBox.currentText())
@@ -1043,10 +1050,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if not fov_list:
             for sb in spinboxes:
                 sb.setRange(1, 100000)
-            return
-        lo, hi = min(fov_list), max(fov_list)
-        for sb in spinboxes:
-            sb.setRange(lo, hi)
+        else:
+            lo, hi = min(fov_list), max(fov_list)
+            for sb in spinboxes:
+                sb.setRange(lo, hi)
+        # Per confirmed real bug: editing the FOV list (ip.FovListLineEdit.
+        # editingFinished, this method's own main trigger) only ever
+        # updated the spinboxes' RANGE -- Same-Modality Alignment's own
+        # Results list (which iterates the FULL fov_list, see its own
+        # docstring) never refreshed to match, so a newly-added/removed
+        # FOV silently didn't show up (or a removed one lingered) until
+        # something ELSE happened to trigger a Results refresh. Self-
+        # guarding (early-returns if reference_hybe/storage_path aren't
+        # set yet), safe to call unconditionally here.
+        self._refresh_same_modality_results_list()
 
     def _refresh_same_modality_results_list(self):
         """
@@ -2103,18 +2120,40 @@ class MainWindow(QtWidgets.QMainWindow):
         plus FOV-level alignment matrices -- gets pulled into the running
         transient/runtime state automatically the moment this FOV becomes
         current, with no button and no re-computation required. Fires on
-        every FOV switch (Cell Segmentation and Spot Localization share
-        the same FovSpinBox) and right after ingestion/parsing complete,
-        per the explicit principle that already-persisted state should
-        never require redoing the work that produced it.
+        every Cell Segmentation FOV switch (cp.FovSpinBox.valueChanged),
+        right after ingestion/parsing complete, AND from Spot
+        Localization's own _refresh_spot_cell_list (which calls this
+        directly rather than relying on Cell Segmentation's spinbox
+        having already been touched for the same FOV -- cp.FovSpinBox and
+        sp.FovSpinBox are two separate widgets, only their range is kept
+        in sync, not their value; see that method's own comment), per the
+        explicit principle that already-persisted state should never
+        require redoing the work that produced it.
+
+        Loops over EVERY configured modality's own storage_path (not just
+        ip.StoragePathLineEdit's CURRENT one) -- per confirmed real bug: a
+        hybe-choosing combo (Spot Localization's own HybeComboBox
+        included) can freely offer hybes from either modality at once
+        (see _storage_path_for_modality's own docstring on this), but this
+        method used to only ever activate whichever ONE modality the
+        Ingestion tab happened to be showing. Selecting a hybe from the
+        OTHER modality then read an fov_matrices/fov_unassigned_spots key
+        that was never loaded at all -- e.g. the FOV-view crop displayer
+        showing 0 unassigned spots for a DNA hybe while the Ingestion tab
+        was still on RNA, even though real unassigned spots existed on
+        disk for that exact (storage_path, fov).
         """
-        ip = self.ui.IngestionPanel
-        storage_path = ip.StoragePathLineEdit.text().strip()
-        if storage_path and self.hybe_records:
+        for modality_name in self.modality_names:
+            storage_path = self._storage_path_for_modality(modality_name)
+            if not storage_path:
+                continue
+            hybe_records = self._hybe_records_for_storage_path(storage_path)
+            if not hybe_records:
+                continue
             key = (storage_path, fov)
             if key not in self.fov_matrices:
                 try:
-                    self.fov_matrices[key] = alignment.read_same_modality_matrices(storage_path, fov, self.hybe_records)
+                    self.fov_matrices[key] = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
                 except Exception:
                     pass
             if key not in self.fov_unassigned_spots:
@@ -2129,7 +2168,23 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.fov_unassigned_spots[key] = spots
                 except Exception:
                     pass
-        self._try_show_existing_cells(fov)
+        # Only once per FOV per session (per confirmed real regression):
+        # _try_show_existing_cells unconditionally OVERWRITES self.
+        # cell_container.data[fov] with a fresh deepcopy of cell_container_
+        # permanent's own (possibly stale) snapshot -- correct the FIRST
+        # time (populating the transient container from what's persisted),
+        # but calling it again after the transient container has since been
+        # mutated in-session (e.g. Save Current Spots identifying spots
+        # into cells) would silently discard that mutation, since cell_
+        # container_permanent is a SEPARATE container _save_current_spots
+        # never writes back into. _activate_fov now runs on every Spot
+        # Localization FOV/hybe/channel change (see _refresh_spot_cell_
+        # list's own comment), so without this guard, EVERY refresh after
+        # a save would revert cell-owned spot counts back to their pre-
+        # save state even though the disk write itself succeeded.
+        if fov not in self._activated_fovs:
+            if self._try_show_existing_cells(fov):
+                self._activated_fovs.add(fov)
 
     def _try_show_existing_cells(self, fov):
         """
@@ -2143,6 +2198,13 @@ class MainWindow(QtWidgets.QMainWindow):
         MIP for display, and stages the same cells into the transient
         container so Save/Discard/Send behave exactly as if they'd just
         been segmented interactively.
+
+        Only ever safe to call ONCE per FOV per session past this point --
+        see _activate_fov's own guard (self._activated_fovs) on why a
+        second call would clobber real, later, in-session mutations to
+        self.cell_container. Fresh-segmentation call sites (which set
+        self._last_segment_context directly, not through this function)
+        are unaffected by that guard -- they never call this at all.
         """
         ip = self.ui.IngestionPanel
         cp = self.ui.CellSegmentPanel
@@ -2368,8 +2430,27 @@ class MainWindow(QtWidgets.QMainWindow):
     # -- spot localization --
 
     def _refresh_spot_cell_list(self):
+        """
+        Self-activating -- calls _activate_fov(fov) first, so this never
+        depends on the user having separately touched Cell Segmentation's
+        OWN FovSpinBox first. Per confirmed real bug: cp.FovSpinBox and
+        sp.FovSpinBox are two genuinely SEPARATE spinbox widgets (only
+        their RANGE is kept in sync, see _refresh_fov_spinbox_bounds, not
+        their value), but _activate_fov -- which lazily loads this FOV's
+        cells/fov_matrices/fov_unassigned_spots from vlinks.h5 into the
+        running session -- was only ever wired to cp.FovSpinBox.
+        valueChanged. A session that only ever touches Spot Localization
+        (never visits Cell Segmentation, or visits a DIFFERENT FOV there)
+        left self.cell_container/self.fov_unassigned_spots never
+        populated for Spot Localization's own current FOV -- Refresh Cell
+        List showed nothing, and the FOV-view crop displayer showed 0
+        unassigned spots, until SOME unrelated action elsewhere happened
+        to trigger _activate_fov for the right FOV.
+        """
         sp = self.ui.SpotLocalizationPanel
         fov = self._current_spot_fov()
+        if fov is not None:
+            self._activate_fov(fov)
         if self.cell_container is None or fov is None:
             sp.populate_cell_choices([])
         else:
@@ -2392,7 +2473,6 @@ class MainWindow(QtWidgets.QMainWindow):
         the cell-owned total. Pure read -- never computes or writes.
         """
         sp = self.ui.SpotLocalizationPanel
-        ip = self.ui.IngestionPanel
         fov = self._current_spot_fov()
         sp.FovListWidget.clear()
         if self.cell_container is None or fov is None:
@@ -2408,8 +2488,19 @@ class MainWindow(QtWidgets.QMainWindow):
             item = QtWidgets.QListWidgetItem(f'{hybe} ch{channel}: {n_spots} spot(s) across {len(cell_ids)} cell(s)')
             item.setData(QtCore.Qt.UserRole, (hybe, channel))
             sp.FovListWidget.addItem(item)
-        storage_path = ip.StoragePathLineEdit.text().strip()
-        unassigned = self.fov_unassigned_spots.get((storage_path, fov), [])
+        # Every configured modality's own unassigned pool (per confirmed
+        # real bug: this used to only ever read ip.StoragePathLineEdit's
+        # CURRENT modality, silently omitting the other modality's own
+        # unassigned spots from the count whenever the Ingestion tab
+        # wasn't pointed at the same modality the FOV-view crop displayer
+        # was actually showing -- e.g. saving DNA-hybe unassigned spots
+        # while Ingestion was still on RNA left this list looking
+        # unchanged even though real spots were identified/persisted).
+        unassigned = []
+        for modality_name in self.modality_names:
+            modality_storage_path = self._storage_path_for_modality(modality_name)
+            if modality_storage_path:
+                unassigned.extend(self.fov_unassigned_spots.get((modality_storage_path, fov), []))
         unassigned_counts = {}
         for s in unassigned:
             unassigned_counts[(s.hybe, s.channel)] = unassigned_counts.get((s.hybe, s.channel), 0) + 1
@@ -2481,10 +2572,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
             suffix = 'spot(s)'
         else:
-            storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip()
+            # Every configured modality's own unassigned pool -- same fix
+            # as _refresh_spot_fov_summary's own (see its comment): this
+            # used to only ever read ip.StoragePathLineEdit's CURRENT
+            # modality, silently omitting the other modality's spots.
             fov = self._current_spot_fov()
-            for s in self.fov_unassigned_spots.get((storage_path, fov), []):
-                counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
+            for modality_name in self.modality_names:
+                modality_storage_path = self._storage_path_for_modality(modality_name)
+                if not modality_storage_path:
+                    continue
+                for s in self.fov_unassigned_spots.get((modality_storage_path, fov), []):
+                    counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
             suffix = 'unassigned spot(s)'
         for hybe, channel in sorted(counts.keys()):
             item = QtWidgets.QListWidgetItem(f'{hybe} ch{channel}: {counts[(hybe, channel)]} {suffix}')
@@ -2578,6 +2676,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_spot_crop_for_display(self, *_args, keep_view=False):
         sp = self.ui.SpotLocalizationPanel
+        fov_for_activation = self._current_spot_fov()
+        if fov_for_activation is not None:
+            self._activate_fov(fov_for_activation)  # see _refresh_spot_cell_list's own comment on why
         cell = self._selected_spot_cell()
         hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
@@ -2633,6 +2734,11 @@ class MainWindow(QtWidgets.QMainWindow):
         modality = sp.current_hybe_modality()
         storage_path = self._storage_path_for_modality(modality)
         fov = self._current_spot_fov()
+        if fov is not None:
+            self._activate_fov(fov)  # see _refresh_spot_cell_list's own comment on why -- confirmed real
+                                     # bug: without this, fov_unassigned_spots could still be empty here
+                                     # (0 unassigned spots shown) whenever this ran before ANY FOV-spinbox
+                                     # valueChanged had ever fired for this exact FOV this session.
         hybe = sp.current_hybe_folder()
         channel_text = sp.ChannelComboBox.currentText()
         if not storage_path or fov is None or not hybe or not channel_text:
@@ -2946,13 +3052,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 n_would_be_mixture += 1
         elapsed = time.perf_counter() - t0
 
-        self.localize_3d_displayer.show_fit_status_grid(grid_results)
+        self.localize_3d_grid_displayer.show_fit_status_grid(grid_results)
+        self.localize_3d_grid_displayer.show()
+        self.localize_3d_grid_displayer.raise_()
         mode_label = 'mixture' if params['multi_mode'] else 'single'
         mixture_msg = f', {n_would_be_mixture} would save >1 component as mixture_centroids' if n_would_be_mixture else ''
         self.localize_3d_displayer.StatusLabel.setText(
             f'{hybe} ch{channel}: PREVIEW ONLY, nothing saved -- {n_would_accept}/{len(targets)} '
             f'selected spot(s) would be accepted{mixture_msg}. '
             f'[{mode_label} mode, {elapsed:.2f}s for {len(targets)} spot(s)]')
+
+    def _mixture_centroid_to_raw(self, coord_xyz, cell, hybe, modality):
+        """
+        Inverse of localization.refine_spot_z's own _to_real closure --
+        maps a shared-frame (x, y, z) (the frame spot.coordinate AND
+        every entry of spot.mixture_centroids beyond the first already
+        live in, see ASpot.mixture_centroids' own docstring) back to
+        hybe's raw pixel frame, so an ALREADY-persisted mixture sibling
+        can be drawn on a raw crop without ever re-running a fit.
+        Identity when cell is None -- spot_mapper's own convention for an
+        unassigned spot is coordinate == raw_coordinate (no transform
+        applies at all), matching _to_real's own else branch.
+        """
+        if cell is None:
+            return coord_xyz
+        x, y, z = coord_xyz
+        H = cell.matrix_to_shared(hybe, modality)
+        Hinv = la.inv(H)
+        rx, ry, _ = Hinv @ np.array([x, y, 1.0])
+        Hz = cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3))
+        return float(rx), float(ry), float(z - Hz[1, 2])
 
     def _show_3d_crop_only(self):
         """
@@ -2964,11 +3093,21 @@ class MainWindow(QtWidgets.QMainWindow):
         View always runs the real fit to preview whether it would
         succeed, which is exactly the expensive part to skip when someone
         just wants a quick look at the raw crop before deciding whether
-        fitting it is even worth doing. Renders into the SAME grid as
-        View, every centroid=None -- no circle ever drawn (nothing was
-        fit, so there's nothing real to circle; draw_spot_fit_status's
-        own "circled = good, plain = missing" convention already treats
-        centroid=None this way, unchanged).
+        fitting it is even worth doing.
+
+        Still draws a circle for a spot that ALREADY has a real,
+        persisted Z (coordinate[2] != 0.0 -- the same proxy the Memory
+        Status/Cell-Spot-Status-Detail "Spot Z" column already uses,
+        since _z_status itself is session-transient) -- per explicit
+        request: "show yellow/blue circles if exist, draw only if
+        exists." This reconstructs crop-local positions from spot.raw_
+        coordinate (already raw-frame, no transform needed) for the
+        representative, and spot.mixture_centroids[1:] (shared-frame,
+        inverse-transformed via _mixture_centroid_to_raw above) for any
+        other accepted component -- it never runs a NEW fit, only places
+        markers for whatever was already computed and saved by an
+        earlier Run. A spot with no real Z yet gets centroid=None, same
+        as before -- no circle, nothing to show.
         """
         resolved = self._resolve_selected_3d_targets()
         if resolved is None:
@@ -2981,17 +3120,27 @@ class MainWindow(QtWidgets.QMainWindow):
             title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
             raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
             try:
-                cubic, _ = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
-                                                             (raw_x, raw_y), pad=params['spad'], use_stack=True)
+                cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
+                                                                        (raw_x, raw_y), pad=params['spad'], use_stack=True)
             except OSError:
                 continue
             if cubic.size == 0:
                 continue
-            grid_results.append((cubic, None, title))
+            centroid = None
+            if spot.coordinate[2] != 0.0:
+                own_raw = spot.raw_coordinate
+                centroid = [(own_raw[0] - xmin, own_raw[1] - ymin, own_raw[2])]
+                for c in spot.mixture_centroids[1:]:
+                    rx, ry, rz = self._mixture_centroid_to_raw(c[:3], cell, hybe, modality)
+                    centroid.append((rx - xmin, ry - ymin, rz))
+            grid_results.append((cubic, centroid, title))
 
-        self.localize_3d_displayer.show_fit_status_grid(grid_results)
+        self.localize_3d_grid_displayer.show_fit_status_grid(grid_results)
+        self.localize_3d_grid_displayer.show()
+        self.localize_3d_grid_displayer.raise_()
         self.localize_3d_displayer.StatusLabel.setText(
-            f'{hybe} ch{channel}: showing raw crop for {len(grid_results)}/{len(targets)} selected spot(s) -- no fit computed.')
+            f'{hybe} ch{channel}: showing raw crop for {len(grid_results)}/{len(targets)} selected spot(s) -- no fit computed '
+            f'(existing Z shown where already saved).')
 
     def _current_spot_scope_max(self):
         """Best-effort max intensity of whatever's currently shown in the

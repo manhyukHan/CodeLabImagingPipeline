@@ -61,17 +61,30 @@ class ASpot():
         if 'mixture_centroids' in kwargs: self.mixture_centroids = tuple(kwargs['mixture_centroids'])
 
     def save(self):
+        """
+        Per explicit request, every float field is rounded to 2 decimal
+        places here -- ON THE WAY OUT to disk only, never mutating self's
+        own in-memory value (a caller doing further coordinate math this
+        same session, e.g. another localization.refine_spot_z pass,
+        still works from full precision; only the PERSISTED copy is
+        rounded). Sub-hundredth-pixel precision was never meaningful for
+        a real detector pixel anyway -- this just stops it from bloating
+        every displayed/persisted coordinate with 15+ meaningless digits
+        (e.g. 701.0033910046826).
+        """
+        def r2(v):
+            return round(float(v), 2)
         return {'id': int(self.id),
                 'fov': int(self.fov),
                 'hybe': str(self.hybe),
                 'channel': int(self.channel),
                 'cell': int(self.cell),
                 'celltype': str(self.celltype),
-                'coordinate': tuple(self.coordinate),
-                'raw_coordinate': tuple(self.raw_coordinate),
-                'size': float(self.size),
-                'brightness': float(self.brightness),
+                'coordinate': tuple(r2(v) for v in self.coordinate),
+                'raw_coordinate': tuple(r2(v) for v in self.raw_coordinate),
+                'size': r2(self.size),
+                'brightness': r2(self.brightness),
                 'neighbors': tuple(self.neighbors),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at,
-                'mixture_centroids': tuple(self.mixture_centroids)}
+                'mixture_centroids': tuple(tuple(r2(v) for v in c) for c in self.mixture_centroids)}
