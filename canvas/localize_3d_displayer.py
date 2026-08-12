@@ -12,7 +12,7 @@ MAX_GRID_COLUMNS = 8
 # silently drifting apart if one is ever tuned without the other.
 DEFAULT_PARAMS = {'spad': 5, 'peak_bound': 2.0, 'max_sigma': 2.5,
                   'max_uncert': 2.0, 'min_hb_ratio': 1.15, 'min_ah_ratio': 0.15,
-                  'min_sep': 3.0, 'multi_mode': False}
+                  'min_sep': 3.0, 'multi_mode': False, 'z_window': 15}
 
 
 class Localize3DDisplayer(QtWidgets.QMainWindow):
@@ -73,9 +73,20 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
     no accepted fit still renders its crop in the grid, just without the
     yellow centroid circle (draw_spot_fit_status's own "circled = good,
     plain = missing/rejected" convention, unchanged).
+
+    Show Crop (ShowCropPushButton/show_crop_requested) is a THIRD, even
+    cheaper action on the same selection -- per explicit request, View
+    still always runs the real fit (single or mixture) to produce its
+    preview, which is exactly the expensive part someone wants to skip
+    when all they want is a quick look at the raw crop before deciding
+    whether fitting it is even worth doing. This renders into the SAME
+    grid as View, just with every centroid=None (no circle at all, ever
+    -- nothing was fit, so there's nothing real to circle), and touches
+    nothing fit-related: no localization.refine_spot_z call at all.
     """
     run_requested = QtCore.pyqtSignal()
     view_requested = QtCore.pyqtSignal()
+    show_crop_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -137,6 +148,17 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         self.MultiModeCheckBox.setChecked(DEFAULT_PARAMS['multi_mode'])
         form.addRow(self.MultiModeCheckBox)
 
+        # How far in Z a second mixture component may be found from this
+        # spot's own coarse Z, before the search even runs (see
+        # localization.refine_spot_z's own z_window docstring) -- a real
+        # crop's raw Z-stack is typically 100+ planes, so an unrestricted
+        # search treats any brightish voxel anywhere in that range as a
+        # candidate "second component."
+        self.ZWindowSpinBox = QtWidgets.QSpinBox()
+        self.ZWindowSpinBox.setRange(1, 200)
+        self.ZWindowSpinBox.setValue(DEFAULT_PARAMS['z_window'])
+        form.addRow('Z search window (+/-px, mixture mode only):', self.ZWindowSpinBox)
+
         self.ResetDefaultsPushButton = QtWidgets.QPushButton('Reset to Defaults')
         self.ResetDefaultsPushButton.clicked.connect(self.reset_defaults)
         left_layout.addWidget(self.ResetDefaultsPushButton)
@@ -171,8 +193,11 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         self.RunPushButton.clicked.connect(self.run_requested.emit)
         self.ViewPushButton = QtWidgets.QPushButton('View (crop + fit status only, nothing saved)')
         self.ViewPushButton.clicked.connect(self.view_requested.emit)
+        self.ShowCropPushButton = QtWidgets.QPushButton('Show Crop (no fit, instant)')
+        self.ShowCropPushButton.clicked.connect(self.show_crop_requested.emit)
         actionRowLayout.addWidget(self.RunPushButton)
         actionRowLayout.addWidget(self.ViewPushButton)
+        actionRowLayout.addWidget(self.ShowCropPushButton)
         middle_layout.addWidget(actionRow)
 
         self.StatusLabel = QtWidgets.QLabel('')
@@ -204,7 +229,8 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
                 'min_hb_ratio': self.MinHBRatioSpinBox.value(),
                 'min_ah_ratio': self.MinAHRatioSpinBox.value(),
                 'min_sep': self.MinSepSpinBox.value(),
-                'multi_mode': self.MultiModeCheckBox.isChecked()}
+                'multi_mode': self.MultiModeCheckBox.isChecked(),
+                'z_window': self.ZWindowSpinBox.value()}
 
     def reset_defaults(self):
         """Restores all fields to DEFAULT_PARAMS -- undoes any manual
@@ -217,20 +243,39 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         self.MinAHRatioSpinBox.setValue(DEFAULT_PARAMS['min_ah_ratio'])
         self.MinSepSpinBox.setValue(DEFAULT_PARAMS['min_sep'])
         self.MultiModeCheckBox.setChecked(DEFAULT_PARAMS['multi_mode'])
+        self.ZWindowSpinBox.setValue(DEFAULT_PARAMS['z_window'])
 
-    def set_spot_choices(self, labels):
+    def set_spot_choices(self, labels, keep_selected=None):
         """
         Repopulates the middle column's list from scratch -- called by
-        MainWindow whenever the crop displayer's own current view changes
-        (new cell/hybe/channel selected, spots added/removed/undone).
-        Everything starts selected (convenient default matching the old
-        "process every spot in view" behavior); the user deselects rows
-        they don't want touched, rather than needing to reselect the same
-        set after every single refresh.
+        MainWindow whenever the crop displayer redraws (new cell/hybe/
+        channel selected, OR spots added/removed/undone/refined within
+        the SAME view). Without keep_selected, everything starts selected
+        (convenient default matching the old "process every spot in
+        view" behavior) -- used for a genuine view switch, where an old
+        selection has nothing meaningful to map onto.
+
+        keep_selected (optional): 0-based row indices, in THIS call's own
+        `labels` numbering, to select instead of defaulting to all --
+        the caller (MainWindow._refresh_localize_3d_spot_choices) resolves
+        these from the PREVIOUS selection by spot identity, not row
+        position (row numbers shift when spots are added/removed/
+        reordered). Per confirmed real bug: this repopulation used to
+        unconditionally selectAll() every single time, including redraws
+        triggered by something else entirely (e.g. adding a manual spot,
+        or Run's own end-of-batch refresh) -- silently discarding
+        whatever subset the user had deliberately selected moments
+        earlier, so a SUBSEQUENT Run/View would act on every spot in
+        view again, not just the ones the user actually picked.
         """
         self.SpotListWidget.clear()
         self.SpotListWidget.addItems(labels)
-        self.SpotListWidget.selectAll()
+        if keep_selected:
+            for i in keep_selected:
+                if 0 <= i < self.SpotListWidget.count():
+                    self.SpotListWidget.item(i).setSelected(True)
+        else:
+            self.SpotListWidget.selectAll()
 
     def selected_indices(self):
         """0-based row indices, matching set_spot_choices' own enumeration order."""

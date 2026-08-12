@@ -108,6 +108,9 @@ class IngestionPanelUI(object):
         self.ShowMemoryViewerPushButton = QtWidgets.QPushButton('Show Cell/Spot Memory Status...')
         layout.addWidget(self.ShowMemoryViewerPushButton)
 
+        self.ShowCellSpotStatusDisplayerPushButton = QtWidgets.QPushButton('Show Cell/Spot Status Detail...')
+        layout.addWidget(self.ShowCellSpotStatusDisplayerPushButton)
+
         viewerGroup = QtWidgets.QGroupBox('MIP Viewer (visually spot-check an ingested FOV/hybe/channel)')
         viewerForm = QtWidgets.QFormLayout(viewerGroup)
         self.ViewerFovSpinBox = QtWidgets.QSpinBox()

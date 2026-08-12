@@ -97,6 +97,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(self.canvas)
         zoom_pan.install_scroll_zoom(self.canvas)
         zoom_pan.install_keyboard_zoom(self.canvas)
+        zoom_pan.install_drag_pan(self.canvas)
 
         scaleRow = QtWidgets.QWidget()
         scaleRowLayout = QtWidgets.QHBoxLayout(scaleRow)
@@ -128,7 +129,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
 
     def set_data(self, crop_image, spot_points, mask=None, color='red', readonly_points=None,
                  context_image=None, context_masks=None, context_title='',
-                 spot_indices=None, readonly_indices=None):
+                 spot_indices=None, readonly_indices=None, keep_view=False):
         """
         spot_indices/readonly_indices: optional lists of DISPLAY index
         numbers, parallel (same length/order) to spot_points/
@@ -176,6 +177,16 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         Ignored when context_image is None.
 
         context_title: optional title string for the LEFT panel.
+
+        keep_view (default False, no behavior change): True preserves
+        the current zoom/pan instead of resetting to the full crop --
+        per confirmed real bug, every manual click (add or remove)
+        round-trips through MainWindow back to this same set_data call
+        to reflect the now-real ASpot-backed point, and the previous
+        unconditional reset meant a user zoomed in to place several
+        spots precisely had the view snap back to full-frame after
+        EVERY single click. Callers doing a genuine view switch (a
+        different cell/hybe/channel) should still leave this False.
         """
         self.crop_image = crop_image
         self.spot_points = list(spot_points)
@@ -189,7 +200,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         self.context_image = context_image
         self.context_masks = list(context_masks) if context_masks else []
         self.context_title = context_title
-        self._redraw(keep_view=False)
+        self._redraw(keep_view=keep_view)
 
     def _redraw(self, keep_view=True):
         if self.crop_image is None:

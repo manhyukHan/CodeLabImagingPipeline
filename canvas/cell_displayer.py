@@ -69,6 +69,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(self.canvas)
         zoom_pan.install_scroll_zoom(self.canvas)
         zoom_pan.install_keyboard_zoom(self.canvas)
+        zoom_pan.install_drag_pan(self.canvas)
 
         scaleRow = QtWidgets.QWidget()
         scaleRowLayout = QtWidgets.QHBoxLayout(scaleRow)

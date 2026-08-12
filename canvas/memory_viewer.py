@@ -53,10 +53,10 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(self.RefreshPushButton)
 
         self.Table = QtWidgets.QTableWidget()
-        self.Table.setColumnCount(9)
+        self.Table.setColumnCount(10)
         self.Table.setHorizontalHeaderLabels(
             ['Storage Path', 'FOV', 'Saved At', 'FOV align', 'Cross-modal', 'Cell align',
-             'Cell celltype', 'Spot celltype', 'Spots'])
+             'Cell celltype', 'Spot celltype', 'Spot Z', 'Spots'])
         self.Table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.Table.verticalHeader().setVisible(False)
         layout.addWidget(self.Table)
@@ -67,7 +67,16 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
         storage_path, fov, saved_at, n_spots,
         fov_computed, fov_total, cross_computed, cross_total,
         cell_computed, cell_total, cell_celltype_computed, cell_celltype_total,
-        spot_computed, spot_total.
+        spot_computed, spot_total, z_computed, z_total.
+
+        n_spots (the 'Spots' column) is every real persisted spot for
+        this FOV -- cell-owned AND the FOV-level unassigned pool, per
+        confirmed bug (this used to only count cell-owned spots). 'Spot
+        Z' is a SEPARATE count over that same total: how many have a
+        real, non-default Z (see MainWindow._refresh_memory_viewer's own
+        comment on why coordinate[2] != 0.0 is used as the persisted
+        proxy for "Z actually localized", since _z_status itself is
+        session-transient and never persisted).
         """
         self.Table.setRowCount(len(rows))
         for i, row in enumerate(rows):
@@ -80,6 +89,7 @@ class MemoryViewerDisplayer(QtWidgets.QMainWindow):
                 f"{row['cell_computed']}/{row['cell_total']}",
                 f"{row['cell_celltype_computed']}/{row['cell_celltype_total']}",
                 f"{row['spot_computed']}/{row['spot_total']}",
+                f"{row['z_computed']}/{row['z_total']}",
                 str(row['n_spots']),
             ]
             for j, val in enumerate(values):

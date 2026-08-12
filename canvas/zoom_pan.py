@@ -1,16 +1,20 @@
 """
-Shared scroll-to-zoom + view-persistence-across-redraw for every
-interactive displayer in this app.
+Shared scroll-to-zoom + drag-to-pan + view-persistence-across-redraw for
+every interactive displayer in this app.
 
 Matplotlib gives no free zoom/pan by default -- a plain FigureCanvasQTAgg
 only resizes with its window (the image content scales to fill, but
 there's no way to zoom into a sub-region). The standard fix,
 NavigationToolbar2QT, was deliberately NOT used here: its pan/zoom tools
-capture left-click-drag, which would fight with this app's manual-mode
-click-to-place interactions (cell polygon vertices, spot placement) --
-exactly the conflict CellClassifier needed a dedicated "F" pan/zoom-toggle
-shortcut to work around with pyqtgraph. Scroll-wheel zoom (this module)
-needs no click at all, so it never competes with those handlers.
+capture LEFT-click-drag, which would fight with this app's manual-mode
+click-to-place interactions (cell polygon vertices, spot placement:
+left-click=add, right-click=remove) -- exactly the conflict CellClassifier
+needed a dedicated "F" pan/zoom-toggle shortcut to work around with
+pyqtgraph. Scroll-wheel zoom (this module) needs no click at all, so it
+never competes with those handlers; drag-to-pan (install_drag_pan, per
+explicit request) uses the MIDDLE mouse button specifically, since
+neither manual-click handler (left/right) ever touches it -- pan works
+in every mode, manual or not, no toggle needed.
 
 Every displayer's _redraw() does fig.clear() + fig.subplots(...) on every
 call (new mask overlay, new scale, a moved vertex, ...), which would
@@ -86,6 +90,61 @@ def install_keyboard_zoom(canvas, zoom_factor=1.2):
         scale = (1 / zoom_factor) if event.key in ('+', '=') else zoom_factor
         _apply_zoom(ax, canvas, cx, cy, scale)
     return canvas.mpl_connect('key_press_event', on_key)
+
+
+def install_drag_pan(canvas, button=2):
+    """
+    Middle-click-drag (button=2 -- Qt/matplotlib's MouseButton.MIDDLE) to
+    pan, grabbing whatever data point was under the cursor at press-time
+    and keeping it under the cursor for the rest of the drag. Deliberately
+    NOT left or right click (see module docstring): those are already
+    manual-mode's add/remove buttons in every displayer this installs
+    into, and using either here would make every manual click also start
+    a pan.
+
+    Converts the drag in PIXEL space (event.x/event.y -- stable widget
+    coordinates, unaffected by the axes' own xlim/ylim) rather than DATA
+    space (event.xdata/ydata): those are computed through the axes'
+    CURRENT transform, which this function is itself changing on every
+    motion event, so re-deriving a delta from consecutive event.xdata
+    values would compound whatever rounding/transform error each step
+    introduces. Instead, the pixel-per-data-unit conversion is captured
+    ONCE at press-time and the axes' own press-time xlim/ylim are always
+    the base a fresh total pixel offset is applied to -- no compounding
+    possible.
+    """
+    state = {}
+
+    def on_press(event):
+        if event.button != button or event.inaxes is None:
+            return
+        ax = event.inaxes
+        inv = ax.transData.inverted()
+        x0d, y0d = inv.transform((event.x, event.y))
+        x1d, y1d = inv.transform((event.x + 1, event.y + 1))
+        state['ax'] = ax
+        state['x0'], state['y0'] = event.x, event.y
+        state['xlim0'], state['ylim0'] = ax.get_xlim(), ax.get_ylim()
+        state['dx_per_px'], state['dy_per_px'] = x1d - x0d, y1d - y0d
+
+    def on_motion(event):
+        if state.get('ax') is None or event.inaxes is not state['ax']:
+            return
+        dx = (event.x - state['x0']) * state['dx_per_px']
+        dy = (event.y - state['y0']) * state['dy_per_px']
+        x0, x1 = state['xlim0']
+        y0, y1 = state['ylim0']
+        state['ax'].set_xlim(x0 - dx, x1 - dx)
+        state['ax'].set_ylim(y0 - dy, y1 - dy)
+        canvas.draw_idle()
+
+    def on_release(event):
+        if event.button == button:
+            state.clear()
+
+    return [canvas.mpl_connect('button_press_event', on_press),
+            canvas.mpl_connect('motion_notify_event', on_motion),
+            canvas.mpl_connect('button_release_event', on_release)]
 
 
 def capture_view(fig):

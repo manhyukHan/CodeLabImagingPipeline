@@ -20,6 +20,7 @@ from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
 from canvas.celltype_result_displayer import CelltypeResultDisplayer
 from canvas.mip_viewer import MipViewerDisplayer
 from canvas.memory_viewer import MemoryViewerDisplayer
+from canvas.cell_spot_status_displayer import CellSpotStatusDisplayer
 from canvas.alignment_preview_window import AlignmentPreviewWindow
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import vlinks_store
@@ -394,10 +395,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.localize_3d_displayer = Localize3DDisplayer()
         self.localize_3d_displayer.run_requested.connect(self._run_3d_localize)
         self.localize_3d_displayer.view_requested.connect(self._view_3d_localize)
+        self.localize_3d_displayer.show_crop_requested.connect(self._show_3d_crop_only)
 
         self.mip_viewer = MipViewerDisplayer()
         self.memory_viewer = MemoryViewerDisplayer()
         self.memory_viewer.RefreshPushButton.clicked.connect(self._refresh_memory_viewer)
+
+        self.cell_spot_status_displayer = CellSpotStatusDisplayer()
+        cssd = self.cell_spot_status_displayer
+        cssd.refresh_requested.connect(self._refresh_cell_spot_status_full)
+        cssd.modality_changed.connect(self._refresh_cell_spot_status_full)
+        cssd.cell_fov_changed.connect(self._refresh_cell_spot_status_cell_panel)
+        cssd.spot_scope_changed.connect(self._on_cell_spot_status_spot_scope_changed)
 
         self.barcode_overview_displayer = BarcodeOverviewDisplayer()
         self.celltype_result_displayer = CelltypeResultDisplayer()
@@ -456,6 +465,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.ViewerChannelComboBox.currentIndexChanged.connect(lambda: self._show_mip_viewer(silent=True) if self.mip_viewer.isVisible() else None)
         ip.CheckIngestionStatusPushButton.clicked.connect(lambda: self._check_ingestion_status(silent=False))
         ip.ShowMemoryViewerPushButton.clicked.connect(self._show_memory_viewer)
+        ip.ShowCellSpotStatusDisplayerPushButton.clicked.connect(self._show_cell_spot_status_displayer)
         ip.AddJobPushButton.clicked.connect(self._add_job_to_queue)
         ip.RemoveJobPushButton.clicked.connect(self._remove_selected_jobs)
         ip.RunQueuePushButton.clicked.connect(self._run_job_queue)
@@ -1404,13 +1414,176 @@ class MainWindow(QtWidgets.QMainWindow):
                 spot_total = len(all_spots)
                 spot_computed = sum(1 for s in all_spots if s.get('linked'))
 
-                rows.append({'storage_path': storage_path, 'fov': fov, 'saved_at': saved_at, 'n_spots': spot_total,
+                # "Spots" (the raw count shown in the table) is every real,
+                # persisted spot for this FOV -- cell-owned AND the FOV-
+                # level unassigned pool (write_fov_spots/read_fov_spots,
+                # a separate vlinks.h5 group write_cells doesn't touch,
+                # see _identify_fov_unassigned_spots) -- per explicit
+                # request/confirmed bug: this used to only count cell-
+                # owned spots, silently dropping every spot still sitting
+                # in fov_unassigned_spots (e.g. manually clicked in FOV
+                # view but not yet identified into a cell) from the
+                # total. spot_total itself (cell-owned only) stays the
+                # correct denominator for the "Spot celltype" ratio right
+                # below -- an unassigned spot has no owning cell to
+                # inherit a celltype from, so counting it there would
+                # just make that ratio permanently short regardless of
+                # real progress.
+                unassigned_dicts = vlinks_store.read_fov_spots(storage_path, fov)
+                n_spots_total = spot_total + len(unassigned_dicts)
+
+                # "Spot Z" -- how many of this FOV's real spots (cell-
+                # owned + unassigned, same total as n_spots_total above)
+                # have a real, non-default Z. spot._z_status itself is a
+                # plain, session-transient Python attribute (see
+                # MainWindow._z_status_text's own docstring) -- never
+                # persisted, so it can't be read back here. coordinate[2]
+                # is: every spot starts at exactly 0.0 (both manual-click
+                # paths and auto-detect always seed z=0.0, see
+                # _on_spot_crop_edited/_run_spot_auto_detect_body), and
+                # refine_spot_z always writes back a real fitted float
+                # (never exactly 0.0 in practice) on acceptance -- so
+                # "coordinate[2] != 0.0" is a reliable, persisted proxy
+                # for "this spot's Z has actually been localized",
+                # without needing the transient _z_status flag at all.
+                z_total = n_spots_total
+                z_computed = sum(1 for s in all_spots + unassigned_dicts
+                                 if s.get('coordinate', (0.0, 0.0, 0.0))[2] != 0.0)
+
+                rows.append({'storage_path': storage_path, 'fov': fov, 'saved_at': saved_at, 'n_spots': n_spots_total,
                             'fov_computed': fov_computed, 'fov_total': fov_total,
                             'cross_computed': cross_computed, 'cross_total': cross_total,
                             'cell_computed': cell_computed, 'cell_total': cell_total,
                             'cell_celltype_computed': cell_celltype_computed, 'cell_celltype_total': cell_total,
-                            'spot_computed': spot_computed, 'spot_total': spot_total})
+                            'spot_computed': spot_computed, 'spot_total': spot_total,
+                            'z_computed': z_computed, 'z_total': z_total})
         self.memory_viewer.set_data(rows)
+
+    def _all_spot_dicts_for_fov(self, storage_path, fov):
+        """
+        Every real, persisted ASpot.save()-shaped dict for one FOV --
+        cell-owned (nested inside each cell's own 'spots' list) AND the
+        FOV-level unassigned pool (a separate vlinks.h5 group, see
+        write_fov_spots/read_fov_spots) -- straight off disk, same "what
+        is REALLY there" principle as CellSpotStatusDisplayer's own
+        class docstring. Used by both its Spot panel and the hybe/channel
+        choice-derivation below.
+        """
+        cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
+        cell_owned = [s for c in (cell_dicts or []) for s in c.get('spots', [])]
+        unassigned = vlinks_store.read_fov_spots(storage_path, fov)
+        return cell_owned + unassigned
+
+    def _show_cell_spot_status_displayer(self):
+        d = self.cell_spot_status_displayer
+        d.set_modality_choices(self.modality_names)
+        self._refresh_cell_spot_status_full()
+        d.show()
+        d.raise_()
+
+    def _refresh_cell_spot_status_full(self):
+        """
+        Re-derives the FOV choices for BOTH panels from the Ingestion
+        tab's own FOV list (Refresh's own job -- the CHOICES themselves,
+        not just the currently-selected scope's data, might be stale;
+        see the class docstring on why this is separate from a plain
+        combo-change refresh), then refreshes both panels for whatever
+        FOV ends up selected.
+        """
+        d = self.cell_spot_status_displayer
+        modality = d.current_modality() or (self.modality_names[0] if self.modality_names else '')
+        if not modality:
+            return
+        storage_path = self._storage_path_for_modality(modality)
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        d.set_cell_fov_choices(fov_list)
+        d.set_spot_fov_choices(fov_list)
+        if not storage_path or not fov_list:
+            d.set_cell_data([], 0, 0)
+            d.set_spot_hybe_choices([])
+            d.set_spot_channel_choices([])
+            d.set_spot_data([], 0)
+            return
+        self._refresh_cell_spot_status_cell_panel()
+        self._on_cell_spot_status_spot_scope_changed()
+
+    def _refresh_cell_spot_status_cell_panel(self):
+        d = self.cell_spot_status_displayer
+        storage_path = self._storage_path_for_modality(d.current_modality())
+        fov = d.current_cell_fov()
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        if not storage_path or fov is None:
+            d.set_cell_data([], 0, len(fov_list))
+            return
+        cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
+        cell_dicts = cell_dicts or []
+        n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
+                      for f in fov_list)
+        d.set_cell_data(cell_dicts, n_total, len(fov_list))
+
+    def _on_cell_spot_status_spot_scope_changed(self):
+        """
+        Single handler for all three Spot-panel combos (FOV/hybe/channel)
+        -- re-derives hybe/channel CHOICES for the current FOV first
+        (cheap, and a no-op on the user's own current selection whenever
+        the FOV didn't actually change, since set_spot_hybe_choices/
+        set_spot_channel_choices preserve it if still present), then
+        refreshes the panel itself.
+        """
+        self._refresh_cell_spot_status_spot_choices()
+        self._refresh_cell_spot_status_spot_panel()
+
+    def _refresh_cell_spot_status_spot_choices(self):
+        d = self.cell_spot_status_displayer
+        storage_path = self._storage_path_for_modality(d.current_modality())
+        fov = d.current_spot_fov()
+        if not storage_path or fov is None:
+            d.set_spot_hybe_choices([])
+            d.set_spot_channel_choices([])
+            return
+        spot_dicts = self._all_spot_dicts_for_fov(storage_path, fov)
+        d.set_spot_hybe_choices(sorted({s['hybe'] for s in spot_dicts}))
+        hybe = d.current_spot_hybe()
+        channels = sorted({s['channel'] for s in spot_dicts if hybe is None or s['hybe'] == hybe})
+        d.set_spot_channel_choices(channels)
+
+    def _ordered_spot_dicts_for_scope(self, storage_path, fov, hybe, channel):
+        """
+        [(global_index, spot_dict), ...], 1-based -- SAME ordering/
+        numbering scheme as _global_spot_order/_global_spot_index_map
+        (unassigned pool first in its own on-disk list order, then cells
+        sorted by cell id, each contributing its own spots in on-disk
+        list order), just rebuilt from persisted dicts (read_cells/
+        read_fov_spots) instead of live ASpot objects -- so a spot's
+        number in CellSpotStatusDisplayer's tree matches its number in
+        the crop displayer / 3D-localization popup, per confirmed real
+        bug: labeling from spot_dict['id'] instead showed EVERY spot as
+        "Spot 0", since ASpot.id defaults to 0 and nothing that creates a
+        spot in this app ever sets it to a real per-spot value.
+        """
+        cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
+        cell_dicts = cell_dicts or []
+        unassigned = vlinks_store.read_fov_spots(storage_path, fov)
+        ordered = [s for s in unassigned if s['hybe'] == hybe and s['channel'] == channel]
+        for c in sorted(cell_dicts, key=lambda c: c['id']):
+            for s in c.get('spots', []):
+                if s['hybe'] == hybe and s['channel'] == channel:
+                    ordered.append(s)
+        return list(enumerate(ordered, start=1))
+
+    def _refresh_cell_spot_status_spot_panel(self):
+        d = self.cell_spot_status_displayer
+        storage_path = self._storage_path_for_modality(d.current_modality())
+        fov = d.current_spot_fov()
+        hybe = d.current_spot_hybe()
+        channel = d.current_spot_channel()
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        if not storage_path or fov is None or hybe is None or channel is None:
+            d.set_spot_data([], 0)
+            return
+        indexed = self._ordered_spot_dicts_for_scope(storage_path, fov, hybe, channel)
+        n_total = sum(len(self._all_spot_dicts_for_fov(storage_path, f)) for f in fov_list)
+        d.set_spot_data(indexed, n_total)
 
     def _show_mip_viewer(self, silent=False):
         """
@@ -2403,7 +2576,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """{id(spot): global_index(1-based)} -- see _global_spot_order."""
         return {id(s): i + 1 for i, (s, _) in enumerate(self._global_spot_order(storage_path, fov, hybe, channel))}
 
-    def _load_spot_crop_for_display(self, *_args):
+    def _load_spot_crop_for_display(self, *_args, keep_view=False):
         sp = self.ui.SpotLocalizationPanel
         cell = self._selected_spot_cell()
         hybe = sp.current_hybe_folder()
@@ -2431,11 +2604,12 @@ class MainWindow(QtWidgets.QMainWindow):
             crop['img'], existing_points, mask=crop['mask'],
             context_image=crop['full_mip'], context_masks=context_masks,
             context_title=f'FOV{fov:02d} {hybe} ch{channel} (full)',
-            spot_indices=spot_indices)
+            spot_indices=spot_indices, keep_view=keep_view)
+        preserve_ids = self._selected_3d_spot_ids()
         self._current_view_spot_refs = [(s, cell) for s in scoped_spots]
-        self._refresh_localize_3d_spot_choices()
+        self._refresh_localize_3d_spot_choices(preserve_selected_ids=preserve_ids)
 
-    def _load_fov_spot_display(self):
+    def _load_fov_spot_display(self, keep_view=False):
         """
         FOV view -- the full raw hybe/channel MIP with BOTH the current
         FOV-level unassigned-spot pool (fov_unassigned_spots, yellow --
@@ -2492,13 +2666,14 @@ class MainWindow(QtWidgets.QMainWindow):
             mip, unassigned_points, color='yellow', readonly_points=cell_owned_points,
             context_image=mip, context_masks=context_masks,
             context_title=f'FOV{fov:02d} {hybe} ch{channel} -- cell masks',
-            spot_indices=spot_indices, readonly_indices=readonly_indices)
+            spot_indices=spot_indices, readonly_indices=readonly_indices, keep_view=keep_view)
         # same "editable list numbered first, then readonly" order
         # SpotCropDisplayer itself already draws (see its class docstring)
         # -- keeps the 3D-localization popup's row numbering identical to
         # what's actually on screen.
+        preserve_ids = self._selected_3d_spot_ids()
         self._current_view_spot_refs = [(s, None) for s in unassigned_spots] + cell_owned_refs
-        self._refresh_localize_3d_spot_choices()
+        self._refresh_localize_3d_spot_choices(preserve_selected_ids=preserve_ids)
 
     def _show_spot_displayer(self, *_args):
         """
@@ -2558,7 +2733,7 @@ class MainWindow(QtWidgets.QMainWindow):
         status = getattr(spot, '_z_status', None)
         return {'accepted': 'Z-accepted', 'rejected': 'Z-rejected'}.get(status, 'Z-not run')
 
-    def _refresh_localize_3d_spot_choices(self):
+    def _refresh_localize_3d_spot_choices(self, preserve_selected_ids=None):
         """
         Repopulates the 3D-localization popup's spot list from
         self._current_view_spot_refs -- the SAME ordered (ASpot,
@@ -2573,6 +2748,19 @@ class MainWindow(QtWidgets.QMainWindow):
         _global_spot_index_map) -- not a 1..N recount over just this
         view -- so a spot's number matches between the two windows and
         stays put across a cell/view switch.
+
+        preserve_selected_ids (optional): a set of id(spot) values --
+        whichever of these are still present in self._current_view_
+        spot_refs get RE-selected instead of the default select-all.
+        Callers pass this whenever this refresh is happening for a
+        reason OTHER than a genuine view switch (e.g. redrawing after a
+        manual spot add/remove within the SAME cell/hybe/channel) --
+        per confirmed real bug, defaulting to select-all on every single
+        redraw silently discarded a user's deliberate selection before
+        they'd had a chance to click Run/View, so Run ended up acting on
+        every spot in view instead of just the selected ones. Falls back
+        to select-all when none of these ids are found in the new view
+        (a genuine view switch has nothing old to preserve).
         """
         sp = self.ui.SpotLocalizationPanel
         storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
@@ -2586,7 +2774,25 @@ class MainWindow(QtWidgets.QMainWindow):
         labels = [f'Spot {gmap.get(id(spot), "?")} | Cell {"unassigned" if cell is None else cell.id} '
                  f'| {self._z_status_text(spot)}'
                  for spot, cell in self._current_view_spot_refs]
-        self.localize_3d_displayer.set_spot_choices(labels)
+        keep_selected = None
+        if preserve_selected_ids:
+            keep_selected = [i for i, (spot, _cell) in enumerate(self._current_view_spot_refs)
+                             if id(spot) in preserve_selected_ids]
+        self.localize_3d_displayer.set_spot_choices(labels, keep_selected=keep_selected)
+
+    def _selected_3d_spot_ids(self):
+        """
+        id(spot) for whichever rows are currently selected in the
+        3D-localization popup's own list, resolved against the CURRENT
+        (about-to-be-replaced) self._current_view_spot_refs -- call this
+        BEFORE overwriting that list/calling _refresh_localize_3d_spot_
+        choices, so the selection can be carried over by spot identity
+        rather than being silently reset (see that method's own
+        preserve_selected_ids docstring).
+        """
+        return {id(self._current_view_spot_refs[i][0])
+                for i in self.localize_3d_displayer.selected_indices()
+                if i < len(self._current_view_spot_refs)}
 
     def _resolve_selected_3d_targets(self):
         """
@@ -2677,7 +2883,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
-                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'])
+                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
+                z_window=params['z_window'])
             if new_coordinate is not None:
                 spot.coordinate = new_coordinate
                 spot.raw_coordinate = new_raw
@@ -2728,7 +2935,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
-                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'])
+                min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
+                z_window=params['z_window'])
             if cubic is not None:
                 grid_results.append((cubic, centroid, title))
             if new_raw is not None:
@@ -2745,6 +2953,45 @@ class MainWindow(QtWidgets.QMainWindow):
             f'{hybe} ch{channel}: PREVIEW ONLY, nothing saved -- {n_would_accept}/{len(targets)} '
             f'selected spot(s) would be accepted{mixture_msg}. '
             f'[{mode_label} mode, {elapsed:.2f}s for {len(targets)} spot(s)]')
+
+    def _show_3d_crop_only(self):
+        """
+        Fit-free counterpart to View -- crops the raw Z-stack around each
+        selected spot's own raw (x,y) via spot_mapper.crop_for_localization
+        directly (the exact same crop step localization.refine_spot_z's
+        own first few lines perform), never calling refine_spot_z itself
+        so no fit (single or mixture) ever runs. Per explicit request:
+        View always runs the real fit to preview whether it would
+        succeed, which is exactly the expensive part to skip when someone
+        just wants a quick look at the raw crop before deciding whether
+        fitting it is even worth doing. Renders into the SAME grid as
+        View, every centroid=None -- no circle ever drawn (nothing was
+        fit, so there's nothing real to circle; draw_spot_fit_status's
+        own "circled = good, plain = missing" convention already treats
+        centroid=None this way, unchanged).
+        """
+        resolved = self._resolve_selected_3d_targets()
+        if resolved is None:
+            return
+        storage_path, fov, hybe, modality, channel, targets = resolved
+        params = self.localize_3d_displayer.params()
+
+        grid_results = []
+        for spot, cell in targets:
+            title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
+            raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
+            try:
+                cubic, _ = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
+                                                             (raw_x, raw_y), pad=params['spad'], use_stack=True)
+            except OSError:
+                continue
+            if cubic.size == 0:
+                continue
+            grid_results.append((cubic, None, title))
+
+        self.localize_3d_displayer.show_fit_status_grid(grid_results)
+        self.localize_3d_displayer.StatusLabel.setText(
+            f'{hybe} ch{channel}: showing raw crop for {len(grid_results)}/{len(targets)} selected spot(s) -- no fit computed.')
 
     def _current_spot_scope_max(self):
         """Best-effort max intensity of whatever's currently shown in the
@@ -2980,10 +3227,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         n_identified, n_identified_cells = self._identify_fov_unassigned_spots(fov, storage_paths)
+        self._assign_spot_indices(fov)
 
         n_spots = sum(c.total_num_spots for c in self.cell_container.data[fov])
         for storage_path in storage_paths:
             vlinks_store.write_cells(storage_path, fov, self.cell_container)
+        # _identify_fov_unassigned_spots already wrote the leftover
+        # unassigned pool once (with whatever stale .id each spot had
+        # coming in) -- re-write it now that _assign_spot_indices has
+        # given every spot its real, current index, so the ids that
+        # actually land on disk for the unassigned pool match write_
+        # cells' own cell-owned spots above, not a snapshot from before
+        # assignment.
+        for modality_name in self.modality_names:
+            modality_storage_path = self._storage_path_for_modality(modality_name)
+            key = (modality_storage_path, fov) if modality_storage_path else None
+            if key is not None and key in self.fov_unassigned_spots:
+                vlinks_store.mirror_write_fov_spots(storage_paths, fov, self.fov_unassigned_spots[key])
 
         sp.LogTextEdit.append(f'FOV{fov:02d}: {len(self.cell_container.data[fov])} cell(s), {n_spots} total spot(s) '
                               f'saved to vlinks.h5 ({n_identified} unassigned spot(s) newly identified into '
@@ -2994,6 +3254,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
+
+    def _assign_spot_indices(self, fov):
+        """
+        Assigns every real spot in this FOV (cell-owned AND the FOV-level
+        unassigned pool) a real, PERSISTED spot.id -- its 1-based position
+        within its own (hybe, channel) group, unassigned-pool spots first
+        then cells sorted by cell id (the SAME ordering _global_spot_order/
+        _global_spot_index_map already use to number spots for display in
+        the crop displayer and 3D-localization popup -- see those for the
+        full rationale). Per explicit request: the index shouldn't only
+        ever exist as a value recomputed fresh in memory for display, it
+        should be saved into vlinks.h5 itself so it's a real, inspectable
+        attribute of the spot -- confirmed real gap, ASpot.id defaults to
+        0 and nothing that creates a spot in this app ever set it to
+        anything else, so every persisted spot showed the same id=0.
+
+        Called right before Save Current Spots writes, so the ids landing
+        on disk reflect the CURRENT ordering/content at save time -- same
+        "recomputed fresh, not a stable-across-edits identity" contract
+        _global_spot_order's own docstring already states: adding/
+        removing a spot elsewhere in the FOV can still shift other spots'
+        ids on the NEXT save, exactly as it already shifts their
+        DISPLAYED number today. This does not itself write anything --
+        the caller (_save_current_spots) persists the result via its own
+        write_cells/mirror_write_fov_spots calls.
+        """
+        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
+        groups = {}  # (hybe, channel) -> [spot, ...], unassigned-pool spots first
+        for (storage_path, spot_fov), spots in self.fov_unassigned_spots.items():
+            if spot_fov != fov:
+                continue
+            for s in spots:
+                groups.setdefault((s.hybe, s.channel), []).append(s)
+        for cell in sorted(cells, key=lambda c: c.id):
+            for s in cell.spots:
+                groups.setdefault((s.hybe, s.channel), []).append(s)
+        for spots in groups.values():
+            for i, s in enumerate(spots, start=1):
+                s.id = i
 
     def _identify_fov_unassigned_spots(self, fov, storage_paths):
         """
@@ -3273,11 +3572,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # a freshly manually-added point would show a local fallback
         # number instead of its real global one until some LATER action
         # happened to trigger a refresh (see SpotCropDisplayer's own
-        # spot_indices fallback).
+        # spot_indices fallback). keep_view=True: this is a redraw of the
+        # SAME view after an in-place edit, not a view switch -- per
+        # confirmed real bug, the previous unconditional reset snapped
+        # the zoom/pan back to full-frame after every single manual
+        # click, making it impossible to place several spots precisely
+        # while zoomed in.
         if ctx['kind'] == 'cell':
-            self._load_spot_crop_for_display()
+            self._load_spot_crop_for_display(keep_view=True)
         else:
-            self._load_fov_spot_display()
+            self._load_fov_spot_display(keep_view=True)
 
     def _on_readonly_spot_removed(self, cell_id, x, y):
         """
@@ -3317,7 +3621,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: removed 1 spot from FOV view '
                               f'(not yet saved -- click Save Current Spots to persist).')
         self._refresh_spot_cell_list()
-        self._load_fov_spot_display()  # re-derives global indices + 3D-localization popup list
+        self._load_fov_spot_display(keep_view=True)  # re-derives global indices + 3D-localization popup list
 
     def _run_spot_auto_detect(self):
         sp = self.ui.SpotLocalizationPanel

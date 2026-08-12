@@ -447,7 +447,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
                   spad=5, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                   min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
                   min_sep=3.0, component_threshold=0.3, max_components=3, claimed_positions=None,
-                  use_mixture=True):
+                  use_mixture=True, z_window=15):
     """
     Adds/refines Z on a spot that's ALREADY PLACED (2D auto-detect or a
     manual click, so spot.raw_coordinate's own x,y are already known and
@@ -473,11 +473,36 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     explicit, opt-in toggle for the crowded-crop case this was built for
     (see the multi-component paragraph below).
 
+    z_window (default 15, only matters when use_mixture=True): candidate
+    seeds are only ever searched for within +/-z_window planes of z0 (the
+    crop's own coarse brightest-voxel Z, computed above) -- NOT across
+    cubic's full native Z depth. cubic always carries the FULL Z-stack
+    (frequently 100+ planes, see crop_for_localization/_build_cell_crop),
+    so an unrestricted find_local_peaks_3d search over the whole thing
+    would treat ANY brightish voxel ANYWHERE in that huge range as a
+    candidate "second component" -- confirmed on real data as the actual
+    cause of two real, confirmed failure modes: (1) an accepted mixture
+    component whose fitted Z ends up dozens+ of planes from this spot's
+    real neighborhood (still numerically "inside" cubic, so the earlier
+    per-seed peak_bound clamp in fit_gaussian_mixture_3d never catches
+    it -- that clamp only bounds the fit AROUND its own seed, and this
+    seed was already wrong), rendering as a centroid floating outside the
+    crop's real, physically-relevant extent; (2) most/all crops -- not
+    just genuinely crowded ones -- registering a spurious "second
+    component" once mixture mode is on, since SOME unrelated brightish
+    voxel exists somewhere in a 100+-plane stack far more often than a
+    real second PSF does. Restricting the seed search itself (not just
+    post-filtering or clamping the fit afterward) means a spurious
+    far-away voxel never becomes a candidate at all, and also fixes
+    find_local_peaks_3d's own threshold_rel being computed against the
+    WRONG (full-stack) maximum instead of this spot's own local
+    neighborhood.
+
     When use_mixture=True and the crop plausibly contains more than one
-    real PSF (find_local_peaks_3d -- ChrTracer3's own FindPeaks3D-
-    equivalent step, scoped to this one spot's crop; see that function's
-    docstring): real case this handles is two spots close enough that a
-    single click/auto-detect pick landed ambiguously between them (e.g.
+    real PSF within that Z window (find_local_peaks_3d -- ChrTracer3's own
+    FindPeaks3D-equivalent step, scoped to this one spot's crop; see that
+    function's docstring): real case this handles is two spots close
+    enough that a single click/auto-detect pick landed ambiguously between them (e.g.
     chr19_downstream_new/DNA_queue Cell 23, spots 29/30 -- ~2px apart,
     same z-slice, a lone single-Gaussian fit pulled toward the midpoint
     between both blobs). Exactly one detected component (by far the
@@ -570,8 +595,24 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     x0, y0 = raw_x - xmin, raw_y - ymin
     z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
 
-    seeds = find_local_peaks_3d(cubic, min_sep=min_sep, threshold_rel=component_threshold,
-                                max_peaks=max_components) if use_mixture else []
+    if use_mixture:
+        # Search for seeds only within +/-z_window of z0, not across
+        # cubic's full native Z depth -- see this function's own
+        # docstring on z_window for why the unrestricted search is a
+        # confirmed, real bug (both a far-away accepted centroid and a
+        # spurious "second component" on crops that are really just one
+        # real blob). threshold_rel is also computed relative to THIS
+        # sub-cube's own max, not the full stack's, so a real local peak
+        # that isn't the single brightest voxel anywhere in 100+ planes
+        # is no longer overlooked either.
+        z0_idx = int(round(z0))
+        zwin_min = max(0, z0_idx - z_window)
+        zwin_max = min(cubic.shape[2], z0_idx + z_window + 1)
+        seeds_local = find_local_peaks_3d(cubic[:, :, zwin_min:zwin_max], min_sep=min_sep,
+                                          threshold_rel=component_threshold, max_peaks=max_components)
+        seeds = [(sx, sy, sz + zwin_min) for (sx, sy, sz) in seeds_local]
+    else:
+        seeds = []
     if len(seeds) <= 1:
         results = [fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
                                    init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
