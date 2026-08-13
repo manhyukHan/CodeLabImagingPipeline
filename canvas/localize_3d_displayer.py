@@ -356,8 +356,11 @@ class Localize3DGridDisplayer(QtWidgets.QMainWindow):
         # is generous; inner spacing (within one spot's own YX/XZ pair)
         # stays tight so the pair still reads as one connected crop.
         col_px, pair_px = 190, 300
+        # top=0.90 (not 0.97) -- the top row's own titles sit just above
+        # ax_yx, inside that same top margin; 0.97 left too little room and
+        # clipped them off the very top of the canvas (confirmed real bug).
         outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
-                                 left=0.03, right=0.98, top=0.97, bottom=0.03)
+                                 left=0.03, right=0.98, top=0.90, bottom=0.03)
         for i, (cubic, centroid, title) in enumerate(results):
             row_pair, col = divmod(i, ncols)
             inner = outer[row_pair, col].subgridspec(2, 1, hspace=0.08)
@@ -394,10 +397,17 @@ class Localize3DGridDisplayer(QtWidgets.QMainWindow):
         scheduled one; resetting scroll position also means a fresh
         selection's grid always starts visible from its own top-left,
         not wherever the previous (possibly much larger) grid had been
-        scrolled to.
+        scrolled to. viewport().repaint() (not just canvas.repaint()) --
+        a canvas.repaint() alone only guarantees the canvas's OWN new
+        (shrunk) rect gets redrawn; the surrounding viewport area the
+        previous, larger canvas used to cover needs its own forced,
+        synchronous repaint too, or stale pixels from that larger
+        previous grid can persist there. self.repaint() covers the same
+        risk one level up, at the whole pop-up window.
         """
         self.canvas.draw()
         self.canvas.repaint()
         self.scroll.horizontalScrollBar().setValue(0)
         self.scroll.verticalScrollBar().setValue(0)
-        self.scroll.viewport().update()
+        self.scroll.viewport().repaint()
+        self.repaint()

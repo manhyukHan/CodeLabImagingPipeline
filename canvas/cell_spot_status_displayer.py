@@ -61,6 +61,45 @@ def populate_cell_tree(tree, cell_dicts):
         _add_tree_children(top, c)
 
 
+def populate_allele_tree(tree, allele_dicts):
+    """
+    One top-level item per allele (label: 'Allele {id} (cell={id|
+    unassigned}, N hybe(s) traced)'), every AnAllele.save() key as an
+    expandable child -- same "show entire attributes" convention as
+    populate_cell_tree/populate_spot_tree.
+    """
+    tree.clear()
+    for a in allele_dicts:
+        cell_label = 'unassigned' if a.get('cell', -1) == -1 else f"cell {a.get('cell')}"
+        n_traced = len(a.get('polymer', {}))
+        top = QtWidgets.QTreeWidgetItem([f"Allele {a.get('id')} ({cell_label}, {n_traced} hybe(s) traced)", ''])
+        tree.addTopLevelItem(top)
+        _add_tree_children(top, a)
+
+
+def populate_matrix_tree(tree, rows):
+    """
+    rows: [{'fov':, 'same_modality': [(hybe, summary_str), ...],
+    'cross_modal': summary_str or None}, ...] -- one top-level item per
+    FOV, children = one per same-modality hybe plus, when this modality
+    has an accepted cross-modal link, one more for it. Pure ground-truth
+    display of whatever's persisted (see MainWindow._refresh_cell_spot_
+    status_matrix_panel's own docstring for exactly what's read and why)
+    -- summary_str is already-formatted text (dx/dy/angle), no further
+    nesting needed the way _add_tree_children's own recursive dict/list
+    handling is for (this data isn't a save()-shaped dict).
+    """
+    tree.clear()
+    for row in rows:
+        n_hybes = len(row['same_modality'])
+        top = QtWidgets.QTreeWidgetItem([f"FOV{row['fov']:02d} ({n_hybes} hybe(s))", ''])
+        tree.addTopLevelItem(top)
+        for hybe, summary in row['same_modality']:
+            top.addChild(QtWidgets.QTreeWidgetItem([hybe, summary]))
+        if row['cross_modal'] is not None:
+            top.addChild(QtWidgets.QTreeWidgetItem(['DNA->RNA (cross-modal)', row['cross_modal']]))
+
+
 def populate_spot_tree(tree, indexed_spot_dicts):
     """
     One top-level item per spot (label: 'Spot {global_index} (hybe, cell)'),
@@ -94,10 +133,14 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     persisted right now," at full per-attribute detail rather than the
     Memory Status viewer's own summary counts.
 
-    Two independent panels, matching the two things vlinks.h5 stores:
-    Cells (scoped by FOV alone -- a cell IS FOV-scoped) and Spots (scoped
-    by FOV + hybe + channel, since a real spot always belongs to exactly
-    one of each). Each panel's own combo selection re-reads and
+    Four independent panels: Matrix (ground-truth FOV-level alignment
+    matrices, scoped by modality alone -- see set_matrix_data), and the
+    three things vlinks.h5 stores per-cell/spot/allele: Cells (scoped by
+    FOV alone -- a cell IS FOV-scoped), Spots (scoped by FOV + hybe +
+    channel, since a real spot always belongs to exactly one of each),
+    and Alleles (scoped by FOV alone, same as Cells -- an allele's own
+    polymer dict already spans every traced hybe internally, no further
+    sub-scoping needed). Each panel's own combo selection re-reads and
     re-populates that panel's own tree live; the top-level Refresh button
     additionally re-reads storage_path's own FOV list from scratch and
     the "total" counts, for the case where vlinks.h5 changed via some
@@ -110,6 +153,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     refresh_requested = QtCore.pyqtSignal()
     cell_fov_changed = QtCore.pyqtSignal()
     spot_scope_changed = QtCore.pyqtSignal()
+    allele_fov_changed = QtCore.pyqtSignal()
     modality_changed = QtCore.pyqtSignal()
 
     def __init__(self):
@@ -133,6 +177,27 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         outer.addWidget(topRow)
         self.ModalityComboBox.currentIndexChanged.connect(self.modality_changed.emit)
         self.RefreshPushButton.clicked.connect(self.refresh_requested.emit)
+
+        # -- Matrix panel: ground-truth check, reads directly off vlinks.h5
+        # (bypassing MainWindow's own self.fov_matrices/cross_modal_result
+        # in-memory caches entirely) -- per explicit request, "we also need
+        # to know the current matrix status stored in vlinks" to
+        # troubleshoot independently of any session staleness. No scope
+        # combo of its own: shows every FOV at once (like the Alignment
+        # tab's own Results lists), scoped only by the shared Modality
+        # combo above and refreshed by the shared Refresh button -- sits
+        # above the Cells/Spots/Alleles splitter, not a 4th pane inside it.
+        matrixGroup = QtWidgets.QGroupBox('Matrix (persisted, all FOVs)')
+        matrixLayout = QtWidgets.QVBoxLayout(matrixGroup)
+        self.MatrixCountLabel = QtWidgets.QLabel('')
+        matrixLayout.addWidget(self.MatrixCountLabel)
+        self.MatrixTree = QtWidgets.QTreeWidget()
+        self.MatrixTree.setColumnCount(2)
+        self.MatrixTree.setHeaderLabels(['Hybe', 'dx, dy, angle'])
+        self.MatrixTree.header().setStretchLastSection(False)  # see CellTree's own comment on this
+        self.MatrixTree.setMaximumHeight(220)
+        matrixLayout.addWidget(self.MatrixTree, stretch=1)
+        outer.addWidget(matrixGroup)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         outer.addWidget(splitter, stretch=1)
@@ -188,6 +253,23 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         self.SpotHybeComboBox.currentIndexChanged.connect(self.spot_scope_changed.emit)
         self.SpotChannelComboBox.currentIndexChanged.connect(self.spot_scope_changed.emit)
 
+        # -- Alleles panel --
+        alleleGroup = QtWidgets.QGroupBox('Alleles')
+        alleleLayout = QtWidgets.QVBoxLayout(alleleGroup)
+        alleleForm = QtWidgets.QFormLayout()
+        self.AlleleFovComboBox = QtWidgets.QComboBox()
+        alleleForm.addRow('FOV:', self.AlleleFovComboBox)
+        alleleLayout.addLayout(alleleForm)
+        self.AlleleCountLabel = QtWidgets.QLabel('')
+        alleleLayout.addWidget(self.AlleleCountLabel)
+        self.AlleleTree = QtWidgets.QTreeWidget()
+        self.AlleleTree.setColumnCount(2)
+        self.AlleleTree.setHeaderLabels(['Attribute', 'Value'])
+        self.AlleleTree.header().setStretchLastSection(False)  # see CellTree's own comment on this
+        alleleLayout.addWidget(self.AlleleTree, stretch=1)
+        splitter.addWidget(alleleGroup)
+        self.AlleleFovComboBox.currentIndexChanged.connect(self.allele_fov_changed.emit)
+
     # -- population helpers (pure UI-state setters, no vlinks/file access here --
     # MainWindow reads vlinks_store and hands the results in) --
 
@@ -219,11 +301,17 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     def set_spot_fov_choices(self, fov_list):
         self._set_fov_choices(self.SpotFovComboBox, fov_list)
 
+    def set_allele_fov_choices(self, fov_list):
+        self._set_fov_choices(self.AlleleFovComboBox, fov_list)
+
     def current_cell_fov(self):
         return self.CellFovComboBox.currentData()
 
     def current_spot_fov(self):
         return self.SpotFovComboBox.currentData()
+
+    def current_allele_fov(self):
+        return self.AlleleFovComboBox.currentData()
 
     def set_spot_hybe_choices(self, hybes):
         current = self.SpotHybeComboBox.currentText()
@@ -262,3 +350,19 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         self.SpotTree.resizeColumnToContents(0)
         self.SpotTree.resizeColumnToContents(1)
         self.SpotCountLabel.setText(f'{len(indexed_spot_dicts)} spot(s) in this FOV/hybe/channel  |  {n_total_spots} spot(s) total')
+
+    def set_allele_data(self, allele_dicts, n_total_alleles, n_total_fovs):
+        populate_allele_tree(self.AlleleTree, allele_dicts)
+        self.AlleleTree.resizeColumnToContents(0)
+        self.AlleleTree.resizeColumnToContents(1)
+        self.AlleleCountLabel.setText(f'{len(allele_dicts)} allele(s) in this FOV  |  {n_total_alleles} allele(s) total across {n_total_fovs} FOV(s)')
+
+    def set_matrix_data(self, rows):
+        """rows: see populate_matrix_tree's own docstring."""
+        populate_matrix_tree(self.MatrixTree, rows)
+        self.MatrixTree.resizeColumnToContents(0)
+        self.MatrixTree.resizeColumnToContents(1)
+        self.MatrixTree.expandAll()
+        n_fovs = len(rows)
+        n_cross = sum(1 for r in rows if r['cross_modal'] is not None)
+        self.MatrixCountLabel.setText(f'{n_fovs} FOV(s){f", {n_cross} with a cross-modal matrix" if n_cross else ""}')

@@ -19,9 +19,9 @@ from canvas.localize_3d_displayer import Localize3DDisplayer, Localize3DGridDisp
 from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
 from canvas.celltype_result_displayer import CelltypeResultDisplayer
 from canvas.mip_viewer import MipViewerDisplayer
-from canvas.memory_viewer import MemoryViewerDisplayer
 from canvas.cell_spot_status_displayer import CellSpotStatusDisplayer
 from canvas.alignment_preview_window import AlignmentPreviewWindow
+from canvas.chromatin_trace_grid_displayer import ChromatinTraceGridDisplayer
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
@@ -30,6 +30,7 @@ from codelab_pipeline.segmentation import segment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
+from codelab_pipeline.models.allele import AnAllele
 from codelab_pipeline.models import celltype
 from skimage.feature import peak_local_max
 
@@ -204,96 +205,85 @@ class AlignmentWorker(QtCore.QThread):
 
 class CellAlignmentWorker(QtCore.QThread):
     """
-    jobs: list of (fov, cells, fov_matrices_for_that_fov, other_ctx).
-    cells are the real ACell objects (automatic mode --
-    compute_cell_alignment mutates cell.matrices in place, so this IS the
-    commit) or deepcopies of them (manual mode -- staged, only merged
-    into the real cells on Accept). Manual mode passes one job (today's
-    single-FOV behavior); automatic mode passes one job per FOV that has
-    permanent segmented cells.
+    jobs: list of (fov, cells, passes). cells are the real ACell objects
+    (automatic mode -- compute_cell_alignment mutates cell.matrices in
+    place, so this IS the commit) or deepcopies of them (manual mode --
+    staged, only merged into the real cells on Accept). Manual mode
+    passes one job (today's single-FOV behavior); automatic mode passes
+    one job per FOV that has permanent segmented cells.
 
-    other_ctx: (other_storage_path, other_hybe_records, other_fov_matrices,
-    other_reference_hybe, other_modality) or None -- see
-    MainWindow._other_modality_cell_alignment_inputs. When present, every
-    cell also gets a SECOND, independent compute_cell_alignment call
-    against the OTHER modality's own hybes (e.g. DNA hybes for an RNA-
-    segmented cell), composed into the cell's own frame via the cross-
-    modal correction -- per explicit request: once both the same-
-    modality and cross-modality layers are established, cell-based
-    alignment shouldn't be limited to a single modality's hybes.
+    passes: one dict PER MODALITY (see MainWindow._cell_alignment_passes,
+    which builds them), each with 'modality', 'storage_path',
+    'hybe_records', 'fov_matrices', 'reference_hybe' and
+    'cellref_fov_matrices'. Every cell gets one compute_cell_alignment
+    call per pass, so a cell ends up carrying a real, fitted residual for
+    EVERY configured modality's hybes -- not just its own segmentation
+    modality's.
+
+    Per explicit correction, what was dropped is narrower than an earlier
+    version of this code assumed: only the genuinely CROSS-MODAL FIT (a
+    DNA hybe's crop phase-correlated against an RNA anchor's crop, i.e.
+    comparing images across the modality boundary) is gone. Each
+    modality's own hybes are still fit against THAT MODALITY'S OWN cell
+    alignment reference (pass['reference_hybe'] = ap.current_cell_
+    reference_hybe(that modality)) -- DNA hybes vs DNA's anchor, RNA
+    hybes vs RNA's anchor -- so both crops in every fit are always the
+    same modality, which is the property that made same-modality fitting
+    work well in the first place. An earlier version instead skipped the
+    other modality's hybes ENTIRELY, which silently left every DNA spot
+    in an RNA cell with no cell-level residual at all (its coordinate
+    fell back to the plain FOV/cross-modal matrix), losing a real,
+    computable, purely same-modality correction: the drift between that
+    DNA hybe and DNA's own cell alignment reference.
+
+    The cell's mask still has to be projected across the modality
+    boundary to define the other modality's crop windows (unavoidable --
+    cell.area is native to the segmentation hybe's frame), via each
+    pass's own 'cellref_fov_matrices'; only the residual FIT itself is
+    kept strictly within one modality.
     """
     progress = QtCore.pyqtSignal(int, int, str)
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, storage_path, hybe_records, modality, reference_hybe=None, channel_type='readout', pad=10):
+    def __init__(self, jobs, channel_type='readout', pad=10):
         super().__init__()
         self.jobs = jobs
-        self.storage_path = storage_path
-        self.hybe_records = hybe_records
-        self.modality = modality
-        self.reference_hybe = reference_hybe
         self.channel_type = channel_type
         self.pad = pad
 
     def run(self):
         try:
             results = []
-            total = sum(len(cells) for _, cells, _, _ in self.jobs)
+            total = sum(len(cells) * max(len(passes), 1) for _, cells, passes in self.jobs)
             done = 0
-            for fov, cells, fov_matrices, other_ctx in self.jobs:
-                # only the hybes actually present in this FOV's fov_matrices
-                # are valid -- self.hybe_records can hold more (e.g. every
-                # hybe in the parsed layout) than what FOV alignment was
-                # actually run/accepted for.
-                hybe_records = [r for r in self.hybe_records if r['folder'] in fov_matrices]
-                if other_ctx is not None:
-                    other_storage_path, other_records_full, other_fov_matrices, other_reference_hybe, other_modality = other_ctx
-                    other_hybe_records = [r for r in other_records_full if r['folder'] in other_fov_matrices]
-                    if other_reference_hybe not in other_fov_matrices:
-                        # other_reference_hybe (that modality's own within-
-                        # experiment reference hybe, as configured on its
-                        # own Alignment tab) isn't itself in the ingested/
-                        # aligned set -- compute_cell_alignment's own
-                        # reference_hybe lookup (record_by_folder[reference_
-                        # _hybe]) would raise a bare KeyError for every cell
-                        # in this FOV, aborting the WHOLE batch run rather
-                        # than just skipping this optional extra layer.
-                        # Same "best-effort, not fatal to the already-done
-                        # same-modality result" treatment as the ValueError
-                        # catch below -- just caught here, before it can
-                        # happen, instead of after.
-                        other_hybe_records = None
-                else:
-                    other_storage_path = other_hybe_records = other_fov_matrices = other_reference_hybe = other_modality = None
+            for fov, cells, passes in self.jobs:
                 for cell in cells:
-                    alignment.compute_cell_alignment(cell, self.storage_path, fov, hybe_records, fov_matrices,
-                                                     reference_hybe=self.reference_hybe, channel_type=self.channel_type,
-                                                     pad=self.pad, modality=self.modality)
-                    if other_ctx is not None and other_hybe_records:
-                        try:
-                            # cell.reference_hybe is a same-modality-only
-                            # hybe name -- it's never a real key in
-                            # other_fov_matrices (the OTHER modality's own
-                            # hybes), so compute_cell_alignment's default
-                            # lookup would silently treat it as identity
-                            # there. Resolve it from fov_matrices (the
-                            # SAME modality this cell/its reference hybe
-                            # actually belongs to, already in scope here)
-                            # and pass it through explicitly instead.
-                            alignment.compute_cell_alignment(cell, other_storage_path, fov, other_hybe_records,
-                                                             other_fov_matrices, reference_hybe=other_reference_hybe,
-                                                             channel_type=self.channel_type, pad=self.pad,
-                                                             cell_reference_hybe_matrix=fov_matrices.get(cell.reference_hybe, np.eye(3)),
-                                                             modality=other_modality)
-                        except ValueError:
-                            # cell doesn't overlap the other modality's own
-                            # reference-hybe frame at all -- a best-effort
-                            # extra layer, not fatal to the (already-done)
-                            # same-modality result.
-                            pass
-                    done += 1
-                    self.progress.emit(done, total, f'FOV{fov:02d} cell {cell.id}: aligned')
+                    for p in passes:
+                        fov_matrices = p['fov_matrices']
+                        # only the hybes actually present in this FOV's own
+                        # fov_matrices are valid -- hybe_records can hold
+                        # more (e.g. every hybe in the parsed layout) than
+                        # what FOV alignment was actually run/accepted for.
+                        hybe_records = [r for r in p['hybe_records'] if r['folder'] in fov_matrices]
+                        # Resolved PER CELL, not once per pass:
+                        # cell.reference_hybe genuinely varies cell-to-cell
+                        # under append-mode segmentation. For the cell's own
+                        # modality this reproduces compute_cell_alignment's
+                        # own default lookup exactly (same dict); for any
+                        # other modality it supplies the value that
+                        # function's docstring explicitly requires the
+                        # caller to pass, since cell.reference_hybe is never
+                        # a key in another modality's own fov_matrices.
+                        cellref_matrix = p['cellref_fov_matrices'].get(cell.reference_hybe, np.eye(3))
+                        alignment.compute_cell_alignment(
+                            cell, p['storage_path'], fov, hybe_records, fov_matrices,
+                            reference_hybe=p['reference_hybe'], channel_type=self.channel_type,
+                            pad=self.pad, modality=p['modality'],
+                            cell_reference_hybe_matrix=cellref_matrix)
+                        done += 1
+                        self.progress.emit(done, total,
+                                           f"FOV{fov:02d} cell {cell.id} ({p['modality']}): aligned")
                 results.append((fov, cells))
             self.finished_ok.emit(results)
         except Exception as e:
@@ -340,9 +330,75 @@ class CrossModalAlignmentWorker(QtCore.QThread):
             self.failed.emit(str(e))
 
 
-def _matrix_summary(hybe, H):
+class ChromatinTracingWorker(QtCore.QThread):
+    """
+    jobs: [(storage_path, fov, [AnAllele, ...]), ...] -- every FOV that
+    already has alleles built (see MainWindow._build_chromatin_alleles_
+    from_selection; this worker never builds alleles itself, only fits
+    whatever's already there -- same "preview/build first, batch commits
+    second" split every other Run-All-style action in this app follows).
+    fov_matrices_by_fov: {fov: {hybe: H}}, precomputed on the main thread
+    before this worker starts (MainWindow._composed_fov_matrices_for_cell_
+    alignment is a plain dict read, but keeping session-state access on
+    the main thread is the safer convention already used elsewhere).
+    cell_lookup(fov, cell_id) -> ACell-or-None resolves each allele's
+    owning cell, if any (MainWindow._find_cell_by_id).
+    """
+    progress = QtCore.pyqtSignal(int, int, str)
+    finished_ok = QtCore.pyqtSignal(dict)  # {(storage_path, fov): [AnAllele, ...]}
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
+                fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
+                fiducial_params, readout_params):
+        super().__init__()
+        self.jobs = jobs
+        self.hybes = hybes
+        self.reference_hybe = reference_hybe
+        self.hybe_fiducial_channels = hybe_fiducial_channels
+        self.hybe_readout_channels = hybe_readout_channels
+        self.modality = modality
+        self.fov_matrices_by_fov = fov_matrices_by_fov
+        self.cell_lookup = cell_lookup
+        self.max_fiducial_drift = max_fiducial_drift
+        self.spad = spad
+        self.z_window = z_window
+        self.fiducial_params = fiducial_params
+        self.readout_params = readout_params
+
+    def run(self):
+        try:
+            results = {}
+            total = sum(len(alleles) for _, _, alleles in self.jobs)
+            done = 0
+            for storage_path, fov, alleles in self.jobs:
+                fov_matrices = self.fov_matrices_by_fov.get(fov, {})
+                for allele in alleles:
+                    cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
+                    localization.build_chromatin_trace_allele(
+                        allele, self.hybes, self.reference_hybe, self.hybe_fiducial_channels,
+                        self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
+                        max_fiducial_drift=self.max_fiducial_drift, spad=self.spad, z_window=self.z_window,
+                        fiducial_params=self.fiducial_params, readout_params=self.readout_params)
+                    done += 1
+                    self.progress.emit(done, total, f'FOV{fov:02d} allele {allele.id}: '
+                                       f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
+                results[(storage_path, fov)] = alleles
+            self.finished_ok.emit(results)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+def _matrix_dxdy_angle(H):
+    """'dx=, dy=, angle= deg' with no hybe prefix -- same numbers _matrix_
+    summary reports, for a caller (Cell/Spot Status Detail's matrix panel)
+    that already shows the hybe name in its own tree column."""
     angle = np.degrees(np.arctan2(H[1, 0], H[0, 0]))
-    return f'{hybe}: dx={H[0,2]:.2f}, dy={H[1,2]:.2f}, angle={angle:.3f} deg'
+    return f'dx={H[0,2]:.2f}, dy={H[1,2]:.2f}, angle={angle:.3f} deg'
+
+
+def _matrix_summary(hybe, H):
+    return f'{hybe}: {_matrix_dxdy_angle(H)}'
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -404,8 +460,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.localize_3d_grid_displayer = Localize3DGridDisplayer()
 
         self.mip_viewer = MipViewerDisplayer()
-        self.memory_viewer = MemoryViewerDisplayer()
-        self.memory_viewer.RefreshPushButton.clicked.connect(self._refresh_memory_viewer)
 
         self.cell_spot_status_displayer = CellSpotStatusDisplayer()
         cssd = self.cell_spot_status_displayer
@@ -413,6 +467,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cssd.modality_changed.connect(self._refresh_cell_spot_status_full)
         cssd.cell_fov_changed.connect(self._refresh_cell_spot_status_cell_panel)
         cssd.spot_scope_changed.connect(self._on_cell_spot_status_spot_scope_changed)
+        cssd.allele_fov_changed.connect(self._refresh_cell_spot_status_allele_panel)
 
         self.barcode_overview_displayer = BarcodeOverviewDisplayer()
         self.celltype_result_displayer = CelltypeResultDisplayer()
@@ -443,6 +498,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._vlinks_refreshed_paths = set()  # storage_paths already reconciled from vlinks this session (see _refresh_params_from_vlinks)
         self._activated_fovs = set()  # FOVs _try_show_existing_cells has already staged into self.cell_container this session (see _activate_fov)
 
+        # (storage_path, fov) -> [AnAllele, ...] -- chromatin tracing's own
+        # session-transient allele list, built from whatever's currently
+        # selected in Spot Localization (see _build_chromatin_alleles_
+        # from_selection), same shape/rationale as fov_unassigned_spots
+        # above. Only Fit All FOVs persists these (mirror_write_fov_
+        # alleles) -- building/previewing stays in-memory only, same
+        # "explicit Save step" convention Spot Localization's own Save
+        # Current Spots already follows.
+        self.chromatin_alleles = {}
+        self.chromatin_fiducial_grid_displayer = ChromatinTraceGridDisplayer('Fiducial')
+        self.chromatin_readout_grid_displayer = ChromatinTraceGridDisplayer('Readout')
+
         self._connect_signals()
         self._switch_current_modality(self.ui.IngestionPanel.ModalityComboBox.currentText())
 
@@ -471,7 +538,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.ViewerHybeComboBox.currentIndexChanged.connect(lambda: self._show_mip_viewer(silent=True) if self.mip_viewer.isVisible() else None)
         ip.ViewerChannelComboBox.currentIndexChanged.connect(lambda: self._show_mip_viewer(silent=True) if self.mip_viewer.isVisible() else None)
         ip.CheckIngestionStatusPushButton.clicked.connect(lambda: self._check_ingestion_status(silent=False))
-        ip.ShowMemoryViewerPushButton.clicked.connect(self._show_memory_viewer)
         ip.ShowCellSpotStatusDisplayerPushButton.clicked.connect(self._show_cell_spot_status_displayer)
         ip.AddJobPushButton.clicked.connect(self._add_job_to_queue)
         ip.RemoveJobPushButton.clicked.connect(self._remove_selected_jobs)
@@ -510,7 +576,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # 3's own Overlay FOV / Preview reference hybe pairing below.
         ap.CellFovSpinBox.valueChanged.connect(lambda _: self._refresh_cell_per_hybe_results_from_spinboxes())
         ap.CellIdSpinBox.valueChanged.connect(lambda _: self._refresh_cell_per_hybe_results_from_spinboxes())
-        ap.CellReferenceHybeComboBox.currentIndexChanged.connect(lambda _: self._refresh_cell_per_hybe_results_from_spinboxes())
         ap.CellResultsListWidget.itemClicked.connect(self._show_cell_alignment_preview)
         ap.PreviewThisCellPushButton.clicked.connect(self._run_cell_alignment_for_selected_cell)
         ap.CellPadSpinBox.valueChanged.connect(lambda _: self._show_cell_alignment_preview_for_hybe())
@@ -546,6 +611,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ctp.ShowBarcodeOverviewPushButton.clicked.connect(self._show_barcode_overview)
         ctp.RunCelltypeDeterminationPushButton.clicked.connect(self._run_celltype_determination)
         ctp.ShowCelltypeResultPushButton.clicked.connect(lambda: self._show_celltype_result())
+
+        chp = self.ui.ChromatinTracingPanel
+        # Check/Uncheck Selected are already self-wired inside
+        # ChromatinTracingPanelUI.setupUi itself (same pattern ingestion_
+        # panel.py's own HybeListWidget buttons already use) -- nothing to
+        # connect here for those two.
+        chp.HybeListWidget.itemChanged.connect(lambda _: self._refresh_chromatin_allele_hybe_choices())
+        chp.AlleleFovSpinBox.valueChanged.connect(lambda _: self._on_chromatin_allele_fov_changed())
+        chp.AlleleHybeComboBox.currentIndexChanged.connect(lambda _: self._on_chromatin_allele_hybe_changed())
+        chp.AlleleChannelComboBox.currentIndexChanged.connect(lambda _: self._refresh_chromatin_allele_spot_choices())
+        chp.BuildAllelesPushButton.clicked.connect(self._build_chromatin_alleles_from_selection)
+        chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
+        chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
 
         self.ui.actionLoad_Config.triggered.connect(self._load_config_dialog)
         self.ui.actionSave_Config.triggered.connect(self._save_config_dialog)
@@ -676,9 +754,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if channel_type:
             ap.SameModalityChannelTypeComboBox.setCurrentText(channel_type)
 
-        cell_reference_hybe = params.get('cell_alignment_reference_hybe')
-        if cell_reference_hybe and not ap.current_cell_reference_hybe():
-            ap.select_cell_reference_hybe(cell_reference_hybe, self._modality_for_storage_path(storage_path))
+        # cell_alignment_reference_hybe is now per-modality-suffixed --
+        # per explicit decision, each modality has its own independent
+        # cell-alignment reference hybe (no more cross-modal residual fit
+        # that needed a single, ambiguous combo -- see CellAlignmentWorker's
+        # own docstring). storage_path here is always ONE specific
+        # modality's own file, so only that modality's own key/combo apply.
+        this_cell_modality = self._modality_for_storage_path(storage_path)
+        cell_reference_hybe = params.get(f'cell_alignment_reference_hybe_{this_cell_modality}')
+        if this_cell_modality and cell_reference_hybe and not ap.current_cell_reference_hybe(this_cell_modality):
+            ap.select_cell_reference_hybe(this_cell_modality, cell_reference_hybe)
         cell_channel_type = params.get('cell_alignment_channel_type')
         if cell_channel_type:
             ap.CellChannelTypeComboBox.setCurrentText(cell_channel_type)
@@ -768,14 +853,23 @@ class MainWindow(QtWidgets.QMainWindow):
             state.update({k: v for k, v in modality_fields.get(name, {}).items() if k in state})
             self.modality_data[name] = state
         self.current_modality = None
-        # only the Ingestion tab's own combo is a real modality selector
-        # any more (see _switch_current_modality's own docstring) -- no
-        # other panel has one left to sync.
+        # the Ingestion tab's own combo is the real modality SWITCHER (see
+        # _switch_current_modality's own docstring). Cell-Based Alignment
+        # has no modality selector of its own at all -- which modality a
+        # cell belongs to is read directly off the cell itself (cell.
+        # modality) wherever a (FOV, Cell ID) resolves to a real cell.
         ip = self.ui.IngestionPanel
         ip.ModalityComboBox.blockSignals(True)
         ip.ModalityComboBox.clear()
         ip.ModalityComboBox.addItems(names)
         ip.ModalityComboBox.blockSignals(False)
+        ap = self.ui.AlignmentPanel
+        ap.build_cell_reference_hybe_fields(names)
+        # Each combo is a brand-new QComboBox object every rebuild (unlike
+        # CellFovSpinBox/CellIdSpinBox, which persist and are wired once
+        # in __init__) -- reconnect here every time.
+        for combo in ap.CellReferenceHybeComboBoxes.values():
+            combo.currentIndexChanged.connect(lambda _: self._refresh_cell_per_hybe_results_from_spinboxes())
         self._switch_current_modality(names[0])
 
     def _active_hybe_records_for_modality(self, name):
@@ -869,6 +963,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, populate in (('RNA', ap.populate_rna_reference_hybe_choices),
                                ('DNA', ap.populate_dna_reference_hybe_choices)):
             populate(self.modality_data.get(name, {}).get('active_hybe_list', []))
+
+        chp = self.ui.ChromatinTracingPanel
+        chp.populate_hybe_list(self.total_active_hybe_list, default_checked=self._default_chromatin_tracing_hybes)
+        chp.populate_reference_hybe_choices(self.total_active_hybe_list)
+        self._refresh_chromatin_allele_hybe_choices()
 
     def _on_set_num_modalities(self):
         ip = self.ui.IngestionPanel
@@ -1294,21 +1393,16 @@ class MainWindow(QtWidgets.QMainWindow):
             'Ingestion status: some FOV/hybe combinations need ingestion.' if any_missing_or_invalid
             else 'Ingestion status: all checked FOV/hybe combinations ready.', 5000)
 
-    def _show_memory_viewer(self):
-        self._refresh_memory_viewer()
-        self.memory_viewer.show()
-        self.memory_viewer.raise_()
-
     def _hybe_records_for_storage_path(self, storage_path):
         """
-        Each Memory Status row needs the hybe list belonging to ITS OWN
-        modality, not whichever modality happens to be currently active
-        (self.hybe_records) -- reusing the active modality's list for
-        every row silently corrupts a different modality's row the
-        moment its hybe folder names differ from the active one's (the
-        normal case, e.g. Hyb_101.. vs Hyb_002..), which is exactly what
-        made a DNA row's FOV-align count collapse after switching to RNA
-        and refreshing.
+        The hybe list belonging to storage_path's OWN modality, not
+        whichever modality happens to be currently active (self.hybe_
+        records) -- a caller iterating multiple storage paths at once
+        must resolve each one's own hybe records independently, since
+        reusing the active modality's list for a DIFFERENT modality's
+        path silently corrupts it the moment its hybe folder names differ
+        from the active one's (the normal case, e.g. Hyb_101.. vs
+        Hyb_002..).
         """
         ip = self.ui.IngestionPanel
         if storage_path == ip.StoragePathLineEdit.text().strip():
@@ -1326,155 +1420,15 @@ class MainWindow(QtWidgets.QMainWindow):
         The real, persisted same-modality reference hybe for this
         storage_path -- read straight from that path's own vlinks.h5
         global params (written whenever a same-modality alignment run is
-        accepted), not from live UI state. Used in a loop over MULTIPLE
-        storage paths at once (Memory Status viewer), so it genuinely
-        needs each path's own independently-persisted fact, not "whatever
-        the single Reference Hybe combo happens to show right now" --
-        that combo no longer even has a notion of "per modality" since it
-        stopped being reset by a modality switch.
+        accepted), not from live UI state. A caller iterating multiple
+        storage paths at once genuinely needs each path's own
+        independently-persisted fact, not "whatever the single Reference
+        Hybe combo happens to show right now" -- that combo no longer
+        even has a notion of "per modality" since it stopped being reset
+        by a modality switch.
         """
         params = vlinks_store.read_global_params(storage_path)
         return (params or {}).get('same_modality_reference_hybe', '')
-
-    def _refresh_memory_viewer(self):
-        """
-        Builds the Cell/Spot Memory Status table: for every storage path
-        this session knows about (RNA and DNA both, if the Alignment tab's
-        Cross-Modal fields are set -- see _all_vlinks_storage_paths) and
-        every FOV in the Ingestion tab's FOV list, what's actually
-        persisted in that experiment's vlinks.h5 right now, i.e. exactly
-        what _activate_fov would load with no further computation.
-
-        Matrix status is 4 separate layers, each with its own intuitive
-        denominator (per explicit request -- the old single "computed/
-        total" column mixed FOV-level per-hybe counts into one unexplained
-        number, e.g. "4/16"):
-        - FOV: (hybes with a real, computed matrix) / (hybes actually
-          INGESTED for this FOV -- not len(self.hybe_records), which can
-          include hybes from the parsed layout that were never ingested
-          for this specific FOV).
-        - Cross-modal: 0/1 or 1/1 (n/a if this storage path isn't paired
-          with another modality via the Alignment tab's fields).
-        - Cell: cells with cell-based alignment computed / total cells.
-        - Spot: spots with linked=True (celltype determination has run) /
-          total spots.
-
-        Two more columns track celltype ASSIGNMENT specifically (linked=
-        True, same flag, but distinct from "Cell align" above which
-        tracks cell-based alignment, not celltype): cells with a celltype
-        assigned / total cells, and the same for spots.
-        """
-        ip = self.ui.IngestionPanel
-        ap = self.ui.AlignmentPanel
-        storage_paths = self._all_vlinks_storage_paths()
-        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
-        if not storage_paths or not fov_list:
-            QtWidgets.QMessageBox.warning(self, 'Cell/Spot Memory Status',
-                                          'Set a storage path (Ingestion tab, and/or the Alignment tab\'s '
-                                          'Cross-Modal RNA/DNA fields) and a FOV list first.')
-            return
-
-        rna_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_path = ap.DnaStoragePathLineEdit.text().strip()
-        cross_paired = bool(rna_path and dna_path)
-
-        rows = []
-        for storage_path in storage_paths:
-            for fov in fov_list:
-                cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
-                cell_dicts = cell_dicts or []
-                saved_at = (vlinks_store.summarize_fov(storage_path, fov) or {}).get('saved_at', '')
-
-                fov_total = 0
-                fov_computed = 0
-                row_hybe_records = self._hybe_records_for_storage_path(storage_path)
-                if row_hybe_records:
-                    ingested, _, _ = self._ingested_hybes_for_fov(storage_path, fov, row_hybe_records)
-                    fov_total = len(ingested)
-                    if ingested:
-                        ingested_records = [r for r in row_hybe_records if r['folder'] in ingested]
-                        matrices = alignment.read_same_modality_matrices(storage_path, fov, ingested_records)
-                        reference_hybe = self._reference_hybe_for_storage_path(storage_path)
-                        # identity is BOTH the correct, real matrix for the
-                        # reference hybe itself (aligned to itself) AND the
-                        # not-yet-aligned seed default for every other hybe
-                        # -- only the actual reference hybe should count as
-                        # "computed" when its matrix happens to be identity.
-                        fov_computed = sum(1 for hybe, H in matrices.items()
-                                          if hybe == reference_hybe or not np.allclose(H, np.eye(3)))
-
-                cross_total = 1 if cross_paired else 0
-                cross_computed = 0
-                if cross_total:
-                    if (storage_path, fov) in self.cross_modal_result:
-                        cross_computed = 1
-                    else:
-                        # in-memory cache only reflects THIS session's runs --
-                        # a matrix computed in an earlier session is still
-                        # real and persisted (write_cross_modal_matrix writes
-                        # into the DNA reference hybe's own H5), so fall back
-                        # to reading it straight off disk before calling this
-                        # FOV "not yet cross-modal aligned".
-                        dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-                        if dna_reference_hybe:
-                            try:
-                                H_disk = alignment.read_cross_modal_matrix(dna_path, fov, dna_reference_hybe)
-                            except Exception:
-                                H_disk = None
-                            cross_computed = 1 if H_disk is not None else 0
-
-                cell_total = len(cell_dicts)
-                cell_computed = sum(1 for c in cell_dicts if c.get('matrices'))
-                cell_celltype_computed = sum(1 for c in cell_dicts if c.get('linked'))
-
-                all_spots = [s for c in cell_dicts for s in c.get('spots', [])]
-                spot_total = len(all_spots)
-                spot_computed = sum(1 for s in all_spots if s.get('linked'))
-
-                # "Spots" (the raw count shown in the table) is every real,
-                # persisted spot for this FOV -- cell-owned AND the FOV-
-                # level unassigned pool (write_fov_spots/read_fov_spots,
-                # a separate vlinks.h5 group write_cells doesn't touch,
-                # see _identify_fov_unassigned_spots) -- per explicit
-                # request/confirmed bug: this used to only count cell-
-                # owned spots, silently dropping every spot still sitting
-                # in fov_unassigned_spots (e.g. manually clicked in FOV
-                # view but not yet identified into a cell) from the
-                # total. spot_total itself (cell-owned only) stays the
-                # correct denominator for the "Spot celltype" ratio right
-                # below -- an unassigned spot has no owning cell to
-                # inherit a celltype from, so counting it there would
-                # just make that ratio permanently short regardless of
-                # real progress.
-                unassigned_dicts = vlinks_store.read_fov_spots(storage_path, fov)
-                n_spots_total = spot_total + len(unassigned_dicts)
-
-                # "Spot Z" -- how many of this FOV's real spots (cell-
-                # owned + unassigned, same total as n_spots_total above)
-                # have a real, non-default Z. spot._z_status itself is a
-                # plain, session-transient Python attribute (see
-                # MainWindow._z_status_text's own docstring) -- never
-                # persisted, so it can't be read back here. coordinate[2]
-                # is: every spot starts at exactly 0.0 (both manual-click
-                # paths and auto-detect always seed z=0.0, see
-                # _on_spot_crop_edited/_run_spot_auto_detect_body), and
-                # refine_spot_z always writes back a real fitted float
-                # (never exactly 0.0 in practice) on acceptance -- so
-                # "coordinate[2] != 0.0" is a reliable, persisted proxy
-                # for "this spot's Z has actually been localized",
-                # without needing the transient _z_status flag at all.
-                z_total = n_spots_total
-                z_computed = sum(1 for s in all_spots + unassigned_dicts
-                                 if s.get('coordinate', (0.0, 0.0, 0.0))[2] != 0.0)
-
-                rows.append({'storage_path': storage_path, 'fov': fov, 'saved_at': saved_at, 'n_spots': n_spots_total,
-                            'fov_computed': fov_computed, 'fov_total': fov_total,
-                            'cross_computed': cross_computed, 'cross_total': cross_total,
-                            'cell_computed': cell_computed, 'cell_total': cell_total,
-                            'cell_celltype_computed': cell_celltype_computed, 'cell_celltype_total': cell_total,
-                            'spot_computed': spot_computed, 'spot_total': spot_total,
-                            'z_computed': z_computed, 'z_total': z_total})
-        self.memory_viewer.set_data(rows)
 
     def _all_spot_dicts_for_fov(self, storage_path, fov):
         """
@@ -1500,12 +1454,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cell_spot_status_full(self):
         """
-        Re-derives the FOV choices for BOTH panels from the Ingestion
+        Re-derives the FOV choices for ALL THREE panels from the Ingestion
         tab's own FOV list (Refresh's own job -- the CHOICES themselves,
         not just the currently-selected scope's data, might be stale;
         see the class docstring on why this is separate from a plain
-        combo-change refresh), then refreshes both panels for whatever
-        FOV ends up selected.
+        combo-change refresh), then refreshes each panel for whatever FOV
+        ends up selected.
         """
         d = self.cell_spot_status_displayer
         modality = d.current_modality() or (self.modality_names[0] if self.modality_names else '')
@@ -1515,14 +1469,71 @@ class MainWindow(QtWidgets.QMainWindow):
         fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
         d.set_cell_fov_choices(fov_list)
         d.set_spot_fov_choices(fov_list)
+        d.set_allele_fov_choices(fov_list)
         if not storage_path or not fov_list:
             d.set_cell_data([], 0, 0)
             d.set_spot_hybe_choices([])
             d.set_spot_channel_choices([])
             d.set_spot_data([], 0)
+            d.set_allele_data([], 0, 0)
             return
+        self._refresh_cell_spot_status_matrix_panel()
         self._refresh_cell_spot_status_cell_panel()
         self._on_cell_spot_status_spot_scope_changed()
+        self._refresh_cell_spot_status_allele_panel()
+
+    def _refresh_cell_spot_status_matrix_panel(self):
+        """
+        Ground-truth matrix check -- reads DIRECTLY off vlinks.h5 via
+        vlinks_store (never self.fov_matrices/self.cross_modal_result,
+        the in-memory caches a stale reference-hybe combo can contaminate
+        -- see _refresh_cross_modal_results_list's own comment on the
+        confirmed real bug this sidesteps), for EVERY FOV in the
+        Ingestion tab's FOV list at once (same "one row per FOV" shape
+        _refresh_same_modality_results_list/_refresh_cross_modal_results_
+        list already use), scoped only by the shared Modality combo.
+        """
+        d = self.cell_spot_status_displayer
+        modality = d.current_modality()
+        storage_path = self._storage_path_for_modality(modality) if modality else None
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        if not storage_path or not fov_list:
+            d.set_matrix_data([])
+            return
+        hybe_records = self._active_hybe_records_for_modality(modality)
+        hybes = [r['folder'] for r in hybe_records]
+        global_params = vlinks_store.read_global_params(storage_path) or {}
+        cross_modal_role = global_params.get('cross_modal_role')
+        is_dna_side = cross_modal_role == 'DNA'
+        is_rna_side = cross_modal_role == 'RNA'
+        rows = []
+        for fov in fov_list:
+            matrices = vlinks_store.read_same_modality_matrices(storage_path, fov, hybes)
+            same_modality = [(hybe, _matrix_dxdy_angle(H)) for hybe, H in sorted(matrices.items())]
+            cross_modal = None
+            if is_dna_side:
+                H_across = vlinks_store.read_cross_modal_matrix(storage_path, fov)
+                if H_across is not None:
+                    cross_modal = _matrix_dxdy_angle(H_across)
+            elif is_rna_side and global_params.get('cross_modal_paired_storage_path'):
+                # RNA is the cross-modal TARGET frame, never itself shifted --
+                # shown as an explicit identity row (not just absent) so the
+                # matrix view reads consistently across both sides of a link.
+                cross_modal = _matrix_dxdy_angle(np.eye(3))
+            rows.append({'fov': fov, 'same_modality': same_modality, 'cross_modal': cross_modal})
+        d.set_matrix_data(rows)
+
+    def _refresh_cell_spot_status_allele_panel(self):
+        d = self.cell_spot_status_displayer
+        storage_path = self._storage_path_for_modality(d.current_modality())
+        fov = d.current_allele_fov()
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        if not storage_path or fov is None:
+            d.set_allele_data([], 0, len(fov_list))
+            return
+        allele_dicts = vlinks_store.read_fov_alleles(storage_path, fov)
+        n_total = sum(len(vlinks_store.read_fov_alleles(storage_path, f)) for f in fov_list)
+        d.set_allele_data(allele_dicts, n_total, len(fov_list))
 
     def _refresh_cell_spot_status_cell_panel(self):
         d = self.cell_spot_status_displayer
@@ -1860,10 +1871,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cell_container = CellContainer([fov], modality=modality)
         self.cell_container.data.setdefault(fov, [])
 
+        # merged (not just `append`) tracks whether `mask`'s own ids are
+        # actually trustworthy as "same physical cell as before" -- only
+        # true once _merge_append_mask has run: it explicitly keeps an old
+        # cell's own id wherever the new segmentation didn't paint over it.
+        # Append checked with NOTHING to append to (no prior mask this
+        # session) falls through to a bare fresh mask, same as non-append --
+        # its ids are just as untrustworthy as a genuinely fresh run's.
+        merged = False
         if append and self._last_segment_context is not None and self._last_segment_context['fov'] == fov \
                 and self.cell_displayer.mask is not None and self.cell_displayer.mask.shape == mask.shape:
             n_before = int(self.cell_displayer.mask.max())
             mask = self._merge_append_mask(self.cell_displayer.mask, mask)
+            merged = True
             method = cp.current_method()
             min_size = cp.MinSizeSpinBox.value() if method == 'cellpose' \
                 else cp.ClassicalMinSizeSpinBox.value() if method == 'classical' else 0
@@ -1878,7 +1898,14 @@ class MainWindow(QtWidgets.QMainWindow):
             cp.LogTextEdit.append('Append mode: no existing mask for this FOV to append to -- starting fresh.')
 
         # min/max size already filtered inside segment_fov/segment_fov_classical -- don't re-filter here
-        self.cell_container.load_new_cells(fov, mask, reference_hybe)
+        # preserve_existing=merged: a surviving cell id's own reference_hybe/
+        # matrices/spots stay exactly as they were (see CellContainer.
+        # load_new_cells's own docstring on why this is only safe once a
+        # real pixel-preserving merge guarantees id continuity) -- per
+        # explicit request, a cell's reference_hybe is fixed at its own
+        # definition time, like its own mask coordinates, and never
+        # retroactively touched by a later save regardless of mode.
+        self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=merged)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe}
         n_cells = len(self.cell_container.get_cells(fov))
         cp.LogTextEdit.append(f'Segmentation complete: {n_cells} cell(s) found.')
@@ -1999,11 +2026,21 @@ class MainWindow(QtWidgets.QMainWindow):
         cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(cells) if cells else 0} cell(s).')
 
     def _on_displayer_mask_edited(self, mask):
+        """
+        A manual add/remove in CellDisplayer -- `mask` is always an edit of
+        the mask the user is already looking at (one label added or one
+        removed), never a fresh independent clustering, so every id it
+        still carries genuinely is the same physical cell as before --
+        preserve_existing=True keeps that cell's own reference_hybe/
+        matrices/spots intact (see CellContainer.load_new_cells's own
+        docstring); only a newly-clicked cell (a genuinely new id) starts
+        blank, at this call's own reference_hybe.
+        """
         if self._last_segment_context is None or self.cell_container is None:
             return
         fov = self._last_segment_context['fov']
         reference_hybe = self._last_segment_context['reference_hybe']
-        self.cell_container.load_new_cells(fov, mask, reference_hybe)
+        self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=True)
         n_cells = len(self.cell_container.get_cells(fov))
         self.ui.CellSegmentPanel.LogTextEdit.append(f'Mask edited in displayer: {n_cells} cell(s) remain.')
 
@@ -2267,25 +2304,22 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     @staticmethod
-    def _cell_hybe_result_label(cell, fov, hybe, modality, reference_key):
+    def _cell_hybe_result_label(cell, fov, spec, reference_hybe, dx, dy, dz):
         """
-        Row text for one (cell, hybe) pair in "Results (per cell, per
-        hybe)" -- 'FOV{fov:03d} Cell {cell:03d}: {hybe} | {reference}',
-        per explicit request. The "(modality)" suffix (on either side)
-        only appears when that hybe belongs to the OTHER (not this cell's
-        own) modality -- hybe names aren't guaranteed unique across
-        modalities, so the bare name alone would be ambiguous there;
-        cell.matrices' own (hybe, modality) key always disambiguates it
-        correctly regardless.
+        Row text for one (cell, hybe) spec (see _cell_overlay_target_
+        specs) in "Results (per cell, per hybe)", per explicit request:
+        'FOV{fov:03d} Cell{cell:03d}: {hybe} ({modality}) | {reference}
+        ({modality}): dx=, dy=, dz='. Always tags BOTH sides with their
+        own modality -- unlike the old 2-column version, every row here
+        can independently be this cell's own modality or a different
+        configured one (_cell_overlay_target_specs now enumerates every
+        modality's hybes, not just cell.matrices' own keys), and hybe
+        names aren't guaranteed unique across modalities, so a bare name
+        alone would be ambiguous.
         """
-        hybe_label = hybe if modality == cell.modality else f'{hybe} ({modality})'
-        if reference_key:
-            reference_hybe, reference_modality = reference_key
-            reference_label = (reference_hybe if reference_modality == cell.modality
-                               else f'{reference_hybe} ({reference_modality})')
-        else:
-            reference_label = cell.reference_hybe
-        return f'FOV{fov:03d} Cell {cell.id:03d}: {hybe_label} | {reference_label}'
+        modality = spec['modality']
+        return (f"FOV{fov:03d} Cell{cell.id:03d}: {spec['hybe']} ({modality}) | "
+               f"{reference_hybe} ({modality}): dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f}")
 
     def _refresh_cell_preview_reference_choices(self, cells_with_matrices, storage_path):
         """
@@ -2360,17 +2394,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_cell_per_hybe_results(self, fov, cell_id):
         """
         Populates "Results (per cell, per hybe)" for exactly the cell
-        identified by the tier-1 FOV/Cell ID spinboxes, using tier-1's
-        own Reference hybe combo (ap.CellReferenceHybeComboBox -- the
-        actual anchor a per-cell-alignment run uses/used) as the
-        reference -- per explicit request, this list shows the result of
-        per-cell alignment for THIS run's configuration (FOV, Cell ID,
-        Reference hybe all from tier 1), not a free-choice browsing tool.
+        identified by the tier-1 FOV/Cell ID spinboxes -- one row per
+        hybe in EVERY configured modality (via _cell_overlay_target_specs,
+        the same enumeration the one-to-all overlay uses), each row
+        resolving ITS OWN modality's configured reference hybe (ap.
+        cell_align_references()) independently -- per explicit request,
+        no modality picker needed: this app only ever holds one modality's
+        cells resident in memory at a time, so cell.modality alone (once
+        the cell itself is found) is unambiguous, and showing every
+        modality's hybes at once (not just the cell's home one) needs no
+        further per-row choice either, since each row's own reference is
+        already fully determined by that row's own modality.
         That's a SEPARATE pairing: Overlay FOV + Preview reference hybe +
         "Results (per cell, overlay)" (tier 3 -- see
         _refresh_cell_overlay_list/_show_cell_all_readouts_overlay).
-        Refreshes live whenever FOV, Cell ID, or Reference hybe changes
-        (see _refresh_cell_per_hybe_results_from_spinboxes). Pure read of
+        Refreshes live whenever FOV or Cell ID changes (see
+        _refresh_cell_per_hybe_results_from_spinboxes). Pure read of
         already-saved/staged real cell data -- never computes or writes.
         Uses its own _cell_per_hybe_context, separate from
         _cell_alignment_display_cells (tier 3's "every cell in this FOV"
@@ -2385,27 +2424,36 @@ class MainWindow(QtWidgets.QMainWindow):
             cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
 
         ap.CellResultsListWidget.clear()
-        if cell is None or not cell.matrices:
+        if cell is None:
             self._cell_per_hybe_context = None
             return
 
-        # Modality/storage_path resolved from the combo's OWN itemData tag,
-        # never from IngestionPanel's current selection -- see
-        # populate_cell_reference_hybe_choices' own docstring for why that
-        # used to crash. An empty combo falls back to the cell's own
-        # (segmentation) modality/reference_hybe -- same fallback the
-        # actual alignment run itself uses (compute_cell_alignment's own
-        # reference_hybe=None default).
-        this_modality = ap.current_cell_reference_modality() or cell.modality
-        storage_path = self._storage_path_for_modality(this_modality)
-        cell_reference_hybe = ap.current_cell_reference_hybe() or cell.reference_hybe
-        reference_key = (cell_reference_hybe, this_modality)
+        # storage_path/hybe_records represent the CELL's OWN (home)
+        # modality -- the anchor _resolve_preview_hybe_context/_cell_
+        # overlay_target_specs need, resolving every OTHER configured
+        # modality's own hybes independently from there.
+        storage_path = self._storage_path_for_modality(cell.modality)
+        hybe_records = self._active_hybe_records_for_modality(cell.modality)
         self._cell_per_hybe_context = {'fov': fov, 'cell': cell, 'storage_path': storage_path,
-                                       'hybe_records': self._active_hybe_records_for_modality(this_modality),
-                                       'reference_key': reference_key}
-        for hybe, modality in sorted(cell.matrices.keys()):
-            item = QtWidgets.QListWidgetItem(self._cell_hybe_result_label(cell, fov, hybe, modality, reference_key))
-            item.setData(QtCore.Qt.UserRole, (fov, cell.id, hybe, modality))
+                                       'hybe_records': hybe_records}
+        if not storage_path:
+            return
+
+        channel_type = ap.CellChannelTypeComboBox.currentText()
+        specs = self._cell_overlay_target_specs(cell, storage_path, fov, hybe_records, channel_type)
+        for spec in sorted(specs, key=lambda s: (s['modality'], s['hybe'])):
+            modality = spec['modality']
+            reference_hybe = ap.current_cell_reference_hybe(modality)
+            if not reference_hybe:
+                continue
+            reference_final_matrix = self._matrix_to_shared(reference_hybe, modality, cell, fov)
+            if reference_final_matrix is None:
+                continue
+            dx = spec['final_matrix'][0, 2] - reference_final_matrix[0, 2]
+            dy = spec['final_matrix'][1, 2] - reference_final_matrix[1, 2]
+            dz = spec['zx_matrix'][0, 2]
+            item = QtWidgets.QListWidgetItem(self._cell_hybe_result_label(cell, fov, spec, reference_hybe, dx, dy, dz))
+            item.setData(QtCore.Qt.UserRole, (fov, cell.id, spec['hybe'], modality))
             ap.CellResultsListWidget.addItem(item)
 
     def _refresh_cell_per_hybe_results_from_spinboxes(self):
@@ -2607,6 +2655,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 return cell
         return None
 
+    def _cell_area_in_readout(self, cell, hybe, modality, fov):
+        """
+        (x_area, y_area) -- this cell's own mask projected into hybe's
+        own native frame, via _matrix_to_cellref (not cell.get_area_in_
+        readout directly) -- per confirmed real bug, cell.matrix_to/get_
+        area_in_readout silently collapse to IDENTITY (not a real FOV-
+        level transform) whenever this cell has no cell.matrices/matrix_
+        anchors entry for (hybe, modality) at all (cell-level alignment
+        never run for it), mispositioning any mask overlay/crop built
+        from it. _matrix_to_cellref already implements the correct have_
+        real-gated fallback to the live FOV/cross-modal matrix. Shared by
+        every MainWindow-level caller that needs this projection for
+        real, currently-displayed positioning (not internal-only use,
+        where ACell's own bare get_area_in_readout -- with no access to
+        live session state -- is the correct/only option, e.g. inside
+        ACell.get_mip or localization._build_cell_crop's own have_real
+        branch).
+
+        Confirmed real bug this fixes: _load_fov_spot_display's own
+        "cell masks" FOV-view overlay called cell.get_area_in_readout
+        directly and never got this fallback, so it silently disagreed
+        with _build_cell_display_crop's own (already-fixed) Cell-view
+        projection for the exact same cell/hybe whenever no real cell-
+        level data existed -- the FOV-view overview (which a user
+        naturally trusts as ground truth) was the one still wrong, not
+        the Cell-view crop being compared against it.
+        """
+        H_cellref = self._matrix_to_cellref(hybe, modality, cell, fov)
+        if H_cellref is None:
+            return np.array([]), np.array([])
+        x_lit, y_lit = cell.area
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
+        return cx, cy
+
     def _build_cell_display_crop(self, cell, hybe, channel, storage_path, fov, pad, modality):
         """
         Raw (unmasked) crop + cell-boundary mask for the interactive
@@ -2618,8 +2700,10 @@ class MainWindow(QtWidgets.QMainWindow):
         boundary as a contour instead. Same bbox math as _build_cell_crop
         (padding, clamping); returns None if the cell doesn't overlap
         this hybe's frame at all (same "no no-alignment" graceful case).
+        Uses _cell_area_in_readout (see its own docstring for the
+        fallback this relies on).
         """
-        x_area, y_area = cell.get_area_in_readout(hybe, modality)
+        x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
         if len(x_area) == 0:
             return None
         x_area, y_area = x_area.astype(int), y_area.astype(int)
@@ -2760,7 +2844,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     if s.hybe == hybe and s.channel == channel:
                         cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1]), cell.id))
                         cell_owned_refs.append((s, cell))
-                x_area, y_area = cell.get_area_in_readout(hybe, modality)
+                # _cell_area_in_readout (not cell.get_area_in_readout
+                # directly) -- per confirmed real bug, see that method's
+                # own docstring: this FOV-view "cell masks" overview was
+                # the one call site that never got the live FOV/cross-
+                # modal fallback _build_cell_display_crop's own Cell-view
+                # crop already has, so the two silently disagreed for any
+                # cell without real cell-level alignment for this hybe.
+                x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
                 if len(x_area):
                     context_masks.append((cell.id, x_area, y_area))
         self._spot_crop_context = {'kind': 'fov', 'storage_path': storage_path, 'fov': fov,
@@ -2945,8 +3036,9 @@ class MainWindow(QtWidgets.QMainWindow):
         selected).
 
         Works from either view -- refine_spot_z itself already accepts
-        cell=None for an unassigned FOV-pool spot (coordinate stays ==
-        raw_coordinate, no transform applies), so a selection can freely
+        cell=None for an unassigned FOV-pool spot (mapped into the shared
+        frame via fov_matrices instead of a cell residual -- see refine_
+        spot_z's own fov_matrices docstring), so a selection can freely
         mix cell-owned and unassigned rows; each is refined with the
         right cell= for its own row.
 
@@ -2983,6 +3075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         claimed_positions = []  # (abs_x, abs_y) of already-refined spots in THIS batch, so
                                 # two distinct spots sharing an ambiguous crop don't collapse
                                 # onto the same blob -- see refine_spot_z's own docstring
+        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
         t0 = time.perf_counter()
         for spot, cell in targets:
             new_coordinate, new_raw, _cubic, _centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
@@ -2990,7 +3083,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
                 min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                z_window=params['z_window'])
+                z_window=params['z_window'], fov_matrices=fov_matrices)
             if new_coordinate is not None:
                 spot.coordinate = new_coordinate
                 spot.raw_coordinate = new_raw
@@ -3034,6 +3127,7 @@ class MainWindow(QtWidgets.QMainWindow):
         n_would_be_mixture = 0
         grid_results = []
         claimed_positions = []  # see _run_3d_localize's own comment on this
+        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
         t0 = time.perf_counter()
         for spot, cell in targets:
             title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
@@ -3042,7 +3136,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
                 min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                z_window=params['z_window'])
+                z_window=params['z_window'], fov_matrices=fov_matrices)
             if cubic is not None:
                 grid_results.append((cubic, centroid, title))
             if new_raw is not None:
@@ -3062,7 +3156,7 @@ class MainWindow(QtWidgets.QMainWindow):
             f'selected spot(s) would be accepted{mixture_msg}. '
             f'[{mode_label} mode, {elapsed:.2f}s for {len(targets)} spot(s)]')
 
-    def _mixture_centroid_to_raw(self, coord_xyz, cell, hybe, modality):
+    def _mixture_centroid_to_raw(self, coord_xyz, cell, hybe, modality, fov_matrices=None):
         """
         Inverse of localization.refine_spot_z's own _to_real closure --
         maps a shared-frame (x, y, z) (the frame spot.coordinate AND
@@ -3070,11 +3164,17 @@ class MainWindow(QtWidgets.QMainWindow):
         live in, see ASpot.mixture_centroids' own docstring) back to
         hybe's raw pixel frame, so an ALREADY-persisted mixture sibling
         can be drawn on a raw crop without ever re-running a fit.
-        Identity when cell is None -- spot_mapper's own convention for an
-        unassigned spot is coordinate == raw_coordinate (no transform
-        applies at all), matching _to_real's own else branch.
+
+        cell is None (unassigned spot): mirrors _to_real's own cell=None
+        branch -- inverts through fov_matrices (see main_window._
+        composed_fov_matrices_for_cell_alignment) when this hybe has a
+        real FOV-level matrix, identity (x, y unchanged) otherwise.
         """
         if cell is None:
+            if fov_matrices and hybe in fov_matrices:
+                x, y, z = coord_xyz
+                rx, ry = spot_mapper.reference_to_raw((x, y), hybe, fov_matrices, modality=modality, cell=None)
+                return rx, ry, z
             return coord_xyz
         x, y, z = coord_xyz
         H = cell.matrix_to_shared(hybe, modality)
@@ -3114,6 +3214,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         storage_path, fov, hybe, modality, channel, targets = resolved
         params = self.localize_3d_displayer.params()
+        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
 
         grid_results = []
         for spot, cell in targets:
@@ -3131,7 +3232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 own_raw = spot.raw_coordinate
                 centroid = [(own_raw[0] - xmin, own_raw[1] - ymin, own_raw[2])]
                 for c in spot.mixture_centroids[1:]:
-                    rx, ry, rz = self._mixture_centroid_to_raw(c[:3], cell, hybe, modality)
+                    rx, ry, rz = self._mixture_centroid_to_raw(c[:3], cell, hybe, modality, fov_matrices=fov_matrices)
                     centroid.append((rx - xmin, ry - ymin, rz))
             grid_results.append((cubic, centroid, title))
 
@@ -3358,48 +3459,96 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_paths:
             QtWidgets.QMessageBox.warning(self, 'Save Current Spots', 'No storage path available.')
             return
-        if self.cell_container is None or not self.cell_container.data.get(fov):
-            QtWidgets.QMessageBox.warning(self, 'Save Current Spots',
-                                          'No cells loaded in memory for this FOV -- refresh the cell list first.')
-            return
 
-        primary_storage_path = self.ui.IngestionPanel.StoragePathLineEdit.text().strip() or storage_paths[0]
-        on_disk_dicts, _ = vlinks_store.read_cells(primary_storage_path, fov)
-        n_on_disk = len(on_disk_dicts) if on_disk_dicts else 0
-        n_in_memory = len(self.cell_container.data[fov])
-        if n_in_memory < n_on_disk:
-            QtWidgets.QMessageBox.critical(
-                self, 'Save Current Spots',
-                f'{n_in_memory} cell(s) in memory but {n_on_disk} already on disk for FOV{fov:02d} -- '
-                f'refusing to save (a bulk write would silently drop the missing cell(s) from vlinks.h5). '
-                f'Refresh the cell list so every cell is loaded, then try again.')
-            return
+        cells_in_memory = self.cell_container.data.get(fov, []) if self.cell_container else []
+        # No cells loaded in memory is only a wipe HAZARD when real cells
+        # already exist on disk for this FOV AND we're about to write_
+        # cells below (a bulk write would then silently drop them) -- so
+        # this check only runs at all when there's something to write.
+        # An empty cell_container is a perfectly legitimate state
+        # otherwise (e.g. just locating some FOV-level unassigned spots
+        # for a modality that's never had cell segmentation run at all),
+        # and must never block the unassigned-pool save below, which
+        # needs no cells at all -- per confirmed real bug (twice now):
+        # this used to compare against self.ui.IngestionPanel.
+        # StoragePathLineEdit's CURRENT storage path regardless of which
+        # modality was actually being worked on, but write_cells mirrors
+        # every cell across EVERY storage_paths entry on every save
+        # (confirmed on real data: a DNA-only FOV's cells appear
+        # identically under RNA's own vlinks.h5 too) -- so on-disk count
+        # is never actually 0 once ANY modality has cells anywhere,
+        # meaning this guard fired (and, being unconditional, blocked
+        # the ENTIRE function including the unrelated unassigned-pool
+        # save) even for a session with zero DNA cells loaded that was
+        # only ever trying to save RNA's own unassigned spots. Scoping
+        # to self.cell_container's own modality/storage path, and only
+        # skipping write_cells (never returning early), fixes both.
+        skip_cell_write = False
+        if cells_in_memory:
+            container_storage_path = self._storage_path_for_modality(self.cell_container.modality) or storage_paths[0]
+            on_disk_dicts, _ = vlinks_store.read_cells(container_storage_path, fov)
+            n_on_disk = len(on_disk_dicts) if on_disk_dicts else 0
+            n_in_memory = len(cells_in_memory)
+            if n_in_memory < n_on_disk:
+                QtWidgets.QMessageBox.critical(
+                    self, 'Save Current Spots',
+                    f'{n_in_memory} {self.cell_container.modality} cell(s) in memory but {n_on_disk} already '
+                    f'on disk for FOV{fov:02d} -- refusing to overwrite this modality\'s cells (a bulk write '
+                    f'would silently drop the missing cell(s) from vlinks.h5). Refresh the cell list so every '
+                    f'cell is loaded, then Save again. The unassigned-spot pool below will still be saved now.')
+                skip_cell_write = True
 
         n_identified, n_identified_cells = self._identify_fov_unassigned_spots(fov, storage_paths)
         self._assign_spot_indices(fov)
 
-        n_spots = sum(c.total_num_spots for c in self.cell_container.data[fov])
-        for storage_path in storage_paths:
-            vlinks_store.write_cells(storage_path, fov, self.cell_container)
-        # _identify_fov_unassigned_spots already wrote the leftover
-        # unassigned pool once (with whatever stale .id each spot had
-        # coming in) -- re-write it now that _assign_spot_indices has
-        # given every spot its real, current index, so the ids that
-        # actually land on disk for the unassigned pool match write_
-        # cells' own cell-owned spots above, not a snapshot from before
-        # assignment.
+        n_spots = sum(c.total_num_spots for c in cells_in_memory)
+        n_cells_saved = 0
+        # Cell-owned spots only have somewhere to be written when there
+        # are real cells in memory for this FOV, and only when the wipe-
+        # hazard check above didn't skip it -- skip write_cells
+        # gracefully (not a hard return) rather than assume it's always
+        # safe/needed to call.
+        if cells_in_memory and not skip_cell_write:
+            for storage_path in storage_paths:
+                vlinks_store.write_cells(storage_path, fov, self.cell_container)
+            n_cells_saved = len(cells_in_memory)
+        # The FOV-level unassigned pool needs no cells at all -- always
+        # attempted regardless of the above. _identify_fov_unassigned_
+        # spots already wrote the leftover pool once (with whatever stale
+        # .id each spot had coming in); re-write it now that _assign_spot_
+        # indices has given every spot its real, current index, so the
+        # ids that actually land on disk match write_cells' own cell-owned
+        # spots above, not a snapshot from before assignment.
+        #
+        # write_fov_spots to JUST this modality's own storage_path here --
+        # NOT mirror_write_fov_spots(storage_paths, ...), which writes the
+        # SAME payload to every storage path this session knows about.
+        # Confirmed real bug: fov_unassigned_spots is keyed by (storage_
+        # path, fov), i.e. genuinely per-modality with no owning cell to
+        # justify cross-modality mirroring (unlike write_cells, where the
+        # SAME cell legitimately has spots spanning both modalities) --
+        # mirroring RNA's own pool onto DNA's storage path (and vice
+        # versa) means whichever modality is processed LAST in self.
+        # modality_names permanently overwrites every OTHER modality's own
+        # unassigned pool with its own spots. Reproduced on a scratch
+        # copy: with self.modality_names == ['RNA', 'DNA'], an RNA Hyb_105
+        # spot and a DNA Hyb_010 spot both pending at once resulted in
+        # BOTH storage paths ending up with only the DNA spot -- RNA's own
+        # spot silently vanished. This is the root cause of "RNA unassigned
+        # spots don't save" whenever DNA also has a pending pool in memory.
         for modality_name in self.modality_names:
             modality_storage_path = self._storage_path_for_modality(modality_name)
             key = (modality_storage_path, fov) if modality_storage_path else None
             if key is not None and key in self.fov_unassigned_spots:
-                vlinks_store.mirror_write_fov_spots(storage_paths, fov, self.fov_unassigned_spots[key])
+                vlinks_store.write_fov_spots(modality_storage_path, fov, self.fov_unassigned_spots[key])
 
-        sp.LogTextEdit.append(f'FOV{fov:02d}: {len(self.cell_container.data[fov])} cell(s), {n_spots} total spot(s) '
-                              f'saved to vlinks.h5 ({n_identified} unassigned spot(s) newly identified into '
-                              f'{n_identified_cells} cell(s) first).')
+        skip_note = ' (cell write skipped -- see dialog)' if skip_cell_write else ''
+        sp.LogTextEdit.append(f'FOV{fov:02d}: {n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} '
+                              f'total spot(s) saved to vlinks.h5{skip_note} ({n_identified} unassigned spot(s) '
+                              f'newly identified into {n_identified_cells} cell(s) first).')
         QtWidgets.QMessageBox.information(
             self, 'Save Current Spots',
-            f'{len(self.cell_container.data[fov])} cell(s), {n_spots} total spot(s) saved.')
+            f'{n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} total spot(s) saved.{skip_note}')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
@@ -3513,9 +3662,18 @@ class MainWindow(QtWidgets.QMainWindow):
                             label = int(mask[iry, irx])
                             owning_cell = cells_by_id.get(label) if label != 0 else None
                 if owning_cell is not None:
-                    cx, cy = spot_mapper.raw_to_reference(
-                        (spot.raw_coordinate[0], spot.raw_coordinate[1]), spot.hybe, {},
-                        modality=modality_name, cell=owning_cell)
+                    # _matrix_to_shared (not spot_mapper.raw_to_reference's
+                    # own cell branch) -- per confirmed real bug, cell.
+                    # matrix_to_shared silently collapses to identity when
+                    # owning_cell has no real cell-level alignment for this
+                    # hybe/modality yet (no fallback of its own);
+                    # _matrix_to_shared already falls back to the live
+                    # FOV/cross-modal matrix in that case.
+                    H_shared = self._matrix_to_shared(spot.hybe, modality_name, owning_cell, fov)
+                    if H_shared is not None:
+                        cx, cy, _ = H_shared @ np.array([spot.raw_coordinate[0], spot.raw_coordinate[1], 1.0])
+                    else:
+                        cx, cy = spot.raw_coordinate[0], spot.raw_coordinate[1]
                     spot.set_metadata(cell=owning_cell.id, coordinate=(cx, cy, 0.0))
                     owning_cell.spots.append(spot)
                     owning_cell.num_spots[spot.hybe] = sum(1 for s in owning_cell.spots if s.hybe == spot.hybe)
@@ -3525,7 +3683,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     still_unassigned.append(spot)
             self.fov_unassigned_spots[key] = still_unassigned
-            vlinks_store.mirror_write_fov_spots(storage_paths, fov, still_unassigned)
+            # write_fov_spots to JUST this modality's own storage_path --
+            # see the matching comment in _save_current_spots' own second
+            # write loop for why mirror_write_fov_spots(storage_paths, ...)
+            # here was a confirmed real bug (cross-modality clobbering).
+            vlinks_store.write_fov_spots(modality_storage_path, fov, still_unassigned)
 
         return total_identified, len(identified_cell_ids)
 
@@ -3669,7 +3831,9 @@ class MainWindow(QtWidgets.QMainWindow):
         (_spot_crop_context['kind']) is currently open. Cell view builds
         real cell-owned ASpots (cell=cell.id, coordinate via cell.matrix_to);
         FOV view builds unassigned ASpots (cell stays at its -1 default,
-        coordinate == raw_coordinate, same as FOV-view auto-detect) --
+        coordinate mapped via the FOV/cross-modal chain alone, same as
+        FOV-view auto-detect -- see spot_mapper.raw_to_reference's own
+        cell=None docstring) --
         identification is deferred to Save Current Spots either way,
         matching FOV auto-detect's own deferred design.
         """
@@ -3679,6 +3843,8 @@ class MainWindow(QtWidgets.QMainWindow):
         hybe, channel = ctx['hybe'], ctx['channel']
         rxmin, rymin = ctx['rxmin'], ctx['rymin']
         img = self.spot_crop_displayer.crop_image
+        if ctx['kind'] != 'cell':
+            fov_matrices = self._composed_fov_matrices_for_cell_alignment(ctx['storage_path'], ctx['fov'])
         new_spots = []
         for x, y in points:
             raw_x, raw_y = x + rxmin, y + rymin
@@ -3690,17 +3856,37 @@ class MainWindow(QtWidgets.QMainWindow):
             spot = ASpot()
             if ctx['kind'] == 'cell':
                 cell = ctx['cell']
-                # empty fov_matrices: cell.matrices[(hybe, modality)] must
-                # already exist to have gotten a crop at all (_build_cell_crop's
-                # own precondition), and spot_mapper._resolve_matrix always
-                # prefers cell.matrices over fov_matrices when a cell is given.
-                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=ctx['modality'], cell=cell)
+                # _matrix_to_shared (not spot_mapper.raw_to_reference's own
+                # cell branch) -- per confirmed real bug, cell.matrix_to_
+                # shared silently collapses to identity when this cell has
+                # no real cell-level alignment for this hybe/modality yet;
+                # _build_cell_display_crop now falls back to the live
+                # FOV/cross-modal matrix to build this crop in the first
+                # place (see its own docstring), so a crop existing no
+                # longer guarantees a real cell.matrices entry the way it
+                # used to -- resolve the same way here instead of assuming.
+                H_shared = self._matrix_to_shared(hybe, ctx['modality'], cell, cell.fov)
+                if H_shared is not None:
+                    cx, cy, _ = H_shared @ np.array([raw_x, raw_y, 1.0])
+                else:
+                    cx, cy = float(raw_x), float(raw_y)
                 spot.set_metadata(fov=cell.fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=brightness)
             else:
+                # No owning cell yet, but still mapped into the SHARED
+                # frame via the FOV/cross-modal chain alone (identity only
+                # for the missing cell-level residual) -- see spot_mapper.
+                # raw_to_reference's own cell=None docstring. Falls back to
+                # raw==coordinate only when this hybe truly has no FOV-level
+                # matrix yet (Same-Modality Alignment never run for it).
+                if hybe in fov_matrices:
+                    cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, fov_matrices,
+                                                          modality=ctx['modality'], cell=None)
+                else:
+                    cx, cy = float(raw_x), float(raw_y)
                 spot.set_metadata(fov=ctx['fov'], hybe=hybe, channel=channel,
-                                  coordinate=(float(raw_x), float(raw_y), 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=brightness)
             new_spots.append(spot)
 
@@ -3808,17 +3994,30 @@ class MainWindow(QtWidgets.QMainWindow):
             if cell is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', 'Select a cell first (Cell view).')
                 return
-            crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality)
+            fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
+            crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality,
+                                                 fov_matrices=fov_matrices)
             if crop is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', f'Cell {cell.id} has no alignment/overlap for {hybe} yet.')
                 return
             img, rxmin, rymin = crop['img'], crop['rxmin'], crop['rymin']
             threshold_abs = sp.threshold_abs(np.nanmax(img))
             coords = peak_local_max(img, min_distance=min_distance, exclude_border=1, threshold_abs=threshold_abs)
+            # H resolved once, outside the loop -- per confirmed real bug,
+            # spot_mapper.raw_to_reference(..., cell=cell) has no fallback
+            # of its own (cell.matrix_to_shared silently collapses to
+            # identity when this cell has no real cell-level alignment for
+            # this hybe/modality); _matrix_to_shared already has the
+            # correct FOV/cross-modal fallback (same one crop above just
+            # used), so resolve through it directly instead.
+            H = self._matrix_to_shared(hybe, modality, cell, fov)
             new_spots = []
             for y, x in coords:
                 raw_x, raw_y = int(x) + rxmin, int(y) + rymin
-                cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, {}, modality=modality, cell=cell)
+                if H is not None:
+                    cx, cy, _ = H @ np.array([raw_x, raw_y, 1.0])
+                else:
+                    cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
@@ -3846,12 +4045,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             threshold_abs = sp.threshold_abs(mip.max())
             coords = peak_local_max(mip, min_distance=min_distance, exclude_border=1, threshold_abs=threshold_abs)
+            # No owning cell yet -- see _on_spot_crop_edited's matching FOV
+            # branch: still mapped into the shared frame via the FOV/cross-
+            # modal chain, identity only for the missing cell-level residual.
+            fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
             new_spots = []
             for y, x in coords:
                 raw_x, raw_y = int(x), int(y)
+                if hybe in fov_matrices:
+                    cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, fov_matrices, modality=modality, cell=None)
+                else:
+                    cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel,
-                                  coordinate=(float(raw_x), float(raw_y), 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))
                 new_spots.append(spot)
             self._push_spot_undo(fov_key=(storage_path, fov))
@@ -3862,6 +4069,352 @@ class MainWindow(QtWidgets.QMainWindow):
             self._load_fov_spot_display()
             self.spot_crop_displayer.show()
             self.spot_crop_displayer.raise_()
+
+    # -- chromatin tracing --
+    #
+    # An allele's (x,y) is already known -- built from whatever's currently
+    # SELECTED in Spot Localization (_build_chromatin_alleles_from_
+    # selection reuses _resolve_selected_3d_targets exactly as-is, the same
+    # selection 3D Localization's own Run/View already act on). Building/
+    # previewing (View Crop) stay in-memory only; Fit All FOVs is the one
+    # action that persists (mirror_write_fov_alleles), same "explicit Save
+    # step" convention Spot Localization's own Save Current Spots follows.
+
+    @staticmethod
+    def _default_chromatin_tracing_hybes(record, modality):
+        """
+        Default-checked state for the Hybes Involved list: modality=='DNA'
+        and datatype in ('H','R','T') -- H is the main genomic-locus
+        hybridization round, R/T are repeat/toehold QC rounds; B (barcode/
+        cell-identity rounds) is deliberately excluded, per explicit
+        request. Confirmed against this repo's own real ExperimentLayout.
+        xlsx files (DNA: 90xH/8xR/4xB/1xT; RNA also carries H-type rows, so
+        the modality check matters -- datatype alone isn't enough to keep
+        RNA's own H rounds out).
+        """
+        return modality == 'DNA' and record.get('datatype') in ('H', 'R', 'T')
+
+    @staticmethod
+    def _chromatin_channel_params(full_params):
+        """
+        (fiducial_params, readout_params) ready for localization.
+        build_chromatin_trace_allele's own fiducial_params/readout_params
+        kwargs, from ChromatinTracingPanel.params()'s own {'fiducial': {...
+        }, 'readout': {..., 'multi_mode':}} shape. fiducial_params passes
+        straight through unchanged (no mixture mode -- _localize_fiducial_
+        hybe has no use_mixture parameter at all, per explicit request);
+        readout_params renames its own 'multi_mode' key to 'use_mixture'
+        (localization.py's own name for it, matching _localize_readout_
+        hybe's own parameter).
+        """
+        readout_params = dict(full_params['readout'])
+        readout_params['use_mixture'] = readout_params.pop('multi_mode')
+        return dict(full_params['fiducial']), readout_params
+
+    def _chromatin_tracing_context(self):
+        """
+        Validates + resolves the Hybes Involved checklist into (hybes,
+        hybe_fiducial_channels, hybe_readout_channels, modality,
+        storage_path, reference_hybe) -- shared by Build Alleles/View Crop/
+        Fit All FOVs so the three can never silently disagree about which
+        hybes/modality/reference/channels are in play. Returns None (after
+        a warning dialog) if anything required is missing.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        checked = chp.checked_hybes()
+        if not checked:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Check at least one hybe first.')
+            return None
+        modalities = {m for _, m in checked}
+        if len(modalities) > 1:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
+                                          'Checked hybes span more than one modality -- pick hybes from a single modality.')
+            return None
+        modality = modalities.pop()
+        storage_path = self._storage_path_for_modality(modality)
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', f'No storage path configured for {modality}.')
+            return None
+        reference_hybe = chp.current_reference_hybe()
+        if not reference_hybe:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Pick a reference hybe first.')
+            return None
+        hybes = [folder for folder, m in checked]
+        if reference_hybe not in hybes:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
+                                          'Reference hybe must also be checked in Hybes Involved.')
+            return None
+        records_by_folder = {r['folder']: r for r in self._hybe_records_for_storage_path(storage_path)}
+        hybe_fiducial_channels = {folder: records_by_folder[folder]['fiducial_channel']
+                                  for folder in hybes if folder in records_by_folder}
+        # The seed spot's own channel only LOCATES the allele-frame (x, y,
+        # z) -- it never determines which channel gets traced (per
+        # explicit correction: seeding from a fiducial-channel spot is
+        # legitimate and explicitly supported, "no need to be fiducial
+        # channel" was never "must not be"). Each hybe's own readout
+        # channel is instead whichever of its real channels ISN'T the
+        # fiducial one -- independent of allele.anchor_channel entirely.
+        hybe_readout_channels = {}
+        for folder in hybes:
+            record = records_by_folder.get(folder)
+            if record is None:
+                continue
+            fiducial_channel = record['fiducial_channel']
+            readout = next((c for c in record.get('channels', []) if c != fiducial_channel), None)
+            if readout is not None:
+                hybe_readout_channels[folder] = readout
+        return hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe
+
+    def _chromatin_storage_path_and_modality(self):
+        """
+        (modality, storage_path) resolved from the Hybes Involved
+        checklist alone -- lighter than _chromatin_tracing_context (no
+        reference-hybe requirement, no warning dialogs), used just to
+        scope the Alleles section's own Hybe/Channel/spot choices. Returns
+        (None, None) if the checked hybes don't yet resolve to exactly one
+        modality/storage_path.
+        """
+        checked = self.ui.ChromatinTracingPanel.checked_hybes()
+        modalities = {m for _, m in checked}
+        if len(modalities) != 1:
+            return None, None
+        modality = modalities.pop()
+        return modality, self._storage_path_for_modality(modality)
+
+    def _refresh_chromatin_allele_hybe_choices(self):
+        """
+        Populates the Alleles section's own Hybe combobox from every
+        active hybe in the SAME modality/storage_path as the Hybes
+        Involved checklist -- not restricted to the checked subset itself
+        (a seed spot's own anchor hybe doesn't need to be one of the
+        traced rounds). Cascades into Channel + spot choices.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            chp.populate_allele_hybe_choices([])
+            self._on_chromatin_allele_hybe_changed()
+            return
+        hybe_records = self._hybe_records_for_storage_path(storage_path)
+        chp.populate_allele_hybe_choices([(r, modality) for r in hybe_records])
+        self._on_chromatin_allele_hybe_changed()
+
+    def _on_chromatin_allele_hybe_changed(self):
+        chp = self.ui.ChromatinTracingPanel
+        record, _modality = chp.current_allele_hybe_record_and_modality()
+        chp.populate_allele_channel_choices(record)
+        self._refresh_chromatin_allele_spot_choices()
+
+    def _refresh_chromatin_allele_spot_choices(self):
+        """Populates the Alleles section's spot-selection list for the
+        currently picked (FOV, hybe, channel), read straight from
+        vlinks.h5 (_ordered_spot_dicts_for_scope) -- same real-data source
+        CellSpotStatusDisplayer already uses, independent of whatever
+        Spot Localization's own live session state currently shows."""
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        fov = chp.AlleleFovSpinBox.value()
+        hybe, _ = chp.current_allele_hybe_key()
+        channel = chp.current_allele_channel()
+        if not storage_path or not hybe or channel is None:
+            chp.populate_spot_choices([])
+            return
+        chp.populate_spot_choices(self._ordered_spot_dicts_for_scope(storage_path, fov, hybe, channel))
+
+    def _build_chromatin_alleles_from_selection(self):
+        """
+        Turns whatever's currently SELECTED in this panel's OWN spot list
+        (Alleles section -- scoped by its own FOV/Hybe/Channel pickers,
+        never Spot Localization's live session state, see class docstring
+        on ui/chromatin_tracing_panel.py) into this FOV's allele list --
+        full replace (same "re-run overwrites" convention as _replace_
+        cell_spots/_replace_fov_unassigned_spots elsewhere in this app),
+        never an incremental merge, so clicking this again after changing
+        the selection can't leave stale alleles from a previous click
+        mixed in. Builds directly from the persisted spot dicts (id/cell/
+        hybe/channel/coordinate/raw_coordinate) -- no live ASpot/ACell
+        needed at build time; the owning cell is resolved later, lazily,
+        wherever a real fit actually needs it (View Crop/Fit All FOVs).
+        """
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Check at least one hybe (Hybes Involved) first.')
+            return
+        fov = chp.AlleleFovSpinBox.value()
+        selected = chp.selected_spot_dicts()
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Select at least one spot first.')
+            return
+        alleles = []
+        for i, d in enumerate(selected, start=1):
+            allele = AnAllele()
+            allele.set_metadata(id=i, fov=fov, cell=d['cell'], anchor_hybe=d['hybe'], anchor_channel=d['channel'],
+                                coordinate=d['coordinate'], raw_coordinate=d['raw_coordinate'])
+            alleles.append(allele)
+        self.chromatin_alleles[(storage_path, fov)] = alleles
+        self._refresh_chromatin_allele_lists(storage_path, fov)
+        chp.StatusLabel.setText(f'Built {len(alleles)} allele(s) for FOV{fov:02d} from {len(selected)} selected spot(s).')
+
+    def _refresh_chromatin_allele_lists(self, storage_path, fov):
+        chp = self.ui.ChromatinTracingPanel
+        alleles = self.chromatin_alleles.get((storage_path, fov), [])
+        rows = [(a.id, f"Allele {a.id}: cell={'unassigned' if a.cell == -1 else a.cell} "
+                       f"anchor={a.anchor_hybe}/{a.anchor_channel} @ "
+                       f"({a.coordinate[0]:.1f}, {a.coordinate[1]:.1f}, {a.coordinate[2]:.1f}) "
+                       f"[{len(a.polymer)} hybe(s) traced]")
+                for a in alleles]
+        chp.populate_allele_list(rows)
+        chp.populate_preview_allele_choices(rows)
+
+    def _on_chromatin_allele_fov_changed(self):
+        chp = self.ui.ChromatinTracingPanel
+        self._refresh_chromatin_allele_spot_choices()
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            chp.populate_allele_list([])
+            chp.populate_preview_allele_choices([])
+            return
+        self._refresh_chromatin_allele_lists(storage_path, chp.AlleleFovSpinBox.value())
+
+    def _view_chromatin_trace_crop(self):
+        """
+        Runs build_chromatin_trace_allele(collect_debug=True) for the ONE
+        allele currently picked in Preview One Allele, with the CURRENT fit
+        parameters -- a real fit, same computation Fit All FOVs would do
+        for this allele, just scoped to one allele and not yet persisted
+        to disk (Fit All FOVs is the one action that writes to vlinks.h5).
+        Populates both grid pop-ups, one tile per active hybe.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        ctx = self._chromatin_tracing_context()
+        if ctx is None:
+            return
+        hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe = ctx
+        fov = chp.AlleleFovSpinBox.value()
+        allele_id = chp.current_preview_allele_id()
+        if allele_id is None:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Build alleles for this FOV first.')
+            return
+        alleles = self.chromatin_alleles.get((storage_path, fov), [])
+        allele = next((a for a in alleles if a.id == allele_id), None)
+        if allele is None:
+            return
+        # Alleles are built straight from persisted spot dicts (see
+        # _build_chromatin_alleles_from_selection), never from a live
+        # ASpot -- self.cell_container may not have this FOV loaded yet
+        # this session, so _find_cell_by_id would silently resolve to
+        # None even for a real cell-owned allele. Self-activating here
+        # matches every other spot-related method's own guard against
+        # exactly that (see _refresh_spot_cell_list).
+        self._activate_fov(fov)
+        cell = self._find_cell_by_id(fov, allele.cell) if allele.cell != -1 else None
+        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+
+        full_params = chp.params()
+        fiducial_params, readout_params = self._chromatin_channel_params(full_params)
+        _, debug = localization.build_chromatin_trace_allele(
+            allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
+            storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
+            spad=full_params['spad'], z_window=full_params['z_window'],
+            fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True)
+
+        fid_results, readout_results = [], []
+        for hybe in hybes:
+            d = debug.get(hybe, {})
+            if d.get('fiducial_cubic') is not None:
+                centroid = [d['fiducial_centroid']] if d['fiducial_centroid'] is not None else None
+                fid_results.append((d['fiducial_cubic'], centroid, hybe))
+            if d.get('readout_cubic') is not None:
+                readout_results.append((d['readout_cubic'], d['readout_centroids'], hybe))
+
+        allele_label = f'FOV{fov:02d}_allele{allele.id}'
+        self.chromatin_fiducial_grid_displayer.show_fit_status_grid(fid_results, allele_label=allele_label, params=full_params)
+        self.chromatin_readout_grid_displayer.show_fit_status_grid(readout_results, allele_label=allele_label, params=full_params)
+        self.chromatin_fiducial_grid_displayer.show()
+        self.chromatin_fiducial_grid_displayer.raise_()
+        self.chromatin_readout_grid_displayer.show()
+        self.chromatin_readout_grid_displayer.raise_()
+        self._refresh_chromatin_allele_lists(storage_path, fov)
+        chp.StatusLabel.setText(f'Allele {allele.id}: {len(allele.polymer)}/{len(hybes)} hybe(s) traced '
+                                f'({len(allele.rejected_hybes)} rejected).')
+
+    def _run_chromatin_tracing_fit_all(self):
+        """
+        Batch-fits every FOV in the Ingestion tab's own FOV list that
+        already has alleles built (Build/Refresh Alleles per FOV, or a
+        previous View Crop -- this never builds alleles itself). Background
+        QThread + progress bar, same pattern as AlignmentWorker/
+        CellAlignmentWorker/CrossModalAlignmentWorker; persists via
+        mirror_write_fov_alleles as soon as the batch completes.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        ctx = self._chromatin_tracing_context()
+        if ctx is None:
+            return
+        hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe = ctx
+        ip = self.ui.IngestionPanel
+        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+
+        jobs, fov_matrices_by_fov = [], {}
+        for fov in fov_list:
+            alleles = self.chromatin_alleles.get((storage_path, fov), [])
+            if not alleles:
+                continue
+            # Alleles are built from persisted spot dicts, not a live
+            # ASpot -- self.cell_container may not have this FOV loaded
+            # yet this session. Activate on the MAIN thread, before the
+            # worker starts, so ChromatinTracingWorker's own cell_lookup
+            # (_find_cell_by_id) has real data to read from the background
+            # thread without touching session state itself.
+            self._activate_fov(fov)
+            jobs.append((storage_path, fov, alleles))
+            fov_matrices_by_fov[fov] = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        if not jobs:
+            QtWidgets.QMessageBox.warning(self, 'Fit All FOVs',
+                                          "No alleles built yet for any FOV in the Ingestion tab's FOV list -- "
+                                          "use Build/Refresh Alleles per FOV first.")
+            return
+
+        full_params = chp.params()
+        fiducial_params, readout_params = self._chromatin_channel_params(full_params)
+
+        chp.ProgressBar.setValue(0)
+        chp.FitAllFovsPushButton.setEnabled(False)
+        self._chromatin_worker = ChromatinTracingWorker(jobs, hybes, reference_hybe, hybe_fiducial_channels,
+                                                         hybe_readout_channels, modality,
+                                                         fov_matrices_by_fov, self._find_cell_by_id,
+                                                         full_params['max_fiducial_drift'], full_params['spad'],
+                                                         full_params['z_window'], fiducial_params, readout_params)
+        self._chromatin_worker.progress.connect(self._on_chromatin_fit_progress)
+        self._chromatin_worker.finished_ok.connect(self._on_chromatin_fit_finished)
+        self._chromatin_worker.failed.connect(self._on_chromatin_fit_failed)
+        self._chromatin_worker.start()
+
+    def _on_chromatin_fit_progress(self, done, total, msg):
+        chp = self.ui.ChromatinTracingPanel
+        chp.ProgressBar.setMaximum(total)
+        chp.ProgressBar.setValue(done)
+        chp.StatusLabel.setText(msg)
+
+    def _on_chromatin_fit_finished(self, results):
+        chp = self.ui.ChromatinTracingPanel
+        chp.FitAllFovsPushButton.setEnabled(True)
+        storage_paths = self._all_vlinks_storage_paths()
+        for (storage_path, fov), alleles in results.items():
+            vlinks_store.mirror_write_fov_alleles(storage_paths, fov, alleles)
+        n_alleles = sum(len(alleles) for alleles in results.values())
+        chp.StatusLabel.setText(f'Fit All FOVs done -- {n_alleles} allele(s) across {len(results)} FOV(s), saved to vlinks.h5.')
+        current_fov = chp.AlleleFovSpinBox.value()
+        for (storage_path, fov) in results:
+            if fov == current_fov:
+                self._refresh_chromatin_allele_lists(storage_path, fov)
+                break
+
+    def _on_chromatin_fit_failed(self, message):
+        chp = self.ui.ChromatinTracingPanel
+        chp.FitAllFovsPushButton.setEnabled(True)
+        QtWidgets.QMessageBox.critical(self, 'Fit All FOVs error', message)
 
     # -- celltype determination --
 
@@ -4553,7 +5106,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         disk_results = {}
         for fov in fov_list:
-            H = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
+            # vlinks_store's own mirror first -- keyed only by (storage_path,
+            # fov), never by dna_reference_hybe's own name, so it can't be
+            # read from the wrong hybe's stack file the way chain.py's own
+            # read can when the reference-hybe combo hasn't been reconciled
+            # against vlinks yet (confirmed real bug: during config load,
+            # ap.DnaReferenceHybeComboBox briefly holds the config file's
+            # own text before _refresh_params_from_vlinks corrects it,
+            # so a read here with the wrong reference hybe silently pulled
+            # /matrix_across out of an unrelated hybe's own file and
+            # permanently contaminated self.cross_modal_result for the rest
+            # of the session -- vlinks_store's copy is immune to this since
+            # it never depends on which hybe is currently selected anywhere).
+            # Falls back to chain.py's own copy only for data saved before
+            # this mirror existed.
+            H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
+            if H is None:
+                H = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
             if H is not None:
                 disk_results[fov] = H
         if disk_results:
@@ -4769,6 +5338,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if H is None:
             H = self.cross_modal_result.get((dna_storage_path, fov))
         if H is None:
+            # vlinks_store's own mirror first -- reference-hybe-independent,
+            # immune to a not-yet-reconciled combo (see _refresh_cross_
+            # modal_results_list's own comment on the confirmed real bug
+            # this avoids); chain.py's own read only as a last resort.
+            H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
+        if H is None:
             H = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
         if H is None:
             QtWidgets.QMessageBox.warning(self, 'Show Cross-Modal Overlay',
@@ -4814,25 +5389,127 @@ class MainWindow(QtWidgets.QMainWindow):
                 return name
         return None
 
+    def _shared_frame_modality(self):
+        """
+        Which modality's own within-experiment frame IS the pipeline's ONE
+        shared frame -- always the RNA side of the cross-modal pair (the
+        side whose own H_across is identity by design; see ACell.
+        matrix_to_shared: "there is no separate DNA's own shared frame").
+        None when no cross-modal pair is configured at all, in which case
+        each caller falls back to its own modality (nothing to bridge).
+        """
+        rna_storage_path = self.ui.AlignmentPanel.RnaStoragePathLineEdit.text().strip()
+        return self._modality_for_storage_path(rna_storage_path) if rna_storage_path else None
+
+    def _cross_modal_bridge(self, from_modality, to_modality, fov):
+        """
+        3x3 mapping from_modality's own within-experiment frame ->
+        to_modality's own within-experiment frame. THE single place the
+        cross-modal direction is decided.
+
+        Takes FRAMES (from/to), never roles ("is this the cell's own
+        modality?") -- per explicit design correction. The stored
+        cross-modal matrix maps the DNA side's frame -> the RNA side's
+        frame (confirmed on real data: DNA's own anchor composes to
+        dx=-13.483 dy=+1.244, matching vlinks' own "DNA->RNA" row), so
+        this returns it as-is for DNA->RNA, its inverse for RNA->DNA, and
+        identity within one modality -- a plain function of the two frame
+        names, with no dependence on which cell happens to be loaded.
+
+        Confirmed real bug this replaces: the direction used to be picked
+        by an `invert` flag keyed on whether storage_path was the cell's
+        OWN side, which silently made the DESTINATION frame depend on the
+        cell's modality. For a DNA cell that sent the DNA leg into RNA's
+        frame while sending the RNA leg into DNA's frame -- the two legs
+        disagreeing by 2x H_across (~27px on real data; the cross-modal
+        bridge hybe's own two copies, which image the same physical
+        sample and should nearly coincide, sat 19.98px apart for a DNA
+        cell vs 7.26px for an RNA cell).
+
+        Returns None when a real cross-modal link is genuinely REQUIRED
+        (the two modalities differ) but isn't available/accepted yet --
+        never a silent identity, which would fabricate an alignment that
+        was never computed. Same-modality always returns identity, so a
+        session with no cross-modal layer at all still works untouched.
+        """
+        if from_modality == to_modality:
+            return np.eye(3)
+        ap = self.ui.AlignmentPanel
+        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
+        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
+        if not rna_storage_path or not dna_storage_path or rna_storage_path == dna_storage_path:
+            return None
+        rna_modality = self._modality_for_storage_path(rna_storage_path)
+        dna_modality = self._modality_for_storage_path(dna_storage_path)
+        if {from_modality, to_modality} != {rna_modality, dna_modality}:
+            return None
+        # vlinks_store's own copy first -- keyed ONLY by (storage_path,
+        # fov), immune to the reference-hybe staleness that made chain.py's
+        # own lookup read /matrix_across out of the wrong hybe's stack file
+        # (see _refresh_cross_modal_results_list's own comment).
+        H_across = self.cross_modal_result.get((dna_storage_path, fov))
+        if H_across is None:
+            H_across = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
+        if H_across is None:
+            dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
+            if dna_reference_hybe:
+                H_across = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
+        if H_across is None:
+            return None
+        return H_across if from_modality == dna_modality else la.inv(H_across)
+
+    def _fov_matrices_in_frame(self, source_modality, frame_modality, fov):
+        """
+        {hybe: 3x3} for every one of source_modality's OWN hybes, each
+        mapping that hybe's own native frame into frame_modality's own
+        within-experiment frame -- the one generalized primitive both
+        same-modality and cross-modal callers now use, differing only in
+        what they pass as frame_modality.
+
+        Composition is always [within, bridge]: the same-modality layer
+        first, then _cross_modal_bridge's own (from -> to) factor, which
+        is identity whenever the two frames coincide -- so RNA->RNA and
+        DNA->DNA fall out of the SAME expression as RNA->DNA/DNA->RNA
+        rather than needing their own branch.
+
+        Returns None when the needed layer genuinely isn't available (no
+        within-experiment matrices for this FOV, or a required cross-modal
+        link that hasn't been accepted) -- a missing hybe WITHIN an
+        otherwise-available dict still degrades to identity at lookup time
+        (see hybe_to_cellref_matrix's own fov_matrices.get(hybe, eye)),
+        which is the "works even without each layer" property.
+        """
+        source_storage_path = self._storage_path_for_modality(source_modality)
+        if not source_storage_path:
+            return None
+        within = self.fov_matrices.get((source_storage_path, fov), {})
+        if not within:
+            return None
+        bridge = self._cross_modal_bridge(source_modality, frame_modality, fov)
+        if bridge is None:
+            return None
+        if np.allclose(bridge, np.eye(3)):
+            return dict(within)
+        return {hybe: alignment.compose_chain([H, bridge]) for hybe, H in within.items()}
+
     def _composed_fov_matrices_for_cell_alignment(self, storage_path, fov):
         """
         The FOV-level matrices to use as compute_cell_alignment's "H1"
-        input for this (storage_path, fov). If an accepted cross-modal
-        result exists here (storage_path is a DNA modality already linked
-        to some RNA experiment), every hybe's matrix gets H_across composed
-        on top via compose_chain, so DNA cell-alignment builds on the
-        cross-modal correction too, not just the within-experiment one --
-        RNA's H_across is always identity by design, so this is a no-op for
-        RNA; DNA before any cross-modal run also falls through unchanged
-        (nothing to compose in yet). Returns a NEW dict -- never mutates
-        self.fov_matrices, so /matrix/{hybe}'s on-disk meaning stays
-        strictly within-experiment for any other reader.
+        input for this (storage_path, fov), expressed in the pipeline's
+        ONE shared frame (see _shared_frame_modality). Thin wrapper over
+        _fov_matrices_in_frame now -- kept as its own name because
+        several call sites have only a storage_path in scope. Returns a
+        NEW dict -- never mutates self.fov_matrices, so /matrix/{hybe}'s
+        on-disk meaning stays strictly within-experiment for any other
+        reader. Falls back to the raw within-experiment matrices when no
+        shared frame is resolvable (no cross-modal pair configured),
+        matching this function's own long-standing "nothing to compose
+        in yet" behavior rather than returning None.
         """
-        within = self.fov_matrices.get((storage_path, fov), {})
-        H_across = self.cross_modal_result.get((storage_path, fov))
-        if H_across is None:
-            return within
-        return {hybe: alignment.compose_chain([H, H_across]) for hybe, H in within.items()}
+        modality = self._modality_for_storage_path(storage_path)
+        frame_modality = self._shared_frame_modality() or modality
+        composed = self._fov_matrices_in_frame(modality, frame_modality, fov) if modality else None
+        return composed if composed is not None else self.fov_matrices.get((storage_path, fov), {})
 
     def _other_modality_cell_alignment_inputs(self, storage_path, fov):
         """
@@ -4847,14 +5524,18 @@ class MainWindow(QtWidgets.QMainWindow):
         for this FOV.
 
         other_fov_matrices: {hybe: 3x3} -- each of the OTHER modality's
-        own within-experiment matrices, composed with the cross-modal
-        correction (or its inverse, if storage_path is the DNA side and
-        H_across therefore needs to be undone to land in DNA's own frame)
-        so it lands directly in storage_path's (the cell's) own frame --
-        ready to hand to compute_cell_alignment as a second, independent
-        fov_matrices input, exactly like
+        own within-experiment matrices, bridged into the pipeline's ONE
+        shared frame (_shared_frame_modality), exactly like
         _composed_fov_matrices_for_cell_alignment's own output for the
-        same-modality case. Previously excluded any hybe name already
+        same-modality case -- both now go through the SAME
+        _fov_matrices_in_frame primitive, so the two legs are guaranteed
+        to land in one frame rather than agreeing only by construction.
+        Per confirmed real bug, this used to bridge into storage_path's
+        (the CELL's) own frame instead, inverting H_across whenever the
+        cell sat on the DNA side -- which made the destination frame
+        depend on the loaded cell's modality and left a DNA cell's two
+        legs disagreeing by 2x H_across (see _cross_modal_bridge's own
+        docstring for the measured numbers). Previously excluded any hybe name already
         present in self.hybe_records (the SAME modality's own set) --
         the shared cross-modal bridge hybe (e.g. Hyb_130) is a real,
         DISTINCT file in BOTH modalities, and that exclusion silently
@@ -4885,23 +5566,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         if storage_path == rna_storage_path:
             other_storage_path = dna_storage_path
-            dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-            invert = False
         elif storage_path == dna_storage_path:
             other_storage_path = rna_storage_path
-            dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-            invert = True
         else:
             return None
-        if not dna_reference_hybe:
-            return None
-
-        H_across = self.cross_modal_result.get((dna_storage_path, fov))
-        if H_across is None:
-            H_across = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
-        if H_across is None:
-            return None
-        H_compose = la.inv(H_across) if invert else H_across
 
         other_modality = self._modality_for_storage_path(other_storage_path)
         other_data = self.modality_data.get(other_modality) if other_modality else None
@@ -4921,39 +5589,99 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return None
 
-        other_within = self.fov_matrices.get((other_storage_path, fov), {})
-        if not other_within:
-            return None
-
-        other_fov_matrices = {hybe: alignment.compose_chain([H, H_compose]) for hybe, H in other_within.items()}
+        # ONE shared frame for both legs, never storage_path's own -- see
+        # this function's own other_fov_matrices docstring and
+        # _cross_modal_bridge for the measured bug that motivated it.
+        frame_modality = self._shared_frame_modality() or other_modality
+        other_fov_matrices = self._fov_matrices_in_frame(other_modality, frame_modality, fov)
         if not other_fov_matrices:
             return None
         return other_storage_path, other_hybe_records, other_fov_matrices, other_reference_hybe, other_modality
 
+    def _cell_alignment_passes(self, cell_modality, storage_path, fov):
+        """
+        One compute_cell_alignment "pass" dict per configured modality --
+        what CellAlignmentWorker consumes (see its own docstring). The
+        cell's OWN modality always comes first; the other modality is
+        appended only when a real cross-modal link exists for this FOV
+        (_other_modality_cell_alignment_inputs), so a single-modality or
+        not-yet-cross-modally-linked session degrades to exactly the old
+        one-pass behavior.
+
+        Every pass anchors on THAT MODALITY'S OWN cell alignment
+        reference (ap.current_cell_reference_hybe(modality)) -- NOT
+        _other_modality_cell_alignment_inputs' own 4th return value,
+        which is that modality's SAME-MODALITY FOV-ALIGNMENT reference
+        (a different, independently-configured setting; see
+        _reference_hybe_for_storage_path). Using the cell-alignment one
+        is what keeps every residual fit strictly within one modality
+        while still being anchored where the rest of the cell-alignment
+        layer expects.
+
+        'cellref_fov_matrices' is ALWAYS the cell's own modality's own
+        composed matrices, for every pass -- that's the frame cell.area
+        is native to, so it's what cell.reference_hybe must be resolved
+        against regardless of which modality's hybes the pass itself
+        fits. The other modality's own 'fov_matrices' are already
+        composed to land in this same frame (see _other_modality_cell_
+        alignment_inputs), so the two are directly compatible.
+        """
+        ap = self.ui.AlignmentPanel
+        own_fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        passes = [{
+            'modality': cell_modality,
+            'storage_path': storage_path,
+            'hybe_records': self._active_hybe_records_for_modality(cell_modality),
+            'fov_matrices': own_fov_matrices,
+            'reference_hybe': ap.current_cell_reference_hybe(cell_modality) or None,
+            'cellref_fov_matrices': own_fov_matrices,
+        }]
+        other = self._other_modality_cell_alignment_inputs(storage_path, fov)
+        if other is not None:
+            other_storage_path, _, other_fov_matrices, _, other_modality = other
+            other_reference_hybe = ap.current_cell_reference_hybe(other_modality)
+            other_records = self._active_hybe_records_for_modality(other_modality)
+            # No configured cell-alignment reference for that modality (or
+            # nothing ingested there) means there's nothing well-defined to
+            # anchor its own fit against -- skip that pass rather than
+            # silently falling back to some other hybe, leaving those hybes
+            # on the FOV/cross-modal matrix alone exactly as before.
+            if other_reference_hybe and other_records:
+                passes.append({
+                    'modality': other_modality,
+                    'storage_path': other_storage_path,
+                    'hybe_records': other_records,
+                    'fov_matrices': other_fov_matrices,
+                    'reference_hybe': other_reference_hybe,
+                    'cellref_fov_matrices': own_fov_matrices,
+                })
+        return passes
+
     def _fov_matrices_for_cell_modality(self, modality, cell, fov):
         """
         The already-composed {hybe: H_to_shared} dict for `modality`,
-        resolved relative to `cell`'s own storage path -- same modality as
-        the cell -> its own within-experiment matrices; any other
-        (currently configured) modality -> the cross-modal-composed
-        matrices for that other modality. Returns None if that FOV-level
-        layer isn't available at all yet (FOV alignment or cross-modal
-        alignment for that pairing hasn't been run/accepted). Shared by
+        every entry expressed in the pipeline's ONE shared frame (see
+        _shared_frame_modality) regardless of which modality `cell` itself
+        was segmented in. Returns None if that FOV-level layer isn't
+        available at all yet (FOV alignment, or the cross-modal link this
+        modality would need, hasn't been run/accepted). Shared by
         _fov_only_matrix_for_hybe so every caller sources this lookup the
         same way, rather than re-deriving it.
+
+        `cell` no longer selects the destination frame -- it only supplies
+        the fallback when no cross-modal pair is configured at all (then
+        there is nothing to bridge and each modality is its own frame).
+        Per confirmed real bug, this used to route the cell's OWN modality
+        through _composed_fov_matrices_for_cell_alignment (-> the shared/
+        RNA frame) but any OTHER modality through _other_modality_cell_
+        alignment_inputs' own cell-relative composition (-> the CELL's
+        frame): for a DNA cell those two destinations differ by 2x
+        H_across, so a cell's two legs silently disagreed by ~27px on real
+        data. Both now go through the same _fov_matrices_in_frame
+        primitive with the same frame_modality.
         """
-        cell_storage_path = self.modality_data.get(cell.modality, {}).get('storage_path')
-        if not cell_storage_path:
-            return None
-        if modality == cell.modality:
-            return self._composed_fov_matrices_for_cell_alignment(cell_storage_path, fov)
-        other = self._other_modality_cell_alignment_inputs(cell_storage_path, fov)
-        if other is None:
-            return None
-        _, _, fov_matrices_for_hybe, _, other_modality = other
-        if other_modality != modality:
-            return None
-        return fov_matrices_for_hybe
+        frame_modality = self._shared_frame_modality() or cell.modality
+        return self._fov_matrices_in_frame(modality, frame_modality, fov)
 
     def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov):
         """
@@ -4980,6 +5708,40 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_reference_hybe_matrix = (cell_fov_matrices or {}).get(cell.reference_hybe, np.eye(3))
         return alignment.hybe_to_cellref_matrix(fov_matrices_for_hybe, cell_reference_hybe_matrix, hybe)
 
+    def _live_cell_matrix_anchor(self, modality, cell, fov):
+        """
+        LIVE replacement for cell.matrix_anchors[modality] -- that
+        modality's own CURRENT cell_align_reference hybe's CURRENT FOV/
+        cross-modal matrix, looked up fresh via _fov_matrices_for_cell_
+        modality rather than cell.matrix_anchors' own stored value.
+
+        Confirmed real staleness bug (per explicit correction -- the cell-
+        level RESIDUAL correction legitimately belongs in the cell's own
+        container and was never meant to be dropped from it; only the
+        ANCHOR needs to stop being read from the cell): cell.matrix_
+        anchors[modality] is captured once, at whatever moment compute_
+        cell_alignment last ran for this cell, and PERSISTED. If Same-
+        Modality or Cross-Modal Alignment is later re-run/re-accepted
+        with a different result, every cell's own matrix_anchors silently
+        goes stale until that cell is individually re-fit -- even though
+        cell.matrices[key]['yx'] (the actual residual) is still perfectly
+        valid. ACell.matrix_to_shared/matrix_between (the bare model
+        methods) still read matrix_anchors directly and stay that way on
+        purpose -- they're the right choice for contexts with no live
+        session state (e.g. ACell.get_mip, localization's own internal
+        have_real branch); this live version is for interactive/UI
+        consumers, which always have session state available.
+
+        Falls back to the stored snapshot only when the live lookup has
+        nothing (this modality's own reference-hybe combo was never set,
+        or its FOV-level layer isn't available at all yet) -- never
+        crashes on a cell that still only has the pre-fix stored anchor.
+        """
+        fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
+        anchor_hybe = self.ui.AlignmentPanel.current_cell_reference_hybe(modality)
+        live = (fov_matrices_for_hybe or {}).get(anchor_hybe) if anchor_hybe else None
+        return live if live is not None else cell.matrix_anchors.get(modality, np.eye(3))
+
     def _matrix_to_cellref(self, hybe, modality, cell, fov):
         """
         hybe's own raw frame -> cell.reference_hybe's own frame -- the
@@ -4987,28 +5749,35 @@ class MainWindow(QtWidgets.QMainWindow):
         need. cell.matrices entries now target THAT compute_cell_
         alignment call's own reference_hybe, not a shared frame (see its
         docstring) -- a same-modality entry and a cross-modal entry can
-        rest in genuinely different frames, bridged only via
-        cell.matrix_anchors (see ACell.matrix_between). So this prefers
-        cell.matrix_to (the real, cell-level-refined composition) only
-        when BOTH hybe's own and cell.reference_hybe's own entries AND
-        both modalities' anchors are actually present -- mixing a real
-        entry for one leg with a raw FOV value for the other would
-        silently combine two different frames, exactly the class of bug
-        this whole redesign exists to avoid. Otherwise falls back to
-        _fov_only_matrix_for_hybe's pure FOV-level computation (no
-        cell.matrices/matrix_anchors dependency at all), so a cell that's
-        never had cell-level alignment run for a given hybe/modality
-        still gets a real, non-identity answer instead of ACell.matrix_
-        to's bare identity default. Returns None only when even the
-        FOV-only fallback has nothing to work with.
+        rest in genuinely different frames, bridged only via each
+        modality's own anchor (see ACell.matrix_between). So this prefers
+        the real, cell-level-refined composition only when BOTH hybe's
+        own and cell.reference_hybe's own residual entries AND both
+        modalities' anchors are actually present -- mixing a real entry
+        for one leg with a raw FOV value for the other would silently
+        combine two different frames, exactly the class of bug this whole
+        redesign exists to avoid. Otherwise falls back to _fov_only_
+        matrix_for_hybe's pure FOV-level computation (no cell.matrices/
+        matrix_anchors dependency at all), so a cell that's never had
+        cell-level alignment run for a given hybe/modality still gets a
+        real, non-identity answer instead of ACell.matrix_to's bare
+        identity default. Returns None only when even the FOV-only
+        fallback has nothing to work with.
+
+        Composes via _live_cell_matrix_anchor (NOT cell.matrix_to, which
+        internally uses cell.matrix_anchors' own possibly-stale snapshot
+        -- see that method's own docstring) -- same bridging formula as
+        ACell.matrix_between, just with a live anchor for each leg.
         """
         key = (hybe, modality)
         self_key = (cell.reference_hybe, cell.modality)
         have_real = (key in cell.matrices and self_key in cell.matrices
                      and modality in cell.matrix_anchors and cell.modality in cell.matrix_anchors)
-        if have_real:
-            return cell.matrix_to(hybe, modality)
-        return self._fov_only_matrix_for_hybe(hybe, modality, cell, fov)
+        if not have_real:
+            return self._fov_only_matrix_for_hybe(hybe, modality, cell, fov)
+        H_a_to_shared = self._live_cell_matrix_anchor(modality, cell, fov) @ cell.matrices[key]['yx']
+        H_b_to_shared = self._live_cell_matrix_anchor(cell.modality, cell, fov) @ cell.matrices[self_key]['yx']
+        return la.inv(H_b_to_shared) @ H_a_to_shared
 
     def _matrix_to_shared(self, hybe, modality, cell, fov):
         """
@@ -5018,90 +5787,95 @@ class MainWindow(QtWidgets.QMainWindow):
         needs now (contrast with _matrix_to_cellref, which targets
         cell.reference_hybe's frame and stays correct/needed for mask-
         related work, e.g. the cell-area leg of celltype barcode
-        classification). Prefers cell.matrix_to_shared (the real, cell-
-        level-refined composition) only when hybe's own entry AND that
-        modality's own anchor are actually present; otherwise falls back
-        to a pure FOV-level lookup (no cell-level residual) via
-        _fov_matrices_for_cell_modality, so a cell that's never had cell-
-        level alignment run for a given hybe/modality still gets a real,
-        non-identity answer instead of ACell.matrix_to_shared's bare
-        identity default. Returns None only when even the FOV-only
-        fallback has nothing to work with -- simpler than _matrix_to_
-        cellref's own fallback (_fov_only_matrix_for_hybe), since there's
-        no bridge-to-cell.reference_hybe step left to compute here.
+        classification). Composes the real, cell-level-refined residual
+        (cell.matrices[key]['yx'] -- this legitimately belongs in the
+        cell's own container, unlike the anchor below) against a LIVE
+        anchor via _live_cell_matrix_anchor, NOT cell.matrix_to_shared
+        (which internally uses cell.matrix_anchors' own stored, possibly-
+        stale snapshot -- see _live_cell_matrix_anchor's own docstring
+        for the confirmed staleness bug this avoids: re-running Same-
+        Modality/Cross-Modal Alignment with a new result used to leave
+        every already-fit cell's own final matrix silently unchanged
+        until that cell was individually re-fit). Falls back to a pure
+        FOV-level lookup (no cell-level residual) via _fov_matrices_for_
+        cell_modality when this cell has no real residual for hybe/
+        modality at all, so a cell that's never had cell-level alignment
+        run still gets a real, non-identity answer instead of an identity
+        default. Returns None only when even the FOV-only fallback has
+        nothing to work with.
         """
         key = (hybe, modality)
-        if key in cell.matrices and modality in cell.matrix_anchors:
-            return cell.matrix_to_shared(hybe, modality)
-        fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-        if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
-            return None
-        return fov_matrices_for_hybe[hybe]
+        if key not in cell.matrices:
+            fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
+            if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
+                return None
+            return fov_matrices_for_hybe[hybe]
+        return self._live_cell_matrix_anchor(modality, cell, fov) @ cell.matrices[key]['yx']
 
     def _cell_overlay_target_specs(self, cell, storage_path, fov, hybe_records, channel_type):
         """
-        Resolves every hybe in cell.matrices (both modalities) into what
-        draw_cell_all_readouts_overlay needs to read/crop/warp it: storage
-        path, channel (also reused for the ZX row -- z-alignment now
-        respects channel_type, same as the yx fit), the FOV-level matrix (the
-        'FOV/cross-modal' stage), and this cell's own final yx/zx
-        matrices -- both resolved into the pipeline's ONE shared frame
-        (RNA's own same-modality reference hybe; see ACell.matrix_to_
-        shared's own docstring), which is what draw_cell_all_readouts_
-        overlay's crop_via expects. fov_only_matrix is a plain fov_
-        matrices lookup (no cell involvement at all -- there's no bridge
-        step left to compute for the FOV/cross-modal stage); final_matrix
-        goes through _matrix_to_shared for the real cell-level residual.
-        Unlike the single-hybe preview, every target here is warped into
-        that ONE fixed shared frame -- that part has no per-target
-        ambiguity.
+        Resolves EVERY active hybe in EVERY configured modality (not just
+        cell.matrices' own keys) into what draw_cell_all_readouts_overlay
+        needs to read/crop/warp it: storage path, channel (also reused for
+        the ZX row -- z-alignment respects channel_type, same as the yx
+        fit), the FOV-level matrix (the 'FOV/cross-modal' stage), and this
+        cell's own final yx/zx matrices -- both resolved into the
+        pipeline's ONE shared frame (RNA's own same-modality reference
+        hybe; see ACell.matrix_to_shared's own docstring), which is what
+        draw_cell_all_readouts_overlay's crop_via expects. fov_only_matrix
+        is a plain fov_matrices lookup (no cell involvement at all -- no
+        bridge step left to compute for the FOV/cross-modal stage);
+        final_matrix goes through _matrix_to_shared, which already falls
+        back to fov_only_matrix's own value whenever this cell has no
+        real cell-level residual for that hybe/modality (per confirmed
+        real bug fix -- see ACell.matrix_to_shared's own docstring) --
+        this cell's own modality naturally gets a real residual for every
+        hybe it was aligned against; the OTHER modality (no cell-level
+        residual fit is attempted across modality boundaries at all, per
+        explicit decision -- see CellAlignmentWorker's own docstring)
+        always resolves to fov_only_matrix here, showing 'FOV/cross-modal'
+        and 'final' as identical for those hybes, which is the honest
+        picture (no per-cell refinement was ever computed for them).
 
-        Excludes hybes with NO cell.matrix_provenance entry -- these are
-        the cell-alignment ANCHOR(s) (same-modality and/or other-modality,
-        see compute_cell_alignment: a hybe skips provenance only when it
-        IS that call's own reference_hybe param), which never got a
-        residual computed against anything, so there's no meaningful raw/
-        FOV/final comparison to show for them.
+        Iterating every configured modality's own active hybe_records
+        directly (not cell.matrices.items()) is what makes other-modality
+        hybes show up here at all now that CellAlignmentWorker no longer
+        writes ANY cell.matrices entry for them -- previously this
+        iterated cell.matrices as its only source, which silently dropped
+        a hybe the moment there was no residual computed for it.
         """
         this_modality = self._modality_for_storage_path(storage_path)
-        same_record_by_folder = {r['folder']: r for r in hybe_records}
-        other = self._other_modality_cell_alignment_inputs(storage_path, fov)
-        other_record_by_folder, other_storage_path, other_modality = {}, None, None
-        if other is not None:
-            other_storage_path, other_hybe_records, _, _, other_modality = other
-            other_record_by_folder = {r['folder']: r for r in other_hybe_records}
+        record_by_folder_by_modality = {this_modality: {r['folder']: r for r in hybe_records}}
+        storage_path_by_modality = {this_modality: storage_path}
+        for name in self.modality_names:
+            if name == this_modality:
+                continue
+            other_storage_path = self._storage_path_for_modality(name)
+            other_hybe_records = self._active_hybe_records_for_modality(name)
+            if not other_storage_path or not other_hybe_records:
+                continue
+            record_by_folder_by_modality[name] = {r['folder']: r for r in other_hybe_records}
+            storage_path_by_modality[name] = other_storage_path
 
         specs = []
-        for (hybe, modality), mats in cell.matrices.items():
-            # modality (not bare-name dict membership) resolves which
-            # side each entry belongs to -- necessary now that the same
-            # hybe NAME can legitimately appear once per modality (the
-            # cross-modal bridge hybe, e.g. Hyb_130, is a real, distinct
-            # file in both).
-            if (hybe, modality) not in cell.matrix_provenance:
-                continue
-            if modality == this_modality and hybe in same_record_by_folder:
-                record = same_record_by_folder[hybe]
-                target_storage_path = storage_path
-            elif modality == other_modality and hybe in other_record_by_folder:
-                record = other_record_by_folder[hybe]
-                target_storage_path = other_storage_path
-            else:
-                continue
+        for modality, record_by_folder in record_by_folder_by_modality.items():
             fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-            if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
+            if not fov_matrices_for_hybe:
                 continue
-            fov_only_matrix = fov_matrices_for_hybe[hybe]
-            final_matrix = self._matrix_to_shared(hybe, modality, cell, fov)
-            if final_matrix is None:
-                continue
-            specs.append({
-                'hybe': hybe, 'modality': modality, 'storage_path': target_storage_path,
-                'channel': alignment.pick_channel_by_type(record, channel_type),
-                'fov_only_matrix': fov_only_matrix,
-                'final_matrix': final_matrix,
-                'zx_matrix': mats.get('zx', np.eye(3)),
-            })
+            for hybe, record in record_by_folder.items():
+                if hybe not in fov_matrices_for_hybe:
+                    continue
+                fov_only_matrix = fov_matrices_for_hybe[hybe]
+                final_matrix = self._matrix_to_shared(hybe, modality, cell, fov)
+                if final_matrix is None:
+                    continue
+                specs.append({
+                    'hybe': hybe, 'modality': modality, 'storage_path': storage_path_by_modality[modality],
+                    'channel': alignment.pick_channel_by_type(record, channel_type),
+                    'fov_only_matrix': fov_only_matrix,
+                    'final_matrix': final_matrix,
+                    'zx_matrix': cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3)),
+                })
         return specs
 
     def _run_cell_alignment(self):
@@ -5114,35 +5888,22 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ap = self.ui.AlignmentPanel
         ip = self.ui.IngestionPanel
-        # storage_path/hybe_records/modality resolved from the picked
-        # reference hybe's OWN modality tag -- see _run_cell_alignment_
-        # for_selected_cell's own comment for why this must never come
-        # from IngestionPanel's current selection, and is an explicit
-        # user choice rather than auto-derived from the cells' own
-        # modality.
-        cell_reference_hybe = ap.current_cell_reference_hybe() or None
-        cell_modality = ap.current_cell_reference_modality()
-        storage_path = self._storage_path_for_modality(cell_modality)
-        hybe_records = self._active_hybe_records_for_modality(cell_modality) if cell_modality else []
         fov_list_all = self._parse_fov_list(ip.FovListLineEdit.text())
-        if not storage_path or not fov_list_all:
-            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
-                                          'Pick a reference hybe (Cell-Based Alignment) and set the FOV list in the Ingestion tab first.')
-            return
-
         fov = ap.CellFovSpinBox.value()
         if fov not in fov_list_all:
             QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
                                           f'FOV{fov} is not in the Ingestion tab\'s FOV list.')
             return
-        if (storage_path, fov) not in self.fov_matrices:
-            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment', 'Run (and accept) FOV alignment for this FOV first.')
-            return
 
         # Cells here are the REAL objects (whichever container has them for
         # this FOV, permanent/saved preferred) -- CellAlignmentWorker mutates
         # them in place, so no staging/deepcopy is needed for an always-save
-        # operation.
+        # operation. Modality is read directly off the container (this app
+        # only ever holds ONE modality's cells resident in memory at a
+        # time -- cell_container/cell_container_permanent always share the
+        # same .modality), never a separate picker -- and that modality's
+        # own configured reference hybe (ap.current_cell_reference_hybe)
+        # is what compute_cell_alignment anchors against.
         container = None
         if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
             container = self.cell_container_permanent
@@ -5154,16 +5915,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         real_cells = container.data[fov]
 
+        cell_modality = container.modality
+        cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
+        storage_path = self._storage_path_for_modality(cell_modality)
+        hybe_records = self._active_hybe_records_for_modality(cell_modality)
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
+                                          f'No storage path configured for {cell_modality}.')
+            return
+        if (storage_path, fov) not in self.fov_matrices:
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment', 'Run (and accept) FOV alignment for this FOV first.')
+            return
+
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
 
         ap.RunCellAlignmentPushButton.setEnabled(False)
         self.statusBar().showMessage('Computing cell alignment...')
-        worker_jobs = [(fov, real_cells, self._composed_fov_matrices_for_cell_alignment(storage_path, fov),
-                        self._other_modality_cell_alignment_inputs(storage_path, fov))]
-        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, storage_path, hybe_records, cell_modality,
-                                                           reference_hybe=cell_reference_hybe, channel_type=channel_type,
-                                                           pad=pad)
+        worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
+        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad)
         self._cell_alignment_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_finished(results, fov, container, storage_path,
@@ -5180,9 +5950,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Cell alignment computed.', 5000)
 
         storage_paths = self._all_vlinks_storage_paths()
+        # per-modality-suffixed key -- see _refresh_params_from_vlinks'
+        # own read side and CellAlignmentWorker's own docstring for why
+        # (each modality now has its own independent reference hybe, no
+        # more single shared/ambiguous value).
+        cell_alignment_kwargs = {f'cell_alignment_reference_hybe_{cell_modality}': cell_reference_hybe} if cell_modality else {}
         for path in storage_paths:
-            vlinks_store.write_global_params(path, cell_alignment_reference_hybe=cell_reference_hybe,
-                                             cell_alignment_channel_type=channel_type, cell_alignment_pad=pad)
+            vlinks_store.write_global_params(path, cell_alignment_channel_type=channel_type,
+                                             cell_alignment_pad=pad, **cell_alignment_kwargs)
         if storage_paths:
             vlinks_store.mirror_write_cells(storage_paths, fov, container)
 
@@ -5269,16 +6044,21 @@ class MainWindow(QtWidgets.QMainWindow):
         have tripped the auto-save-on-large-shift threshold. Reads the
         SAME live tier-1 controls (reference hybe/channel/pad) Run Cell
         Alignment itself reads -- matches this button's own "reuse
-        whatever the panel currently shows" contract, not IngestionPanel's
-        current selection (see populate_cell_reference_hybe_choices'
-        docstring for why that used to crash)."""
+        whatever the panel currently shows" contract. Modality is read
+        directly off the first cell in the list -- every cell here comes
+        from the SAME single-modality container (self.cell_container/
+        cell_container_permanent), so they all share one modality anyway,
+        no separate picker needed."""
         ap = self.ui.AlignmentPanel
-        cell_modality = ap.current_cell_reference_modality()
-        storage_path = self._storage_path_for_modality(cell_modality)
-        if not storage_path or not self._cell_alignment_display_cells:
+        if not self._cell_alignment_display_cells:
             QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', 'Run Cell Alignment first.')
             return
-        cell_reference_hybe = ap.current_cell_reference_hybe() or None
+        cell_modality = self._cell_alignment_display_cells[0][1].modality
+        storage_path = self._storage_path_for_modality(cell_modality)
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', f'No storage path configured for {cell_modality}.')
+            return
+        cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
         n_saved = 0
@@ -5297,11 +6077,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_cell_alignment_preview(self, item):
         """
         Every row in "Results (per cell, per hybe)" belongs to the SAME
-        single cell, and the reference is tier 1's own Reference hybe
-        (both already resolved into _cell_per_hybe_context by
-        _refresh_cell_per_hybe_results) -- the row itself IS the target-
-        hybe choice, so clicking it previews that hybe directly against
-        that reference, no separate target combo needed.
+        single cell -- the row itself IS the target-hybe choice, so
+        clicking it previews that hybe directly. The reference side is no
+        longer a single fixed choice (see _show_cell_alignment_preview_
+        for_hybe -- one block per configured modality's own reference
+        hybe now), so only target_key needs to be remembered here.
         """
         pctx = self._cell_per_hybe_context
         if pctx is None:
@@ -5309,11 +6089,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fov, cell_id, hybe, modality = item.data(QtCore.Qt.UserRole)
         cell = pctx['cell']
         target_key = (hybe, modality)
-        reference_key = pctx['reference_key']
         self._cell_preview_context = {'fov': fov, 'cell': cell, 'storage_path': pctx['storage_path'],
-                                      'hybe_records': pctx['hybe_records'], 'target_key': target_key,
-                                      'reference_key': reference_key}
-        self._show_cell_alignment_preview_for_hybe(target_key=target_key, reference_key=reference_key)
+                                      'hybe_records': pctx['hybe_records'], 'target_key': target_key}
+        self._show_cell_alignment_preview_for_hybe(target_key=target_key)
 
     def _resolve_preview_hybe_context(self, hybe, modality, storage_path, hybe_records, fov):
         """
@@ -5348,26 +6126,34 @@ class MainWindow(QtWidgets.QMainWindow):
             return None, None, f"{hybe} ({modality}) isn't in that modality's parsed layout."
         return other_record_by_folder[hybe], other_storage_path, None
 
-    def _show_cell_alignment_preview_for_hybe(self, target_key=None, reference_key=None):
+    def _show_cell_alignment_preview_for_hybe(self, target_key=None):
         """
-        target_key/reference_key: (hybe, modality) tuples -- matches
-        cell.matrices' own key shape. Both default to whatever's stored
-        in _cell_preview_context (set by _show_cell_alignment_preview
-        from the last-clicked Results-list row and tier 1's own Reference
-        hybe combo respectively) -- neither needs a separate combo of its
-        own here. Target and reference don't need to share a modality --
-        any hybe can be compared against any other hybe directly, RNA
-        against DNA included (see ACell.matrix_between).
+        target_key: (hybe, modality) tuple -- matches cell.matrices' own
+        key shape. Defaults to whatever's stored in _cell_preview_context
+        (set by _show_cell_alignment_preview from the last-clicked
+        Results-list row) -- no separate target combo needed here.
 
-        This works because draw_cell_alignment_preview_3col only ever
-        needs target's and reference's OWN matrices independently, both
-        expressed relative to the pipeline's ONE shared reference frame
-        (each crops the shared-frame mask via its own inverse-warp, then
-        the two crops are composited for visual comparison) -- it never
-        needs a direct target-vs-reference matrix. So both are resolved
-        the exact same way, via a plain fov_matrices lookup / _matrix_to_
-        shared (same resolvers _cell_overlay_target_specs uses),
-        completely independently of one another.
+        The reference side is no longer a single fixed choice -- per
+        explicit request, one 2x3 block is drawn per configured
+        modality's own reference hybe (ap.cell_align_references()), all
+        compared against the SAME target hybe. Modalities with no real
+        pick, or whose reference hybe fails to resolve, are silently
+        skipped (status bar shows target-level errors only; a genuinely
+        empty reference_specs list still calls through and shows
+        whatever target-only info _draw_three_way can given zero rows,
+        rather than silently doing nothing).
+
+        Every reference/target matrix is resolved the exact same way --
+        a plain fov_matrices lookup for fov_only_matrix/spec['fov_matrix'],
+        _matrix_to_shared for final_matrix/spec['final_matrix'] -- since
+        draw_cell_alignment_preview_3col only ever needs each hybe's OWN
+        matrix independently expressed relative to the pipeline's ONE
+        shared reference frame (each crops the shared-frame mask via its
+        own inverse-warp, then the crops are composited for visual
+        comparison), never a direct target-vs-reference matrix. Target
+        and any reference don't need to share a modality -- any hybe can
+        be compared against any other hybe directly, RNA against DNA
+        included (see ACell.matrix_between).
         """
         pctx = getattr(self, '_cell_preview_context', None)
         if pctx is None:
@@ -5375,12 +6161,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ap = self.ui.AlignmentPanel
         if target_key is None:
             target_key = pctx.get('target_key')
-        if reference_key is None:
-            reference_key = pctx.get('reference_key')
-        if not target_key or not reference_key:
+        if not target_key:
             return
         target_hybe, target_modality = target_key
-        reference_hybe, reference_modality = reference_key
         cell, fov = pctx['cell'], pctx['fov']
         storage_path, hybe_records = pctx['storage_path'], pctx['hybe_records']
         channel_type = ap.CellChannelTypeComboBox.currentText()
@@ -5391,49 +6174,68 @@ class MainWindow(QtWidgets.QMainWindow):
         if err:
             self.statusBar().showMessage(f"Can't preview {target_hybe} ({target_modality}): {err}", 8000)
             return
-        reference_record, reference_storage_path, err = self._resolve_preview_hybe_context(
-            reference_hybe, reference_modality, storage_path, hybe_records, fov)
-        if err:
-            self.statusBar().showMessage(f"Can't use {reference_hybe} ({reference_modality}) as reference: {err}", 8000)
-            return
 
-        # fov_only_matrix/reference_fov_matrix are plain fov_matrices
-        # lookups (no cell involvement, no bridge step left to compute);
-        # final_matrix/reference_final_matrix go through _matrix_to_shared
-        # for the pipeline's ONE shared reference frame (what draw_cell_
-        # alignment_preview_3col's bounds_via now expects -- see
-        # ACell.matrix_to_shared).
+        # fov_only_matrix is a plain fov_matrices lookup (no cell
+        # involvement, no bridge step left to compute); final_matrix goes
+        # through _matrix_to_shared for the pipeline's ONE shared
+        # reference frame (what draw_cell_alignment_preview_3col's
+        # bounds_via now expects -- see ACell.matrix_to_shared).
         target_fov_matrices = self._fov_matrices_for_cell_modality(target_modality, cell, fov)
         fov_only_matrix = (target_fov_matrices or {}).get(target_hybe)
-        reference_fov_matrices = self._fov_matrices_for_cell_modality(reference_modality, cell, fov)
-        reference_fov_matrix = (reference_fov_matrices or {}).get(reference_hybe)
         final_matrix = self._matrix_to_shared(target_hybe, target_modality, cell, fov)
-        # Computed INDEPENDENTLY from reference_fov_matrix, not reused --
-        # see draw_cell_alignment_preview_3col's own docstring for why
-        # reference_hybe's own final column needs the SAME KIND of matrix
-        # (_matrix_to_shared, folding in reference_hybe's own real
-        # residual) the target's final column uses, not the residual-
-        # blind FOV-only one.
-        reference_final_matrix = self._matrix_to_shared(reference_hybe, reference_modality, cell, fov)
-        if fov_only_matrix is None or reference_fov_matrix is None or final_matrix is None or reference_final_matrix is None:
+        if fov_only_matrix is None or final_matrix is None:
             self.statusBar().showMessage(
-                f"Can't preview {target_hybe} ({target_modality}): no FOV-level alignment available for it "
-                "or its reference hybe yet.", 8000)
+                f"Can't preview {target_hybe} ({target_modality}): no FOV-level alignment available for it yet.", 8000)
             return
-
-        reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
         target_channel = alignment.pick_channel_by_type(target_record, channel_type)
+
+        reference_specs = []
+        for modality, reference_hybe in ap.cell_align_references().items():
+            record, reference_storage_path, err = self._resolve_preview_hybe_context(
+                reference_hybe, modality, storage_path, hybe_records, fov)
+            if err:
+                continue
+            reference_fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
+            reference_fov_matrix = (reference_fov_matrices or {}).get(reference_hybe)
+            if reference_fov_matrix is None:
+                continue
+            # 'final_matrix' deliberately OMITTED -- draw_cell_alignment_
+            # preview_3col's own default (spec.get('final_matrix',
+            # reference_fov_matrix)) then pins the reference/red side to
+            # the SAME matrix on 'FOV/cross-modal' AND 'final', per
+            # explicit correction of a confirmed real regression: this
+            # used to call _matrix_to_shared(reference_hybe, ...)
+            # independently here, which, now that reference_hybe is
+            # ALWAYS this modality's own cell_align_reference (the
+            # residual-fit ANCHOR itself -- see ap.cell_align_references),
+            # only ever happened to numerically coincide with reference_
+            # fov_matrix (the anchor's own residual against itself is
+            # ~identity by construction) rather than being a STRUCTURAL
+            # guarantee -- silently reintroducing "red moves between
+            # columns" as a live possibility, breaking the established
+            # principle that column 3's whole role is showing whether
+            # cyan (target) was corrected onto a FIXED red (reference),
+            # never the reverse. The Results list's own dx/dy math is a
+            # legitimately different use of the TRUE final matrix and
+            # still calls _matrix_to_shared directly (see
+            # _refresh_cell_per_hybe_results) -- only this preview's own
+            # reference crop is pinned.
+            reference_specs.append({
+                'modality': modality, 'storage_path': reference_storage_path, 'hybe': reference_hybe,
+                'channel': alignment.pick_channel_by_type(record, channel_type),
+                'fov_matrix': reference_fov_matrix,
+            })
+
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
             cell.reference_hybe, np.eye(3))
 
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cell_alignment_preview_3col(
-            cell, fov, reference_storage_path, reference_hybe, reference_channel,
-            reference_fov_matrix,
+            cell, fov, reference_specs,
             target_storage_path, target_hybe, target_channel,
             fov_only_matrix, final_matrix, pad=pad, target_modality=target_modality,
-            reference_final_matrix=reference_final_matrix, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
+            mask_anchor_fov_matrix=mask_anchor_fov_matrix)
 
     def _show_cell_all_readouts_overlay(self, item=None):
         """
@@ -5537,17 +6339,18 @@ class MainWindow(QtWidgets.QMainWindow):
                                           f'No segmented cell with ID {cell_id} found in FOV{fov:02d}.')
             return
 
-        # storage_path/hybe_records/modality all resolved from the picked
-        # reference hybe's OWN modality tag -- never from IngestionPanel's
-        # current selection (see populate_cell_reference_hybe_choices'
-        # docstring for the crash this used to cause: picking a hybe from
-        # modality A while Ingestion happened to show modality B), and by
-        # explicit request an actual free choice, not auto-derived from
-        # real_cell.modality.
-        cell_reference_hybe = ap.current_cell_reference_hybe() or None
-        cell_modality = ap.current_cell_reference_modality()
+        # Modality read directly off real_cell -- no separate picker (see
+        # ui/alignment_panel.py's own comment on why: this app only ever
+        # holds one modality's cells resident in memory at a time, so the
+        # found cell's own .modality is already unambiguous). Reference
+        # hybe still comes from that modality's own configured combo,
+        # never from IngestionPanel's current selection (see populate_
+        # cell_reference_hybe_choices' own docstring for the crash that
+        # used to cause).
+        cell_modality = real_cell.modality
+        cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         storage_path = self._storage_path_for_modality(cell_modality)
-        hybe_records = self._active_hybe_records_for_modality(cell_modality) if cell_modality else []
+        hybe_records = self._active_hybe_records_for_modality(cell_modality)
         if not storage_path or not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
                                           'Pick a reference hybe (Cell-Based Alignment) and parse that modality\'s layout first.')
@@ -5559,13 +6362,11 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
 
-        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
-        other_ctx = self._other_modality_cell_alignment_inputs(storage_path, fov)
         staged_cell = deepcopy(real_cell)
 
-        worker = CellAlignmentWorker([(fov, [staged_cell], fov_matrices, other_ctx)], storage_path, hybe_records,
-                                     cell_modality, reference_hybe=cell_reference_hybe,
-                                     channel_type=channel_type, pad=pad)
+        worker = CellAlignmentWorker(
+            [(fov, [staged_cell], self._cell_alignment_passes(cell_modality, storage_path, fov))],
+            channel_type=channel_type, pad=pad)
         result_holder = {}
         worker.finished_ok.connect(lambda results: result_holder.__setitem__('results', results))
         worker.failed.connect(lambda message: result_holder.__setitem__('error', message))
@@ -5783,20 +6584,18 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.lock_modality_setup()
         self._activate_modalities(names, modality_fields=modalities)
 
-        if glob.get('cell_align_reference_hybe') and not ap.current_cell_reference_hybe():
-            # Only a fallback for when vlinks (already applied by
-            # _activate_modalities -> _refresh_params_from_vlinks, which
-            # runs before this line) had nothing real to say -- vlinks-
-            # actual values must always win over this stale config
-            # default, never get overwritten by it after the fact.
-            # Persisted as a bare folder name (pre-dates the modality tag,
-            # see cell_alignment_reference_hybe's own vlinks-side comment)
-            # -- try every configured modality in turn, first real match
-            # wins; no-op if it belonged to a modality no longer configured.
-            for name in self.modality_names:
-                ap.select_cell_reference_hybe(glob['cell_align_reference_hybe'], name)
-                if ap.current_cell_reference_hybe() == glob['cell_align_reference_hybe']:
-                    break
+        # cell_align_reference_hybe is now per-modality-suffixed (see
+        # _save_config_dialog's own write side) -- one independent XML
+        # key per configured modality, matching cell_align_references'
+        # own {modality: hybe} shape. Only a fallback for when vlinks
+        # (already applied by _activate_modalities -> _refresh_params_
+        # from_vlinks, which runs before this line) had nothing real to
+        # say -- vlinks-actual values must always win over this stale
+        # config default, never get overwritten by it after the fact.
+        for name in self.modality_names:
+            config_value = glob.get(f'cell_align_reference_hybe_{name}')
+            if config_value and not ap.current_cell_reference_hybe(name):
+                ap.select_cell_reference_hybe(name, config_value)
 
     def _save_config_dialog(self):
         """
@@ -5840,7 +6639,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 'num_modalities': len(self.modality_names),
                 'fov_list': self._parse_fov_list(ip.FovListLineEdit.text()),
                 'cross_modality_channel_type': ap.ChannelTypeComboBox.currentText(),
-                'cell_align_reference_hybe': ap.current_cell_reference_hybe(),
+                # per-modality-suffixed -- see cell_align_references' own
+                # {modality: hybe} shape (CellAlignmentWorker no longer
+                # attempts a cross-modal residual fit, so each modality
+                # needs its own independent, explicit reference hybe --
+                # see that class's own docstring).
+                **{f'cell_align_reference_hybe_{name}': hybe
+                  for name, hybe in ap.cell_align_references().items()},
                 'cell_align_channel_type': ap.CellChannelTypeComboBox.currentText(),
                 'cell_seg_fov': cp.FovSpinBox.value(),
                 'celltype_names': self.ui.CelltypeDeterminationPanel.celltype_names(),

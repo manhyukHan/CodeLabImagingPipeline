@@ -380,7 +380,8 @@ def localize_spots_worker(fov, hybe, hybe_list, cell_parameter_dict,
     else:
         return np.zeros((0,7), dtype=float), (img,bimg,np.zeros((0,7), dtype=float)), hybe
 
-def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None):
+def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
+                     fov_matrices=None, cell_reference_hybe_matrix=None):
     """
     Shared crop-building logic for localize_cell_2d_worker/3d_worker AND
     the interactive spot localization panel's "Current Cell" scope --
@@ -396,6 +397,29 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None)
     contiguous/ascending) and the cell-mask fancy indexing done on the
     resulting in-memory array instead.
 
+    fov_matrices/cell_reference_hybe_matrix (both optional, default None):
+    live FOV/cross-modal matrices for `hybe`'s own modality, and cell.
+    reference_hybe's own transform into that same shared frame -- same
+    two parameters compute_cell_alignment itself takes, same convention
+    (cell_reference_hybe_matrix defaults to fov_matrices.get(cell.
+    reference_hybe, identity) when not given, correct whenever fov_
+    matrices is the CELL's own modality; a cross-modal caller must
+    resolve and pass it explicitly, since cell.reference_hybe is never a
+    real key in the OTHER modality's own fov_matrices). Used ONLY as a
+    fallback -- per confirmed real bug, cell.get_area_in_readout/matrix_
+    to_shared silently collapse to IDENTITY (not a real FOV-level
+    transform) whenever this cell has no cell.matrices/matrix_anchors
+    entry for (hybe, modality) at all (never had cell-level alignment run
+    for it), mispositioning both this crop's own placement AND any spot
+    coordinate a caller derives from it. When real cell-level data IS
+    present for both this hybe and cell.reference_hybe (same "have_real"
+    condition MainWindow._matrix_to_cellref/_matrix_to_shared already
+    use), that real, cell-level-refined result is used unchanged --
+    fov_matrices only ever substitutes for a genuinely MISSING cell-level
+    entry, never overrides a real one. Omitting fov_matrices preserves
+    the old identity-default behavior exactly (existing callers that
+    haven't been updated yet still work, just without this fix).
+
     Returns None only if the transformed area is genuinely empty (e.g.
     the cell has no mask pixels at all) -- get_area_in_readout itself
     never raises: no alignment matrix yet for (hybe, modality) means
@@ -409,7 +433,27 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None)
     if none)}.
     """
     modality = modality if modality is not None else cell.modality
-    x_area, y_area = cell.get_area_in_readout(hybe, modality)
+    key = (hybe, modality)
+    self_key = (cell.reference_hybe, cell.modality)
+    have_real = (key in cell.matrices and self_key in cell.matrices
+                 and modality in cell.matrix_anchors and cell.modality in cell.matrix_anchors)
+    if have_real or fov_matrices is None or hybe not in fov_matrices:
+        # real cell-level data, or no fallback available -- old behavior
+        # (identity-default via cell.get_area_in_readout/matrix_to_shared
+        # when neither real data nor a fallback exists).
+        x_area, y_area = cell.get_area_in_readout(hybe, modality)
+    else:
+        # No real cell-level entry for (hybe, modality) -- fall back to
+        # the FOV/cross-modal-only transform instead of silently
+        # collapsing to identity. Mirrors ACell.get_area_in_readout's own
+        # body exactly, substituting the FOV-only H_cellref for cell.
+        # matrix_to(hybe, modality).
+        if cell_reference_hybe_matrix is None:
+            cell_reference_hybe_matrix = fov_matrices.get(cell.reference_hybe, np.eye(3))
+        H_cellref = alignment.hybe_to_cellref_matrix(fov_matrices, cell_reference_hybe_matrix, hybe)
+        x_lit, y_lit = cell.area
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
+        x_area, y_area = cx, cy
     if len(x_area) == 0:
         return None
     x_area, y_area = x_area.astype(int), y_area.astype(int)
@@ -436,8 +480,15 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None)
     # -- see ACell.matrix_to_shared's own docstring for why, not
     # cell.reference_hybe's frame), matching spot_mapper.raw_to_
     # reference's own convention, which matrix_to_shared is what
-    # actually resolves.
-    H = cell.matrix_to_shared(hybe, modality)
+    # actually resolves. Same have_real-gated fallback as the area/crop
+    # placement above -- fov_matrices[hybe] directly (no cell-reference
+    # bridging needed here, unlike the area case, since fov_matrices is
+    # already expressed in the shared frame) whenever this cell has no
+    # real cell-level entry for (hybe, modality).
+    if not have_real and fov_matrices is not None and hybe in fov_matrices:
+        H = fov_matrices[hybe]
+    else:
+        H = cell.matrix_to_shared(hybe, modality)
     Hz = cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3))
 
     return {'img': img, 'stacks': stacks, 'bimg': bimg, 'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
@@ -447,7 +498,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
                   spad=5, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                   min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
                   min_sep=3.0, component_threshold=0.3, max_components=3, claimed_positions=None,
-                  use_mixture=True, z_window=15):
+                  use_mixture=True, z_window=15, fov_matrices=None):
     """
     Adds/refines Z on a spot that's ALREADY PLACED (2D auto-detect or a
     manual click, so spot.raw_coordinate's own x,y are already known and
@@ -541,9 +592,19 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     raw (x,y,z) is also transformed through cell.matrix_to_shared/
     matrices' zx entry into the pipeline's ONE shared reference frame
     (RNA's own same-modality reference hybe -- matching every other spot
-    coordinate in this project, see ACell.matrix_to_shared); omit for a
-    cell-less (e.g. FOV unassigned-pool) spot, where coordinate ==
-    raw_coordinate, no transform applies.
+    coordinate in this project, see ACell.matrix_to_shared).
+
+    fov_matrices (optional, only consulted when cell is None): the
+    {hybe: 3x3} FOV/cross-modal-level chain for this storage_path/fov
+    (see main_window._composed_fov_matrices_for_cell_alignment and
+    spot_mapper.raw_to_reference's own cell=None docstring) -- maps a
+    cell-less (FOV unassigned-pool) spot's fitted (x,y) into the SAME
+    shared frame too, identity only for the missing cell-level residual,
+    so an unassigned spot's coordinate stays comparable to a cell-owned
+    one's instead of silently staying in its own hybe's raw frame. Falls
+    back to raw==coordinate (x,y unchanged) when omitted or this hybe
+    has no FOV-level matrix yet -- the graceful "no alignment yet"
+    degradation, matching every other cell=None caller in this codebase.
 
     Returns (new_coordinate, new_raw_coordinate, cubic, centroid,
     extra_results, mixture_centroids) -- NEVER mutates spot itself, so
@@ -707,7 +768,10 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             H = cell.matrix_to_shared(hybe, m)
             Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
-            coord = (float(x1), float(y1), float(zf + Hz[1, 2]))
+            coord = (float(x1), float(y1), float(zf + Hz[0, 2]))
+        elif fov_matrices and hybe in fov_matrices:
+            x1, y1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe, fov_matrices, modality=modality, cell=None)
+            coord = (x1, y1, raw[2])
         else:
             coord = raw
         return coord, raw, float(amp)
@@ -780,7 +844,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
 
         raw_x, raw_y = x + rxmin, y + rymin
         x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
-        z1 = z + Hz[1, 2]
+        z1 = z + Hz[0, 2]
 
         spot = ASpot()
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
@@ -887,7 +951,7 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
 
         raw_x, raw_y, raw_z = x + rxmin, y + rymin, z0 + szmin
         x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
-        z1 = raw_z + Hz[1, 2]
+        z1 = raw_z + Hz[0, 2]
 
         spot = ASpot()
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
@@ -925,3 +989,321 @@ def localize_cells_3d(cell_container, fov, hybe_records, channel,
             cell.spots.extend(spots)
             cell.num_spots[hybe] = cell.num_spots.get(hybe, 0) + len(spots)
             cell.total_num_spots += len(spots)
+
+
+# -- chromatin tracing --
+#
+# An allele's (x,y) is already known (the seed spot the user selected in
+# Spot Localization -- see AnAllele.anchor_hybe/coordinate) -- no fresh
+# detection here. Per hybe: crop+fit the fiducial channel (single
+# component, this hybe's own local anchor), compute this hybe's own drift
+# relative to the reference hybe's fiducial (both already in the shared
+# frame -- see spot_mapper.raw_to_reference), reject the hybe outright if
+# that drift is too large, otherwise crop+fit the readout channel
+# (mixture-capable) and apply the same drift correction to every accepted
+# candidate. This is plain 3D localization (fit_gaussian_3d/
+# fit_gaussian_mixture_3d, unmodified) plus a shift calculation -- no new
+# fitting math, no new registration subsystem. `cell` is passed straight
+# through to spot_mapper exactly like refine_spot_z already does (None for
+# an allele whose anchor spot has no owning cell, a real ACell otherwise)
+# -- chromatin tracing has no mechanistic dependency on cell-based
+# alignment; it just uses whichever matrix chain already applies to this
+# allele's own anchor spot.
+
+def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov, modality, cell, fov_matrices,
+                            spad=8, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
+                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0):
+    """
+    Crops+fits ONE hybe's fiducial channel around an allele's already-known
+    shared-frame (x,y). Always single-component (fit_gaussian_3d) -- no
+    mixture mode here, per explicit request: a fiducial's whole purpose is
+    ONE per-hybe drift-correction anchor, and a fiducial bead field has no
+    legitimate multi-locus case the way a real genomic-locus readout does
+    (see _localize_readout_hybe's own mixture-capable search).
+
+    Returns (shared_xyz_amp_or_None, cubic_or_None, crop_local_xyz_or_None)
+    -- cubic/crop_local_xyz are for display only (canvas.spot_fit_status.
+    draw_spot_fit_status's own cubic/centroid params, unmodified), always
+    returned regardless of caller the same way refine_spot_z always returns
+    its own cubic -- a batch caller (build_chromatin_trace_allele) simply
+    discards them; a preview caller keeps them. cubic is None only when
+    this hybe's raw stack doesn't exist or the crop itself came back empty;
+    crop_local_xyz is None whenever nothing was accepted, even if cubic
+    itself is real (matching draw_spot_fit_status's own "circled = good,
+    plain = missing" convention).
+    """
+    try:
+        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell)
+        cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, fiducial_channel,
+                                                                 (raw_x, raw_y), pad=spad, use_stack=True)
+    except OSError:
+        return None, None, None
+    if cubic.size == 0:
+        return None, None, None
+    x0, y0 = raw_x - xmin, raw_y - ymin
+    z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+
+    result = fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                             init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                             min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
+    if result is None:
+        return None, cubic, None
+    amp, xf, yf, zf = result[:4]
+    raw_fx, raw_fy = xf + xmin, yf + ymin
+    sx, sy = spot_mapper.raw_to_reference((raw_fx, raw_fy), hybe, fov_matrices, modality=modality, cell=cell)
+    sz = zf
+    if cell is not None:
+        m = modality if modality is not None else cell.modality
+        Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
+        sz = zf + Hz[0, 2]
+    shared_result = (float(sx), float(sy), float(sz), float(amp))
+    return shared_result, cubic, (xf, yf, zf)
+
+
+def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
+                           spad=8, use_mixture=True, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
+                           min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
+                           min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15):
+    """
+    Crops+fits ONE hybe's readout channel around the same allele anchor,
+    mixture-capable (find_local_peaks_3d + fit_gaussian_mixture_3d, same
+    z_window-restricted seed search refine_spot_z already uses, for the
+    same reason: an unrestricted search over a 100+-plane stack treats any
+    brightish voxel anywhere in it as a candidate "second component").
+    Every ACCEPTED component is kept -- unlike refine_spot_z's own Z/XY-
+    distance-from-representative and amplitude-ratio sibling gates (built
+    to decide "is this second blob actually the same physical spot"),
+    chromatin-tracing candidates within one hybe are never pruned against
+    each other: a real second locus in one round (e.g. sister chromatids)
+    is a genuine, independent trace value, not noise to filter out.
+
+    delta: (dx, dy, dz) shared-frame local drift correction for this hybe,
+    already computed by the caller from this hybe's own fiducial fit vs.
+    the reference hybe's (see build_chromatin_trace_allele) -- added to
+    every accepted component after it's mapped to the shared frame, same
+    "fiducial(ref) - fiducial(round)" correction ChrTracer3_FitSpots.m
+    applies, just expressed in the shared frame instead of raw pixels.
+
+    Returns (candidates, cubic_or_None, crop_local_xyz_list) -- candidates
+    is a list of (x, y, z, amplitude) in the shared frame, already delta-
+    corrected (empty if none accepted); cubic/crop_local_xyz_list are for
+    display only, same "always returned, caller discards if unused"
+    convention as _localize_fiducial_hybe above -- crop_local_xyz_list is
+    in the SAME order as candidates (never includes a rejected component).
+    """
+    try:
+        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell)
+        cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, readout_channel,
+                                                                 (raw_x, raw_y), pad=spad, use_stack=True)
+    except OSError:
+        return [], None, []
+    if cubic.size == 0:
+        return [], None, []
+    x0, y0 = raw_x - xmin, raw_y - ymin
+    z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+
+    if use_mixture:
+        z0_idx = int(round(z0))
+        zwin_min = max(0, z0_idx - z_window)
+        zwin_max = min(cubic.shape[2], z0_idx + z_window + 1)
+        seeds_local = find_local_peaks_3d(cubic[:, :, zwin_min:zwin_max], min_sep=min_sep,
+                                          threshold_rel=component_threshold, max_peaks=max_components)
+        seeds = [(sx, sy, sz + zwin_min) for (sx, sy, sz) in seeds_local]
+    else:
+        seeds = []
+
+    if len(seeds) <= 1:
+        results = [fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                                   init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                                   min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)]
+    else:
+        results = fit_gaussian_mixture_3d(cubic, seeds, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                                          init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                                          min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
+
+    dx, dy, dz = delta
+    m = modality if modality is not None else (cell.modality if cell is not None else None)
+    Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3)) if cell is not None else np.eye(3)
+    candidates, crop_local = [], []
+    for r in results:
+        if r is None:
+            continue
+        amp, xf, yf, zf = r[:4]
+        raw_rx, raw_ry = xf + xmin, yf + ymin
+        sx, sy = spot_mapper.raw_to_reference((raw_rx, raw_ry), hybe, fov_matrices, modality=modality, cell=cell)
+        sz = zf + Hz[0, 2] if cell is not None else zf
+        candidates.append((float(sx + dx), float(sy + dy), float(sz + dz), float(amp)))
+        crop_local.append((xf, yf, zf))
+    return candidates, cubic, crop_local
+
+
+# Fiducial-fit and readout-fit params are independently configurable (see
+# build_chromatin_trace_allele's own fiducial_params/readout_params) --
+# this is just the shared fallback for whichever keys a caller's own dict
+# doesn't set, so a caller only needs to override what it actually wants
+# to differ between the two. Fiducial has no mixture mode (see
+# _localize_fiducial_hybe) so it only ever uses the common subset; readout
+# additionally accepts min_sep/use_mixture. min_hb_ratio's own DEFAULT
+# differs between the two, per explicit request: a real genomic-locus
+# readout spot is legitimately dimmer against its local background than a
+# fiducial bead, so readout's default peak/background floor is relaxed to
+# 1.05 vs. fiducial's 1.15.
+_DEFAULT_FIDUCIAL_FIT_PARAMS = dict(peak_bound=2.0, max_sigma=2.5, max_uncert=2.0,
+                                    min_hb_ratio=1.15, min_ah_ratio=0.15)
+_DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS, min_hb_ratio=1.05,
+                                   min_sep=3.0, use_mixture=False)
+
+
+def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
+                                 storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
+                                 spad=8, z_window=15, fiducial_params=None, readout_params=None,
+                                 collect_debug=False):
+    """
+    Fills in allele.fiducial_trace/polymer/rejected_hybes for every hybe in
+    `hybes` (folder names) -- full replace, same "re-run overwrites"
+    convention as _replace_cell_spots/_replace_fov_unassigned_spots
+    elsewhere in this app. Two phases:
+
+    1. Fiducial-only fit for every hybe (_localize_fiducial_hybe) ->
+       allele.fiducial_trace[hybe].
+    2. baseline = allele.fiducial_trace[reference_hybe]; for every other
+       hybe, delta = baseline - fiducial_trace[hybe] (shared frame); reject
+       (allele.rejected_hybes[hybe] = reason, no readout fit attempted) when
+       either fiducial is missing, or the XY magnitude of delta exceeds
+       max_fiducial_drift -- per explicit request, evaluated in the shared
+       frame, never against raw_coordinates (a raw-frame distance would be
+       comparing two different hybes' own native pixel grids, not the same
+       physical space). XY only (not a combined XY+Z magnitude), matching
+       this pipeline's own established convention elsewhere (compute_cell_
+       alignment / the mixture-sibling QC gates each bound XY and Z
+       separately, never combined) -- otherwise fits the readout channel
+       (_localize_readout_hybe) and stores its delta-corrected candidates
+       in allele.polymer[hybe].
+
+    hybe_fiducial_channels/hybe_readout_channels: {hybe: channel(int)} --
+    one entry per hybe each, independently resolved from that hybe's own
+    ExperimentLayout record (hybe_record['fiducial_channel'] and whichever
+    of hybe_record['channels'] isn't the fiducial one). Deliberately NOT
+    derived from allele.anchor_channel (the seed spot's own channel) --
+    per confirmed real bug/explicit correction: an allele's seed spot only
+    LOCATES the allele-frame (x, y, z); it does not determine which
+    channel gets traced. Building the readout channel from anchor_channel
+    meant an allele seeded from a fiducial-channel spot (a legitimate,
+    explicitly-supported choice -- "no need to be fiducial channel" was
+    never "must not be") silently traced the FIDUCIAL channel through
+    every hybe instead of the real readout channel, rendering visually
+    identical fiducial/readout grids. Both dicts can differ hybe to hybe.
+
+    spad/max_fiducial_drift apply identically to both fiducial and readout
+    fitting -- crop placement and the drift-rejection gate are cross-
+    cutting, not something fiducial vs. readout fitting would ever want to
+    disagree about. z_window only affects readout (its mixture seed-search
+    Z-window -- fiducial has no mixture mode, see _localize_fiducial_hybe).
+    fiducial_params (subset of peak_bound, max_sigma, max_uncert,
+    min_hb_ratio, min_ah_ratio) and readout_params (those five plus
+    min_sep, use_mixture) are independently configurable, per explicit
+    request -- a fiducial bead and a real genomic-locus probe can have
+    genuinely different brightness/PSF characteristics worth tuning
+    separately, though only readout ever needs multi-component search: a
+    fiducial's whole purpose is ONE per-hybe drift-correction anchor.
+    Missing keys in either dict fall back to _DEFAULT_FIDUCIAL_FIT_PARAMS/
+    _DEFAULT_READOUT_FIT_PARAMS's own values, so a caller only needs to
+    override what it actually wants to differ.
+
+    collect_debug=False (default, the "Fit All FOVs" batch path -- no
+    reason to hold every hybe's raw crop in memory for a run that never
+    displays them, or to pay for a readout crop+fit on a hybe already
+    known to be rejected): returns allele alone, and a rejected hybe's
+    readout channel is never even cropped. collect_debug=True (the
+    "Preview One Allele" path, see canvas.chromatin_trace_grid_displayer):
+    ALWAYS crops+fits the readout channel for every hybe, accepted or
+    rejected -- per explicit request, a crop should always be visible
+    (map the allele's coordinate into that hybe's own frame and crop
+    nearby); only the fitted position marker depends on whether the gate
+    passed (delta stays uncorrected, (0,0,0), for a rejected hybe's
+    preview crop). Also returns a {hybe: {'fiducial_cubic',
+    'fiducial_centroid', 'readout_cubic', 'readout_centroids'}} dict, each
+    cubic/centroid already shaped exactly as canvas.spot_fit_status.
+    draw_spot_fit_status expects (centroid=None when nothing was accepted
+    -- that function's own "plain = missing" convention).
+
+    Mutates allele in place either way.
+    """
+    allele.fiducial_trace = {}
+    allele.polymer = {}
+    allele.rejected_hybes = {}
+    shared_xy = (allele.coordinate[0], allele.coordinate[1])
+    debug = {} if collect_debug else None
+
+    fiducial_kwargs = dict(spad=spad, **{**_DEFAULT_FIDUCIAL_FIT_PARAMS, **(fiducial_params or {})})
+    readout_kwargs = dict(spad=spad, z_window=z_window, **{**_DEFAULT_READOUT_FIT_PARAMS, **(readout_params or {})})
+
+    for hybe in hybes:
+        if debug is not None:
+            debug[hybe] = {'fiducial_cubic': None, 'fiducial_centroid': None,
+                           'readout_cubic': None, 'readout_centroids': None}
+        fid_channel = hybe_fiducial_channels.get(hybe)
+        if fid_channel is None:
+            allele.fiducial_trace[hybe] = None
+            allele.rejected_hybes[hybe] = 'no fiducial channel configured'
+            continue
+        fid_result, fid_cubic, fid_centroid = _localize_fiducial_hybe(
+            shared_xy, hybe, fid_channel, storage_path, fov, modality, cell, fov_matrices, **fiducial_kwargs)
+        allele.fiducial_trace[hybe] = fid_result
+        if debug is not None:
+            debug[hybe]['fiducial_cubic'] = fid_cubic
+            debug[hybe]['fiducial_centroid'] = fid_centroid
+
+    baseline = allele.fiducial_trace.get(reference_hybe)
+    for hybe in hybes:
+        # reject_reason may already be set from phase 1 ('no fiducial
+        # channel configured'); otherwise derive it from this hybe's own
+        # fiducial vs. the reference's.
+        reject_reason = allele.rejected_hybes.get(hybe)
+        fid = allele.fiducial_trace.get(hybe)
+        delta = (0.0, 0.0, 0.0)
+        if reject_reason is None:
+            if baseline is None:
+                reject_reason = 'reference hybe fiducial not found'
+            elif fid is None:
+                reject_reason = 'fiducial not found'
+            else:
+                dx, dy, dz = baseline[0] - fid[0], baseline[1] - fid[1], baseline[2] - fid[2]
+                delta = (dx, dy, dz)
+                drift = float(np.hypot(dx, dy))
+                if drift > max_fiducial_drift:
+                    reject_reason = f'drift {drift:.1f}px > max {max_fiducial_drift}px'
+
+        readout_channel = hybe_readout_channels.get(hybe)
+        if readout_channel is None and reject_reason is None:
+            reject_reason = 'no readout channel configured'
+
+        # Batch mode (collect_debug=False, nothing ever displays this crop):
+        # skip a hybe already known to be rejected -- no reason to pay for
+        # the readout crop+fit. Preview mode (collect_debug=True) always
+        # crops+fits every hybe regardless of accept/reject -- per explicit
+        # request, a crop should always be visible (map the allele's
+        # coordinate into this hybe's own frame and crop nearby); only the
+        # FIT/marker depends on whether the gate passed. delta stays
+        # (0, 0, 0) (uncorrected) whenever it couldn't be computed. A
+        # missing readout channel, though, means there's nothing to crop
+        # at all -- always skipped, even in preview mode.
+        if readout_channel is None or (reject_reason is not None and debug is None):
+            allele.rejected_hybes[hybe] = reject_reason
+            continue
+
+        candidates, readout_cubic, readout_centroids = _localize_readout_hybe(
+            shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices,
+            delta, **readout_kwargs)
+        if debug is not None:
+            debug[hybe]['readout_cubic'] = readout_cubic
+            debug[hybe]['readout_centroids'] = readout_centroids or None
+
+        if reject_reason is not None:
+            allele.rejected_hybes[hybe] = reject_reason
+            continue
+        if candidates:
+            allele.polymer[hybe] = candidates
+        else:
+            allele.rejected_hybes[hybe] = 'no readout peak accepted'
+    return (allele, debug) if collect_debug else allele

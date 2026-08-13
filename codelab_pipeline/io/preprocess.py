@@ -320,11 +320,21 @@ def msd_cost_function(params, moving_image, reference_image, fixed_scale=1.0, fi
     return msd
 
 def find_best_alignment(moving_image, reference_image, fixed_scale=1.0,
-                        fixed_angle=False, initial_guess=[0,0,0], method='Powell',verbose=False):
+                        fixed_angle=False, initial_guess=[0,0,0], method='Powell', verbose=False, bounds=None):
     # Initial guess: [dx, dy, angle]
+    # bounds (default None, no behavior change): [(dx_min, dx_max), (dy_min,
+    # dy_max), (angle_min, angle_max)] -- scipy's Powell implementation
+    # supports bounds natively (clips each line search to stay within them),
+    # so passing this constrains the SEARCH itself rather than checking the
+    # result after the fact. The angle bound is a no-op whenever fixed_angle
+    # isn't False (msd_cost_function ignores that parameter entirely then,
+    # and find_best_alignment itself never reads the optimizer's own angle
+    # value in that case either -- see angle_to_use below), so it's always
+    # safe to pass the same 3-tuple regardless of fixed_angle.
 
     # Minimize the cost function
-    result = minimize(msd_cost_function, initial_guess, args=(moving_image, reference_image, fixed_scale, fixed_angle), method=method)
+    result = minimize(msd_cost_function, initial_guess, args=(moving_image, reference_image, fixed_scale, fixed_angle),
+                      method=method, bounds=bounds)
     if verbose:
         print(f"Optimization Result: {result}")
         print(f"Success: {result.success}, Message: {result.message}")
@@ -369,9 +379,11 @@ def find_translation_via_phase_correlation(img1, img2):
 
     return affine_matrix
 
-def compute_msd_homography_matrix(moving_image, reference_image, fixed_scale=1.0, fixed_angle=False, initial_guess=[0,0,0], method='Powell', verbose=False):
+def compute_msd_homography_matrix(moving_image, reference_image, fixed_scale=1.0, fixed_angle=False,
+                                  initial_guess=[0,0,0], method='Powell', verbose=False, bounds=None):
     # Find best alignment
-    affine_matrix = find_best_alignment(moving_image, reference_image, fixed_scale, fixed_angle, initial_guess, method, verbose)
+    affine_matrix = find_best_alignment(moving_image, reference_image, fixed_scale, fixed_angle, initial_guess,
+                                        method, verbose, bounds=bounds)
     
     # Convert affine transformation to homography
     homography_matrix = np.array([

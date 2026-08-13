@@ -10,6 +10,33 @@ from ..io import preprocess
 from ..io import vlinks_store
 import cv2
 
+# Hard, non-configurable engine-level bounds on any fitted alignment matrix
+# -- FOV-level (same-modality, cross-modal, via align_readout_to_reference)
+# and cell-level (the compute_cell_alignment residual) alike -- per explicit
+# request, deliberately NOT exposed as a tunable UI setting: anything a fit
+# claims beyond this is treated as an optimizer artifact, not a real result,
+# regardless of what any particular experiment's own drift tolerance might
+# be. Confirmed via a deliberate bad-value test (dx=1071, dy=42, angle=100
+# deg on a real DNA-RNA cross-modal pair) that fits well outside real
+# biological drift can otherwise be silently accepted and propagated.
+MAX_ALIGNMENT_TRANSLATION_PX = 30.0
+MAX_ALIGNMENT_ROTATION_DEG = 10.0
+
+
+def _within_hard_alignment_bounds(H, max_translation=MAX_ALIGNMENT_TRANSLATION_PX,
+                                  max_rotation=MAX_ALIGNMENT_ROTATION_DEG):
+    """
+    True iff H's own translation (both dx, dy independently) and rotation
+    stay within the hard engine-level bounds above. Shared by every fitted-
+    matrix gate in this module so they can never independently drift apart
+    on what counts as "plausible."
+    """
+    dx, dy = H[0, 2], H[1, 2]
+    if abs(dx) > max_translation or abs(dy) > max_translation:
+        return False
+    return abs(_h_rotation_angle_degrees(H)) <= max_rotation
+
+
 def align_cell(yx, H, shape):
     """
     Transforms mask coordinates yx=(y,x) into H's target frame. Checks
@@ -363,6 +390,19 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     if it exceeds that bound -- a hard cap, not just a tiebreaker, per
     explicit request for a tunable bound on how much real physical drift
     is plausible between two hybridization rounds/imaging sessions.
+
+    Independently of max_shift (which is opt-in, off by default): every
+    candidate is also checked against the hard, non-configurable engine-
+    level bounds (MAX_ALIGNMENT_TRANSLATION_PX/MAX_ALIGNMENT_ROTATION_DEG,
+    see their own module-level docstring) BEFORE candidate selection --
+    whichever candidate has the lowest reconstruction residual AMONG the
+    ones actually within bounds wins, same "best of the genuinely
+    plausible options" principle used everywhere else in this pipeline
+    (e.g. mixture-fit sibling selection). If NO candidate qualifies (a
+    single-candidate free-angle fit that itself is out of bounds, or --
+    in the ORB/rotation branch -- all three of ORB/fixed-angle-confirm/
+    zero-angle are out of bounds), returns identity: an out-of-bound fit
+    is treated as "no real correction found," never applied partially.
     """
     if border_trim > 0:
         moving_mip = moving_mip[border_trim:-border_trim, border_trim:-border_trim]
@@ -371,17 +411,38 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     moving_norm = preprocess.normalize_to_uint8(moving_mip, lb, ub)
     reference_norm = preprocess.normalize_to_uint8(reference_mip, lb, ub)
 
+    # Native optimizer bounds for the Powell/MSD candidates below -- unlike
+    # ORB+RANSAC (a closed-form/RANSAC estimator with no bounds mechanism
+    # to hook into, see compute_features_affinelike_matrix), Powell's own
+    # scipy implementation supports bounds= directly, constraining the
+    # SEARCH itself rather than only checking its result after the fact.
+    powell_bounds = [(-MAX_ALIGNMENT_TRANSLATION_PX, MAX_ALIGNMENT_TRANSLATION_PX),
+                     (-MAX_ALIGNMENT_TRANSLATION_PX, MAX_ALIGNMENT_TRANSLATION_PX),
+                     (-MAX_ALIGNMENT_ROTATION_DEG, MAX_ALIGNMENT_ROTATION_DEG)]
+
     H_orb = preprocess.compute_features_affinelike_matrix(moving_norm, reference_norm)
     angle_orb = _h_rotation_angle_degrees(H_orb)
 
     if abs(angle_orb) < angle_threshold:
-        H_final = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=False)
+        candidates = [preprocess.compute_msd_homography_matrix(moving_norm, reference_norm,
+                                                                fixed_scale=1.0, fixed_angle=False,
+                                                                bounds=powell_bounds)]
     else:
-        H_confirm = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=angle_orb)
-        H_zero = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=True)
+        H_confirm = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
+                                                              fixed_angle=angle_orb, bounds=powell_bounds)
+        H_zero = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
+                                                           fixed_angle=True, bounds=powell_bounds)
         candidates = [H_orb, H_confirm, H_zero]
-        residuals = [_reconstruction_residual(moving_norm, reference_norm, H) for H in candidates]
-        H_final = candidates[int(np.argmin(residuals))]
+
+    # ORB is still checked post-hoc here (no native bounds available for
+    # it); the Powell candidates above are now bounded at the SEARCH level
+    # too, so this is a genuine belt-and-suspenders double-check for them,
+    # not their only safeguard.
+    in_bounds = [H for H in candidates if _within_hard_alignment_bounds(H)]
+    if not in_bounds:
+        return np.eye(3)
+    residuals = [_reconstruction_residual(moving_norm, reference_norm, H) for H in in_bounds]
+    H_final = in_bounds[int(np.argmin(residuals))]
 
     if max_shift is not None:
         dx, dy = H_final[0, 2], H_final[1, 2]
@@ -728,15 +789,20 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     method), BEFORE both reject gates score it. Per explicit request,
     this cell-level step is meant to be a small translation-only
     REFINEMENT, not a free continuous optimization -- rounding keeps it
-    "no sub-pixel" the same way it's already "no rotation". Also closes a
-    confirmed real gap: the preview functions never resample pixel
-    content, only reposition an integer-rounded crop window, so a
-    sub-pixel H2 the gate scores via true bilinear interpolation
-    (_reconstruction_residual's own warpAffine) can render as anywhere
-    from invisible to a blunt 1px snap once displayed -- rounding here
-    makes the gate score exactly the operation the preview can actually
-    perform. Opt-in: still experimental, not yet the pipeline's own
-    default.
+    "no sub-pixel" the same way it's already "no rotation". Opt-in: still
+    experimental, not yet the pipeline's own default.
+
+    NOTE: this option's ORIGINAL second justification is now obsolete and
+    deliberately no longer claimed here. It used to argue that the
+    preview could only reposition an integer-rounded crop window, so a
+    sub-pixel H2 would render as anywhere from invisible to a blunt 1px
+    snap, and rounding made the gate score what the preview could
+    actually draw. draw_cell_alignment_preview_3col now applies the
+    residual to the IMAGE via warpAffine (float, both the YX and the ZX
+    row) instead of moving an int() window, so it displays a sub-pixel
+    residual at full precision -- the display no longer constrains the
+    fit, and rounding is now purely a modelling choice about what a
+    cell-level refinement should be allowed to express.
 
     modality: which modality hybe_records/fov_matrices/storage_path belong
     to for THIS call -- cell.matrices/cell.matrix_provenance are keyed by
@@ -765,14 +831,17 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
 
     The cell-level residual (H2, fitted via phase correlation between the
     target and reference crops) is rejected -- falls back to identity,
-    keeping the FOV/cross-modal-only alignment -- under TWO independent
+    keeping the FOV/cross-modal-only alignment -- under THREE independent
     gates: (1) its magnitude exceeds `pad` (the crop couldn't have
-    contained real content that far out), and (2) it doesn't actually
-    improve the crop match (_reconstruction_residual after applying H2
-    isn't strictly better than before, both measured on the same target/
-    reference crops this residual was fitted from) -- phase correlation
-    can converge to a local minimum that's a worse match than no
-    correction at all, which the magnitude bound alone doesn't catch
+    contained real content that far out), (2) its magnitude exceeds the
+    hard, non-configurable engine-level bound (see this module's own
+    MAX_ALIGNMENT_TRANSLATION_PX -- independent of `pad`, which is user-
+    tunable and sometimes intentionally larger), and (3) it doesn't
+    actually improve the crop match (_reconstruction_residual after
+    applying H2 isn't strictly better than before, both measured on the
+    same target/reference crops this residual was fitted from) -- phase
+    correlation can converge to a local minimum that's a worse match than
+    no correction at all, which neither magnitude bound alone catches
     since the bad shift can still be small.
 
     cell.matrix_anchors[modality] is ALSO written here (once per call) --
@@ -997,6 +1066,16 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # the FOV/cross-modal layer this refinement was built on top of
         # is still valid and must still be written.
         magnitude_rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        # Independent of pad (which bounds how far the crop itself could
+        # even show real content, and is user-tunable, sometimes larger
+        # than the hard cap below for legitimate reasons): the hard,
+        # non-configurable engine-level translation bound (see this
+        # module's own MAX_ALIGNMENT_TRANSLATION_PX) applies here too --
+        # a cell-level residual is meant to be a SMALL correction on top
+        # of already-good FOV/cross-modal alignment, so anything beyond
+        # this bound is an optimizer artifact regardless of what pad
+        # happens to be configured to.
+        hard_bound_rejected = not _within_hard_alignment_bounds(H2_fitted)
         # Second, independent gate: phase correlation can lock onto a
         # local minimum that's a worse match than doing nothing at all
         # (a real cv2.phaseCorrelate failure mode -- it doesn't return
@@ -1019,7 +1098,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         residual_before = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, np.eye(3))
         residual_after = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, H2_fitted)
         quality_rejected = not (residual_after < residual_before)
-        rejected = magnitude_rejected or quality_rejected
+        rejected = magnitude_rejected or hard_bound_rejected or quality_rejected
         H2 = np.eye(3) if rejected else H2_fitted
         # H2 outermost (this cell's own residual refinement measured
         # against reference_hybe's own crop) -- H1@H2 lands directly in
@@ -1125,6 +1204,9 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         if rejected:
             if magnitude_rejected:
                 reject_reason = (f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}')
+            elif hard_bound_rejected:
+                reject_reason = (f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > hard cap='
+                                 f'{MAX_ALIGNMENT_TRANSLATION_PX}px')
             else:
                 reject_reason = (f'reconstruction residual {residual_after:.1f} >= {residual_before:.1f} '
                                  f'(no improvement over FOV/cross-modal)')

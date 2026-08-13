@@ -14,6 +14,10 @@ def _unassigned_spots_group_path(fov):
     return f'/FOV{fov:02d}/unassigned_spots'
 
 
+def _alleles_group_path(fov):
+    return f'/FOV{fov:02d}/alleles'
+
+
 def write_cells(storage_path, fov, cell_container):
     """
     Real, on-disk persistence for one FOV's cells (with their nested spots
@@ -199,6 +203,53 @@ def mirror_write_fov_spots(storage_paths, fov, spots):
             continue
         seen.add(path)
         write_fov_spots(path, fov, spots)
+
+
+def write_fov_alleles(storage_path, fov, alleles):
+    """
+    Persists one FOV's chromatin-tracing alleles (AnAllele.save()-shaped
+    dicts -- id/anchor_hybe/anchor_channel/coordinate/raw_coordinate/
+    fiducial_trace/polymer/rejected_hybes/final_polymer) at their own
+    top-level location, same shape/rationale as write_fov_spots: a plain
+    pickled list, full-replace of the whole FOV's allele list, never
+    touching /FOV##/cells or /FOV##/unassigned_spots.
+    """
+    payload = [allele.save() for allele in alleles]
+    blob = np.void(pickle.dumps(payload))
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_alleles_group_path(fov))
+        if 'blob' in grp:
+            del grp['blob']
+        grp.create_dataset('blob', data=blob)
+        grp.attrs['saved_at'] = datetime.now().isoformat()
+        grp.attrs['n_alleles'] = len(alleles)
+
+
+def read_fov_alleles(storage_path, fov):
+    """Returns a list of AnAllele.save()-shaped dicts (feed to
+    AnAllele().set_metadata(**d)), or [] if nothing's been persisted for
+    this FOV yet."""
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return []
+    grp_path = _alleles_group_path(fov)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f or 'blob' not in f[grp_path]:
+            return []
+        raw = bytes(f[grp_path]['blob'][()])
+    return pickle.loads(raw)
+
+
+def mirror_write_fov_alleles(storage_paths, fov, alleles):
+    """write_fov_alleles into every distinct storage path given -- same
+    dual-modality mirroring rationale as mirror_write_fov_spots."""
+    seen = set()
+    for path in storage_paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        write_fov_alleles(path, fov, alleles)
 
 
 def _params_group_path():

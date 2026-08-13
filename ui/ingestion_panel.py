@@ -105,9 +105,6 @@ class IngestionPanelUI(object):
         self.IngestionStatusTextEdit.setMaximumHeight(140)
         layout.addWidget(self.IngestionStatusTextEdit)
 
-        self.ShowMemoryViewerPushButton = QtWidgets.QPushButton('Show Cell/Spot Memory Status...')
-        layout.addWidget(self.ShowMemoryViewerPushButton)
-
         self.ShowCellSpotStatusDisplayerPushButton = QtWidgets.QPushButton('Show Cell/Spot Status Detail...')
         layout.addWidget(self.ShowCellSpotStatusDisplayerPushButton)
 
