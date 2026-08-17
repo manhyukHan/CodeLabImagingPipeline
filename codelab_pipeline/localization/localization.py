@@ -1188,7 +1188,7 @@ _DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS, min_hb_ratio=1.
 def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
-                                 collect_debug=False):
+                                 collect_debug=False, resolver=None):
     """
     Fills in allele.fiducial_trace/polymer/rejected_hybes for every hybe in
     `hybes` (folder names) -- full replace, same "re-run overwrites"
@@ -1279,7 +1279,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.rejected_hybes[hybe] = 'no fiducial channel configured'
             continue
         fid_result, fid_cubic, fid_centroid = _localize_fiducial_hybe(
-            shared_xy, hybe, fid_channel, storage_path, fov, modality, cell, fov_matrices, **fiducial_kwargs)
+            shared_xy, hybe, fid_channel, storage_path, fov, modality, cell, fov_matrices,
+            resolver=resolver, **fiducial_kwargs)
         allele.fiducial_trace[hybe] = fid_result
         if debug is not None:
             debug[hybe]['fiducial_cubic'] = fid_cubic
@@ -1325,7 +1326,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
 
         candidates, readout_cubic, readout_centroids = _localize_readout_hybe(
             shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices,
-            delta, **readout_kwargs)
+            delta, resolver=resolver, **readout_kwargs)
         if debug is not None:
             debug[hybe]['readout_cubic'] = readout_cubic
             debug[hybe]['readout_centroids'] = readout_centroids or None

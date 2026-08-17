@@ -386,6 +386,11 @@ class ChromatinTracingWorker(QtCore.QThread):
     the main thread is the safer convention already used elsewhere).
     cell_lookup(fov, cell_id) -> ACell-or-None resolves each allele's
     owning cell, if any (MainWindow._find_cell_by_id).
+    resolver_by_fov: {fov: FrameResolver}, likewise precomputed on the
+    main thread -- MainWindow._frame_resolver READS QT WIDGETS (the
+    storage-path line edits), so it must never be called from here.
+    Cell-independent by design: the z path uses only bridge_z_between
+    plus the cell's own zx, never the resolver's per-cell anchors.
     """
     progress = QtCore.pyqtSignal(int, int, str)
     finished_ok = QtCore.pyqtSignal(dict)  # {(storage_path, fov): [AnAllele, ...]}
@@ -393,8 +398,9 @@ class ChromatinTracingWorker(QtCore.QThread):
 
     def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
-                fiducial_params, readout_params):
+                fiducial_params, readout_params, resolver_by_fov=None):
         super().__init__()
+        self.resolver_by_fov = resolver_by_fov or {}
         self.jobs = jobs
         self.hybes = hybes
         self.reference_hybe = reference_hybe
@@ -422,7 +428,8 @@ class ChromatinTracingWorker(QtCore.QThread):
                         allele, self.hybes, self.reference_hybe, self.hybe_fiducial_channels,
                         self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
                         max_fiducial_drift=self.max_fiducial_drift, spad=self.spad, z_window=self.z_window,
-                        fiducial_params=self.fiducial_params, readout_params=self.readout_params)
+                        fiducial_params=self.fiducial_params, readout_params=self.readout_params,
+                        resolver=self.resolver_by_fov.get(fov))
                     done += 1
                     self.progress.emit(done, total, f'FOV{fov:02d} allele {allele.id}: '
                                        f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
@@ -3681,6 +3688,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # two distinct spots sharing an ambiguous crop don't collapse
                                 # onto the same blob -- see refine_spot_z's own docstring
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        # ONE resolver for the whole batch: cell_z_offset's z path uses only
+        # bridge_z_between (FOV-bounded) plus the cell's own zx read from the
+        # `cell` argument -- never the resolver's per-cell anchors -- so a
+        # cell-independent resolver is complete here. Without it the
+        # cross-modal Z drift is silently dropped from every refined spot.
+        resolver = self._frame_resolver(None, fov)
         t0 = time.perf_counter()
         for spot, cell in targets:
             new_coordinate, new_raw, _cubic, _centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
@@ -3688,7 +3701,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
                 min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                z_window=params['z_window'], fov_matrices=fov_matrices)
+                z_window=params['z_window'], fov_matrices=fov_matrices, resolver=resolver)
             if new_coordinate is not None:
                 spot.coordinate = new_coordinate
                 spot.raw_coordinate = new_raw
@@ -3733,6 +3746,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid_results = []
         claimed_positions = []  # see _run_3d_localize's own comment on this
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        resolver = self._frame_resolver(None, fov)  # same resolver _run_3d_localize uses, so
+                                                    # preview and run report the same z
         t0 = time.perf_counter()
         for spot, cell in targets:
             title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
@@ -3741,7 +3756,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
                 max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
                 min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                z_window=params['z_window'], fov_matrices=fov_matrices)
+                z_window=params['z_window'], fov_matrices=fov_matrices, resolver=resolver)
             if cubic is not None:
                 grid_results.append((cubic, centroid, title))
             if new_raw is not None:
@@ -4922,7 +4937,8 @@ class MainWindow(QtWidgets.QMainWindow):
             allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
             storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
             spad=full_params['spad'], z_window=full_params['z_window'],
-            fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True)
+            fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
+            resolver=self._frame_resolver(None, fov))
 
         fid_results, readout_results = [], []
         for hybe in hybes:
@@ -4961,7 +4977,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip = self.ui.IngestionPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
 
-        jobs, fov_matrices_by_fov = [], {}
+        jobs, fov_matrices_by_fov, resolver_by_fov = [], {}, {}
         for fov in fov_list:
             alleles = self.chromatin_alleles.get((storage_path, fov), [])
             if not alleles:
@@ -4975,6 +4991,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._activate_fov(fov)
             jobs.append((storage_path, fov, alleles))
             fov_matrices_by_fov[fov] = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+            # Built here, on the main thread, for the same reason as
+            # fov_matrices_by_fov: _frame_resolver reads Qt line edits.
+            resolver_by_fov[fov] = self._frame_resolver(None, fov)
         if not jobs:
             QtWidgets.QMessageBox.warning(self, 'Fit All FOVs',
                                           "No alleles built yet for any FOV in the Ingestion tab's FOV list -- "
@@ -4990,7 +5009,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          hybe_readout_channels, modality,
                                                          fov_matrices_by_fov, self._find_cell_by_id,
                                                          full_params['max_fiducial_drift'], full_params['spad'],
-                                                         full_params['z_window'], fiducial_params, readout_params)
+                                                         full_params['z_window'], fiducial_params, readout_params,
+                                                         resolver_by_fov=resolver_by_fov)
         self._chromatin_worker.progress.connect(self._on_chromatin_fit_progress)
         self._chromatin_worker.finished_ok.connect(self._on_chromatin_fit_finished)
         self._chromatin_worker.failed.connect(self._on_chromatin_fit_failed)
