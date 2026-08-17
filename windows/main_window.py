@@ -5743,11 +5743,20 @@ class MainWindow(QtWidgets.QMainWindow):
             # permanently contaminated self.cross_modal_result for the rest
             # of the session -- vlinks_store's copy is immune to this since
             # it never depends on which hybe is currently selected anywhere).
-            # Falls back to chain.py's own copy only for data saved before
-            # this mirror existed.
+            # There is deliberately NO fallback to chain.py's reference-hybe-
+            # keyed read. An empty mirror means "no cross-modal alignment has
+            # ever been accepted", and the correct answer to that is no bridge
+            # at all -- identity, which the FrameResolver already supplies as
+            # its documented default for an uncomputed layer. Reading
+            # {dna_reference_hybe}_stack.h5's own /matrix_across instead
+            # cannot distinguish an accepted matrix from whatever stale bytes
+            # happen to sit in an unrelated hybe's file, and a fallback that
+            # only holds when the mirror is ALREADY populated guards nothing:
+            # on a freshly-rebuilt vlinks it fires every time and permanently
+            # caches garbage here (confirmed -- this is what rotated every
+            # projected cell mask ~100 degrees in the RNA hybes while the DNA
+            # hybes, needing no bridge, stayed correct).
             H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
-            if H is None:
-                H = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
             if H is not None:
                 disk_results[fov] = H
         if disk_results:
@@ -6007,13 +6016,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if H is None:
             H = self.cross_modal_result.get((dna_storage_path, fov))
         if H is None:
-            # vlinks_store's own mirror first -- reference-hybe-independent,
-            # immune to a not-yet-reconciled combo (see _refresh_cross_
-            # modal_results_list's own comment on the confirmed real bug
-            # this avoids); chain.py's own read only as a last resort.
+            # vlinks_store's own mirror is the ONLY accepted disk source --
+            # reference-hybe-independent, immune to a not-yet-reconciled combo
+            # (see _refresh_cross_modal_results_list's own comment for the full
+            # reasoning). Nothing here is a real answer -- "not accepted yet",
+            # reported below -- not a reason to scavenge
+            # {dna_reference_hybe}_stack.h5's own /matrix_across.
             H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
-        if H is None:
-            H = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
         if H is None:
             QtWidgets.QMessageBox.warning(self, 'Show Cross-Modal Overlay',
                                           f'No cross-modal result for FOV{fov:02d} yet -- run alignment first.')
