@@ -565,10 +565,10 @@ class PipelineCanvas():
 
         raw_zx = zx_via(target_storage_path, target_hybe, target_channel, raw_bounds)
         fov_zx = zx_via(target_storage_path, target_hybe, target_channel, fov_bounds)
-        H_zx = cell.matrices.get((target_hybe, target_modality if target_modality is not None else cell.modality), {}).get('zx', np.eye(3))
+        dz_cell = alignment.entry_dz(cell.matrices.get((target_hybe, target_modality if target_modality is not None else cell.modality)))
         # ZX column 3 reads at column 2's OWN native window (never a
         # residual-moved one), then applies BOTH corrections in one warp:
-        # the depth shift (H_zx[0,2]) and the SAME float residual_dx the
+        # the depth shift (dz_cell) and the SAME float residual_dx the
         # YX row above just used. hybe_zx_projection's own array is
         # (width, depth), so in cv2's (x=column, y=row) convention on THAT
         # array the depth shift lands in [0,2] and the x shift in [1,2] --
@@ -612,7 +612,7 @@ class PipelineCanvas():
             """
             if zx_wide is None:
                 return np.full((1, 1), np.nan, dtype=np.float32).T
-            H_zx_display = np.array([[1., 0., float(H_zx[0, 2]) + float(relative_z)],
+            H_zx_display = np.array([[1., 0., float(dz_cell) + float(relative_z)],
                                      [0., 1., residual_dx]])
             if np.allclose(H_zx_display[:, 2], 0.0):
                 # Nothing to apply -- skip warpAffine entirely. Even an
@@ -775,7 +775,7 @@ class PipelineCanvas():
         TARGET hybes are split.
 
         target_specs: [{'hybe', 'storage_path', 'channel', 'modality',
-        'fov_only_matrix', 'final_matrix', 'zx_matrix'}, ...] -- one entry
+        'fov_only_matrix', 'final_matrix', 'dz'}, ...] -- one entry
         per active hybe in EVERY configured modality (not just cell.
         matrices' own keys -- a modality this cell has no cell-level
         residual for still gets a spec, via the FOV-only fallback), pre-
@@ -966,7 +966,7 @@ class PipelineCanvas():
                 final_zx_precorrection = zx_via(sp, hybe, spec['channel'], final_b)
                 if raw_zx_raw is None or fov_zx_raw is None or final_zx_precorrection is None:
                     continue
-                H_zx = spec.get('zx_matrix', np.eye(3))
+                H_zx = np.array([[1., 0., float(spec.get('dz', 0.0))], [0., 1., 0.], [0., 0., 1.]])
                 # borderValue=NaN -- see draw_cell_alignment_preview_3col's
                 # own identical warpAffine call for the rationale.
                 final_zx_raw = cv2.warpAffine(final_zx_precorrection, H_zx[:2],

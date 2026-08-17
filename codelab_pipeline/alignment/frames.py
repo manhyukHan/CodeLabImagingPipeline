@@ -54,6 +54,8 @@ want the invariant enforced rather than assumed.
 import numpy as np
 import numpy.linalg as la
 
+from . import chain
+
 
 IDENTITY = np.eye(3)
 
@@ -199,9 +201,7 @@ class FrameResolver:
         """
         z_cell = 0.0
         if cell is not None:
-            zx = getattr(cell, 'matrices', {}).get((hybe, modality), {}).get('zx')
-            if zx is not None:
-                z_cell = float(np.asarray(zx)[0, 2])
+            z_cell = chain.entry_dz(getattr(cell, 'matrices', {}).get((hybe, modality)))
         return z_cell + self.bridge_z_between(modality, self.shared)
 
     # -- the primitive ---------------------------------------------------

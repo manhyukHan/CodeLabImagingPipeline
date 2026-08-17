@@ -362,6 +362,24 @@ def _h_rotation_angle_degrees(H):
     return float(np.degrees(np.arctan2(H[0, 1], H[0, 0])))
 
 
+def entry_dz(entry):
+    """
+    The Z shift out of an ACell.matrices entry, as a plain float.
+
+    'dz' is the current shape. A legacy 'zx' 3x3 is read at [0, 2] -- the
+    only element it ever carried: Z alignment is a 1D correlation, that
+    matrix was never composed, inverted or multiplied anywhere, and every
+    reader read exactly that one element. The conversion is therefore
+    exact and unambiguous, so legacy data is accepted rather than rejected.
+    """
+    if not entry:
+        return 0.0
+    if 'dz' in entry:
+        return float(entry['dz'])
+    zx = entry.get('zx')
+    return 0.0 if zx is None else float(np.asarray(zx)[0, 2])
+
+
 def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, border_trim=0, max_shift=None,
                                angle_threshold=0.5):
     """
@@ -1041,7 +1059,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # other hybe whenever it ISN'T this run's reference_hybe, and
             # forcing it to identity in that case would silently discard
             # that real correction rather than compute it.
-            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3), 'yx_is_residual': True}
+            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
             continue
 
         # H1 (hybe's native frame -> shared frame -> reference_hybe's
@@ -1065,7 +1083,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # H1 is deliberately NOT baked in: it is recomposed at read
             # time from the CURRENT FOV matrices, so re-running FOV
             # alignment updates this cell without a re-fit.
-            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3), 'yx_is_residual': True}
+            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
             cell.matrix_provenance[key] = {
                 'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe} '
                                       f'[cell-level residual SKIPPED: cell does not overlap this hybe\'s frame, '
@@ -1203,7 +1221,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # from CURRENT matrices -- see frames.FrameResolver.to_shared.
         H_yx = H2
 
-        H_zx = np.eye(3)
+        z_shift = 0.0
         z_shift = 0.0
         if including_z:
             # z-depth correction uses the same channel_type-resolved
@@ -1282,7 +1300,6 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # Reject rather than clamp, same as H2 -- "reject" here just
             # means z=0 (identity), never dropping the hybe.
             z_shift = 0.0 if z_rejected else z_shift_fitted
-            H_zx[0, 2] = z_shift
 
         if not including_z:
             zx_note = ''
@@ -1308,7 +1325,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             reject_note = f' [cell-level residual REJECTED: {reject_reason}, fell back to FOV/cross-modal only]'
         else:
             reject_note = ''
-        cell.matrices[key] = {'yx': H_yx, 'zx': H_zx, 'yx_is_residual': True}
+        cell.matrices[key] = {'yx': H_yx, 'dz': float(z_shift), 'yx_is_residual': True}
         cell.matrix_provenance[key] = {
             'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}' + reject_note + zx_note,
             'steps': np.stack([H1, H2]),

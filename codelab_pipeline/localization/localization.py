@@ -20,7 +20,7 @@ def cell_z_offset(cell, hybe, modality, resolver=None):
     frame.
 
     THE single place localization reads z from. This replaced five
-    independent inline `z + Hz[0, 2]` sites -- that repetition is exactly
+    independent inline `z + Hz` sites -- that repetition is exactly
     what let a wrong index (`Hz[1, 2]`, structurally always 0) survive
     unnoticed in all five at once, silently discarding every Z correction.
 
@@ -35,9 +35,9 @@ def cell_z_offset(cell, hybe, modality, resolver=None):
     if cell is None:
         return 0.0
     entry = cell.matrices.get((hybe, modality), {})
-    if entry.get('yx_is_residual') is None and 'zx' not in entry:
+    if entry.get('yx_is_residual') is None and 'dz' not in entry and 'zx' not in entry:
         return 0.0
-    return float(np.asarray(entry.get('zx', np.eye(3)))[0, 2])
+    return alignment.entry_dz(entry)
 
 
 def gaussian_2d(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
@@ -430,7 +430,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         H = fov_matrices[hybe]
     else:
         H = cell.matrix_to_shared(hybe, modality)
-    Hz = cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3))
+    Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
 
     return {'img': img, 'stacks': stacks, 'bimg': bimg, 'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
 
@@ -707,7 +707,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
         if cell is not None:
             m = modality if modality is not None else cell.modality
             H = cell.matrix_to_shared(hybe, m)
-            Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
+            Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
             coord = (float(x1), float(y1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
         elif fov_matrices and hybe in fov_matrices:
@@ -997,7 +997,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     sz = zf
     if cell is not None:
         m = modality if modality is not None else cell.modality
-        Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
+        Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
     shared_result = (float(sx), float(sy), float(sz), float(amp))
     return shared_result, cubic, (xf, yf, zf)
@@ -1066,7 +1066,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
 
     dx, dy, dz = delta
     m = modality if modality is not None else (cell.modality if cell is not None else None)
-    Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3)) if cell is not None else np.eye(3)
+    Hz = alignment.entry_dz(cell.matrices.get((hybe, m))) if cell is not None else 0.0
     candidates, crop_local = [], []
     for r in results:
         if r is None:

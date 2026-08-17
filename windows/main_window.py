@@ -3026,7 +3026,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             dx = spec['final_matrix'][0, 2] - reference_final_matrix[0, 2]
             dy = spec['final_matrix'][1, 2] - reference_final_matrix[1, 2]
-            dz = spec['zx_matrix'][0, 2]
+            dz = spec.get('dz', 0.0)
             item = QtWidgets.QListWidgetItem(self._cell_hybe_result_label(cell, fov, spec, reference_hybe, dx, dy, dz))
             item.setData(QtCore.Qt.UserRole, (fov, cell.id, spec['hybe'], modality))
             ap.CellResultsListWidget.addItem(item)
@@ -3790,7 +3790,7 @@ class MainWindow(QtWidgets.QMainWindow):
         H = cell.matrix_to_shared(hybe, modality)
         Hinv = la.inv(H)
         rx, ry, _ = Hinv @ np.array([x, y, 1.0])
-        Hz = cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3))
+        Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
         return float(rx), float(ry), float(z - Hz[1, 2])
 
     def _show_3d_crop_only(self):
@@ -6530,7 +6530,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     'channel': alignment.pick_channel_by_type(record, channel_type),
                     'fov_only_matrix': fov_only_matrix,
                     'final_matrix': final_matrix,
-                    'zx_matrix': cell.matrices.get((hybe, modality), {}).get('zx', np.eye(3)),
+                    'dz': alignment.entry_dz(cell.matrices.get((hybe, modality))),
                 })
         return specs
 

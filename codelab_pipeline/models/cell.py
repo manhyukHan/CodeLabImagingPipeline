@@ -47,10 +47,13 @@ class ACell():
        incorporated, otherwise the nucleus.
      frame_shape: tuple (height, width) -- full-frame size, needed to bound-check
        coordinates transformed into another hybe's frame (align_cell)
-     matrices: dict {(hybe, modality): {'yx': ndarray(3,3), 'zx': ndarray(3,3)}}
+     matrices: dict {(hybe, modality): {'yx': ndarray(3,3), 'dz': float}}
        -- this cell's own composed alignment matrix per (hybe, modality)
-       (mirrors how a FOV has /matrix/{hybe}); 'yx' is in-plane, 'zx' is
-       the depth correction. Keyed by (hybe, modality), NOT bare hybe --
+       (mirrors how a FOV has /matrix/{hybe}); 'yx' is in-plane, 'dz' is
+       the depth correction as a plain scalar (Z alignment is a 1D
+       correlation; the old 'zx' 3x3 carried one DOF at [0,2], was never
+       composed or inverted, and every reader read that one element).
+       Read via chain.entry_dz, which also accepts the legacy 'zx'. Keyed by (hybe, modality), NOT bare hybe --
        the cross-modal "bridge" hybe (e.g. Hyb_130) is a real, distinct
        file in BOTH modalities, so a bare-string key would collide the
        two and silently lose one of them. 'yx' maps that (hybe, modality)
@@ -315,7 +318,8 @@ class ACell():
                 'celltype': str(self.celltype),
                 'area': tuple(self.area),
                 'frame_shape': tuple(self.frame_shape),
-                'matrices': {key: {'yx': np.array(m['yx']), 'zx': np.array(m['zx'])}
+                'matrices': {key: {'yx': np.array(m['yx']), 'dz': alignment.entry_dz(m),
+                                   'yx_is_residual': bool(m.get('yx_is_residual', False))}
                             for key, m in self.matrices.items()},
                 'matrix_anchors': {modality: np.array(H) for modality, H in self.matrix_anchors.items()},
                 'matrix_provenance': dict(self.matrix_provenance),
