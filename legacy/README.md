@@ -25,6 +25,23 @@ Moved out of the active tree on 2026-08-07 as part of a codebase cleanup pass (s
     and cell/spot/param/MIP/matrix persistence into vlinks.h5 goes through
     `codelab_pipeline/io/vlinks_store.py` instead -- see 2026-08-08's vlinks-MIP-storage pass).
 
+Second cleanup pass, 2026-08-17, after the `FrameResolver` alignment refactor. A dead-code
+scan (docstring/comment-stripped, so prose mentions do not count as callers) found these two
+modules had no importer anywhere in the tree -- not just no callers, no `import` of the module
+itself. Unlike the 2026-08-07 pass, this was checked at module level, which is what the
+`find_best_alignment` correction below taught: a function-name grep is not enough.
+
+- `fiducial_spot_mapper.py` -- from `codelab_pipeline/matlab/fiducial_spot_mapper.py` (that
+  package is now gone; it held nothing else). A ChrTracer3 (MATLAB) `AllFits.csv` /
+  `selectSpots.csv` import bridge. Superseded by this pipeline's own 3D localization:
+  `localize_chromatin_trace_hybe` in `codelab_pipeline/localization/localization.py`, which
+  `ui/chromatin_tracing_panel.py` drives, builds `AnAllele` objects directly.
+  Its `from ..models.allele import AnAllele` was rewritten absolute so it still imports here.
+- `cellclassifier_compat.py` -- from `codelab_pipeline/io/cellclassifier_compat.py`. Exports
+  `CellContainer`/`ACell`/`ASpot` into CellClassifier's `.smeta` pickle shape. No live export
+  path in the GUI calls it. Kept because its header documents CellClassifier's three pickle
+  formats and which of them round-trip.
+
   Correction (2026-08-08): `find_best_alignment`/`msd_cost_function` were *not* dead -- they were
   moved here in the original 2026-08-07 pass on a same-file-reference-only grep that missed
   `compute_msd_homography_matrix` (still live in `preprocess.py`) calling `find_best_alignment`
