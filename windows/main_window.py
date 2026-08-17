@@ -198,12 +198,6 @@ class AlignmentWorker(QtCore.QThread):
         self.write = write
         self.border_trim = border_trim
         self.max_shift = max_shift
-        # Z drift is measured in the SAME run as dx/dy -- it is a component
-        # of the cross-modal result, not a separate parameter (per explicit
-        # correction: a drift is a measurement like X and Y, so it belongs
-        # in Results and in Accept, never in a spinbox).
-        self.rna_fiducial_channel = rna_fiducial_channel
-        self.dna_fiducial_channel = dna_fiducial_channel
 
     def run(self):
         try:
