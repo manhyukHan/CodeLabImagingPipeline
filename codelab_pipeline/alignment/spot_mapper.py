@@ -52,7 +52,16 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     -- correct for the common case of a same-modality lookup.
     """
     if cell is not None:
+        # Guard: a bare cell-level residual is only half the transform --
+        # the FOV leg is recomposed by frames.FrameResolver, which this
+        # module has no access to. Silently composing it here would drop
+        # the FOV correction. See ACell._require_composable.
         key_modality = modality if modality is not None else cell.modality
+        entry = cell.matrices.get((hybe, key_modality))
+        if entry is not None and entry.get('yx_is_residual'):
+            raise ValueError(
+                f'spot_mapper: cell {cell.id} matrices[({hybe}, {key_modality})] is a bare '
+                f'residual; resolve via frames.FrameResolver instead of passing `cell` here.')
         return cell.matrix_to_shared(hybe, key_modality)
     if hybe not in fov_matrices:
         raise KeyError(f"No alignment matrix for hybe '{hybe}' -- pass a fov_matrices entry "

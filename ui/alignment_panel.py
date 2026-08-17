@@ -104,6 +104,12 @@ class AlignmentPanelUI(object):
         self.CrossModalMaxShiftSpinBox.setSuffix(' px')
         crossLayout.addRow('Max shift (0 = unbounded):', self.CrossModalMaxShiftSpinBox)
 
+        # Z drift is deliberately NOT a control here. It is a measured
+        # component of the cross-modal result, exactly like dx/dy -- so it
+        # is computed by Run Cross-Modal Alignment, shown in Results, and
+        # persisted by Accept. Exposing it as an editable spinbox framed a
+        # measurement as a parameter and detached it from the run that
+        # produces it.
         self.CrossModalFovSpinBox = QtWidgets.QSpinBox()
         self.CrossModalFovSpinBox.setRange(1, 100000)
         self.CrossModalFovSpinBox.setValue(1)

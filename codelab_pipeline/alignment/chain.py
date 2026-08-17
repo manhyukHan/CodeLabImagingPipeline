@@ -661,6 +661,94 @@ def read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe):
         return None
 
 
+MAX_CROSS_MODAL_Z_PLANES = 80.0
+
+
+def hybe_zy_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
+    """
+    The ZY counterpart of hybe_zx_projection: max-projects along WIDTH (X)
+    instead of height, giving a (height, depth) "Y-by-Z" image. Same
+    contract and same caller obligations (bounds must already be valid and
+    in-frame) -- see hybe_zx_projection.
+    """
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
+    projection = stack.max(axis=1)  # (height, depth)
+    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
+
+
+def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dna_hybe,
+                           rna_channel, dna_channel, y0=192, y1=832, x0=192, x1=832):
+    """
+    FOV-level cross-modal Z drift, in PLANES, from DNA's frame into RNA's --
+    the same direction the 2D H_across is stored in, so both legs of the
+    cross-modal bridge share one convention.
+
+    METHOD: 1D cross-correlation of the two references' whole-FOV depth
+    profiles, computed from BOTH the ZX and the ZY projection and summed
+    before taking the peak. Summing the two correlation curves (rather
+    than averaging two separately-chosen peaks) lets a weak axis be
+    outvoted instead of contributing its own spurious argmax.
+
+    Focal-plane matching was tried first and is NOT used: measured on real
+    data, the variance-of-Laplacian peak of these fiducial stacks
+    frequently lands on a stack ENDPOINT (RNA Hyb_130 FOV02 z=0, DNA
+    Hyb_400 FOV01 z=161/177, FOV02 z=171/177, prominence 0.20-0.27),
+    because the focus curve has no interior maximum. That produced drift
+    estimates of -51 and -171 planes against a per-cell truth near -12.
+    The focal planes are still REPORTED in `diagnostics` as a cross-check.
+
+    Returns (dz, quality, diagnostics). quality is the peak normalized
+    correlation (1.0 = perfect); gate on it and keep the manual override,
+    since on equal-depth stacks this returns ~0 where the truth was
+    +12/+4 -- a graceful failure (degrades toward no correction) but a
+    real one.
+    """
+    from ..segmentation import segment as _segment
+
+    def depth_profiles(storage_path, hybe, channel):
+        zx = hybe_zx_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
+                                0.3, 0.9999, normalize=False)
+        zy = hybe_zy_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
+                                0.3, 0.9999, normalize=False)
+        return zx.mean(axis=0).astype(np.float64), zy.mean(axis=0).astype(np.float64)
+
+    rna_zx, rna_zy = depth_profiles(rna_storage_path, rna_hybe, rna_channel)
+    dna_zx, dna_zy = depth_profiles(dna_storage_path, dna_hybe, dna_channel)
+
+    def z(v):
+        v = np.asarray(v, dtype=np.float64)
+        return (v - v.mean()) / (v.std() + 1e-9)
+
+    span = int(MAX_CROSS_MODAL_Z_PLANES)
+    lags = list(range(-span, span + 1))
+    totals, per_axis = [], {}
+    for name, (pa, pb) in (('zx', (rna_zx, dna_zx)), ('zy', (rna_zy, dna_zy))):
+        a, b = z(pa), z(pb)
+        curve = []
+        for lag in lags:
+            ia = np.arange(len(a)); ib = ia + lag
+            m = (ib >= 0) & (ib < len(b))
+            curve.append(float(np.mean(a[ia[m]] * b[ib[m]])) if m.sum() >= 50 else -np.inf)
+        curve = np.array(curve)
+        per_axis[name] = -float(lags[int(np.argmax(curve))])
+        totals.append(curve)
+    combined = np.where(np.isfinite(totals[0]) & np.isfinite(totals[1]),
+                        totals[0] + totals[1], -np.inf)
+    best_i = int(np.argmax(combined))
+    dz = -float(lags[best_i])
+    quality = float(combined[best_i] / 2.0)
+
+    zs_r, v_r = _segment.focus_profile(rna_storage_path, fov, rna_hybe, rna_channel)
+    zs_d, v_d = _segment.focus_profile(dna_storage_path, fov, dna_hybe, dna_channel)
+    focal_rna, focal_dna = int(zs_r[int(np.argmax(v_r))]), int(zs_d[int(np.argmax(v_d))])
+    diagnostics = {'focal_rna': focal_rna, 'focal_dna': focal_dna,
+                   'focal_dz': -float(focal_dna - focal_rna),
+                   'zx_dz': per_axis['zx'], 'zy_dz': per_axis['zy']}
+    return dz, quality, diagnostics
+
+
 def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     """
     A cell-region Z-stack crop, max-projected along the height (Y) axis to
@@ -963,7 +1051,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # other hybe whenever it ISN'T this run's reference_hybe, and
             # forcing it to identity in that case would silently discard
             # that real correction rather than compute it.
-            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3)}
+            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3), 'yx_is_residual': True}
             continue
 
         # H1 (hybe's native frame -> shared frame -> reference_hybe's
@@ -983,8 +1071,11 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # was this code's own earlier, WRONG behavior) -- H1 above is
             # still fully valid, so fall back to H1-only (H2=identity)
             # exactly like a rejected residual does.
-            H_yx = H1
-            cell.matrices[key] = {'yx': H_yx, 'zx': np.eye(3)}
+            # BARE residual (identity here -- no crop, so nothing fitted).
+            # H1 is deliberately NOT baked in: it is recomposed at read
+            # time from the CURRENT FOV matrices, so re-running FOV
+            # alignment updates this cell without a re-fit.
+            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3), 'yx_is_residual': True}
             cell.matrix_provenance[key] = {
                 'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe} '
                                       f'[cell-level residual SKIPPED: cell does not overlap this hybe\'s frame, '
@@ -1100,13 +1191,18 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         quality_rejected = not (residual_after < residual_before)
         rejected = magnitude_rejected or hard_bound_rejected or quality_rejected
         H2 = np.eye(3) if rejected else H2_fitted
-        # H2 outermost (this cell's own residual refinement measured
-        # against reference_hybe's own crop) -- H1@H2 lands directly in
-        # reference_hybe's own frame, this run's natural resting place;
-        # no further push to a shared frame (see this function's own
-        # docstring for why that's a consumer-side concern now, via
-        # matrix_anchors).
-        H_yx = compose_chain([H1, H2])
+        # Stored BARE, per explicit decision. H2 is the residual measured
+        # against reference_hybe's own crop, in that reference frame.
+        #
+        # This used to store compose_chain([H1, H2]) -- H1 baked in. That
+        # made a stored cell entry a COMPLETE hybe->anchor transform, and
+        # therefore froze the FOV matrix as it stood at fit time: re-running
+        # FOV alignment changed nothing for any already-fitted cell until it
+        # was individually re-fit, silently. Storing only what this step
+        # actually measured keeps the three layers independently updatable,
+        # which is the whole point of having layers. Consumers recompose H1
+        # from CURRENT matrices -- see frames.FrameResolver.to_shared.
+        H_yx = H2
 
         H_zx = np.eye(3)
         z_shift = 0.0
@@ -1213,7 +1309,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             reject_note = f' [cell-level residual REJECTED: {reject_reason}, fell back to FOV/cross-modal only]'
         else:
             reject_note = ''
-        cell.matrices[key] = {'yx': H_yx, 'zx': H_zx}
+        cell.matrices[key] = {'yx': H_yx, 'zx': H_zx, 'yx_is_residual': True}
         cell.matrix_provenance[key] = {
             'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}' + reject_note + zx_note,
             'steps': np.stack([H1, H2]),

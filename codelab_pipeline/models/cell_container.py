@@ -22,7 +22,8 @@ class CellContainer():
         self.modality = modality
         self.data = {f: [] for f in fov_list}
 
-    def load_new_cells(self, fov, mask, reference_hybe, min_size=0, max_size=np.inf, preserve_existing=False):
+    def load_new_cells(self, fov, mask, reference_hybe, min_size=0, max_size=np.inf, preserve_existing=False,
+                       reference_modality=None):
         """
         Build ACell objects directly from a Cellpose (or any integer-labeled)
         mask -- reuses whatever produced the mask (segment.py's Cellpose
@@ -77,6 +78,7 @@ class CellContainer():
         self.data[fov] = []
         ids = np.unique(mask)
         ids = ids[ids > 0]
+        cell_modality = reference_modality or self.modality
         for cell_id in ids:
             y, x = np.where(mask == cell_id)
             if len(x) < min_size or len(x) > max_size:
@@ -85,8 +87,20 @@ class CellContainer():
             cell = ACell()
             if old is not None:
                 same_frame = (old.reference_hybe == reference_hybe)
-                cell.set_metadata(id=int(cell_id), fov=int(fov), modality=self.modality,
+                # Nucleus bookkeeping is carried over ONLY for a cell that
+                # actually has a cytoplasm. For a plain nucleus-only cell,
+                # `area` IS the nucleus, so the fields are deliberately left
+                # unset and ACell._backfill_frame_defaults mirrors them onto
+                # whatever area this run just produced -- passing old.nucleus
+                # there would freeze the nucleus at the PREVIOUS mask while
+                # area moved to the new one, silently desyncing the two.
+                nucleus_kwargs = ({'nucleus': old.nucleus, 'nucleus_hybe': old.nucleus_hybe,
+                                   'nucleus_modality': old.nucleus_modality}
+                                  if old.has_cytoplasm() else {})
+                cell.set_metadata(id=int(cell_id), fov=int(fov), modality=old.modality or cell_modality,
                                   reference_hybe=old.reference_hybe, celltype=old.celltype,
+                                  reference_modality=old.reference_modality,
+                                  **nucleus_kwargs,
                                   area=(x, y) if same_frame else old.area,
                                   frame_shape=mask.shape if same_frame else old.frame_shape,
                                   matrices=deepcopy(old.matrices), matrix_anchors=deepcopy(old.matrix_anchors),
@@ -94,8 +108,17 @@ class CellContainer():
                                   total_num_spots=old.total_num_spots, num_spots=deepcopy(old.num_spots),
                                   distmap=deepcopy(old.distmap), linked=old.linked, linked_at=old.linked_at)
             else:
-                cell.set_metadata(id=int(cell_id), fov=int(fov), modality=self.modality,
-                                  reference_hybe=reference_hybe, area=(x, y), frame_shape=mask.shape)
+                # modality comes from the REFERENCE HYBE, not from the
+                # container's own label. Confirmed real bug: the container
+                # carries whatever modality the program happened to be on,
+                # so segmenting on a DNA hybe while the app sat on RNA
+                # produced cells whose modality contradicted their own
+                # reference_hybe -- and cell alignment then built passes
+                # for the wrong modality and wrote nothing at all.
+                cell.set_metadata(id=int(cell_id), fov=int(fov), modality=cell_modality,
+                                  reference_hybe=reference_hybe, reference_modality=cell_modality,
+                                  nucleus_hybe=reference_hybe, nucleus_modality=cell_modality,
+                                  area=(x, y), frame_shape=mask.shape)
             self.data[fov].append(cell)
 
     def get_cell(self, fov, index):
@@ -113,6 +136,13 @@ class CellContainer():
         container = cls(fov_list, modality=modality)
         for fov, cell_dicts in saved.items():
             container.data[fov] = [_cell_from_dict(d, modality) for d in cell_dicts]
+        # The cells are authoritative, not the caller's label: write_cells
+        # stores container.modality in the payload, so a container loaded
+        # under the program's CURRENT modality would otherwise re-save
+        # cells under a modality that contradicts their own.
+        loaded_modalities = {c.modality for cells in container.data.values() for c in cells if c.modality}
+        if len(loaded_modalities) == 1:
+            container.modality = loaded_modalities.pop()
         return container
 
 

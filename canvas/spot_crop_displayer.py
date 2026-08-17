@@ -234,7 +234,20 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
             blank_cax = left_divider.append_axes('right', size='5%', pad=0.05)
             blank_cax.axis('off')
         if self.crop_mask is not None:
-            ax.contour(self.crop_mask.astype(np.uint8), levels=[0.5], colors='yellow', linewidths=1)
+            # An integer LABEL mask (FOV view passes one) gets a contour per
+            # label, so touching cells stay visually separate -- a single
+            # boolean contour would trace only their merged outer hull. A
+            # plain boolean mask (Cell view's single-cell crop) still takes
+            # the cheap one-call path.
+            arr = np.asarray(self.crop_mask)
+            if arr.dtype != bool and arr.max() > 1:
+                for value in np.unique(arr):
+                    if value == 0:
+                        continue
+                    ys, xs = np.where(arr == value)
+                    self._contour_one(ax, xs, ys)
+            else:
+                ax.contour(arr.astype(np.uint8), levels=[0.5], colors='yellow', linewidths=1)
         if self.readonly_points:
             title = f'{len(self.spot_points)} spot(s) + {len(self.readonly_points)} other'
         else:
@@ -286,22 +299,23 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         """
         vmin, vmax = self.ScaleControl.vmin_vmax(self.context_image)
         ax.imshow(self.context_image, cmap=cm.gray, vmin=vmin, vmax=vmax)
-        # One combined boolean raster + one contour call, not a filled
-        # scatter per cell (per explicit preference for a contour/boundary
-        # look, matching crop_mask's own convention in _redraw) and not
-        # one contour call per cell either -- real segmentation masks
-        # don't touch/overlap, so a single raster's contour still draws
-        # one closed boundary per cell, at a fraction of the per-cell cost
-        # a FOV view's ~100 cells would otherwise incur.
+        # ONE CONTOUR PER CELL, each on its own local bbox raster.
+        #
+        # This used to rasterize every cell into a single shared boolean
+        # array and make one contour call, on the stated assumption that
+        # "real segmentation masks don't touch/overlap". That assumption is
+        # false for this data: touching cells merge into one blob and the
+        # contour then traces their OUTER hull only, so a cluster like
+        # cells 4/5/6/7 came out as one shape with no divisions -- exactly
+        # the cells you most need told apart.
+        #
+        # Per-cell contouring keeps every boundary, including the shared
+        # ones. Cost is kept off the full frame by rasterizing each cell
+        # into its own padded bbox and passing explicit X/Y coordinates, so
+        # this is ~N small arrays rather than N full-frame ones.
         if self.context_masks:
-            combined = np.zeros(self.context_image.shape, dtype=np.uint8)
             for _, xs, ys in self.context_masks:
-                if len(xs) == 0:
-                    continue
-                ix, iy = np.asarray(xs).astype(int), np.asarray(ys).astype(int)
-                valid = (iy >= 0) & (iy < combined.shape[0]) & (ix >= 0) & (ix < combined.shape[1])
-                combined[iy[valid], ix[valid]] = 1
-            ax.contour(combined, levels=[0.5], colors='yellow', linewidths=1)
+                self._contour_one(ax, xs, ys)
             for label, xs, ys in self.context_masks:
                 if label is None or len(xs) == 0:
                     continue
@@ -315,6 +329,25 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         if self.context_title:
             ax.set_title(self.context_title, fontsize=10)
         ax.axis('off')
+
+    @staticmethod
+    def _contour_one(ax, xs, ys, color='yellow', linewidth=1):
+        """
+        One cell's own closed boundary, rasterized only over its own
+        bounding box (+1px pad so the contour closes even when the cell
+        runs to the box edge) and drawn with explicit X/Y coordinates so it
+        lands in true image pixel coordinates regardless of the axes'
+        origin convention.
+        """
+        if len(xs) == 0:
+            return
+        ix, iy = np.asarray(xs).astype(int), np.asarray(ys).astype(int)
+        x0, x1 = int(ix.min()) - 1, int(ix.max()) + 1
+        y0, y1 = int(iy.min()) - 1, int(iy.max()) + 1
+        local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
+        local[iy - y0, ix - x0] = 1
+        gx, gy = np.arange(x0, x1 + 1), np.arange(y0, y1 + 1)
+        ax.contour(gx, gy, local, levels=[0.5], colors=color, linewidths=linewidth)
 
     def _set_manual_mode(self, on):
         self._manual_mode = on

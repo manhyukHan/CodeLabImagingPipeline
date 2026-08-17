@@ -318,7 +318,7 @@ class PipelineCanvas():
                                          target_storage_path, target_hybe, target_channel,
                                          fov_only_matrix, final_matrix,
                                          pad=30, lb=0.3, ub=0.9999, save_path=None, target_modality=None,
-                                         mask_anchor_fov_matrix=None):
+                                         mask_anchor_fov_matrix=None, cross_modal_z=0.0):
         """
         3-way comparison for one target hybe against this cell, drawn as
         one 2-row (YX plane, ZX plane) block PER entry in reference_specs
@@ -595,31 +595,44 @@ class PipelineCanvas():
         wide_bounds = (ymin_b, ymax_b, xmin_b - x_margin, xmax_b + x_margin)
         zx_wide = _nan_zx_crop(target_storage_path, fov, target_hybe, target_channel,
                                wide_bounds, height, width, lb, ub)
-        if zx_wide is None:
-            final_zx = np.full((1, 1), np.nan, dtype=np.float32)
-        else:
-            H_zx_display = np.array([[1., 0., float(H_zx[0, 2])], [0., 1., residual_dx]])
+        def build_final_zx(relative_z):
+            """
+            Column 3's ZX for ONE reference block. `relative_z` is the
+            cross-modal drift of the TARGET measured against THAT BLOCK'S
+            OWN reference -- never an absolute target-to-shared value.
+
+            Confirmed real bug this fixes: the absolute value was applied
+            here while the reference side stayed pinned, so a block
+            comparing a hybe against ITSELF (Hyb_002 DNA vs Hyb_002 DNA)
+            showed a z separation equal to the whole cross-modal drift --
+            a pure artifact, and a direct violation of the same-hybe-
+            perfect-overlay invariant the YX row has always held. The
+            relative value is 0 whenever both sides share a modality,
+            which is exactly when it must be.
+            """
+            if zx_wide is None:
+                return np.full((1, 1), np.nan, dtype=np.float32).T
+            H_zx_display = np.array([[1., 0., float(H_zx[0, 2]) + float(relative_z)],
+                                     [0., 1., residual_dx]])
             if np.allclose(H_zx_display[:, 2], 0.0):
-                # Nothing to apply -- skip warpAffine entirely rather than
-                # round-tripping through it. Confirmed real artifact: even
-                # an exactly-identity warp NaNs the final DEPTH row, because
-                # bilinear sampling at the last row reaches one row past the
-                # array into borderValue. That rendered as a flat gray line
-                # across a mid-frame cell that has no missing data at all.
-                # align_cell checks its own matrix for identity for the same
-                # reason -- check the math, not the caller's expectations.
+                # Nothing to apply -- skip warpAffine entirely. Even an
+                # exactly-identity warp NaNs the final DEPTH row (bilinear
+                # sampling reaches one row past the array into borderValue),
+                # which rendered as a flat gray line across a mid-frame cell
+                # with no missing data at all.
                 warped_wide = zx_wide
             else:
                 warped_wide = cv2.warpAffine(zx_wide, H_zx_display,
                                              (zx_wide.shape[1], zx_wide.shape[0]),
                                              borderValue=float('nan'))
-            final_zx = warped_wide[x_margin:x_margin + (xmax_b - xmin_b)]
+            return warped_wide[x_margin:x_margin + (xmax_b - xmin_b)].T
+
         # hybe_zx_projection returns (width, depth) -- transpose here, at
         # display time only, so X (shared with the YX row above, same
         # xmin:xmax window) reads left-to-right and Z reads top-to-bottom,
         # matching the YX row's own orientation and letting the two
         # combine into one readable 3D shape (per explicit request).
-        raw_zx, fov_zx, final_zx = raw_zx.T, fov_zx.T, final_zx.T
+        raw_zx, fov_zx = raw_zx.T, fov_zx.T
 
         # One 2-row (YX, ZX) block per entry in reference_specs -- per
         # explicit request, one block per configured modality's own
@@ -631,6 +644,9 @@ class PipelineCanvas():
             reference_storage_path, reference_hybe = spec['storage_path'], spec['hybe']
             reference_channel = spec['channel']
             reference_fov_matrix = spec['fov_matrix']
+            # Target's drift measured against THIS block's own reference --
+            # 0 for a same-modality block (see build_final_zx).
+            final_zx = build_final_zx(float(cross_modal_z) - float(spec.get('cross_modal_z', 0.0)))
 
             ref_mip = _read_mip(reference_storage_path, fov, reference_hybe, reference_channel)
             # raw is H=identity (cell.area taken literally, matching the

@@ -628,6 +628,37 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     return matrices
 
 
+def write_cross_modal_z(storage_path, fov, dz):
+    """
+    FOV-level cross-modal Z drift in PLANES, stored beside the 2D
+    /matrix_across as its own /params/FOV##/z_across scalar.
+
+    A separate key, NOT a reshape of matrix_across into 4x4: every consumer
+    of that matrix (compose_chain, align_cell, hybe_to_cellref_matrix,
+    matrix_anchors, the matrix viewer, the preview) assumes 3x3/2D, and z
+    already lives in this codebase as an additive scalar channel alongside
+    the affine (see ACell.matrices' own {'yx','zx'} split). Extending the
+    affine would touch every one of those; adding a parallel scalar
+    touches none. Old files simply have no z_across and read back as 0.
+    """
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(_fov_params_group_path(fov))
+        grp.attrs['z_across'] = float(dz)
+
+
+def read_cross_modal_z(storage_path, fov):
+    """Planes, DNA frame -> RNA frame. 0.0 when never written (see write_cross_modal_z)."""
+    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    if not os.path.exists(vlinks_path):
+        return 0.0
+    grp_path = _fov_params_group_path(fov)
+    with h5py.File(vlinks_path, 'r') as f:
+        if grp_path not in f:
+            return 0.0
+        return float(f[grp_path].attrs.get('z_across', 0.0))
+
+
 def write_cross_modal_matrix(storage_path, fov, H):
     """
     Mirrors an already-computed H_across (see

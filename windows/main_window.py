@@ -14,6 +14,7 @@ from config import path as repo_path, config_name
 from ui.main_window_ui import MainWindowUI
 from canvas.pipeline_canvas import PipelineCanvas
 from canvas.cell_displayer import CellDisplayer
+from ui.cytoplasm_panel import CytoplasmSegmentationWindow
 from canvas.spot_crop_displayer import SpotCropDisplayer
 from canvas.localize_3d_displayer import Localize3DDisplayer, Localize3DGridDisplayer
 from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
@@ -25,6 +26,7 @@ from canvas.chromatin_trace_grid_displayer import ChromatinTraceGridDisplayer
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.alignment import frames
 from codelab_pipeline.alignment import spot_mapper
 from codelab_pipeline.segmentation import segment
 from codelab_pipeline.localization import localization
@@ -121,7 +123,8 @@ class CellSegmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(object, object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, storage_path, fov, reference_hybe, channel, diameter, min_size, max_size):
+    def __init__(self, storage_path, fov, reference_hybe, channel, diameter, min_size, max_size,
+                 projection=('MIP (stored)', None, None)):
         super().__init__()
         self.storage_path = storage_path
         self.fov = fov
@@ -130,12 +133,15 @@ class CellSegmentWorker(QtCore.QThread):
         self.diameter = diameter
         self.min_size = min_size
         self.max_size = max_size
+        self.projection = projection
 
     def run(self):
         try:
+            mode, z_plane, z_range = self.projection
             mask, reference_image = segment.segment_fov(
                 self.storage_path, self.fov, self.reference_hybe, self.channel,
-                diameter=self.diameter, min_size=self.min_size, max_size=self.max_size)
+                diameter=self.diameter, min_size=self.min_size, max_size=self.max_size,
+                projection_mode=mode, z_plane=z_plane, z_range=z_range)
             self.finished_ok.emit(mask, reference_image)
         except Exception as e:
             self.failed.emit(str(e))
@@ -146,8 +152,10 @@ class ClassicalSegmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(object, object)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, storage_path, fov, reference_hybe, channel, method, absolute_cutoff, min_distance, min_size, max_size):
+    def __init__(self, storage_path, fov, reference_hybe, channel, method, absolute_cutoff, min_distance,
+                 min_size, max_size, projection=('MIP (stored)', None, None)):
         super().__init__()
+        self.projection = projection
         self.storage_path = storage_path
         self.fov = fov
         self.reference_hybe = reference_hybe
@@ -160,10 +168,12 @@ class ClassicalSegmentWorker(QtCore.QThread):
 
     def run(self):
         try:
+            mode, z_plane, z_range = self.projection
             mask, reference_image = segment.segment_fov_classical(
                 self.storage_path, self.fov, self.reference_hybe, self.channel,
                 method=self.method, absolute_cutoff=self.absolute_cutoff, min_distance=self.min_distance,
-                min_size=self.min_size, max_size=self.max_size)
+                min_size=self.min_size, max_size=self.max_size,
+                projection_mode=mode, z_plane=z_plane, z_range=z_range)
             self.finished_ok.emit(mask, reference_image)
         except Exception as e:
             self.failed.emit(str(e))
@@ -188,10 +198,17 @@ class AlignmentWorker(QtCore.QThread):
         self.write = write
         self.border_trim = border_trim
         self.max_shift = max_shift
+        # Z drift is measured in the SAME run as dx/dy -- it is a component
+        # of the cross-modal result, not a separate parameter (per explicit
+        # correction: a drift is a measurement like X and Y, so it belongs
+        # in Results and in Accept, never in a spinbox).
+        self.rna_fiducial_channel = rna_fiducial_channel
+        self.dna_fiducial_channel = dna_fiducial_channel
 
     def run(self):
         try:
             results = {}
+            z_results = {}
             for i, fov in enumerate(self.fov_list):
                 matrices = alignment.align_same_modality(self.storage_path, fov, self.hybe_records,
                                                               self.reference_hybe, write=self.write,
@@ -275,7 +292,14 @@ class CellAlignmentWorker(QtCore.QThread):
                         # function's docstring explicitly requires the
                         # caller to pass, since cell.reference_hybe is never
                         # a key in another modality's own fov_matrices.
-                        cellref_matrix = p['cellref_fov_matrices'].get(cell.reference_hybe, np.eye(3))
+                        # Resolved from the CELL's own reference_modality, not
+                        # the pass's -- after cytoplasmic segmentation a cell's
+                        # reference_hybe can belong to the other modality, and
+                        # looking it up in the wrong modality's dict would miss
+                        # and silently fall back to identity.
+                        frame_modality = cell.reference_modality or cell.modality
+                        cellref_matrix = p['cellref_fov_matrices'].get(
+                            frame_modality, {}).get(cell.reference_hybe, np.eye(3))
                         alignment.compute_cell_alignment(
                             cell, p['storage_path'], fov, hybe_records, fov_matrices,
                             reference_hybe=p['reference_hybe'], channel_type=self.channel_type,
@@ -297,7 +321,8 @@ class CrossModalAlignmentWorker(QtCore.QThread):
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, rna_storage_path, dna_storage_path, fov_list, all_fov_matrices,
-                 rna_reference_hybe, dna_reference_hybe, channel_type, write=True, border_trim=0, max_shift=None):
+                 rna_reference_hybe, dna_reference_hybe, channel_type, write=True, border_trim=0, max_shift=None,
+                 rna_fiducial_channel=None, dna_fiducial_channel=None):
         super().__init__()
         self.rna_storage_path = rna_storage_path
         self.dna_storage_path = dna_storage_path
@@ -309,10 +334,17 @@ class CrossModalAlignmentWorker(QtCore.QThread):
         self.write = write
         self.border_trim = border_trim
         self.max_shift = max_shift
+        # Z drift is measured in the SAME run as dx/dy -- it is a component
+        # of the cross-modal result, not a separate parameter (per explicit
+        # correction: a drift is a measurement like X and Y, so it belongs
+        # in Results and in Accept, never in a spinbox).
+        self.rna_fiducial_channel = rna_fiducial_channel
+        self.dna_fiducial_channel = dna_fiducial_channel
 
     def run(self):
         try:
             results = {}
+            z_results = {}
             for i, fov in enumerate(self.fov_list):
                 rna_fov_matrices = self.all_fov_matrices.get((self.rna_storage_path, fov), {})
                 dna_fov_matrices = self.all_fov_matrices.get((self.dna_storage_path, fov), {})
@@ -324,8 +356,19 @@ class CrossModalAlignmentWorker(QtCore.QThread):
                     alignment.write_cross_modal_matrix(self.dna_storage_path, fov, H,
                                                         self.rna_reference_hybe, self.dna_reference_hybe, self.channel_type)
                 results[fov] = H
-                self.progress.emit(i + 1, len(self.fov_list), f'FOV{fov:02d}: cross-modal computed')
-            self.finished_ok.emit(results)
+                dz = 0.0
+                if self.rna_fiducial_channel is not None and self.dna_fiducial_channel is not None:
+                    try:
+                        dz, _q, _diag = alignment.estimate_cross_modal_z(
+                            self.rna_storage_path, self.dna_storage_path, fov,
+                            self.rna_reference_hybe, self.dna_reference_hybe,
+                            self.rna_fiducial_channel, self.dna_fiducial_channel)
+                    except (OSError, KeyError):
+                        dz = 0.0   # raw stack unavailable -- no z layer, not a failed run
+                z_results[fov] = float(dz)
+                self.progress.emit(i + 1, len(self.fov_list),
+                                   f'FOV{fov:02d}: cross-modal computed (dz={dz:+.1f})')
+            self.finished_ok.emit({'H': results, 'z': z_results})
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -440,6 +483,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell_displayer = CellDisplayer()
         self.cell_displayer.mask_edited.connect(self._on_displayer_mask_edited)
 
+        # ONE displayer for both nucleus segmentation and cytoplasm review
+        # -- per explicit request, now that primary segmentation can itself
+        # run on a single/range projection there is nothing left that
+        # distinguished the two views. self._cell_displayer_mode routes
+        # mask edits to the right handler ('segmentation' -> the transient
+        # cell container, 'cytoplasm' -> the staged cytoplasm result), so a
+        # remove-by-ID in either context still lands where it belongs.
+        self.cytoplasm_window = CytoplasmSegmentationWindow()
+        self._cell_displayer_mode = 'segmentation'
+        self._cytoplasm_result = None  # {'labels','fov','hybe','modality','channel','image',...}
+
         self.spot_crop_displayer = SpotCropDisplayer()
         self.spot_crop_displayer.spots_edited.connect(self._on_spot_crop_edited)
         self.spot_crop_displayer.readonly_point_removed.connect(self._on_readonly_spot_removed)
@@ -481,10 +535,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alignment_preview_window = AlignmentPreviewWindow()
         self.preview_canvas = PipelineCanvas(self.alignment_preview_window.canvas)
         self.cross_modal_result = {}  # {(dna_storage_path, fov): H}, committed
+        self.cross_modal_z = {}       # {(dna_storage_path, fov): planes}, DNA frame -> RNA frame
         self._same_modality_context = None
         self._pending_same_modality_alignment = None  # {fov: {hybe: H}} awaiting Accept/Reject
         self._cross_modal_context = None
-        self._pending_cross_modal = None  # {fov: H} awaiting Accept/Reject
+        self._pending_cross_modal = None    # {fov: H} awaiting Accept/Reject
+        self._pending_cross_modal_z = {}    # {fov: planes} staged alongside
         # Align All Cells in FOV always computes AND saves immediately (no
         # staging) -- only the per-cell tuning tool below stages a result.
         self._pending_per_cell_alignment = None  # (real_cell, staged_cell) awaiting Accept/Reject, or None
@@ -546,7 +602,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cp.RunSegmentationPushButton.clicked.connect(self._run_cell_segmentation)
         cp.ShowDisplayerPushButton.toggled.connect(self._toggle_cell_displayer)
-        self.cell_displayer.UpdatePushButton.clicked.connect(self._ensure_cell_displayer_initialized)
+        cp.ShowCytoplasmPushButton.clicked.connect(self._show_cytoplasm_window)
+        cp.AutoFocusPushButton.clicked.connect(self._autodetect_segmentation_focus)
+        for _w in (cp.ZStartSpinBox, cp.ZEndSpinBox):
+            _w.valueChanged.connect(lambda _=None: cp.refresh_run_label())
+        cp.ZPlaneSpinBox.valueChanged.connect(lambda _=None: self._on_segmentation_plane_changed())
+        cp.ProjectionModeComboBox.currentIndexChanged.connect(
+            lambda _=None: (cp.refresh_run_label(), self._refresh_cell_displayer_view()))
+        cp.ViewRangePushButton.clicked.connect(self._refresh_cell_displayer_view)
+        cp.refresh_run_label()
+        cp.FovSpinBox.valueChanged.connect(lambda _: self._refresh_segmentation_depth())
+        cp.ReferenceHybeComboBox.currentIndexChanged.connect(lambda _: self._refresh_segmentation_depth())
+        cp.ChannelComboBox.currentIndexChanged.connect(lambda _: self._refresh_segmentation_depth())
+        # FOV/reference-hybe/channel now drive the Cell Displayer's own view
+        # directly. These used to require the displayer's 'Update' button
+        # (since removed): that button is a remnant of when the panel also
+        # carried a modality selector and a change here could not be acted
+        # on unambiguously. It can now, so a stale view after changing any
+        # of the three is just a bug.
+        cp.FovSpinBox.valueChanged.connect(lambda _: self._refresh_cell_displayer_view())
+        cp.ReferenceHybeComboBox.currentIndexChanged.connect(
+            lambda _: self._refresh_cell_displayer_view())
+        cp.ChannelComboBox.currentIndexChanged.connect(
+            lambda _: self._refresh_cell_displayer_view())
+        cw = self.cytoplasm_window
+        cw.RefreshCellsPushButton.clicked.connect(self._refresh_cytoplasm_cell_list)
+        cw.HybeComboBox.currentIndexChanged.connect(self._on_cytoplasm_hybe_changed)
+        cw.FovSpinBox.valueChanged.connect(lambda _: self._refresh_cytoplasm_cell_list())
+        cw.ChannelComboBox.currentIndexChanged.connect(lambda _: self._refresh_cytoplasm_depth())
+        cw.AutoFocusPushButton.clicked.connect(self._autodetect_cytoplasm_focus)
+        for _w in (cw.SeedModeComboBox,):
+            _w.currentIndexChanged.connect(lambda _=None: cw.refresh_run_label())
+        for _w in (cw.ZStartSpinBox, cw.ZEndSpinBox):
+            _w.valueChanged.connect(lambda _=None: cw.refresh_run_label())
+        cw.ZPlaneSpinBox.valueChanged.connect(lambda _=None: self._on_cytoplasm_plane_changed())
+        cw.ProjectionModeComboBox.currentIndexChanged.connect(
+            lambda _=None: (cw.refresh_run_label(), self._refresh_cytoplasm_view()))
+        cw.ViewRangePushButton.clicked.connect(self._refresh_cytoplasm_view)
+        cw.refresh_run_label()
+        cw.PreviewNucleiPushButton.clicked.connect(self._preview_cytoplasm_nuclei)
+        cw.RunPushButton.clicked.connect(self._run_cytoplasm_segmentation)
+        cw.IncorporatePushButton.clicked.connect(self._incorporate_cytoplasm)
         cp.SaveCellsPushButton.clicked.connect(self._save_cells)
         cp.DiscardCellsPushButton.clicked.connect(self._discard_cells)
         cp.SendPermanentPushButton.clicked.connect(self._send_permanent_cells_to_transient)
@@ -1805,14 +1901,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         cp.RunSegmentationPushButton.setEnabled(False)
-        cp.LogTextEdit.append(f'Segmenting FOV{fov:02d} ({reference_hybe}, ch{channel}, method={method})...')
+        if not self._confirm_projection_choice(cp, 'Run Segmentation'):
+            return
+        proj_desc = segment.describe_projection(*cp.current_projection())
+        cp.LogTextEdit.append(
+            f'Segmenting FOV{fov:02d} ({reference_hybe}, ch{channel}, method={method}, {proj_desc})...')
         self.statusBar().showMessage('Segmenting...')
 
         if method == 'cellpose':
             diameter = cp.DiameterSpinBox.value()
             min_size = cp.MinSizeSpinBox.value()
             max_size = cp.MaxSizeSpinBox.value()
-            self._segment_worker = CellSegmentWorker(storage_path, fov, reference_hybe, channel, diameter, min_size, max_size)
+            self._segment_worker = CellSegmentWorker(storage_path, fov, reference_hybe, channel,
+                                                     diameter, min_size, max_size,
+                                                     projection=cp.current_projection())
         else:
             classical_method = cp.ClassicalAlgorithmComboBox.currentText().lower()
             absolute_cutoff = cp.ClassicalAbsoluteCutoffSpinBox.value()
@@ -1820,7 +1922,9 @@ class MainWindow(QtWidgets.QMainWindow):
             min_size = cp.ClassicalMinSizeSpinBox.value()
             max_size = cp.ClassicalMaxSizeSpinBox.value()
             self._segment_worker = ClassicalSegmentWorker(storage_path, fov, reference_hybe, channel,
-                                                           classical_method, absolute_cutoff, min_distance, min_size, max_size)
+                                                           classical_method, absolute_cutoff, min_distance,
+                                                           min_size, max_size,
+                                                           projection=cp.current_projection())
         self._segment_worker.finished_ok.connect(
             lambda mask, ref_img: self._on_cell_segment_finished(mask, ref_img, fov, reference_hybe, modality, append=append))
         self._segment_worker.failed.connect(self._on_cell_segment_failed)
@@ -1905,8 +2009,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # explicit request, a cell's reference_hybe is fixed at its own
         # definition time, like its own mask coordinates, and never
         # retroactively touched by a later save regardless of mode.
-        self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=merged)
-        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe}
+        self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=merged,
+                                           reference_modality=modality)
+        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         n_cells = len(self.cell_container.get_cells(fov))
         cp.LogTextEdit.append(f'Segmentation complete: {n_cells} cell(s) found.')
         cp.RunSegmentationPushButton.setEnabled(True)
@@ -1921,13 +2026,456 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().clearMessage()
         QtWidgets.QMessageBox.critical(self, 'Segmentation error', message)
 
+    def _refresh_cell_displayer_view(self):
+        """
+        Re-reads whatever FOV/reference hybe/channel Cell Segmentation now
+        points at and repaints the Cell Displayer, but ONLY while it is
+        actually showing a segmentation view -- a cytoplasm result staged
+        in the same window must not be silently replaced just because the
+        user scrolled the FOV spinbox.
+        """
+        if self._cell_displayer_mode != 'segmentation':
+            return
+        if not self.cell_displayer.isVisible():
+            return
+        self._ensure_cell_displayer_initialized()
+
     def _toggle_cell_displayer(self, checked):
         if checked:
+            self._cell_displayer_mode = 'segmentation'
             self._ensure_cell_displayer_initialized()
             self.cell_displayer.show()
             self.cell_displayer.raise_()
         else:
             self.cell_displayer.hide()
+
+    # -- cytoplasmic segmentation --
+
+    def _cytoplasm_cells(self, fov):
+        """
+        The TRANSIENT container's cells for this FOV -- the ones every
+        displayer shows and the ones Save promotes to permanent.
+
+        Transient first, per explicit correction and confirmed real bug:
+        this used to prefer the PERMANENT container, so Incorporate wrote
+        cytoplasms onto permanent while _save_cells copies transient ->
+        permanent and writes THAT -- overwriting the cytoplasms with the
+        untouched cells, which is exactly why Save appeared to do nothing.
+        Falling back to permanent only when nothing is staged keeps the
+        read-only paths (preview, cell list) working before segmentation.
+        """
+        for container in (self.cell_container, self.cell_container_permanent):
+            if container is not None and container.data.get(fov):
+                return container, container.data[fov]
+        return None, []
+
+    def _cells_for_fov(self, fov):
+        """Just the cells -- see _cytoplasm_cells for which container wins."""
+        return self._cytoplasm_cells(fov)[1]
+
+    def _show_cytoplasm_window(self):
+        cw = self.cytoplasm_window
+        cw.FovSpinBox.setValue(self.ui.CellSegmentPanel.FovSpinBox.value())
+        cw.set_hybe_choices(self.total_active_hybe_list)
+        self._on_cytoplasm_hybe_changed()
+        self._refresh_cytoplasm_cell_list()
+        cw.show()
+        cw.raise_()
+
+    def _on_cytoplasm_hybe_changed(self):
+        cw = self.cytoplasm_window
+        record = cw.current_hybe_record()
+        cw.set_channel_choices(record['channels'] if record else [])
+        self._refresh_cytoplasm_depth()
+
+    def _refresh_cytoplasm_depth(self):
+        cw = self.cytoplasm_window
+        hybe, modality = cw.current_hybe_key()
+        channel = cw.current_channel()
+        storage_path = self._storage_path_for_modality(modality) if modality else None
+        depth = 0
+        if storage_path and hybe and channel is not None:
+            try:
+                depth = segment.stack_depth(storage_path, cw.FovSpinBox.value(), hybe, channel)
+            except OSError:
+                depth = 0
+        cw.set_depth(depth)
+
+    def _autodetect_segmentation_focus(self):
+        """Detect Focal Plane for the PRIMARY segmentation panel -- same metric and
+        same button-only policy as the cytoplasm one, just a different panel's
+        hybe/channel/FOV and z controls."""
+        cp = self.ui.CellSegmentPanel
+        hybe, modality = cp.current_reference_hybe(), cp.current_reference_modality()
+        channel = int(cp.ChannelComboBox.currentText()) if cp.ChannelComboBox.currentText() else None
+        storage_path = self._storage_path_for_modality(modality) if modality else None
+        if not (storage_path and hybe and channel is not None):
+            QtWidgets.QMessageBox.warning(self, 'Cell Segmentation',
+                                          'Pick a reference hybe and channel first.')
+            return
+        self._apply_focus_detection(cp, storage_path, cp.FovSpinBox.value(), hybe, channel,
+                                    cp.LogTextEdit.append)
+
+    def _apply_focus_detection(self, panel, storage_path, fov, hybe, channel, log):
+        """Shared by both panels' Detect Focal Plane buttons -- one metric, one
+        plateau rule, one place to fix. Seeds the RANGE with the >=90%-of-peak
+        plateau as well as the single peak, since focus varies across the field
+        while the metric only samples the centre."""
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            zs, values = segment.focus_profile(storage_path, fov, hybe, channel)
+        except (OSError, KeyError) as exc:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.warning(self, 'Detect Focal Plane',
+                                          f"Can't read the raw stack for {hybe} ch{channel}: {exc}")
+            return None
+        QtWidgets.QApplication.restoreOverrideCursor()
+        peak = int(zs[int(np.argmax(values))])
+        plateau = zs[values >= 0.9 * values.max()]
+        panel.set_depth(int(zs.max()) + 1)
+        panel.ZPlaneSpinBox.setValue(peak)
+        panel.ZStartSpinBox.setValue(int(plateau.min()))
+        panel.ZEndSpinBox.setValue(int(plateau.max()))
+        panel.show_focus_profile(zs, values, peak)
+        # Detecting a focal plane and then not using it was the trap the Run
+        # confirmation existed to catch; switching here removes the trap at
+        # its source. The confirmation stays for the case where the mode is
+        # later put BACK to the stored MIP by hand.
+        panel.ProjectionModeComboBox.setCurrentText('single plane')
+        middle = int(zs.max()) // 2
+        log(f'Focal plane z={peak} (middle would have been z={middle}, '
+            f'off by {peak - middle:+d}); >=90% plateau z={int(plateau.min())}-{int(plateau.max())}. '
+            f'Projection switched to single plane z={peak}.')
+        return peak
+
+    def _on_segmentation_plane_changed(self):
+        """Live view while scrolling Plane z -- single-plane only. A single
+        slice is one cheap h5py read, unlike a range (see ViewRangePushButton)."""
+        cp = self.ui.CellSegmentPanel
+        cp.refresh_run_label()
+        if cp.ProjectionModeComboBox.currentText() == 'single plane':
+            self._refresh_cell_displayer_view()
+
+    def _on_cytoplasm_plane_changed(self):
+        cw = self.cytoplasm_window
+        cw.refresh_run_label()
+        if cw.ProjectionModeComboBox.currentText() == 'single plane':
+            self._refresh_cytoplasm_view()
+
+    def _refresh_cytoplasm_view(self):
+        """Repaint the shared displayer with the cytoplasm panel's CURRENT
+        projection, keeping the selected-nuclei overlay if there is one."""
+        ctx = self._cytoplasm_context()
+        if ctx is None:
+            return
+        fov, hybe, modality, channel, _, image = ctx
+        cw = self.cytoplasm_window
+        chosen = set(cw.selected_cell_ids())
+        cells = [c for c in self._cells_for_fov(fov) if c.id in chosen]
+        label_mask = (self._build_nucleus_label_mask(cells, hybe, modality, fov, image.shape)
+                      if cells else np.zeros(image.shape, dtype=np.int32))
+        self._cell_displayer_mode = 'cytoplasm'
+        self.cell_displayer.setWindowTitle(
+            f'Cell Displayer -- FOV{fov:02d} {hybe} ch{channel} ({modality}) '
+            f'[{segment.describe_projection(*cw.current_projection())}] -- selected nuclei')
+        self.cell_displayer.set_data(image, label_mask.astype(float))
+        self.cell_displayer.show()
+        self.cell_displayer.raise_()
+
+    def _confirm_projection_choice(self, panel, title):
+        """
+        True to proceed. Blocks ONLY the genuinely ambiguous case: a focal
+        plane was detected this session, yet the run is still about to use
+        the stored MIP -- so every z control on screen is populated and
+        ignored.
+
+        Not cosmetic caution. Measured on real data, same FOV/hybe/channel/
+        parameters: stored MIP found 33 cells, single plane z=76 found 91.
+        Silently doing the 33-cell thing because a combobox was left alone
+        is the failure this exists to catch, and it fires only in that exact
+        combination so it cannot become click-through noise.
+        """
+        mode, z_plane, z_range = panel.current_projection()
+        if not (getattr(panel, 'focus_detected', False) and mode == 'MIP (stored)'):
+            return True
+        reply = QtWidgets.QMessageBox.question(
+            self, title,
+            f'A focal plane was detected (z={z_plane}, plateau z={z_range[0]}-{z_range[1]}), '
+            f'but Projection is still "MIP (stored)" -- the run will use the stored '
+            f'full-depth MIP and ignore those values.\n\n'
+            f'On real data the stored MIP found substantially fewer cells than the '
+            f'focal plane did.\n\nRun with the stored MIP anyway?',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        return reply == QtWidgets.QMessageBox.Yes
+
+    def _refresh_segmentation_depth(self):
+        cp = self.ui.CellSegmentPanel
+        hybe, modality = cp.current_reference_hybe(), cp.current_reference_modality()
+        channel = int(cp.ChannelComboBox.currentText()) if cp.ChannelComboBox.currentText() else None
+        storage_path = self._storage_path_for_modality(modality) if modality else None
+        depth = 0
+        if storage_path and hybe and channel is not None:
+            try:
+                depth = segment.stack_depth(storage_path, cp.FovSpinBox.value(), hybe, channel)
+            except OSError:
+                depth = 0
+        cp.set_depth(depth)
+
+    def _autodetect_cytoplasm_focus(self):
+        """
+        Finds the sharpest plane and points every z control at it. Explicitly
+        button-driven (per explicit preference): the metric reads every plane,
+        so it should never fire as a side effect of switching FOV.
+
+        Also seeds the RANGE with the plateau at >=90% of peak sharpness, not
+        just the single peak -- focus varies across the field while this
+        metric only samples the centre, so a range projection over the
+        plateau is generally the safer default.
+        """
+        cw = self.cytoplasm_window
+        hybe, modality = cw.current_hybe_key()
+        channel = cw.current_channel()
+        storage_path = self._storage_path_for_modality(modality) if modality else None
+        if not (storage_path and hybe and channel is not None):
+            QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
+                                          'Pick a cytoplasm hybe and channel first.')
+            return
+        self._apply_focus_detection(cw, storage_path, cw.FovSpinBox.value(), hybe, channel, cw.log)
+
+    def _refresh_cytoplasm_cell_list(self):
+        cw = self.cytoplasm_window
+        fov = cw.FovSpinBox.value()
+        _, cells = self._cytoplasm_cells(fov)
+        rows = []
+        for cell in sorted(cells, key=lambda c: c.id):
+            n_nucleus = len(cell.nucleus[0])
+            suffix = ' [has cytoplasm]' if cell.has_cytoplasm() else ''
+            rows.append((cell.id,
+                         f'Cell {cell.id:03d} -- nucleus {n_nucleus}px @ '
+                         f'{cell.nucleus_hybe} ({cell.nucleus_modality}){suffix}'))
+        cw.set_cell_choices(rows)
+        if not rows:
+            cw.log(f'FOV{fov:02d}: no cells loaded -- segment nuclei first.')
+
+    def _cell_nucleus_in_readout(self, cell, hybe, modality, fov):
+        """
+        (x, y) -- this cell's NUCLEUS projected into `hybe`'s own native
+        frame, using the live FOV/cross-modal matrices rather than
+        ACell.get_nucleus_in_readout's bare lookup, for exactly the reason
+        _cell_area_in_readout exists: the bare model method collapses to
+        identity whenever this cell has no cell-level entry for the pair,
+        which silently mispositions the projection.
+
+        Anchors on the cell's OWN nucleus_hybe/nucleus_modality, which can
+        differ cell to cell within one FOV -- that is what makes the
+        rendered seed image a genuine stitch rather than one shared warp.
+        """
+        H = self._matrix_to_frame(hybe, modality, cell, fov,
+                                  cell.nucleus_hybe, cell.nucleus_modality)
+        if H is None:
+            return np.array([]), np.array([])
+        x_lit, y_lit = cell.nucleus
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H), cell.frame_shape)
+        return cx, cy
+
+    def _build_nucleus_label_mask(self, cells, hybe, modality, fov, shape):
+        """
+        Every given cell's nucleus painted with its own REAL cell id, all
+        projected into (hybe, modality)'s frame. Used both for the seed
+        image and, with the full cell list, as incorporate_cytoplasm's own
+        overlap authority -- so an unselected cell can still win its pixels
+        back from a cytoplasm that overlapped it.
+
+        Cells are painted largest-first so that where two projected nuclei
+        collide, the SMALLER one still ends up visible rather than being
+        buried -- a collision here is a projection artifact, and silently
+        losing a whole small cell is the worse failure.
+        """
+        label_mask = np.zeros(shape, dtype=np.int32)
+        painted = []
+        for cell in cells:
+            x, y = self._cell_nucleus_in_readout(cell, hybe, modality, fov)
+            if len(x) == 0:
+                continue
+            painted.append((len(x), cell.id, x, y))
+        for _, cell_id, x, y in sorted(painted, reverse=True):
+            ix, iy = x.astype(int), y.astype(int)
+            valid = (iy >= 0) & (iy < shape[0]) & (ix >= 0) & (ix < shape[1])
+            label_mask[iy[valid], ix[valid]] = cell_id
+        return label_mask
+
+    def _cytoplasm_context(self):
+        """(fov, hybe, modality, channel, storage_path, image) or None, with the user told why."""
+        cw = self.cytoplasm_window
+        fov = cw.FovSpinBox.value()
+        hybe, modality = cw.current_hybe_key()
+        channel = cw.current_channel()
+        if not hybe or modality is None or channel is None:
+            QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
+                                          'Pick a cytoplasm hybe and channel first.')
+            return None
+        storage_path = self._storage_path_for_modality(modality)
+        mode, z_plane, z_range = cw.current_projection()
+        try:
+            image = (segment.read_projection(storage_path, fov, hybe, channel, mode=mode,
+                                             z_plane=z_plane, z_range=z_range)
+                     if storage_path else None)
+        except (OSError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(
+                self, 'Cytoplasmic Segmentation',
+                f"Can't read {hybe} ch{channel} ({modality}) for FOV{fov:02d} at '{mode}': {exc}")
+            return None
+        if image is None:
+            QtWidgets.QMessageBox.warning(
+                self, 'Cytoplasmic Segmentation',
+                f'FOV{fov:02d} {hybe} ch{channel} ({modality}) is not in vlinks.h5 -- ingest it first.')
+            return None
+        return fov, hybe, modality, channel, storage_path, image
+
+    def _preview_cytoplasm_nuclei(self):
+        ctx = self._cytoplasm_context()
+        if ctx is None:
+            return
+        fov, hybe, modality, channel, _, image = ctx
+        cw = self.cytoplasm_window
+        _, cells = self._cytoplasm_cells(fov)
+        chosen = set(cw.selected_cell_ids())
+        selected = [c for c in cells if c.id in chosen]
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
+                                          'No cells selected as nuclei.')
+            return
+        label_mask = self._build_nucleus_label_mask(selected, hybe, modality, fov, image.shape)
+        n_drawn = len(np.unique(label_mask)) - 1
+        self._cell_displayer_mode = 'cytoplasm'
+        self.cell_displayer.setWindowTitle(
+            f'Cytoplasm Displayer -- FOV{fov:02d} {hybe} ch{channel} ({modality}) -- selected nuclei')
+        self.cell_displayer.set_data(image, label_mask.astype(float))
+        self.cell_displayer.show()
+        self.cell_displayer.raise_()
+        cw.log(f'Preview: {n_drawn}/{len(selected)} selected nucleus/nuclei project into '
+               f'{hybe} ({modality}).')
+        if n_drawn < len(selected):
+            cw.log('  (some nuclei fall outside this hybe\'s frame entirely -- check alignment)')
+
+    def _run_cytoplasm_segmentation(self):
+        ctx = self._cytoplasm_context()
+        if ctx is None:
+            return
+        fov, hybe, modality, channel, _, image = ctx
+        cw = self.cytoplasm_window
+        _, cells = self._cytoplasm_cells(fov)
+        chosen = set(cw.selected_cell_ids())
+        selected = [c for c in cells if c.id in chosen]
+        if not selected:
+            QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
+                                          'No cells selected as nuclei.')
+            return
+
+        if not self._confirm_projection_choice(cw, 'Run Cytoplasmic Search'):
+            return
+        seed_labels = self._build_nucleus_label_mask(selected, hybe, modality, fov, image.shape)
+        seed_image = segment.render_nucleus_seed(seed_labels, mode=cw.current_seed_mode())
+        dilation = cw.NucleusDilationSpinBox.value()
+        if dilation:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilation + 1, 2 * dilation + 1))
+            seed_image = cv2.dilate(seed_image, kernel)
+        # Scaled to the cytoplasm image's own dynamic range: cellpose
+        # normalizes per channel, and a 0/1 channel beside a real 16-bit
+        # one is not something its own preprocessing expects.
+        seed_image = seed_image * float(np.percentile(image, 99.9))
+
+        diameter = cw.DiameterSpinBox.value() or None
+        proj_desc = segment.describe_projection(*cw.current_projection())
+        cw.log(f'Running cellpose on {hybe} ch{channel} ({modality}) [{proj_desc}], '
+               f'{len(selected)} nucleus seed(s), seed style={cw.current_seed_mode()}, '
+               f'diameter={diameter or "auto"}...')
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            cyto_labels = segment.segment_cytoplasm(
+                image, seed_image, diameter=diameter,
+                min_size=cw.MinSizeSpinBox.value(), max_size=cw.MaxSizeSpinBox.value())
+        except Exception as exc:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            QtWidgets.QMessageBox.critical(self, 'Cytoplasmic Segmentation', str(exc))
+            cw.log(f'FAILED: {exc}')
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+
+        # Selection captured HERE, at run time -- incorporating later must
+        # honour what was actually seeded, not whatever the checkboxes say
+        # by then.
+        self._cytoplasm_result = {'labels': cyto_labels, 'fov': fov, 'hybe': hybe,
+                                  'modality': modality, 'channel': channel, 'image': image,
+                                  'selected_ids': sorted(chosen)}
+        cw.IncorporatePushButton.setEnabled(True)
+        n = len(np.unique(cyto_labels)) - 1
+        cw.log(f'Cellpose returned {n} cytoplasm label(s). Review/remove in the displayer, '
+               f'then Incorporate.')
+        self._cell_displayer_mode = 'cytoplasm'
+        self.cell_displayer.setWindowTitle(
+            f'Cytoplasm Displayer -- FOV{fov:02d} {hybe} ch{channel} ({modality}) -- raw cytoplasm')
+        self.cell_displayer.set_data(image, cyto_labels.astype(float))
+        self.cell_displayer.show()
+        self.cell_displayer.raise_()
+
+    def _incorporate_cytoplasm(self):
+        result = self._cytoplasm_result
+        if result is None:
+            return
+        fov, hybe, modality = result['fov'], result['hybe'], result['modality']
+        cw = self.cytoplasm_window
+        container, cells = self._cytoplasm_cells(fov)
+        if not cells:
+            QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
+                                          'No cells loaded for this FOV any more.')
+            return
+        # Cytoplasms are a STAGED edit: they belong in the transient
+        # container so Save promotes them, and so every displayer shows
+        # them before saving. If only permanent cells exist, stage a copy
+        # rather than mutating what is already on disk.
+        if container is not self.cell_container:
+            if self.cell_container is None:
+                self.cell_container = CellContainer([fov], modality=container.modality)
+            self.cell_container.data[fov] = deepcopy(cells)
+            cells = self.cell_container.data[fov]
+
+        # EVERY cell's nucleus, not just the selected ones -- an unselected
+        # cell still has to win its own pixels back from any cytoplasm that
+        # overlapped it (see incorporate_cytoplasm's own docstring).
+        nucleus_labels = self._build_nucleus_label_mask(cells, hybe, modality, fov,
+                                                        result['image'].shape)
+        merged, claimed = segment.incorporate_cytoplasm(
+            result['labels'], nucleus_labels, eligible_ids=result.get('selected_ids'))
+
+        n_updated = 0
+        for cell in cells:
+            if cell.id not in claimed:
+                continue  # keeps its own nucleus, reference hybe and frame untouched
+            y, x = np.where(merged == cell.id)
+            if len(x) == 0:
+                continue
+            cell.set_metadata(area=(x, y), reference_hybe=hybe, reference_modality=modality,
+                              frame_shape=merged.shape)
+            n_updated += 1
+
+        skipped = [c.id for c in cells if c.id not in claimed]
+        cw.log(f'Incorporated {n_updated} cytoplasm(s) at {hybe} ({modality}); '
+               f'{len(skipped)} cell(s) left nucleus-only.')
+        if skipped:
+            cw.log(f'  nucleus-only: {", ".join(str(i) for i in sorted(skipped)[:20])}'
+                   + (' ...' if len(skipped) > 20 else ''))
+        cw.log('Cell ids and count are unchanged. Alignment matrices were NOT recomputed -- '
+               're-run Cell-Based Alignment if you want the residual refit against the cytoplasm.')
+        self._cell_displayer_mode = 'cytoplasm'
+        self.cell_displayer.setWindowTitle(
+            f'Cytoplasm Displayer -- FOV{fov:02d} {hybe} ({modality}) -- merged (nucleus wins)')
+        self.cell_displayer.set_data(result['image'], merged.astype(float))
+        self._refresh_cytoplasm_cell_list()
+        QtWidgets.QMessageBox.information(
+            self, 'Cytoplasmic Segmentation',
+            f'{n_updated} cell(s) now carry a cytoplasm; {len(skipped)} kept nucleus-only.\n\n'
+            f'Not yet written to vlinks.h5 -- use Cell Segmentation\'s Save.')
 
     def _ensure_cell_displayer_initialized(self):
         """
@@ -1957,7 +2505,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_path or not reference_hybe or not channel_text:
             return
         channel = int(channel_text)
-        reference_image = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, channel)
+        # Whatever projection the panel is currently set to -- so what you
+        # review is what Run will actually segment, rather than the stored
+        # MIP always standing in for it.
+        proj_mode, proj_plane, proj_range = cp.current_projection()
+        try:
+            reference_image = segment.read_projection(storage_path, fov, reference_hybe, channel,
+                                                      mode=proj_mode, z_plane=proj_plane, z_range=proj_range)
+        except (OSError, KeyError) as exc:
+            cp.LogTextEdit.append(f"Can't read {reference_hybe} ch{channel} for FOV{fov:02d}: {exc}")
+            return
         if reference_image is None:
             cp.LogTextEdit.append(f'{reference_hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
@@ -2021,12 +2578,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 cp.LogTextEdit.append(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
                                       f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
 
-        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe}
+        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         self.cell_displayer.set_data(reference_image, mask)
         cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(cells) if cells else 0} cell(s).')
 
     def _on_displayer_mask_edited(self, mask):
         """
+        Routed by self._cell_displayer_mode, since one CellDisplayer now
+        serves both flows: a cytoplasm-review edit must NOT be pushed
+        through load_new_cells (that would rewrite the cell container from
+        a cytoplasm label image), and a segmentation edit must not be
+        mistaken for a staged cytoplasm result.
+
         A manual add/remove in CellDisplayer -- `mask` is always an edit of
         the mask the user is already looking at (one label added or one
         removed), never a fresh independent clustering, so every id it
@@ -2036,11 +2599,17 @@ class MainWindow(QtWidgets.QMainWindow):
         docstring); only a newly-clicked cell (a genuinely new id) starts
         blank, at this call's own reference_hybe.
         """
+        if self._cell_displayer_mode == 'cytoplasm':
+            if self._cytoplasm_result is not None:
+                self._cytoplasm_result['labels'] = np.asarray(mask).astype(np.int32)
+            return
         if self._last_segment_context is None or self.cell_container is None:
             return
         fov = self._last_segment_context['fov']
         reference_hybe = self._last_segment_context['reference_hybe']
-        self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=True)
+        self.cell_container.load_new_cells(
+            fov, mask, reference_hybe, preserve_existing=True,
+            reference_modality=self._last_segment_context.get('modality'))
         n_cells = len(self.cell_container.get_cells(fov))
         self.ui.CellSegmentPanel.LogTextEdit.append(f'Mask edited in displayer: {n_cells} cell(s) remain.')
 
@@ -2098,7 +2667,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None or self._last_segment_context is None:
             QtWidgets.QMessageBox.warning(self, 'Save Cells', 'Run segmentation first.')
             return
+        # The FOV actually staged in the transient container -- not
+        # _last_segment_context's, which only tracks the last SEGMENTATION
+        # run and goes stale after a cytoplasm incorporate on another FOV.
         fov = self._last_segment_context['fov']
+        staged = [f for f, cells in self.cell_container.data.items() if cells]
+        if staged and fov not in staged:
+            fov = staged[0]
         already_saved = (self.cell_container_permanent is not None
                           and fov in self.cell_container_permanent.data
                           and len(self.cell_container_permanent.data[fov]) > 0)
@@ -2293,7 +2868,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None:
             self.cell_container = CellContainer([fov], modality=self.cell_container_permanent.modality)
         self.cell_container.data[fov] = deepcopy(cells)
-        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe}
+        # the CELLS' own segmentation modality, not the app's current one
+        # (see cell_container.load_new_cells on why these can differ)
+        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
+                                      'modality': cells[0].reference_modality or cells[0].modality}
         self.cell_displayer.set_data(reference_image, mask)
         ap = self.ui.AlignmentPanel
         ap.CellOverlayFovSpinBox.blockSignals(True)
@@ -2782,7 +3360,18 @@ class MainWindow(QtWidgets.QMainWindow):
                                    'modality': sp.current_hybe_modality(), 'rxmin': rxmin, 'rymin': rymin}
         scoped_spots = [s for s in cell.spots if s.hybe == hybe and s.channel == channel]
         existing_points = [(s.raw_coordinate[0] - rxmin, s.raw_coordinate[1] - rymin) for s in scoped_spots]
-        context_masks = [(cell.id, crop['mask_x'], crop['mask_y'])]
+        # EVERY cell in this FOV, not just the selected one -- the left
+        # panel exists to orient you, and a single lone contour among a
+        # field of unmarked cells does not (confirmed: this used to pass
+        # only [(cell.id, ...)], so every neighbour was invisible).
+        # The selected cell is still the one the RIGHT panel crops to.
+        context_masks = []
+        for other in self._cells_for_fov(fov):
+            ox, oy = self._cell_area_in_readout(other, hybe, sp.current_hybe_modality(), fov)
+            if len(ox):
+                context_masks.append((other.id, ox, oy))
+        if not context_masks:
+            context_masks = [(cell.id, crop['mask_x'], crop['mask_y'])]
         gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
         spot_indices = [gmap[id(s)] for s in scoped_spots]
         self.spot_crop_displayer.set_data(
@@ -2854,6 +3443,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
                 if len(x_area):
                     context_masks.append((cell.id, x_area, y_area))
+        # The RIGHT (working) panel gets the cell boundaries too, as one
+        # combined raster -- per confirmed real bug it was passed mask=None
+        # here, so the panel a user actually clicks in showed no cell
+        # outlines at all, while the LEFT context panel drew all 67. Cell
+        # view never had the problem because its crop always carries a real
+        # mask. rxmin/rymin are 0 in this view, so the FOV-frame mask
+        # coordinates are already the panel's own coordinates.
+        # LABEL raster, not boolean: the displayer contours each label
+        # separately so touching cells stay distinguishable (a boolean
+        # would trace only their merged outer hull).
+        fov_mask = np.zeros(mip.shape, dtype=np.int32)
+        for cell_id, xs, ys in context_masks:
+            ix, iy = np.asarray(xs).astype(int), np.asarray(ys).astype(int)
+            valid = (iy >= 0) & (iy < mip.shape[0]) & (ix >= 0) & (ix < mip.shape[1])
+            fov_mask[iy[valid], ix[valid]] = int(cell_id)
         self._spot_crop_context = {'kind': 'fov', 'storage_path': storage_path, 'fov': fov,
                                    'hybe': hybe, 'channel': channel, 'modality': modality, 'rxmin': 0, 'rymin': 0}
         gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
@@ -2861,6 +3465,7 @@ class MainWindow(QtWidgets.QMainWindow):
         readonly_indices = [gmap[id(s)] for s, _ in cell_owned_refs]
         self.spot_crop_displayer.set_data(
             mip, unassigned_points, color='yellow', readonly_points=cell_owned_points,
+            mask=fov_mask if fov_mask.any() else None,
             context_image=mip, context_masks=context_masks,
             context_title=f'FOV{fov:02d} {hybe} ch{channel} -- cell masks',
             spot_indices=spot_indices, readonly_indices=readonly_indices, keep_view=keep_view)
@@ -5140,7 +5745,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in sorted(display_results.keys()):
             H = display_results[fov]
             suffix = ' [pending]' if fov in pending_fovs else ''
-            item = QtWidgets.QListWidgetItem(f'FOV{fov:02d} {_matrix_summary("DNA->RNA", H)}{suffix}')
+            dz = self._pending_cross_modal_z.get(fov)
+            if dz is None:
+                dz = self.cross_modal_z.get((dna_storage_path, fov))
+            if dz is None:
+                dz = vlinks_store.read_cross_modal_z(dna_storage_path, fov)
+            item = QtWidgets.QListWidgetItem(
+                f'FOV{fov:02d} {_matrix_summary("DNA->RNA", H)}, dz={float(dz or 0.0):+.1f}{suffix}')
             item.setData(QtCore.Qt.UserRole, fov)
             ap.CrossModalResultsListWidget.addItem(item)
 
@@ -5176,11 +5787,24 @@ class MainWindow(QtWidgets.QMainWindow):
         border_trim = ap.CrossModalBorderTrimSpinBox.value()
         max_shift = ap.CrossModalMaxShiftSpinBox.value() or None
 
+        # Fiducial channels for the Z leg -- z drift is measured on the
+        # same reference pair as dx/dy, in the same run.
+        rna_fid = dna_fid = None
+        try:
+            rna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                self._modality_for_storage_path(rna_storage_path))}[rna_reference_hybe]
+            dna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                self._modality_for_storage_path(dna_storage_path))}[dna_reference_hybe]
+            rna_fid = alignment.pick_channel_by_type(rna_rec, 'fiducial')
+            dna_fid = alignment.pick_channel_by_type(dna_rec, 'fiducial')
+        except (KeyError, TypeError):
+            pass
         ap.RunCrossModalPushButton.setEnabled(False)
         self.statusBar().showMessage('Running cross-modal alignment...')
         self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, [fov], self.fov_matrices,
                                                               rna_reference_hybe, dna_reference_hybe, channel_type, write=False,
-                                                              border_trim=border_trim, max_shift=max_shift)
+                                                              border_trim=border_trim, max_shift=max_shift,
+                                                              rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
         self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
         self._cross_modal_worker.finished_ok.connect(
             lambda results: self._on_cross_modal_finished(results, rna_storage_path, dna_storage_path,
@@ -5189,6 +5813,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cross_modal_worker.start()
 
     def _on_cross_modal_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
+        # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z
+        # drift is part of the cross-modal RESULT, staged and accepted with it.
+        if isinstance(results, dict) and 'H' in results and 'z' in results:
+            self._pending_cross_modal_z = dict(results['z'])
+            results = results['H']
         ap = self.ui.AlignmentPanel
         ap.RunCrossModalPushButton.setEnabled(True)
         self.statusBar().showMessage('Cross-modal alignment computed.', 5000)
@@ -5236,11 +5865,24 @@ class MainWindow(QtWidgets.QMainWindow):
         border_trim = ap.CrossModalBorderTrimSpinBox.value()
         max_shift = ap.CrossModalMaxShiftSpinBox.value() or None
 
+        # Fiducial channels for the Z leg -- z drift is measured on the
+        # same reference pair as dx/dy, in the same run.
+        rna_fid = dna_fid = None
+        try:
+            rna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                self._modality_for_storage_path(rna_storage_path))}[rna_reference_hybe]
+            dna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                self._modality_for_storage_path(dna_storage_path))}[dna_reference_hybe]
+            rna_fid = alignment.pick_channel_by_type(rna_rec, 'fiducial')
+            dna_fid = alignment.pick_channel_by_type(dna_rec, 'fiducial')
+        except (KeyError, TypeError):
+            pass
         ap.RunAllCrossModalPushButton.setEnabled(False)
         self.statusBar().showMessage('Running cross-modal alignment for all FOVs...')
         self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, fov_list, self.fov_matrices,
                                                               rna_reference_hybe, dna_reference_hybe, channel_type, write=True,
-                                                              border_trim=border_trim, max_shift=max_shift)
+                                                              border_trim=border_trim, max_shift=max_shift,
+                                                              rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
         self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
         self._cross_modal_worker.finished_ok.connect(
             lambda results: self._on_cross_modal_all_finished(results, rna_storage_path, dna_storage_path,
@@ -5249,6 +5891,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cross_modal_worker.start()
 
     def _on_cross_modal_all_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
+        # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z
+        # drift is part of the cross-modal RESULT, staged and accepted with it.
+        if isinstance(results, dict) and 'H' in results and 'z' in results:
+            self._pending_cross_modal_z = dict(results['z'])
+            results = results['H']
         ap = self.ui.AlignmentPanel
         ap.RunAllCrossModalPushButton.setEnabled(True)
         self.statusBar().showMessage('Cross-modal alignment computed.', 5000)
@@ -5264,6 +5911,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                                  rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
                                                  rna_fov_matrices=self.fov_matrices.get((rna_storage_path, fov), {}),
                                                  dna_fov_matrices=self.fov_matrices.get((dna_storage_path, fov), {}))
+            self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
             self._mirror_cross_modal_params_to_vlinks(rna_storage_path, dna_storage_path, fov, H,
                                                       rna_reference_hybe, dna_reference_hybe, channel_type)
         QtWidgets.QMessageBox.information(self, 'Cross-modal alignment complete',
@@ -5288,6 +5936,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                                  H, save_path=save_path,
                                                  rna_fov_matrices=self.fov_matrices.get((ctx['rna_storage_path'], fov), {}),
                                                  dna_fov_matrices=self.fov_matrices.get((ctx['dna_storage_path'], fov), {}))
+            self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
             self._mirror_cross_modal_params_to_vlinks(ctx['rna_storage_path'], ctx['dna_storage_path'], fov, H,
                                                       ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'])
         self.cross_modal_result.update({(ctx['dna_storage_path'], fov): H for fov, H in self._pending_cross_modal.items()})
@@ -5401,63 +6050,76 @@ class MainWindow(QtWidgets.QMainWindow):
         rna_storage_path = self.ui.AlignmentPanel.RnaStoragePathLineEdit.text().strip()
         return self._modality_for_storage_path(rna_storage_path) if rna_storage_path else None
 
+    def _frame_resolver(self, cell, fov):
+        """
+        Build the ONE resolver (alignment/frames.py) from live session
+        state. Everything frame-related should route through this; the
+        older per-question resolvers remain only as thin wrappers.
+
+        `within` is deliberately the RAW per-modality matrices straight
+        out of self.fov_matrices -- NOT _composed_fov_matrices_for_cell_
+        alignment's output, which already has the cross-modal bridge
+        folded in. FrameResolver applies the bridge itself, so handing it
+        pre-bridged matrices would count that leg twice.
+        """
+        ap = self.ui.AlignmentPanel
+        rna_sp = ap.RnaStoragePathLineEdit.text().strip()
+        dna_sp = ap.DnaStoragePathLineEdit.text().strip()
+        rna_modality = self._modality_for_storage_path(rna_sp) if rna_sp else None
+        dna_modality = self._modality_for_storage_path(dna_sp) if dna_sp else None
+        shared = rna_modality or (cell.modality if cell is not None else None)
+
+        within = {}
+        for modality in self.modality_names:
+            sp = self._storage_path_for_modality(modality)
+            if sp:
+                within[modality] = dict(self.fov_matrices.get((sp, fov), {}))
+
+        bridge_xy = None
+        bridge_z = 0.0
+        if rna_modality and dna_modality and rna_modality != dna_modality:
+            bridge_xy = self.cross_modal_result.get((dna_sp, fov))
+            if bridge_xy is None:
+                bridge_xy = vlinks_store.read_cross_modal_matrix(dna_sp, fov)
+            bridge_z = self.cross_modal_z.get((dna_sp, fov))
+            if bridge_z is None:
+                bridge_z = vlinks_store.read_cross_modal_z(dna_sp, fov)
+
+        anchors = {}
+        if cell is not None:
+            for modality in self.modality_names:
+                if modality in cell.matrix_anchors:
+                    anchors[modality] = self._live_cell_matrix_anchor(modality, cell, fov)
+        return frames.FrameResolver(within, shared, bridge_xy=bridge_xy, bridge_z=float(bridge_z or 0.0),
+                                    bridge_from=dna_modality if bridge_xy is not None else None,
+                                    anchors=anchors)
+
     def _cross_modal_bridge(self, from_modality, to_modality, fov):
         """
-        3x3 mapping from_modality's own within-experiment frame ->
-        to_modality's own within-experiment frame. THE single place the
-        cross-modal direction is decided.
-
-        Takes FRAMES (from/to), never roles ("is this the cell's own
-        modality?") -- per explicit design correction. The stored
-        cross-modal matrix maps the DNA side's frame -> the RNA side's
-        frame (confirmed on real data: DNA's own anchor composes to
-        dx=-13.483 dy=+1.244, matching vlinks' own "DNA->RNA" row), so
-        this returns it as-is for DNA->RNA, its inverse for RNA->DNA, and
-        identity within one modality -- a plain function of the two frame
-        names, with no dependence on which cell happens to be loaded.
-
-        Confirmed real bug this replaces: the direction used to be picked
-        by an `invert` flag keyed on whether storage_path was the cell's
-        OWN side, which silently made the DESTINATION frame depend on the
-        cell's modality. For a DNA cell that sent the DNA leg into RNA's
-        frame while sending the RNA leg into DNA's frame -- the two legs
-        disagreeing by 2x H_across (~27px on real data; the cross-modal
-        bridge hybe's own two copies, which image the same physical
-        sample and should nearly coincide, sat 19.98px apart for a DNA
-        cell vs 7.26px for an RNA cell).
-
-        Returns None when a real cross-modal link is genuinely REQUIRED
-        (the two modalities differ) but isn't available/accepted yet --
-        never a silent identity, which would fabricate an alignment that
-        was never computed. Same-modality always returns identity, so a
-        session with no cross-modal layer at all still works untouched.
+        from_modality's frame -> to_modality's. Thin wrapper over
+        frames.FrameResolver.bridge -- the direction rule lives there, in
+        one place, shared with the Z leg.
         """
-        if from_modality == to_modality:
-            return np.eye(3)
-        ap = self.ui.AlignmentPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        if not rna_storage_path or not dna_storage_path or rna_storage_path == dna_storage_path:
-            return None
-        rna_modality = self._modality_for_storage_path(rna_storage_path)
-        dna_modality = self._modality_for_storage_path(dna_storage_path)
-        if {from_modality, to_modality} != {rna_modality, dna_modality}:
-            return None
-        # vlinks_store's own copy first -- keyed ONLY by (storage_path,
-        # fov), immune to the reference-hybe staleness that made chain.py's
-        # own lookup read /matrix_across out of the wrong hybe's stack file
-        # (see _refresh_cross_modal_results_list's own comment).
-        H_across = self.cross_modal_result.get((dna_storage_path, fov))
-        if H_across is None:
-            H_across = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
-        if H_across is None:
-            dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-            if dna_reference_hybe:
-                H_across = alignment.read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe)
-        if H_across is None:
-            return None
-        return H_across if from_modality == dna_modality else la.inv(H_across)
+        return self._frame_resolver(None, fov).bridge(from_modality, to_modality)
+    def _commit_cross_modal_z(self, fov, dz=None):
+        """
+        Persist this FOV's measured z drift alongside its H_across. `dz`
+        comes from the SAME alignment run that produced H -- it is a
+        measured component of the result, never a user-set parameter.
+        """
+        dna_sp = self.ui.AlignmentPanel.DnaStoragePathLineEdit.text().strip()
+        if not dna_sp or dz is None:
+            return
+        self.cross_modal_z[(dna_sp, fov)] = float(dz)
+        vlinks_store.write_cross_modal_z(dna_sp, fov, float(dz))
 
+    def _cross_modal_z(self, from_modality, to_modality, fov):
+        """
+        Planes to ADD moving z between modality frames. Wrapper over
+        frames.FrameResolver.bridge_z_between, so the XY and Z legs can no
+        longer disagree about direction -- they read the same rule.
+        """
+        return self._frame_resolver(None, fov).bridge_z_between(from_modality, to_modality)
     def _fov_matrices_in_frame(self, source_modality, frame_modality, fov):
         """
         {hybe: 3x3} for every one of source_modality's OWN hybes, each
@@ -5618,27 +6280,33 @@ class MainWindow(QtWidgets.QMainWindow):
         while still being anchored where the rest of the cell-alignment
         layer expects.
 
-        'cellref_fov_matrices' is ALWAYS the cell's own modality's own
-        composed matrices, for every pass -- that's the frame cell.area
-        is native to, so it's what cell.reference_hybe must be resolved
-        against regardless of which modality's hybes the pass itself
-        fits. The other modality's own 'fov_matrices' are already
-        composed to land in this same frame (see _other_modality_cell_
-        alignment_inputs), so the two are directly compatible.
+        'cellref_fov_matrices' is {modality: composed matrices} for EVERY
+        configured modality, identical across passes -- the frame cell.area
+        is native to is a PER-CELL fact (cell.reference_modality), not a
+        per-pass one, once cytoplasmic segmentation can move a cell's
+        reference_hybe into the other modality. The worker picks the right
+        entry per cell. Every modality's matrices are already composed into
+        the one shared frame (see _fov_matrices_in_frame), so they are
+        directly comparable.
         """
         ap = self.ui.AlignmentPanel
         own_fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        # Keyed by modality: a cell's own reference_hybe may live in EITHER
+        # modality once a cytoplasm is attached, and that is a per-cell fact
+        # the worker has to resolve, not something a per-FOV pass can bake in.
+        frames_by_modality = {cell_modality: own_fov_matrices}
         passes = [{
             'modality': cell_modality,
             'storage_path': storage_path,
             'hybe_records': self._active_hybe_records_for_modality(cell_modality),
             'fov_matrices': own_fov_matrices,
             'reference_hybe': ap.current_cell_reference_hybe(cell_modality) or None,
-            'cellref_fov_matrices': own_fov_matrices,
+            'cellref_fov_matrices': frames_by_modality,
         }]
         other = self._other_modality_cell_alignment_inputs(storage_path, fov)
         if other is not None:
             other_storage_path, _, other_fov_matrices, _, other_modality = other
+            frames_by_modality[other_modality] = other_fov_matrices
             other_reference_hybe = ap.current_cell_reference_hybe(other_modality)
             other_records = self._active_hybe_records_for_modality(other_modality)
             # No configured cell-alignment reference for that modality (or
@@ -5653,7 +6321,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     'hybe_records': other_records,
                     'fov_matrices': other_fov_matrices,
                     'reference_hybe': other_reference_hybe,
-                    'cellref_fov_matrices': own_fov_matrices,
+                    'cellref_fov_matrices': frames_by_modality,
                 })
         return passes
 
@@ -5683,7 +6351,8 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_modality = self._shared_frame_modality() or cell.modality
         return self._fov_matrices_in_frame(modality, frame_modality, fov)
 
-    def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov):
+    def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov,
+                                  frame_hybe=None, frame_modality=None):
         """
         hybe's own FOV/cross-modal-level matrix (no cell-level residual,
         even if a real one now exists) into cell.reference_hybe's own
@@ -5701,11 +6370,15 @@ class MainWindow(QtWidgets.QMainWindow):
         stays lenient, defaulting to identity, matching the "before" of
         an unaligned experiment rather than failing the whole lookup).
         """
+        # Defaults to the cell's own `area` frame; cytoplasm-aware callers
+        # pass the nucleus frame explicitly (see _matrix_to_frame).
+        frame_hybe = frame_hybe or cell.reference_hybe
+        frame_modality = frame_modality or cell.reference_modality or cell.modality
         fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
         if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
             return None
-        cell_fov_matrices = self._fov_matrices_for_cell_modality(cell.modality, cell, fov)
-        cell_reference_hybe_matrix = (cell_fov_matrices or {}).get(cell.reference_hybe, np.eye(3))
+        frame_fov_matrices = self._fov_matrices_for_cell_modality(frame_modality, cell, fov)
+        cell_reference_hybe_matrix = (frame_fov_matrices or {}).get(frame_hybe, np.eye(3))
         return alignment.hybe_to_cellref_matrix(fov_matrices_for_hybe, cell_reference_hybe_matrix, hybe)
 
     def _live_cell_matrix_anchor(self, modality, cell, fov):
@@ -5743,74 +6416,39 @@ class MainWindow(QtWidgets.QMainWindow):
         return live if live is not None else cell.matrix_anchors.get(modality, np.eye(3))
 
     def _matrix_to_cellref(self, hybe, modality, cell, fov):
-        """
-        hybe's own raw frame -> cell.reference_hybe's own frame -- the
-        "best available" transform get_area_in_readout-style consumers
-        need. cell.matrices entries now target THAT compute_cell_
-        alignment call's own reference_hybe, not a shared frame (see its
-        docstring) -- a same-modality entry and a cross-modal entry can
-        rest in genuinely different frames, bridged only via each
-        modality's own anchor (see ACell.matrix_between). So this prefers
-        the real, cell-level-refined composition only when BOTH hybe's
-        own and cell.reference_hybe's own residual entries AND both
-        modalities' anchors are actually present -- mixing a real entry
-        for one leg with a raw FOV value for the other would silently
-        combine two different frames, exactly the class of bug this whole
-        redesign exists to avoid. Otherwise falls back to _fov_only_
-        matrix_for_hybe's pure FOV-level computation (no cell.matrices/
-        matrix_anchors dependency at all), so a cell that's never had
-        cell-level alignment run for a given hybe/modality still gets a
-        real, non-identity answer instead of ACell.matrix_to's bare
-        identity default. Returns None only when even the FOV-only
-        fallback has nothing to work with.
+        """hybe's raw frame -> the frame cell.area lives in. Wrapper over _matrix_to_frame."""
+        return self._matrix_to_frame(hybe, modality, cell, fov,
+                                     cell.reference_hybe, cell.reference_modality)
 
-        Composes via _live_cell_matrix_anchor (NOT cell.matrix_to, which
-        internally uses cell.matrix_anchors' own possibly-stale snapshot
-        -- see that method's own docstring) -- same bridging formula as
-        ACell.matrix_between, just with a live anchor for each leg.
+    def _matrix_to_frame(self, hybe, modality, cell, fov, frame_hybe, frame_modality):
         """
-        key = (hybe, modality)
-        self_key = (cell.reference_hybe, cell.modality)
-        have_real = (key in cell.matrices and self_key in cell.matrices
-                     and modality in cell.matrix_anchors and cell.modality in cell.matrix_anchors)
-        if not have_real:
-            return self._fov_only_matrix_for_hybe(hybe, modality, cell, fov)
-        H_a_to_shared = self._live_cell_matrix_anchor(modality, cell, fov) @ cell.matrices[key]['yx']
-        H_b_to_shared = self._live_cell_matrix_anchor(cell.modality, cell, fov) @ cell.matrices[self_key]['yx']
-        return la.inv(H_b_to_shared) @ H_a_to_shared
+        hybe's raw frame -> (frame_hybe, frame_modality)'s raw frame.
+
+        Thin wrapper over frames.FrameResolver.transform. The target frame
+        stays an explicit argument because a cell defines masks in two of
+        them -- reference_hybe for `area`, nucleus_hybe for `nucleus` --
+        and after cytoplasmic segmentation those can sit in different
+        modalities.
+        """
+        resolver = self._frame_resolver(cell, fov)
+        H, _dz, _missing = resolver.transform((hybe, modality),
+                                              (frame_hybe, frame_modality or cell.modality), cell)
+        return H
 
     def _matrix_to_shared(self, hybe, modality, cell, fov):
         """
-        hybe's own raw frame -> the pipeline's ONE shared reference frame
-        (RNA's own same-modality reference hybe) -- the "best available"
-        transform every SPOT-coordinate/preview-final-column consumer
-        needs now (contrast with _matrix_to_cellref, which targets
-        cell.reference_hybe's frame and stays correct/needed for mask-
-        related work, e.g. the cell-area leg of celltype barcode
-        classification). Composes the real, cell-level-refined residual
-        (cell.matrices[key]['yx'] -- this legitimately belongs in the
-        cell's own container, unlike the anchor below) against a LIVE
-        anchor via _live_cell_matrix_anchor, NOT cell.matrix_to_shared
-        (which internally uses cell.matrix_anchors' own stored, possibly-
-        stale snapshot -- see _live_cell_matrix_anchor's own docstring
-        for the confirmed staleness bug this avoids: re-running Same-
-        Modality/Cross-Modal Alignment with a new result used to leave
-        every already-fit cell's own final matrix silently unchanged
-        until that cell was individually re-fit). Falls back to a pure
-        FOV-level lookup (no cell-level residual) via _fov_matrices_for_
-        cell_modality when this cell has no real residual for hybe/
-        modality at all, so a cell that's never had cell-level alignment
-        run still gets a real, non-identity answer instead of an identity
-        default. Returns None only when even the FOV-only fallback has
-        nothing to work with.
+        hybe's own raw frame -> the pipeline's ONE shared frame.
+
+        Thin wrapper over frames.FrameResolver (see that module) -- kept
+        because many call sites read better as "to shared" than as a
+        transform to an explicit key, but it owns no composition logic of
+        its own any more. Returns None only when the shared frame itself
+        can't be identified.
         """
-        key = (hybe, modality)
-        if key not in cell.matrices:
-            fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-            if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
-                return None
-            return fov_matrices_for_hybe[hybe]
-        return self._live_cell_matrix_anchor(modality, cell, fov) @ cell.matrices[key]['yx']
+        resolver = self._frame_resolver(cell, fov)
+        if resolver.shared is None:
+            return None
+        return resolver.to_shared(hybe, modality, cell)
 
     def _cell_overlay_target_specs(self, cell, storage_path, fov, hybe_records, channel_type):
         """
@@ -6224,6 +6862,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 'modality': modality, 'storage_path': reference_storage_path, 'hybe': reference_hybe,
                 'channel': alignment.pick_channel_by_type(record, channel_type),
                 'fov_matrix': reference_fov_matrix,
+                # This reference's OWN cross-modal z, so the preview can use
+                # the target's drift RELATIVE to it rather than an absolute
+                # value the pinned reference never receives.
+                'cross_modal_z': self._cross_modal_z(
+                    modality, self._shared_frame_modality() or cell.modality, fov),
             })
 
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
@@ -6235,7 +6878,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cell, fov, reference_specs,
             target_storage_path, target_hybe, target_channel,
             fov_only_matrix, final_matrix, pad=pad, target_modality=target_modality,
-            mask_anchor_fov_matrix=mask_anchor_fov_matrix)
+            mask_anchor_fov_matrix=mask_anchor_fov_matrix,
+            cross_modal_z=self._cross_modal_z(
+                target_modality, self._shared_frame_modality() or cell.modality, fov))
 
     def _show_cell_all_readouts_overlay(self, item=None):
         """
@@ -6270,7 +6915,8 @@ class MainWindow(QtWidgets.QMainWindow):
         pad = ap.CellPadSpinBox.value()
 
         reference_key = ap.CellPreviewReferenceHybeComboBox.currentData()
-        reference_hybe, reference_modality = reference_key if reference_key else (cell.reference_hybe, cell.modality)
+        reference_hybe, reference_modality = (reference_key if reference_key
+                                              else (cell.reference_hybe, cell.reference_modality))
         reference_record, reference_storage_path, err = self._resolve_preview_hybe_context(
             reference_hybe, reference_modality, storage_path, self.hybe_records, fov)
         if err:

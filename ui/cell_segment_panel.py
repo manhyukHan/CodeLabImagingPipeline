@@ -1,4 +1,8 @@
 from PyQt5 import QtWidgets, QtCore
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+
+from codelab_pipeline.segmentation.segment import PROJECTION_MODES, describe_projection
 
 
 class CellSegmentPanelUI(object):
@@ -52,12 +56,60 @@ class CellSegmentPanelUI(object):
         appendModeLabel.setWordWrap(True)
         layout.addWidget(appendModeLabel)
 
+        projGroup = QtWidgets.QGroupBox('Projection (source image)')
+        projLayout = QtWidgets.QFormLayout(projGroup)
+        self.ProjectionModeComboBox = QtWidgets.QComboBox()
+        self.ProjectionModeComboBox.addItems(list(PROJECTION_MODES))
+        # 'MIP (stored)' first, so nothing existing changes. The
+        # depth-resolved modes are available here -- not only in cytoplasmic
+        # search -- per explicit request: a single/range projection is often
+        # the better image to find cells in at all, whether or not any
+        # nucleus has been determined yet.
+        projLayout.addRow('Projection:', self.ProjectionModeComboBox)
+        self.ZPlaneSpinBox = QtWidgets.QSpinBox(); self.ZPlaneSpinBox.setRange(0, 100000)
+        projLayout.addRow('Plane z:', self.ZPlaneSpinBox)
+        zRow = QtWidgets.QWidget(); zLayout = QtWidgets.QHBoxLayout(zRow)
+        zLayout.setContentsMargins(0, 0, 0, 0)
+        self.ZStartSpinBox = QtWidgets.QSpinBox(); self.ZStartSpinBox.setRange(0, 100000)
+        self.ZEndSpinBox = QtWidgets.QSpinBox(); self.ZEndSpinBox.setRange(0, 100000)
+        self.ViewRangePushButton = QtWidgets.QPushButton('View')
+        self.ViewRangePushButton.setMaximumWidth(60)
+        # Range projections are the one mode with no natural "live" trigger:
+        # editing z-start or z-end mid-edit would recompute a range that the
+        # user has not finished specifying, and a range read is a real
+        # multi-plane stack read, not a single slice. So the range is applied
+        # on demand, explicitly, unlike single-plane which updates as you
+        # scroll its own spinbox.
+        zLayout.addWidget(self.ZStartSpinBox); zLayout.addWidget(QtWidgets.QLabel('to'))
+        zLayout.addWidget(self.ZEndSpinBox); zLayout.addWidget(self.ViewRangePushButton)
+        projLayout.addRow('Range z:', zRow)
+        self.AutoFocusPushButton = QtWidgets.QPushButton('Detect Focal Plane')
+        projLayout.addRow(self.AutoFocusPushButton)
+        self.FocusCanvas = FigureCanvasQTAgg(Figure(figsize=(4, 1.35)))
+        self.FocusCanvas.setMinimumHeight(115)
+        projLayout.addRow(self.FocusCanvas)
+        layout.addWidget(projGroup)
+
         self.RunSegmentationPushButton = QtWidgets.QPushButton('Run Segmentation')
+        # Label restated from the live projection on every change -- see
+        # refresh_run_label. The button you are about to press should say
+        # what it will actually do; a log line after the fact does not help
+        # when the wrong choice costs two thirds of the cells.
+        self.focus_detected = False
         layout.addWidget(self.RunSegmentationPushButton)
 
         self.ShowDisplayerPushButton = QtWidgets.QPushButton('Show Cell Displayer')
         self.ShowDisplayerPushButton.setCheckable(True)
         layout.addWidget(self.ShowDisplayerPushButton)
+
+        self.ShowCytoplasmPushButton = QtWidgets.QPushButton('Cytoplasmic Segmentation...')
+        # Opens its own pop-up (ui/cytoplasm_panel.py) rather than adding a
+        # mode to this panel: cytoplasmic search runs AFTER nuclei already
+        # exist, against a different hybe (often the other modality's), with
+        # its own cell selection and parameters -- none of which the fields
+        # above can express without silently changing what they mean for the
+        # ordinary nucleus-segmentation flow.
+        layout.addWidget(self.ShowCytoplasmPushButton)
 
         transientGroup = QtWidgets.QGroupBox('Transient Cell Container (this FOV, staged)')
         transientLayout = QtWidgets.QVBoxLayout(transientGroup)
@@ -185,6 +237,34 @@ class CellSegmentPanelUI(object):
         """Owning modality name for whatever's currently selected, or None if nothing is."""
         data = self.ReferenceHybeComboBox.currentData()
         return data[1] if data is not None else None
+
+    def refresh_run_label(self):
+        self.RunSegmentationPushButton.setText(
+            f'Run Segmentation  [{describe_projection(*self.current_projection())}]')
+
+    def current_projection(self):
+        """(mode, z_plane, (z0, z1)) -- ready to splat into segment.read_projection."""
+        return (self.ProjectionModeComboBox.currentText(),
+                self.ZPlaneSpinBox.value(),
+                (self.ZStartSpinBox.value(), self.ZEndSpinBox.value()))
+
+    def set_depth(self, depth):
+        top = max(depth - 1, 0)
+        for box in (self.ZPlaneSpinBox, self.ZStartSpinBox, self.ZEndSpinBox):
+            box.setMaximum(top)
+        if depth and self.ZEndSpinBox.value() == 0:
+            self.ZEndSpinBox.setValue(top)
+
+    def show_focus_profile(self, zs, values, peak):
+        self.focus_detected = True
+        fig = self.FocusCanvas.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.plot(zs, values, lw=1.0)
+        ax.axvline(peak, color='red', ls='--', lw=1.0)
+        ax.set_xlabel('z', fontsize=7); ax.set_ylabel('focus', fontsize=7)
+        ax.tick_params(labelsize=6); ax.set_title(f'sharpest z={peak}', fontsize=7)
+        fig.tight_layout(); self.FocusCanvas.draw()
 
     def current_method(self):
         """'cellpose' / 'classical' / 'manual' -- lowercase, matches segment.py's own method kwarg casing."""

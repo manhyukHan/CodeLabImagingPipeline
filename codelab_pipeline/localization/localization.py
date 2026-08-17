@@ -14,6 +14,32 @@ import cv2
 from ..alignment import chain as alignment
 from ..alignment import spot_mapper
 
+def cell_z_offset(cell, hybe, modality, resolver=None):
+    """
+    Additive z (planes) taking a spot in (hybe, modality) to the shared
+    frame.
+
+    THE single place localization reads z from. This replaced five
+    independent inline `z + Hz[0, 2]` sites -- that repetition is exactly
+    what let a wrong index (`Hz[1, 2]`, structurally always 0) survive
+    unnoticed in all five at once, silently discarding every Z correction.
+
+    `resolver` (frames.FrameResolver, from MainWindow._frame_resolver) is
+    required to include the FOV-level CROSS-MODAL z drift, which is
+    FOV-bounded and therefore applies to unassigned spots too. Without it
+    only the cell's own same-modality residual is available; a bare
+    residual entry raises rather than being half-applied.
+    """
+    if resolver is not None:
+        return float(resolver.z_to_shared(hybe, modality, cell))
+    if cell is None:
+        return 0.0
+    entry = cell.matrices.get((hybe, modality), {})
+    if entry.get('yx_is_residual') is None and 'zx' not in entry:
+        return 0.0
+    return float(np.asarray(entry.get('zx', np.eye(3)))[0, 2])
+
+
 def gaussian_2d(xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
     x, y = xy
     xo, yo = float(xo), float(yo)
@@ -434,9 +460,14 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     """
     modality = modality if modality is not None else cell.modality
     key = (hybe, modality)
-    self_key = (cell.reference_hybe, cell.modality)
+    # reference_MODALITY, not cell.modality -- cell.reference_hybe can
+    # belong to the other modality once a cytoplasm is attached (see
+    # ACell's own docstring), and pairing it with the cell's home
+    # modality would key a (hybe, modality) entry that never exists.
+    reference_modality = cell.reference_modality or cell.modality
+    self_key = (cell.reference_hybe, reference_modality)
     have_real = (key in cell.matrices and self_key in cell.matrices
-                 and modality in cell.matrix_anchors and cell.modality in cell.matrix_anchors)
+                 and modality in cell.matrix_anchors and reference_modality in cell.matrix_anchors)
     if have_real or fov_matrices is None or hybe not in fov_matrices:
         # real cell-level data, or no fallback available -- old behavior
         # (identity-default via cell.get_area_in_readout/matrix_to_shared
@@ -498,7 +529,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
                   spad=5, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                   min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
                   min_sep=3.0, component_threshold=0.3, max_components=3, claimed_positions=None,
-                  use_mixture=True, z_window=15, fov_matrices=None):
+                  use_mixture=True, z_window=15, fov_matrices=None, resolver=None):
     """
     Adds/refines Z on a spot that's ALREADY PLACED (2D auto-detect or a
     manual click, so spot.raw_coordinate's own x,y are already known and
@@ -768,7 +799,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             H = cell.matrix_to_shared(hybe, m)
             Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
-            coord = (float(x1), float(y1), float(zf + Hz[0, 2]))
+            coord = (float(x1), float(y1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
         elif fov_matrices and hybe in fov_matrices:
             x1, y1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe, fov_matrices, modality=modality, cell=None)
             coord = (x1, y1, raw[2])
@@ -795,7 +826,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
 
 def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
                             max_to_background, max_to_average, absolute_threshold,
-                            min_distance, frac, max_num_alleles, pad):
+                            min_distance, frac, max_num_alleles, pad, resolver=None):
     """
     2D localization for one cell in one hybe, with sub-pixel gaussian
     refinement (the fit_gaussian_2d step that exists but is commented out
@@ -844,7 +875,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
 
         raw_x, raw_y = x + rxmin, y + rymin
         x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
-        z1 = z + Hz[0, 2]
+        z1 = z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
@@ -887,7 +918,7 @@ def localize_cells_2d(cell_container, fov, hybe_records, channel,
 def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
                             max_to_background=1.25, max_to_average=1.25, absolute_threshold=200.0,
                             min_distance=3, frac=0.8, max_num_alleles=2, max_sigma=2.5, pad=5, spad=5,
-                            peak_bound=2.0, max_uncert=2.0, min_hb_ratio=1.15, min_ah_ratio=0.15):
+                            peak_bound=2.0, max_uncert=2.0, min_hb_ratio=1.15, min_ah_ratio=0.15, resolver=None):
     """
     3D localization for one cell in one hybe: a 2D peak search + coarse
     z-profile seed (same as localize_cell_2d_worker/localize_spots_worker),
@@ -951,7 +982,7 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
 
         raw_x, raw_y, raw_z = x + rxmin, y + rymin, z0 + szmin
         x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
-        z1 = raw_z + Hz[0, 2]
+        z1 = raw_z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
@@ -1012,7 +1043,7 @@ def localize_cells_3d(cell_container, fov, hybe_records, channel,
 
 def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov, modality, cell, fov_matrices,
                             spad=8, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0):
+                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0, resolver=None):
     """
     Crops+fits ONE hybe's fiducial channel around an allele's already-known
     shared-frame (x,y). Always single-component (fit_gaussian_3d) -- no
@@ -1055,7 +1086,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     if cell is not None:
         m = modality if modality is not None else cell.modality
         Hz = cell.matrices.get((hybe, m), {}).get('zx', np.eye(3))
-        sz = zf + Hz[0, 2]
+        sz = zf + cell_z_offset(cell, hybe, m, resolver)
     shared_result = (float(sx), float(sy), float(sz), float(amp))
     return shared_result, cubic, (xf, yf, zf)
 
@@ -1063,7 +1094,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
 def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
                            spad=8, use_mixture=True, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
-                           min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15):
+                           min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15, resolver=None):
     """
     Crops+fits ONE hybe's readout channel around the same allele anchor,
     mixture-capable (find_local_peaks_3d + fit_gaussian_mixture_3d, same
@@ -1131,7 +1162,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
         amp, xf, yf, zf = r[:4]
         raw_rx, raw_ry = xf + xmin, yf + ymin
         sx, sy = spot_mapper.raw_to_reference((raw_rx, raw_ry), hybe, fov_matrices, modality=modality, cell=cell)
-        sz = zf + Hz[0, 2] if cell is not None else zf
+        sz = zf + cell_z_offset(cell, hybe, m, resolver)
         candidates.append((float(sx + dx), float(sy + dy), float(sz + dz), float(amp)))
         crop_local.append((xf, yf, zf))
     return candidates, cubic, crop_local

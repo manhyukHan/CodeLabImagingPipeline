@@ -85,8 +85,6 @@ class CellDisplayer(QtWidgets.QMainWindow):
         # on toggle-open, but callable directly so picking up a panel change
         # (new FOV, different hybe) doesn't require closing and reopening
         # this window.
-        self.UpdatePushButton = QtWidgets.QPushButton('Update')
-        scaleRowLayout.addWidget(self.UpdatePushButton)
         layout.addWidget(scaleRow)
 
         self.ManualAddModeCheckBox = QtWidgets.QCheckBox(
