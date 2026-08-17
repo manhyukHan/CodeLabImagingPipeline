@@ -227,9 +227,12 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
         }
 
         with h5py.File(stack_h5name, 'w') as f:
+            # No /matrix group: alignment matrices are metadata and live in
+            # vlinks.h5 alone (see chain.write_same_modality_matrices). A
+            # stack file holds raw data plus the MIP derived from it in this
+            # same pass -- nothing mutable, so nothing here can go stale.
             stack_group = f.create_group('/stack')
             mip_group = f.create_group('/mip')
-            matrix_group = f.create_group('/matrix')
             f.attrs.update(attributes)
 
             dat = None
@@ -243,7 +246,6 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
                                      f'totalFrames predicts {expected_depth}')
                 create_or_replace_dataset(stack_group, f'ch{ch}', dat, 'uint16')
                 create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
-            create_or_replace_dataset(matrix_group, folder, np.eye(3), 'float32')
             attributes['shape'] = dat.shape
             f.attrs.update(attributes)
         logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')

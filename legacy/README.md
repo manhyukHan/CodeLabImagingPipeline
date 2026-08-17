@@ -42,6 +42,23 @@ itself. Unlike the 2026-08-07 pass, this was checked at module level, which is w
   path in the GUI calls it. Kept because its header documents CellClassifier's three pickle
   formats and which of them round-trip.
 
+Third cleanup pass, 2026-08-17, removing obsolete metadata from the raw stack files. Per the
+standing principle that `vlinks.h5` is the authoritative store for metadata/parameters and
+`{hybe}_stack.h5` holds raw data only, `/matrix` and `/matrix_across` were removed from both
+the code and the data. `/mip` stays: it is derived from the raw stack in the same ingestion
+pass, is never recomputed, and its live reader (`_build_cell_crop`) takes it from the same
+open file handle it must use for `/stack` anyway. The hazard being removed is specifically
+*mutable* metadata duplicated across two stores -- matrices are refit per alignment run and
+keyed by reference hybe, so they rot; a MIP is a pure function of raw data written once.
+
+- `localize_spots_worker.py` -- from `codelab_pipeline/localization/localization.py`. Zero code
+  references (AST check, docstrings stripped -- the check `find_best_alignment` below taught).
+  Moved rather than deleted because localization.py's own docstrings cite it as a porting
+  reference, and it needs to carry a warning: it reads `/matrix/{hybe}` out of the raw stack
+  file, a store that no longer has any writer and was measured to disagree with vlinks on
+  16 of 18 hybes. See that file's header. Live equivalents: `localize_cell_2d_worker`/
+  `localize_cell_3d_worker`.
+
   Correction (2026-08-08): `find_best_alignment`/`msd_cost_function` were *not* dead -- they were
   moved here in the original 2026-08-07 pass on a same-file-reference-only grep that missed
   `compute_msd_homography_matrix` (still live in `preprocess.py`) calling `find_best_alignment`

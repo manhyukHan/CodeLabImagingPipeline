@@ -616,51 +616,6 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     return align_readout_to_reference(dna_mip_aligned, rna_mip_aligned, lb, ub, border_trim=border_trim, max_shift=max_shift)
 
 
-def write_cross_modal_matrix(dna_storage_path, fov, H, rna_reference_hybe, dna_reference_hybe, channel_type):
-    """
-    Persists an already-computed H_across (from link_cross_modal) into a new
-    /matrix_across dataset in the DNA reference hybe's own H5 file --
-    link_cross_modal itself never wrote anywhere (unlike
-    align_same_modality, which always did), so this closes that gap.
-    Written into the DNA side specifically since H_across is, by
-    link_cross_modal's own convention, the matrix that maps DNA's
-    within-experiment frame onto RNA's -- RNA's own frame is the shared
-    global frame and never needs an /matrix_across entry of its own.
-    Mirrors /matrix/{hybe}'s existing provenance-attrs convention
-    (reference_sequence/steps) so both are discoverable the same way.
-    """
-    h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r+') as f:
-        if '/matrix_across' not in f:
-            f.create_dataset('/matrix_across', shape=(3, 3), dtype='float64')
-        f['/matrix_across'][:] = H
-        f['/matrix_across'].attrs['rna_reference_hybe'] = rna_reference_hybe
-        f['/matrix_across'].attrs['dna_reference_hybe'] = dna_reference_hybe
-        f['/matrix_across'].attrs['channel_type'] = channel_type
-
-
-def read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe):
-    """
-    Reads back an already-computed/written H_across from the DNA reference
-    hybe's own H5 (see write_cross_modal_matrix) -- returns None if nothing
-    has been written yet for this FOV (unlike within-experiment matrices,
-    there's no identity default seeded at ingestion time here: a FOV
-    genuinely hasn't been cross-modal-aligned until this has been run at
-    least once, so None is the honest answer, not a fabricated identity).
-    This is the read-back half needed so a cross-modal overlay can be
-    re-shown without requiring the result to still be in the in-memory
-    cross_modal_result dict from the current session.
-    """
-    h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    try:
-        with h5py.File(h5path, 'r') as f:
-            if '/matrix_across' not in f:
-                return None
-            return f['/matrix_across'][:]
-    except OSError:
-        return None
-
-
 MAX_CROSS_MODAL_Z_PLANES = 80.0
 
 

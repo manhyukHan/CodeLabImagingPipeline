@@ -321,7 +321,7 @@ class CrossModalAlignmentWorker(QtCore.QThread):
     failed = QtCore.pyqtSignal(str)
 
     def __init__(self, rna_storage_path, dna_storage_path, fov_list, all_fov_matrices,
-                 rna_reference_hybe, dna_reference_hybe, channel_type, write=True, border_trim=0, max_shift=None,
+                 rna_reference_hybe, dna_reference_hybe, channel_type, border_trim=0, max_shift=None,
                  rna_fiducial_channel=None, dna_fiducial_channel=None):
         super().__init__()
         self.rna_storage_path = rna_storage_path
@@ -331,7 +331,6 @@ class CrossModalAlignmentWorker(QtCore.QThread):
         self.rna_reference_hybe = rna_reference_hybe
         self.dna_reference_hybe = dna_reference_hybe
         self.channel_type = channel_type
-        self.write = write
         self.border_trim = border_trim
         self.max_shift = max_shift
         # Z drift is measured in the SAME run as dx/dy -- it is a component
@@ -352,9 +351,6 @@ class CrossModalAlignmentWorker(QtCore.QThread):
                                                rna_fov_matrices, dna_fov_matrices,
                                                self.rna_reference_hybe, self.dna_reference_hybe, self.channel_type,
                                                border_trim=self.border_trim, max_shift=self.max_shift)
-                if self.write:
-                    alignment.write_cross_modal_matrix(self.dna_storage_path, fov, H,
-                                                        self.rna_reference_hybe, self.dna_reference_hybe, self.channel_type)
                 results[fov] = H
                 dz = 0.0
                 if self.rna_fiducial_channel is not None and self.dna_fiducial_channel is not None:
@@ -5831,7 +5827,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.RunCrossModalPushButton.setEnabled(False)
         self.statusBar().showMessage('Running cross-modal alignment...')
         self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, [fov], self.fov_matrices,
-                                                              rna_reference_hybe, dna_reference_hybe, channel_type, write=False,
+                                                              rna_reference_hybe, dna_reference_hybe, channel_type,
                                                               border_trim=border_trim, max_shift=max_shift,
                                                               rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
         self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
@@ -5909,7 +5905,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.RunAllCrossModalPushButton.setEnabled(False)
         self.statusBar().showMessage('Running cross-modal alignment for all FOVs...')
         self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, fov_list, self.fov_matrices,
-                                                              rna_reference_hybe, dna_reference_hybe, channel_type, write=True,
+                                                              rna_reference_hybe, dna_reference_hybe, channel_type,
                                                               border_trim=border_trim, max_shift=max_shift,
                                                               rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
         self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
@@ -5957,8 +5953,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._pending_cross_modal or ctx is None:
             return
         for fov, H in self._pending_cross_modal.items():
-            alignment.write_cross_modal_matrix(ctx['dna_storage_path'], fov, H, ctx['rna_reference_hybe'],
-                                               ctx['dna_reference_hybe'], ctx['channel_type'])
             save_path = os.path.join(ctx['dna_storage_path'], f'FOV{fov:02d}', 'cross_modal_overlay.png')
             self.preview_canvas.draw_cross_modal_preview(ctx['rna_storage_path'], ctx['dna_storage_path'], fov,
                                                  ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'],
@@ -5992,10 +5986,11 @@ class MainWindow(QtWidgets.QMainWindow):
         already-computed result with a freshly-changed channel_type (or
         just checking a different FOV) doesn't require re-running the
         alignment. Matrix source, in priority order: a staged (not-yet-
-        accepted) result, the in-memory cross_modal_result cache,
-        then a direct disk read (read_cross_modal_matrix) as a last
-        resort -- same "never require re-computation just to look" pattern
-        used by the within-experiment/cell overlay viewers.
+        accepted) result, the in-memory cross_modal_result cache, then
+        vlinks_store.read_cross_modal_matrix as a last resort -- same
+        "never require re-computation just to look" pattern used by the
+        within-experiment/cell overlay viewers. vlinks is the only disk
+        source; nothing here reads a raw stack file.
         """
         ap = self.ui.AlignmentPanel
         rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
