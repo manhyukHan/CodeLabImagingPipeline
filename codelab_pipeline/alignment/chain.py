@@ -23,15 +23,45 @@ MAX_ALIGNMENT_TRANSLATION_PX = 30.0
 MAX_ALIGNMENT_ROTATION_DEG = 10.0
 
 
-def _within_hard_alignment_bounds(H, max_translation=MAX_ALIGNMENT_TRANSLATION_PX,
+def _center_displacement(H, shape):
+    """
+    How far H actually moves the image centre, in px: (dy, dx).
+
+    This, not H's raw translation column, is what "how big is this
+    correction" means. A rotation about the image centre, written as a
+    matrix about the ORIGIN, carries a large translation column that is
+    pure bookkeeping -- an 8 deg rotation of a 1024x1024 frame has
+    t=(70.8, -64.1) while moving the centre not at all. Reading that
+    column as displacement makes rotation magnitude scale with frame size
+    and with distance from the origin, which is meaningless.
+    """
+    cx, cy = shape[1] / 2.0, shape[0] / 2.0
+    nx, ny = (np.asarray(H, dtype=float)[:2] @ np.array([cx, cy, 1.0]))
+    return ny - cy, nx - cx
+
+
+def _within_hard_alignment_bounds(H, shape=None, max_translation=MAX_ALIGNMENT_TRANSLATION_PX,
                                   max_rotation=MAX_ALIGNMENT_ROTATION_DEG):
     """
-    True iff H's own translation (both dx, dy independently) and rotation
-    stay within the hard engine-level bounds above. Shared by every fitted-
+    True iff H's translation (dy, dx independently) and rotation stay
+    within the hard engine-level bounds above. Shared by every fitted-
     matrix gate in this module so they can never independently drift apart
     on what counts as "plausible."
+
+    `shape` (height, width) makes the translation test measure displacement
+    AT THE IMAGE CENTRE via _center_displacement. Without it the test falls
+    back to H's raw translation column, which is correct only for a pure
+    translation: for any real rotation that column is dominated by the
+    rotation's own origin offset, so the gate rejected correct fits purely
+    for containing rotation. Confirmed on synthetic ground truth -- ORB
+    recovered 8 deg exactly, and this gate threw the result away for
+    "70.8 px of translation" that did not move the centre at all. Pass
+    shape wherever it is available.
     """
-    dx, dy = H[0, 2], H[1, 2]
+    if shape is not None:
+        dy, dx = _center_displacement(H, shape)
+    else:
+        dx, dy = H[0, 2], H[1, 2]
     if abs(dx) > max_translation or abs(dy) > max_translation:
         return False
     return abs(_h_rotation_angle_degrees(H)) <= max_rotation
@@ -438,18 +468,23 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     # it); the Powell candidates above are now bounded at the SEARCH level
     # too, so this is a genuine belt-and-suspenders double-check for them,
     # not their only safeguard.
-    in_bounds = [H for H in candidates if _within_hard_alignment_bounds(H)]
+    in_bounds = [H for H in candidates if _within_hard_alignment_bounds(H, moving_norm.shape)]
     if not in_bounds:
         return np.eye(3)
     residuals = [_reconstruction_residual(moving_norm, reference_norm, H) for H in in_bounds]
     H_final = in_bounds[int(np.argmin(residuals))]
 
     if max_shift is not None:
-        dx, dy = H_final[0, 2], H_final[1, 2]
+        # Clip the CENTRE displacement, not the raw translation column, and
+        # adjust the column by the difference so the rotation block survives
+        # untouched. Clipping the column directly would corrupt any rotation
+        # (whose column is mostly origin offset, not displacement) into a
+        # different, arbitrary transform rather than a smaller one.
+        dy, dx = _center_displacement(H_final, moving_norm.shape)
         if abs(dx) > max_shift or abs(dy) > max_shift:
             H_final = H_final.copy()
-            H_final[0, 2] = np.clip(dx, -max_shift, max_shift)
-            H_final[1, 2] = np.clip(dy, -max_shift, max_shift)
+            H_final[0, 2] += float(np.clip(dx, -max_shift, max_shift)) - dx
+            H_final[1, 2] += float(np.clip(dy, -max_shift, max_shift)) - dy
 
     return H_final
 
