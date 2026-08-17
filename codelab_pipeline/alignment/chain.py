@@ -1156,6 +1156,15 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # of already-good FOV/cross-modal alignment, so anything beyond
         # this bound is an optimizer artifact regardless of what pad
         # happens to be configured to.
+        # No `shape` argument here, deliberately: a cell-level residual is
+        # translation-only by construction -- every producer of H2_fitted
+        # above (_multi_peak_translation, find_translation_via_phase_
+        # correlation, and the brute-force dx/dy search) returns a matrix
+        # whose 2x2 block is exactly identity. Centre displacement and the
+        # raw translation column are therefore identically equal, so the
+        # column read is correct and passing shape would be a no-op. Rotation
+        # is not expected at this layer at all; it belongs to the FOV/cross-
+        # modal fits, which is where _center_displacement matters.
         hard_bound_rejected = not _within_hard_alignment_bounds(H2_fitted)
         # Second, independent gate: phase correlation can lock onto a
         # local minimum that's a worse match than doing nothing at all
