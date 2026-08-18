@@ -1338,7 +1338,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in sorted(display_results.keys()):
             matrices = display_results[fov]
             suffix = ' [pending]' if fov in pending_fovs else ''
-            for hybe, H in matrices.items():
+            for key, H in matrices.items():
+                hybe = key[0] if isinstance(key, tuple) else key
                 item = QtWidgets.QListWidgetItem(f'FOV{fov:02d} {_matrix_summary(hybe, H)}{suffix}')
                 item.setData(QtCore.Qt.UserRole, (fov, hybe))
                 ap.SameModalityResultsListWidget.addItem(item)
@@ -6724,9 +6725,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
                                           f'No storage path configured for {cell_modality}.')
             return
-        if (storage_path, fov) not in self.fov_matrices:
-            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment', 'Run (and accept) FOV alignment for this FOV first.')
-            return
+        # No FOV-alignment prerequisite -- per core principle, absence of
+        # alignment at any layer is IDENTITY, never a blocker: every layer
+        # must run standalone. (The old gate also read the pre-unification
+        # (storage_path, fov) key shape, so it blocked unconditionally.)
+        if not self._fov_matrices_for(storage_path, fov):
+            self.statusBar().showMessage(
+                'No FOV alignment for this FOV yet -- proceeding with identity.', 8000)
 
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
@@ -7164,9 +7169,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
                                           'Pick a reference hybe (Cell-Based Alignment) and parse that modality\'s layout first.')
             return
-        if (storage_path, fov) not in self.fov_matrices:
-            QtWidgets.QMessageBox.warning(self, 'Preview This Cell', 'Run (and accept) FOV alignment for this FOV first.')
-            return
+        # No FOV-alignment prerequisite -- per core principle, absence of
+        # alignment at any layer is IDENTITY, never a blocker: every layer
+        # must run standalone. (The old gate also read the pre-unification
+        # (storage_path, fov) key shape, so it blocked unconditionally.)
+        if not self._fov_matrices_for(storage_path, fov):
+            self.statusBar().showMessage(
+                'No FOV alignment for this FOV yet -- proceeding with identity.', 8000)
 
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()

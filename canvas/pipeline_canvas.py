@@ -737,6 +737,7 @@ class PipelineCanvas():
         ref_mip = _read_mip(storage_path, fov, reference_hybe, ref_channel)
         height, width = ref_mip.shape
 
+        matrices = _bare_hybe(matrices)
         before_images = {reference_hybe: ref_mip}
         after_images = {reference_hybe: ref_mip}
         for record in hybe_records:
@@ -1041,6 +1042,7 @@ class PipelineCanvas():
         channel (from ExperimentLayout, never assumed uniform).
         matrices: {hybe: 3x3} -- from alignment.align_same_modality.
         """
+        matrices = _bare_hybe(matrices)
         reference_mip = _read_mip(storage_path, fov, reference_hybe, fiducial_channels[reference_hybe])
         moving_mip = _read_mip(storage_path, fov, target_hybe, fiducial_channels[target_hybe])
         self.draw_alignment_preview(reference_mip, moving_mip, matrices[target_hybe],
@@ -1066,14 +1068,29 @@ class PipelineCanvas():
         dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
 
         h, w = rna_mip.shape
-        H_rna_within = (rna_fov_matrices or {}).get(rna_reference_hybe, np.eye(3))
-        H_dna_within = (dna_fov_matrices or {}).get(dna_reference_hybe, np.eye(3))
+        H_rna_within = _bare_hybe(rna_fov_matrices).get(rna_reference_hybe, np.eye(3))
+        H_dna_within = _bare_hybe(dna_fov_matrices).get(dna_reference_hybe, np.eye(3))
         rna_mip_corrected = cv2.warpAffine(rna_mip.astype(np.float32), H_rna_within[:2], (w, h))
         dna_mip_corrected = cv2.warpAffine(dna_mip.astype(np.float32), H_dna_within[:2], (w, h))
 
         self.draw_alignment_preview(rna_mip_corrected, dna_mip_corrected, H_across,
                                     f'{dna_reference_hybe} (DNA) -> {rna_reference_hybe} (RNA), {channel_type}',
                                     save_path=save_path)
+
+
+def _bare_hybe(matrices):
+    """
+    DISPLAY-BOUNDARY adapter: {(hybe, modality): H} or {hybe: H} -> {hybe: H}.
+
+    The one sanctioned flattening of the (hybe, modality) key. A draw call
+    renders ONE modality-narrowed matrix set, so its hybes are unambiguous
+    here -- and matplotlib titles/labels want the bare name. Everywhere
+    else in the pipeline the pair is the key; flattening outside a display
+    boundary is the bug class FrameMatrices exists to reject.
+    """
+    if not matrices:
+        return {}
+    return {(k[0] if isinstance(k, tuple) else k): v for k, v in matrices.items()}
 
 
 def _read_mip(storage_path, fov, hybe, channel):
