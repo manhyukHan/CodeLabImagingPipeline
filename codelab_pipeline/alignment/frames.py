@@ -122,6 +122,21 @@ class FrameMatrices(dict):
         self._check(key)
         return super().__contains__(key)
 
+    def for_modality(self, modality):
+        """
+        Just this modality's entries, as a FrameMatrices that knows its own
+        modality.
+
+        The store itself is keyed by FOV and spans every modality -- one
+        source of truth, with storage_path no longer smuggling modality in
+        an outer key. Callers that genuinely work in one frame ask for that
+        view HERE, at the boundary where they already know which modality
+        they mean, instead of every function downstream growing a modality
+        argument it only forwards.
+        """
+        return FrameMatrices({k: v for k, v in self.items() if k[1] == modality},
+                             modality=modality)
+
     def hybes_for(self, modality):
         """Every hybe present for one modality, as a plain sorted list."""
         return sorted(h for (h, m) in self.keys() if m == modality)

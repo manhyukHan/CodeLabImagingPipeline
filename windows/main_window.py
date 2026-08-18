@@ -341,8 +341,8 @@ class CrossModalAlignmentWorker(QtCore.QThread):
             results = {}
             z_results = {}
             for i, fov in enumerate(self.fov_list):
-                rna_fov_matrices = self.all_fov_matrices.get((self.rna_storage_path, fov), alignment.FrameMatrices())
-                dna_fov_matrices = self.all_fov_matrices.get((self.dna_storage_path, fov), alignment.FrameMatrices())
+                rna_fov_matrices = self.all_fov_matrices.get(fov, alignment.FrameMatrices()).for_modality(vlinks_store.modality_of(self.rna_storage_path))
+                dna_fov_matrices = self.all_fov_matrices.get(fov, alignment.FrameMatrices()).for_modality(vlinks_store.modality_of(self.dna_storage_path))
                 H = alignment.link_cross_modal(self.rna_storage_path, self.dna_storage_path, fov,
                                                rna_fov_matrices, dna_fov_matrices,
                                                self.rna_reference_hybe, self.dna_reference_hybe, self.channel_type,
@@ -450,7 +450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
 
         self.hybe_records = []
-        self.fov_matrices = {}
+        self.fov_matrices = {}   # {fov: FrameMatrices{(hybe, modality): H}}
         # (storage_path, fov) -> {(hybe, channel): [ASpot, ...]} -- Whole
         # FOV spot auto-detect peaks that don't land inside any cell's
         # mask. Not stored on any ACell (there's nothing to own them),
@@ -907,11 +907,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     fovs_to_populate = set(self._parse_fov_list(ip.FovListLineEdit.text()))
                     fovs_to_populate.add(self.ui.CellSegmentPanel.FovSpinBox.value())
                     for fov_to_populate in fovs_to_populate:
-                        key = (paired_path, fov_to_populate)
-                        if key not in self.fov_matrices:
+                        if not self._fov_matrices_for(paired_path, fov_to_populate):
                             try:
-                                self.fov_matrices[key] = alignment.read_same_modality_matrices(
-                                    paired_path, fov_to_populate, other_hybe_records_for_matrices)
+                                self._merge_fov_matrices(
+                                    fov_to_populate,
+                                    alignment.read_same_modality_matrices(
+                                        paired_path, fov_to_populate,
+                                        other_hybe_records_for_matrices))
                             except Exception:
                                 pass
 
@@ -1291,11 +1293,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if matrices:
                 disk_results[fov] = matrices
         if disk_results:
-            self.fov_matrices.update({(storage_path, fov): m for fov, m in disk_results.items()})
+            for _fov, _m in disk_results.items():
+                self._merge_fov_matrices(_fov, _m)
 
         display_results = dict(disk_results)
-        for (sp, fov), matrices in self.fov_matrices.items():
-            if sp == storage_path and matrices:
+        # Keyed by FOV now, spanning both modalities -- narrow to the one
+        # this list is showing rather than filtering on an outer path key.
+        for fov in self.fov_matrices:
+            matrices = self._fov_matrices_for(storage_path, fov)
+            if matrices:
                 display_results[fov] = matrices
         pending_fovs = set()
         if self._pending_same_modality_alignment:
@@ -2783,10 +2789,11 @@ class MainWindow(QtWidgets.QMainWindow):
             hybe_records = self._hybe_records_for_storage_path(storage_path)
             if not hybe_records:
                 continue
-            key = (storage_path, fov)
-            if key not in self.fov_matrices:
+            key = (storage_path, fov)     # still the unassigned-pool key
+            if not self._fov_matrices_for(storage_path, fov):
                 try:
-                    self.fov_matrices[key] = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
+                    self._merge_fov_matrices(
+                        fov, alignment.read_same_modality_matrices(storage_path, fov, hybe_records))
                 except Exception:
                     pass
             if key not in self.fov_unassigned_spots:
@@ -5213,7 +5220,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # (never for stored/analyzed data) -- same established
             # exception used by every alignment preview in canvas/
             # pipeline_canvas.py
-            fmats = self.fov_matrices.get((storage_path, fov), alignment.FrameMatrices())
+            fmats = self._fov_matrices_for(storage_path, fov)
             if hybe in fmats:
                 height, width = img.shape
                 img = cv2.warpAffine(img.astype(np.float32), fmats[hybe][:2], (width, height))
@@ -5636,7 +5643,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_fov_alignment_all_finished(self, results, storage_path, hybe_records, reference_hybe):
         ap = self.ui.AlignmentPanel
         self._same_modality_context = {'storage_path': storage_path, 'hybe_records': hybe_records, 'reference_hybe': reference_hybe}
-        self.fov_matrices.update({(storage_path, fov): m for fov, m in results.items()})
+        for _fov, _m in results.items():
+            self._merge_fov_matrices(_fov, _m)
         self._pending_same_modality_alignment = None
         self._refresh_same_modality_results_list()
         ap.RunAllFovAlignmentPushButton.setEnabled(True)
@@ -5671,7 +5679,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.preview_canvas.draw_fov_all_readouts_overlay(ctx['storage_path'], fov, ctx['hybe_records'],
                                                       ctx['reference_hybe'], matrices, save_path=save_path,
                                                       channel_type=channel_type)
-        self.fov_matrices.update({(ctx['storage_path'], fov): m for fov, m in self._pending_same_modality_alignment.items()})
+        for _fov, _m in self._pending_same_modality_alignment.items():
+            self._merge_fov_matrices(_fov, _m)
         self._pending_same_modality_alignment = None
         self._refresh_same_modality_results_list()
         ap.SameModalityAcceptPushButton.setEnabled(False)
@@ -5698,7 +5707,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # a staged (not-yet-accepted) manual result takes priority so the
         # preview shows what the user is actually about to accept/reject,
         # not a stale prior result
-        matrices = (self._pending_same_modality_alignment or {}).get(fov) or self.fov_matrices.get((ctx['storage_path'], fov))
+        matrices = ((self._pending_same_modality_alignment or {}).get(fov)
+                    or self._fov_matrices_for(ctx['storage_path'], fov))
         if matrices is None:
             return
         self.alignment_preview_window.show()
@@ -5732,7 +5742,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if ctx is not None and ctx.get('storage_path') == storage_path:
             matrices = (self._pending_same_modality_alignment or {}).get(fov)
         if matrices is None:
-            matrices = self.fov_matrices.get((storage_path, fov))
+            matrices = self._fov_matrices_for(storage_path, fov)
         if matrices is None:
             matrices = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
 
@@ -5897,8 +5907,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, last_fov,
                                              rna_reference_hybe, dna_reference_hybe, channel_type, results[last_fov],
-                                             rna_fov_matrices=self.fov_matrices.get((rna_storage_path, last_fov), alignment.FrameMatrices()),
-                                             dna_fov_matrices=self.fov_matrices.get((dna_storage_path, last_fov), alignment.FrameMatrices()))
+                                             rna_fov_matrices=self._fov_matrices_for(rna_storage_path, last_fov),
+                                             dna_fov_matrices=self._fov_matrices_for(dna_storage_path, last_fov))
 
         ap.CrossModalAcceptPushButton.setEnabled(True)
         ap.CrossModalRejectPushButton.setEnabled(True)
@@ -5971,8 +5981,8 @@ class MainWindow(QtWidgets.QMainWindow):
             save_path = os.path.join(dna_storage_path, f'FOV{fov:02d}', 'cross_modal_overlay.png')
             self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, fov,
                                                  rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
-                                                 rna_fov_matrices=self.fov_matrices.get((rna_storage_path, fov), alignment.FrameMatrices()),
-                                                 dna_fov_matrices=self.fov_matrices.get((dna_storage_path, fov), alignment.FrameMatrices()))
+                                                 rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
+                                                 dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
             self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
             self._mirror_cross_modal_params_to_vlinks(rna_storage_path, dna_storage_path, fov, H,
                                                       rna_reference_hybe, dna_reference_hybe, channel_type)
@@ -5994,8 +6004,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.preview_canvas.draw_cross_modal_preview(ctx['rna_storage_path'], ctx['dna_storage_path'], fov,
                                                  ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'],
                                                  H, save_path=save_path,
-                                                 rna_fov_matrices=self.fov_matrices.get((ctx['rna_storage_path'], fov), alignment.FrameMatrices()),
-                                                 dna_fov_matrices=self.fov_matrices.get((ctx['dna_storage_path'], fov), alignment.FrameMatrices()))
+                                                 rna_fov_matrices=self._fov_matrices_for(ctx['rna_storage_path'], fov),
+                                                 dna_fov_matrices=self._fov_matrices_for(ctx['dna_storage_path'], fov))
             self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
             self._mirror_cross_modal_params_to_vlinks(ctx['rna_storage_path'], ctx['dna_storage_path'], fov, H,
                                                       ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'])
@@ -6064,8 +6074,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, fov,
                                              rna_reference_hybe, dna_reference_hybe, channel_type, H,
-                                             rna_fov_matrices=self.fov_matrices.get((rna_storage_path, fov), alignment.FrameMatrices()),
-                                             dna_fov_matrices=self.fov_matrices.get((dna_storage_path, fov), alignment.FrameMatrices()))
+                                             rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
+                                             dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
 
     # -- cell-based alignment --
 
@@ -6134,7 +6144,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for modality in self.modality_names:
             sp = self._storage_path_for_modality(modality)
             if sp:
-                within[modality] = dict(self.fov_matrices.get((sp, fov), alignment.FrameMatrices()))
+                within[modality] = dict(self._fov_matrices_for(sp, fov))
 
         bridge_xy = None
         bridge_z = 0.0
@@ -6181,6 +6191,39 @@ class MainWindow(QtWidgets.QMainWindow):
         longer disagree about direction -- they read the same rule.
         """
         return self._frame_resolver(None, fov).bridge_z_between(from_modality, to_modality)
+    def _fov_matrices_for(self, storage_path, fov):
+        """
+        One modality's FOV matrices, named by the storage_path that selects
+        it. Empty (not None) when nothing is cached for that FOV.
+
+        self.fov_matrices is keyed by FOV alone and holds every modality's
+        entries under (hybe, modality) keys. storage_path is no longer part
+        of the key -- it used to smuggle modality into an outer tuple, which
+        is what forced the inner dict to use a bare hybe and made the bridge
+        hybe ambiguous. It now does one job: naming which modality this
+        caller means, at the boundary where it already knows.
+        """
+        if not storage_path:
+            return alignment.FrameMatrices()
+        return self.fov_matrices.get(fov, alignment.FrameMatrices()).for_modality(
+            vlinks_store.modality_of(storage_path))
+
+    def _merge_fov_matrices(self, fov, matrices):
+        """
+        Fold one modality's matrices into the FOV's shared store.
+
+        Merge, never replace: the store spans both modalities now, so
+        assigning a single modality's dict over it would silently drop the
+        other one -- the same shape of bug as the spot-slice overwrite.
+        """
+        current = self.fov_matrices.get(fov)
+        if current is None:
+            current = alignment.FrameMatrices()
+            self.fov_matrices[fov] = current
+        current.update(matrices)
+        current.modality = None      # spans modalities; callers must narrow
+        return current
+
     def _fov_matrices_in_frame(self, source_modality, frame_modality, fov):
         """
         {hybe: 3x3} for every one of source_modality's OWN hybes, each
@@ -6205,7 +6248,7 @@ class MainWindow(QtWidgets.QMainWindow):
         source_storage_path = self._storage_path_for_modality(source_modality)
         if not source_storage_path:
             return None
-        within = self.fov_matrices.get((source_storage_path, fov), alignment.FrameMatrices())
+        within = self._fov_matrices_for(source_storage_path, fov)
         if not within:
             return None
         bridge = self._cross_modal_bridge(source_modality, frame_modality, fov)
@@ -6232,7 +6275,7 @@ class MainWindow(QtWidgets.QMainWindow):
         modality = self._modality_for_storage_path(storage_path)
         frame_modality = self._shared_frame_modality() or modality
         composed = self._fov_matrices_in_frame(modality, frame_modality, fov) if modality else None
-        return composed if composed is not None else self.fov_matrices.get((storage_path, fov), alignment.FrameMatrices())
+        return composed if composed is not None else self._fov_matrices_for(storage_path, fov)
 
     def _other_modality_cell_alignment_inputs(self, storage_path, fov):
         """
