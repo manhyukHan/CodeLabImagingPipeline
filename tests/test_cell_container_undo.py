@@ -43,8 +43,14 @@ def test_fingerprint_is_bytes_and_stable():
     fp1, fp2 = c.fingerprint(FOV), c.fingerprint(FOV)
     assert all(isinstance(v, bytes) for v in fp1.values())
     assert fp1 == fp2, 'identical state must fingerprint identically'
+    # the hazard bytes exist to avoid: dict equality over ndarray values
+    # either lies (returns False for identical cells) or raises outright.
     d = c.save()[FOV][0]
-    assert not (d == c.save()[FOV][0]) or True  # documented numpy hazard; bytes avoid it
+    try:
+        equal = (d == c.save()[FOV][0])
+        assert equal is False or equal is True  # older numpy: wrong answer
+    except ValueError:
+        pass                                    # newer numpy: raises
 
 def test_restore_refingerprints_identically():
     """apply_inverse must CONVERGE: restore -> fingerprint == original,
@@ -68,6 +74,34 @@ def test_diffundo_two_streaks_on_cells():
     assert not u.can_undo()
     u.redo(); assert c.by_id(FOV, 1) is None, 'redo re-removes'
 
+
+def test_area_arrays_are_write_locked():
+    c = mk(1)
+    try:
+        c.area[0][0] = 999
+        assert False, 'in-place coordinate write must raise'
+    except ValueError:
+        pass
+
+def test_sync_from_is_isolated_and_minimal():
+    a, b = filled(), CellContainer([FOV])
+    n = b.sync_from(a, FOV)
+    assert n == 3 and sorted(b.data[FOV]) == [1, 2, 3]
+    # unchanged cells are NOT re-materialized on a second sync
+    obj_before = b.data[FOV][2]
+    assert b.sync_from(a, FOV) == 0 and b.data[FOV][2] is obj_before
+    # scalar mutation on one tier never leaks to the other
+    b.data[FOV][2].celltype = 'X'
+    assert a.data[FOV][2].celltype == ''
+    # matrix-entry replacement on one tier never leaks either
+    b.data[FOV][3].matrices[('H', 'RNA')] = {'yx': np.eye(3), 'dz': 1.0}
+    assert ('H', 'RNA') not in a.data[FOV][3].matrices
+    # removal propagates on the next sync
+    a.remove(FOV, [1])
+    b.sync_from(a, FOV)
+    assert sorted(b.data[FOV]) == [2, 3]
+
+
 def _run_all():
     fails = 0
     for name, fn in sorted(t for t in globals().items() if t[0].startswith('test_')):
@@ -75,7 +109,8 @@ def _run_all():
             fn(); print(f'  PASS  {name}')
         except Exception as e:
             fails += 1; print(f'  FAIL  {name}: {e!r}')
-    print(f'\n{5 - fails}/5 passed')
+    n = sum(1 for k in globals() if k.startswith('test_'))
+    print(f'\n{n - fails}/{n} passed')
     return 1 if fails else 0
 
 if __name__ == '__main__':

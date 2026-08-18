@@ -8,6 +8,29 @@ from ..alignment import chain as alignment
 from ..io import vlinks_store
 
 
+def _frozen_xy(xy):
+    """
+    (x, y) coordinate arrays, WRITE-LOCKED. Per explicit decision: mask
+    coordinates are never partially edited after definition (cytoplasm
+    incorporation REPLACES area, demoting the old one to the nucleus
+    fields -- it does not edit in place), so the arrays are stored
+    non-editable. That is what lets tier transfer share them by reference
+    instead of deep-copying kilobytes per cell: an in-place write anywhere
+    now raises instead of silently corrupting the other tier.
+    """
+    x, y = xy
+    x = np.asarray(x)
+    y = np.asarray(y)
+    try:
+        x.flags.writeable = False
+        y.flags.writeable = False
+    except ValueError:
+        # a view of a still-writeable base cannot be locked; copy then lock
+        x = x.copy(); y = y.copy()
+        x.flags.writeable = False; y.flags.writeable = False
+    return (x, y)
+
+
 class ACell():
     """
     a cell class
@@ -112,11 +135,11 @@ class ACell():
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'reference_hybe' in kwargs: self.reference_hybe = str(kwargs['reference_hybe'])
         if 'reference_modality' in kwargs: self.reference_modality = str(kwargs['reference_modality'])
-        if 'nucleus' in kwargs: self.nucleus = tuple(kwargs['nucleus'])
+        if 'nucleus' in kwargs: self.nucleus = _frozen_xy(kwargs['nucleus'])
         if 'nucleus_hybe' in kwargs: self.nucleus_hybe = str(kwargs['nucleus_hybe'])
         if 'nucleus_modality' in kwargs: self.nucleus_modality = str(kwargs['nucleus_modality'])
         if 'celltype' in kwargs: self.celltype = str(kwargs['celltype'])
-        if 'area' in kwargs: self.area = tuple(kwargs['area'])
+        if 'area' in kwargs: self.area = _frozen_xy(kwargs['area'])
         if 'frame_shape' in kwargs: self.frame_shape = tuple(kwargs['frame_shape'])
         if 'matrices' in kwargs: self.matrices = dict(kwargs['matrices'])
         if 'matrix_anchors' in kwargs: self.matrix_anchors = dict(kwargs['matrix_anchors'])
@@ -156,9 +179,36 @@ class ACell():
             return True
         return len(self.area[0]) != len(self.nucleus[0])
 
+    def light_copy(self):
+        """
+        Tier-transfer copy: fresh object, scalars copied, coordinate arrays
+        SHARED (write-locked, see _frozen_xy), matrix dicts shallow-copied
+        (entries are replaced wholesale by the alignment code, never
+        mutated in place). Replaces deepcopy in container syncing -- the
+        arrays are the bulk of a cell, and they are immutable by
+        construction now.
+        """
+        c = ACell()
+        c.id, c.fov = self.id, self.fov
+        c.reference_hybe, c.reference_modality = self.reference_hybe, self.reference_modality
+        c.nucleus_hybe, c.nucleus_modality = self.nucleus_hybe, self.nucleus_modality
+        c.celltype, c.linked, c.linked_at = self.celltype, self.linked, self.linked_at
+        c.area, c.nucleus = self.area, self.nucleus          # shared, frozen
+        c.frame_shape = self.frame_shape
+        c.matrices = {k: dict(v) for k, v in self.matrices.items()}
+        c.matrix_anchors = dict(self.matrix_anchors)
+        c.matrix_provenance = dict(self.matrix_provenance)
+        c.distmap = self.distmap
+        return c
+
     def calculate_distmap(self, spots):
-        """spots: this cell's spots, queried from the FOV's spot container
-        by the caller (SpotContainer.of_cell) -- the cell holds no copy."""
+        """
+        THE analysis-time computation, per explicit decision: distmap is
+        derived data, computed fresh from the current spots
+        (SpotContainer.of_cell) wherever analysis or inspection needs it --
+        never maintained incrementally, never trusted from an earlier
+        save. The persisted field is a legacy slot that stays empty.
+        """
         if spots:
             pos = np.array([spot.coordinate for spot in spots])
             self.distmap = ssd.squareform(ssd.pdist(pos))
@@ -312,11 +362,18 @@ class ACell():
                 'fov': int(self.fov),
                 'reference_hybe': str(self.reference_hybe),
                 'reference_modality': str(self.reference_modality),
-                'nucleus': tuple(self.nucleus),
+                # fresh copies, never the live (possibly shared) arrays:
+                # nucleus and area can reference the SAME objects (backfill
+                # sets nucleus = area), and pickle memoizes shared objects
+                # into back-references -- so byte-identical VALUES would
+                # fingerprint differently depending on sharing history.
+                # Decoupling here makes save() bytes a pure function of
+                # values, which the diff-undo convergence depends on.
+                'nucleus': (np.array(self.nucleus[0]), np.array(self.nucleus[1])),
                 'nucleus_hybe': str(self.nucleus_hybe),
                 'nucleus_modality': str(self.nucleus_modality),
                 'celltype': str(self.celltype),
-                'area': tuple(self.area),
+                'area': (np.array(self.area[0]), np.array(self.area[1])),
                 'frame_shape': tuple(self.frame_shape),
                 'matrices': {key: {'yx': np.array(m['yx']), 'dz': alignment.entry_dz(m),
                                    'yx_is_residual': bool(m.get('yx_is_residual', False))}

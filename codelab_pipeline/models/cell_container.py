@@ -37,7 +37,7 @@ class CellContainer():
         if len(fov_list) == 0:
             raise ValueError('Make container with positive-length fovs')
         self.fov_list = fov_list
-        self.data = {f: [] for f in fov_list}
+        self.data = {f: {} for f in fov_list}   # {fov: {cell.id: ACell}}
 
     def load_new_cells(self, fov, mask, reference_hybe, min_size=0, max_size=np.inf, preserve_existing=False,
                        reference_modality=None):
@@ -151,6 +151,29 @@ class CellContainer():
         run mints it again -- undo (the diff streak) is the only way back."""
         fov_cells = self.data.get(fov, {})
         return [fov_cells.pop(int(i)) for i in cell_ids if int(i) in fov_cells]
+
+    def sync_from(self, other, fov):
+        """
+        Diff-driven tier transfer, replacing whole-dict deepcopy: compare
+        canonical fingerprints, then materialize light_copies for ONLY the
+        added/changed cells and drop the removed ones -- unchanged cells
+        keep this tier's existing object untouched. Safe without deep
+        copies because of two enforced facts: coordinate arrays are
+        write-locked (shared references cannot be corrupted) and cell ids
+        are unique until the next segmentation run.
+        """
+        mine = self.fingerprint(fov)
+        theirs = other.fingerprint(fov)
+        fov_cells = self.data.setdefault(fov, {})
+        n_changed = 0
+        for cid in list(fov_cells):
+            if cid not in theirs:
+                del fov_cells[cid]
+        for cid, blob in theirs.items():
+            if mine.get(cid) != blob:
+                fov_cells[cid] = other.data[fov][cid].light_copy()
+                n_changed += 1
+        return n_changed
 
     # -- diff/undo plumbing (duck-typed for spot_container.DiffUndo) ------
     def fingerprint(self, fov):

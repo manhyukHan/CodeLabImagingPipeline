@@ -1688,6 +1688,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
         cell_dicts = cell_dicts or []
+        # distmap at ANALYSIS TIME: derived fresh from the store's current
+        # spots for display, never read from a persisted copy (the saved
+        # slot is a legacy field that stays empty by design).
+        import scipy.spatial.distance as _ssd
+        spots_by_cell = {}
+        for sd in vlinks_store.read_spots(storage_path, fov):
+            if int(sd.get('cell', -1)) != -1:
+                spots_by_cell.setdefault(int(sd['cell']), []).append(sd['coordinate'])
+        for d in cell_dicts:
+            pos = spots_by_cell.get(int(d.get('id', -1)))
+            if pos and len(pos) > 1:
+                d['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
         n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
                       for f in fov_list)
         # Spots are no longer nested in the cell dict; count them per cell
@@ -2751,7 +2763,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         if self.cell_container_permanent is None:
             self.cell_container_permanent = CellContainer([fov])
-        self.cell_container_permanent.data[fov] = deepcopy(self.cell_container.data[fov])
+        self.cell_container_permanent.sync_from(self.cell_container, fov)
         storage_paths = self._all_vlinks_storage_paths()
         if storage_paths:
             # Cells changed -> spot ownership may have changed everywhere in
@@ -2793,7 +2805,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if self.cell_container is None:
             self.cell_container = CellContainer([fov])
-        self.cell_container.data[fov] = deepcopy(self.cell_container_permanent.data[fov])
+        self.cell_container.sync_from(self.cell_container_permanent, fov)
         cp.LogTextEdit.append(f'Pulled {len(self.cell_container.get_cells(fov))} cell(s) from permanent for FOV{fov:02d}.')
 
     def _activate_fov(self, fov):
@@ -2958,7 +2970,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.cell_container is None:
             self.cell_container = CellContainer([fov])
-        self.cell_container.data[fov] = {int(c.id): c for c in deepcopy(cells)}
+        self.cell_container.sync_from(self.cell_container_permanent, fov)
         # the CELLS' own segmentation modality, not the app's current one
         # (see cell_container.load_new_cells on why these can differ)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
