@@ -1,9 +1,60 @@
+import glob
 import os
 import pickle
 from datetime import datetime
 
 import h5py
 import numpy as np
+
+
+_MODALITY_CACHE = {}
+
+
+def _vlinks_path(storage_path):
+    """
+    The ONE vlinks.h5 for the project a per-modality stack directory belongs
+    to. `storage_path` still names that modality's own raw-stack directory
+    (that is genuinely per-modality -- the DAX lands there); vlinks lives one
+    level up and is shared by every modality in the project.
+
+    Unifying the file is what lets modality stop being a system-wide mode:
+    everything inside is keyed by (modality, hybe), so a caller asks for the
+    pair it wants rather than first switching the whole program into a
+    modality. See _modality_of for where that key comes from.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(storage_path).rstrip(os.sep)),
+                        'vlinks.h5')
+
+
+def _modality_of(storage_path):
+    """
+    Which modality owns this stack directory, read from the `modality` attr
+    ingestion writes onto every {hybe}_stack.h5.
+
+    Deliberately NOT taken from app config or a directory-name convention:
+    ingestion is the one place modality is genuinely authoritative (it is
+    the only step that knows which ExperimentLayout a DAX came from), so
+    every later reader derives it from that record instead of carrying its
+    own notion. Cached per directory -- this reads attrs only, never pixels.
+    """
+    key = os.path.abspath(storage_path)
+    if key in _MODALITY_CACHE:
+        return _MODALITY_CACHE[key]
+    for fov_dir in sorted(glob.glob(os.path.join(key, 'FOV*'))):
+        for stack in sorted(glob.glob(os.path.join(fov_dir, '*_stack.h5'))):
+            try:
+                with h5py.File(stack, 'r') as f:
+                    m = f.attrs.get('modality')
+            except OSError:
+                continue
+            if m is not None:
+                m = m.decode() if isinstance(m, bytes) else str(m)
+                _MODALITY_CACHE[key] = m
+                return m
+    raise ValueError(
+        f'cannot determine modality for {storage_path}: no ingested '
+        f'{{hybe}}_stack.h5 there carries a `modality` attr. Ingest at least '
+        f'one hybe for this modality first.')
 
 
 def _cells_group_path(fov):
@@ -39,7 +90,7 @@ def write_cells(storage_path, fov, cell_container):
     cells = cell_container.data.get(fov, [])
     payload = {'modality': cell_container.modality, 'cells': [cell.save() for cell in cells]}
     blob = np.void(pickle.dumps(payload))
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_cells_group_path(fov))
         if 'blob' in grp:
@@ -76,7 +127,7 @@ def write_single_cell(storage_path, fov, cell):
         existing.append(cell_dict)
     payload = {'modality': modality or cell.modality, 'cells': existing}
     blob = np.void(pickle.dumps(payload))
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_cells_group_path(fov))
         if 'blob' in grp:
@@ -94,7 +145,7 @@ def read_cells(storage_path, fov):
     (None, '') if nothing has been persisted for this FOV yet (a
     freshly-ingested experiment, or a FOV never segmented).
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None, ''
     grp_path = _cells_group_path(fov)
@@ -110,7 +161,7 @@ def summarize_fov(storage_path, fov):
     """{'n_cells':, 'n_spots':, 'saved_at':} straight from the group attrs
     (no need to unpickle the whole blob just to count) -- (None if nothing
     persisted for this FOV yet."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _cells_group_path(fov)
@@ -169,7 +220,7 @@ def write_fov_spots(storage_path, fov, spots):
     """
     payload = [spot.save() for spot in spots]
     blob = np.void(pickle.dumps(payload))
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_unassigned_spots_group_path(fov))
         if 'blob' in grp:
@@ -182,7 +233,7 @@ def write_fov_spots(storage_path, fov, spots):
 def read_fov_spots(storage_path, fov):
     """Returns a list of ASpot.save()-shaped dicts (feed to ASpot().set_metadata(**d)),
     or [] if nothing's been persisted for this FOV yet."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return []
     grp_path = _unassigned_spots_group_path(fov)
@@ -216,7 +267,7 @@ def write_fov_alleles(storage_path, fov, alleles):
     """
     payload = [allele.save() for allele in alleles]
     blob = np.void(pickle.dumps(payload))
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_alleles_group_path(fov))
         if 'blob' in grp:
@@ -230,7 +281,7 @@ def read_fov_alleles(storage_path, fov):
     """Returns a list of AnAllele.save()-shaped dicts (feed to
     AnAllele().set_metadata(**d)), or [] if nothing's been persisted for
     this FOV yet."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return []
     grp_path = _alleles_group_path(fov)
@@ -279,7 +330,7 @@ def write_global_params(storage_path, **params):
     others'. Segmentation is deliberately NOT written here -- see
     write_fov_params, it can legitimately differ per FOV.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_params_group_path())
         for k, v in params.items():
@@ -294,7 +345,7 @@ def read_global_params(storage_path):
     half of "parse every current metadata from the storage path" (used
     to refresh session state on activation, before any config-file
     default is allowed to apply)."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
     grp_path = _params_group_path()
@@ -339,7 +390,7 @@ def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_
         'barcode_method': barcode_method,
     }
     blob = np.void(pickle.dumps(payload))
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_params_group_path())
         if 'celltype_config_blob' in grp:
@@ -355,7 +406,7 @@ def read_celltype_config(storage_path):
     nothing's been persisted for this storage path yet.
     """
     empty_calibration = {'scale': {}, 'lower_bound': {}, 'upper_bound': {}}
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}, {}, empty_calibration, None
     grp_path = _params_group_path()
@@ -392,7 +443,7 @@ def write_fov_params(storage_path, fov, **params):
     cell/spot blob -- one dedicated metadata area, cheap to read
     regardless of whether any cells have ever been saved for this FOV.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_fov_params_group_path(fov))
         for k, v in params.items():
@@ -404,7 +455,7 @@ def write_fov_params(storage_path, fov, **params):
 def read_fov_params(storage_path, fov):
     """{key: value} of whatever's been written via write_fov_params for
     this FOV, or {} if nothing yet / no vlinks.h5."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
     grp_path = _fov_params_group_path(fov)
@@ -414,12 +465,12 @@ def read_fov_params(storage_path, fov):
         return dict(f[grp_path].attrs)
 
 
-def _mip_group_path(fov, hybe):
-    return f'/FOV{fov:02d}/mip/{hybe}'
+def _mip_group_path(fov, modality, hybe):
+    return f'/FOV{fov:02d}/mip/{modality}/{hybe}'
 
 
-def _fov_matrix_group_path(fov):
-    return f'/FOV{fov:02d}/matrix'
+def _fov_matrix_group_path(fov, modality):
+    return f'/FOV{fov:02d}/matrix/{modality}'
 
 
 def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None):
@@ -460,9 +511,9 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     stack file's own .attrs, now mirrored here so display code never needs
     that raw file just to answer this.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_mip_group_path(fov, hybe))
+        grp = f.require_group(_mip_group_path(fov, _modality_of(storage_path), hybe))
         for ch, mip in channel_mips.items():
             name = f'ch{ch}'
             if name in grp:
@@ -470,7 +521,7 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
             grp.create_dataset(name, data=np.asarray(mip))
         if fiducial_channel is not None:
             grp.attrs['fiducial_channel'] = int(fiducial_channel)
-        mgrp = f.require_group(_fov_matrix_group_path(fov))
+        mgrp = f.require_group(_fov_matrix_group_path(fov, _modality_of(storage_path)))
         if hybe not in mgrp:
             mgrp.create_dataset(hybe, data=np.eye(3, dtype='float32'))
 
@@ -478,10 +529,10 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
 def read_hybe_mip(storage_path, fov, hybe, channel):
     """The vlinks.h5-stored MIP for one hybe/channel (see write_hybe_mip),
     or None if this hybe hasn't been ingested yet / no vlinks.h5 yet."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, hybe)
+    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         name = f'ch{channel}'
         if grp_path not in f or name not in f[grp_path]:
@@ -498,10 +549,10 @@ def fiducial_channel_mip(storage_path, fov, hybe):
     attr -- only present for hybes ingested after write_hybe_mip started
     stashing it) isn't in vlinks.h5 yet.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, hybe)
+    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -518,10 +569,10 @@ def readout_channel_mip(storage_path, fov, hybe):
     if this hybe/its fiducial_channel attr isn't in vlinks.h5 yet, or if it
     genuinely has no non-fiducial channel.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, hybe)
+    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -542,10 +593,10 @@ def mip_channels_present(storage_path, fov, hybe):
     distinction windows/main_window.py's ingestion-status check already
     surfaces to the user (MISSING vs INCOMPLETE/UNREADABLE).
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, hybe)
+    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f:
             return None
@@ -564,12 +615,13 @@ def ingested_hybes_for_fov(storage_path, fov, hybe_list):
     request, rather than active_hybe_list being gated to rare moments
     because recomputing it used to be expensive.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return []
     with h5py.File(vlinks_path, 'r') as f:
+        modality = _modality_of(storage_path)
         return [hybe for hybe in hybe_list
-                if _mip_group_path(fov, hybe) in f and len(f[_mip_group_path(fov, hybe)]) > 0]
+                if _mip_group_path(fov, modality, hybe) in f and len(f[_mip_group_path(fov, modality, hybe)]) > 0]
 
 
 def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
@@ -586,9 +638,9 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     alone (matches how write_cross_modal_matrix below already mirrors the
     cross-modal case into vlinks.h5, for the same reason).
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_fov_matrix_group_path(fov))
+        grp = f.require_group(_fov_matrix_group_path(fov, _modality_of(storage_path)))
         for hybe, H in matrices.items():
             if hybe in grp:
                 del grp[hybe]
@@ -612,14 +664,15 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     contract the old per-file-based version had (see that function's own
     docstring in chain.py for why this distinction matters downstream).
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
     matrices = {}
     with h5py.File(vlinks_path, 'r') as f:
-        matrix_grp_path = _fov_matrix_group_path(fov)
+        modality = _modality_of(storage_path)
+        matrix_grp_path = _fov_matrix_group_path(fov, modality)
         for hybe in hybe_list:
-            if _mip_group_path(fov, hybe) not in f:
+            if _mip_group_path(fov, modality, hybe) not in f:
                 continue  # not ingested yet
             if matrix_grp_path in f and hybe in f[matrix_grp_path]:
                 matrices[hybe] = f[matrix_grp_path][hybe][:]
@@ -641,7 +694,7 @@ def write_cross_modal_z(storage_path, fov, dz):
     affine would touch every one of those; adding a parallel scalar
     touches none. Old files simply have no z_across and read back as 0.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_fov_params_group_path(fov))
         grp.attrs['z_across'] = float(dz)
@@ -649,7 +702,7 @@ def write_cross_modal_z(storage_path, fov, dz):
 
 def read_cross_modal_z(storage_path, fov):
     """Planes, DNA frame -> RNA frame. 0.0 when never written (see write_cross_modal_z)."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return 0.0
     grp_path = _fov_params_group_path(fov)
@@ -671,7 +724,7 @@ def write_cross_modal_matrix(storage_path, fov, H):
     yet loaded. This copy is reachable from vlinks.h5 alone, no
     reference hybe required to find it.
     """
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
         grp = f.require_group(_fov_params_group_path(fov))
         if 'matrix_across' in grp:
@@ -682,7 +735,7 @@ def write_cross_modal_matrix(storage_path, fov, H):
 def read_cross_modal_matrix(storage_path, fov):
     """The vlinks.h5-mirrored H_across for this FOV, or None if nothing's
     been written here yet (see write_cross_modal_matrix)."""
-    vlinks_path = os.path.join(storage_path, 'vlinks.h5')
+    vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _fov_params_group_path(fov)
