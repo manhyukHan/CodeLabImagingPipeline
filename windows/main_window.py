@@ -4395,20 +4395,22 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback = owner.reference_modality if owner is not None else None
             return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
 
-        if not cells:
-            # No cells LOADED is identity for the CELL leg only -- the FOV/
-            # cross-modal legs must still recast every spot's shared-frame
-            # coordinate (confirmed real bug: this used to return early,
-            # so a save in a session without the cell layer loaded wrote
-            # coordinate == raw_coordinate for every spot). Ownership is
-            # deliberately untouched here: cells existing on disk but not
-            # loaded must never cost a spot its owner.
-            assignment.recast_spots_to_shared(spots, to_shared, {})
-            self._ensure_spot_uids(fov, spots)
-            n_owned = sum(1 for s in spots if int(s.cell) != -1)
-            return n_owned, len(spots) - n_owned
+        # ONE uniform flow, cell existence never required (per explicit
+        # spec): (1) label mask in each spot's own frame -- ALL-ZEROS when
+        # no cells are loaded; (2) mask[int(y), int(x)] sets cell (and
+        # celltype from the owner) -- so with zero cells every spot
+        # becomes -1, the transient container being AUTHORITATIVE at save
+        # exactly as it is for cell writes; (3) coordinates recast to the
+        # shared frame regardless -- through the owner's cell leg when
+        # assigned, through modality alone when not. The earlier version
+        # returned early with no cells (confirmed real bug: a save in
+        # such a session wrote coordinate == raw_coordinate for every
+        # spot and touched no ownership).
         cells_by_id = {c.id: c for c in cells}
-        frame_shape = cells[0].frame_shape
+        # frame_shape only sizes the label mask; with zero cells the mask
+        # is all zeros and every lookup lands on "no owner" regardless of
+        # shape, so the placeholder is exact, not approximate.
+        frame_shape = cells[0].frame_shape if cells else (1, 1)
 
         def area_in_frame(cell, hybe, modality):
             # Resolver-backed projection -- the library default
