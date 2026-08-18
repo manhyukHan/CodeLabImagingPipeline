@@ -1696,10 +1696,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for sd in vlinks_store.read_spots(storage_path, fov):
             if int(sd.get('cell', -1)) != -1:
                 spots_by_cell.setdefault(int(sd['cell']), []).append(sd['coordinate'])
-        for d in cell_dicts:
-            pos = spots_by_cell.get(int(d.get('id', -1)))
+        for cell_dict in cell_dicts:
+            pos = spots_by_cell.get(int(cell_dict.get('id', -1)))
             if pos and len(pos) > 1:
-                d['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
+                cell_dict['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
         n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
                       for f in fov_list)
         # Spots are no longer nested in the cell dict; count them per cell
