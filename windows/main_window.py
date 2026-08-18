@@ -905,41 +905,41 @@ class MainWindow(QtWidgets.QMainWindow):
             if cross_channel_type:
                 ap.ChannelTypeComboBox.setCurrentText(cross_channel_type)
 
-            other_name = 'DNA' if role == 'RNA' else 'RNA'
-            other_data = self.ui.IngestionPanel.modality_data.setdefault(other_name, self._blank_modality_state())
-            other_data['storage_path'] = paired_path
-            other_params = vlinks_store.read_global_params(paired_path)
-            if not other_data['layout_path'] and other_params.get('layout_path'):
-                other_data['layout_path'] = other_params['layout_path']
-            if other_name not in self.ui.IngestionPanel.modality_names:
-                self.ui.IngestionPanel.modality_names = list(self.ui.IngestionPanel.modality_names) + [other_name]
-
-            # _other_modality_cell_alignment_inputs also needs
-            # self.fov_matrices[(paired_path, fov)] -- normally only
-            # populated by _activate_fov for whichever modality is
-            # "current" (never the paired one, since that requires an
-            # actual modality switch) -- read it directly here, same
-            # read_same_modality_matrices call _activate_fov itself uses,
-            # for the CellSegmentPanel's current FOV plus anything in the
-            # Ingestion tab's own FOV list.
-            if other_data['layout_path']:
+            # Backfill self.fov_matrices for the PAIRED (non-current)
+            # modality too -- normally only populated by _activate_fov for
+            # whichever modality is "current" (never the paired one, since
+            # that requires an actual modality switch) -- read it directly
+            # here, same read_same_modality_matrices call _activate_fov
+            # itself uses, for the CellSegmentPanel's current FOV plus
+            # anything in the Ingestion tab's own FOV list. This tail used
+            # to also DISCOVER the paired modality from the retired
+            # cross_modal_role/cross_modal_paired_storage_path params --
+            # obsolete (and, left half-deleted, a NameError that blocked
+            # config load) now that _activate_modalities seeds every
+            # configured modality's own state before this ever runs.
+            for paired_modality in {rna_modality, dna_modality} - {self._modality_for_storage_path(storage_path)}:
+                paired_data = self.ui.IngestionPanel.modality_data.get(paired_modality, {})
+                paired_path = paired_data.get('storage_path', '')
+                paired_layout = paired_data.get('layout_path', '') or (
+                    vlinks_store.read_global_params(paired_path).get('layout_path', '') if paired_path else '')
+                if not paired_path or not paired_layout:
+                    continue
                 try:
-                    other_hybe_records_for_matrices = preprocess.parse_experiment_layout(other_data['layout_path'])
+                    paired_hybe_records = preprocess.parse_experiment_layout(paired_layout)
                 except Exception:
-                    other_hybe_records_for_matrices = None
-                if other_hybe_records_for_matrices:
-                    fovs_to_populate = set(self._parse_fov_list(ip.FovListLineEdit.text()))
-                    fovs_to_populate.add(self.ui.CellSegmentPanel.FovSpinBox.value())
-                    for fov_to_populate in fovs_to_populate:
-                        if not self._fov_matrices_for(paired_path, fov_to_populate):
-                            try:
-                                self._merge_fov_matrices(
-                                    fov_to_populate,
-                                    alignment.read_same_modality_matrices(
-                                        paired_path, fov_to_populate,
-                                        other_hybe_records_for_matrices))
-                            except Exception:
-                                pass
+                    continue
+                fovs_to_populate = set(self._parse_fov_list(ip.FovListLineEdit.text()))
+                fovs_to_populate.add(self.ui.CellSegmentPanel.FovSpinBox.value())
+                for fov_to_populate in fovs_to_populate:
+                    if not self._fov_matrices_for(paired_path, fov_to_populate):
+                        try:
+                            self._merge_fov_matrices(
+                                fov_to_populate,
+                                alignment.read_same_modality_matrices(
+                                    paired_path, fov_to_populate,
+                                    paired_hybe_records))
+                        except Exception:
+                            pass
 
         # backfill self.cross_modal_result from vlinks so
         # _other_modality_cell_alignment_inputs finds a real H_across

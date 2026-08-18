@@ -36,8 +36,13 @@ SKIP_PREFIX = ('_save', '_run_', '_write', '_delete', '_remove', '_accept',
 def build():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     from windows.main_window import MainWindow
-    w = MainWindow()
-    w._load_config(CONFIG)
+    # EXACTLY main.py's launch form: the constructor itself loads the
+    # config. A NameError inside config load once blocked a real launch
+    # while this harness, loading the config only post-construction and
+    # only pre-verification, never saw it -- the sweep must BE the
+    # clean-run launch test, and must be re-run after any verification
+    # that writes params/matrices (persisted state arms new load paths).
+    w = MainWindow(CONFIG)
     w._activate_fov(FOV)
     return app, w
 
