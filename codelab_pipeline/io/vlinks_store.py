@@ -103,6 +103,85 @@ def allocate_spot_uids(storage_path, fov, count):
         return list(range(start, start + int(count)))
 
 
+def _spot_slice_path(fov, modality, hybe, channel):
+    """
+    One blob per (modality, hybe, channel) inside the FOV's spot group.
+
+    That is exactly the scope a save writes and a removal clears, so a save
+    replaces one blob and can never touch a hybe the user never opened.
+    Assigned and unassigned spots share the blob -- they differ only in
+    ASpot.cell -- so no operation here needs to know or care which is which.
+    """
+    return f'{_spots_group_path(fov)}/{modality}/{hybe}/ch{int(channel)}'
+
+
+def write_spots(storage_path, fov, modality, hybe, channel, spots):
+    """
+    Full replace of ONE (modality, hybe, channel) slice with `spots`.
+
+    Full replace within the slice, so deletions propagate: a spot the user
+    removed is simply absent from `spots` and therefore gone from disk.
+    Scoped to the slice, so it cannot delete anything outside it. Both
+    properties are needed together -- a FOV-wide replace would propagate
+    deletions the user never made, in hybes they never opened.
+
+    Any spot still carrying uid 0 is allocated one here, so nothing ever
+    reaches storage without a stable identity.
+    """
+    spots = list(spots)
+    unallocated = [sp for sp in spots if not getattr(sp, 'uid', 0)]
+    if unallocated:
+        for sp, uid in zip(unallocated, allocate_spot_uids(storage_path, fov, len(unallocated))):
+            sp.uid = uid
+    payload = [sp.save() for sp in spots]
+    seen = {}
+    for d in payload:
+        if d['uid'] in seen:
+            raise ValueError(
+                f'duplicate spot uid {d["uid"]} in FOV{fov:02d} '
+                f'{modality}/{hybe}/ch{channel} -- uid must identify one spot')
+        seen[d['uid']] = True
+    blob = np.void(pickle.dumps(payload))
+    with h5py.File(_vlinks_path(storage_path), 'a') as f:
+        grp = f.require_group(_spot_slice_path(fov, modality, hybe, channel))
+        if 'blob' in grp:
+            del grp['blob']
+        grp.create_dataset('blob', data=blob)
+        grp.attrs['saved_at'] = datetime.now().isoformat()
+        grp.attrs['n_spots'] = len(payload)
+
+
+def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
+    """
+    ASpot.save()-shaped dicts. With modality/hybe/channel given, just that
+    slice; with none, every spot in the FOV across every slice. Assigned and
+    unassigned come back together -- filter on 'cell' (-1 = unassigned) if a
+    caller wants one or the other.
+    """
+    vlinks_path = _vlinks_path(storage_path)
+    if not os.path.exists(vlinks_path):
+        return []
+    out = []
+    with h5py.File(vlinks_path, 'r') as f:
+        if modality is not None and hybe is not None and channel is not None:
+            gp = _spot_slice_path(fov, modality, hybe, channel)
+            if gp in f and 'blob' in f[gp]:
+                out.extend(pickle.loads(bytes(f[gp]['blob'][()])))
+            return out
+        root = _spots_group_path(fov)
+        if root not in f:
+            return out
+        for mod in f[root]:
+            if not isinstance(f[f'{root}/{mod}'], h5py.Group):
+                continue
+            for hy in f[f'{root}/{mod}']:
+                for ch in f[f'{root}/{mod}/{hy}']:
+                    g = f[f'{root}/{mod}/{hy}/{ch}']
+                    if 'blob' in g:
+                        out.extend(pickle.loads(bytes(g['blob'][()])))
+    return out
+
+
 def _unassigned_spots_group_path(fov):
     return f'/FOV{fov:02d}/unassigned_spots'
 
