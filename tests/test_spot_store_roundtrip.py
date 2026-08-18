@@ -117,6 +117,9 @@ def populate():
     rather than on behaviour, which is how the first version of this file
     reported two failures that were entirely its own doing.
     """
+    global _real_spots_before
+    if _real_spots_before is None:
+        _real_spots_before = _real_spot_state()
     build_scratch()
     _detected.clear()
     for hybe, modality, channel, queue in SLICES:
@@ -204,12 +207,42 @@ def test_assigned_and_unassigned_share_a_slice():
     assert assigned and unassigned, 'expected a mix of assigned and unassigned in one slice'
 
 
-def test_real_data_untouched():
-    """The whole run must have stayed inside the scratch project."""
+_real_spots_before = None
+
+
+def _real_spot_state():
+    """Byte-level fingerprint of the real store's spot groups."""
+    import hashlib
+    out = {}
     with h5py.File(os.path.join(REAL, 'vlinks.h5'), 'r') as f:
         for fov in (1, 2):
-            assert f'FOV{fov:02d}/spots' not in f, \
-                f'the test wrote spots into REAL data at FOV{fov:02d}/spots'
+            g = f.get(f'FOV{fov:02d}/spots')
+            if g is None:
+                out[fov] = None
+                continue
+            h = hashlib.md5()
+
+            def visit(name, obj):
+                if isinstance(obj, h5py.Dataset):
+                    h.update(name.encode())
+                    h.update(bytes(obj[()]))
+            g.visititems(visit)
+            out[fov] = h.hexdigest()
+    return out
+
+
+def test_real_data_untouched():
+    """
+    The whole run must have stayed inside the scratch project.
+
+    Asserts the real store's spot groups are UNCHANGED, not absent: the app
+    legitimately writes /FOV##/spots during normal use, so absence was the
+    wrong invariant -- it began failing the moment anyone (the user, or an
+    end-to-end check of the real save path) had ever saved a spot for real.
+    """
+    assert _real_spots_before is not None, 'populate() never ran'
+    assert _real_spot_state() == _real_spots_before, \
+        'this test run MODIFIED the real store'
 
 
 def test_harness_detects_the_old_unscoped_store():

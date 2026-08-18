@@ -214,6 +214,13 @@ class SpotLocalizationPanelUI(object):
         removeRowLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveTransientSpotsPushButton = QtWidgets.QPushButton('Revert This Hybe/Channel')
         removeRowLayout.addWidget(self.RemoveTransientSpotsPushButton)
+        # One operation over one store: clears assigned and unassigned alike
+        # for the current hybe/channel/modality -- the capability the old
+        # "Remove Unassigned spots" button could not provide because the
+        # split store hid assigned spots from it. In-memory; Save persists
+        # the emptied slice.
+        self.ClearHybeChannelPushButton = QtWidgets.QPushButton('Clear This Hybe/Channel')
+        removeRowLayout.addWidget(self.ClearHybeChannelPushButton)
         layout.addWidget(removeRow)
 
         # -- Undo | Redo -- see MainWindow._push_spot_undo_snapshot/_undo_spot_edit/_redo_spot_edit --

@@ -691,6 +691,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.ShowDisplayerPushButton.toggled.connect(self._toggle_spot_crop_displayer)
         sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
+        sp.ClearHybeChannelPushButton.clicked.connect(self._clear_current_hybe_channel)
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
@@ -4092,7 +4093,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # BOTH storage paths ending up with only the DNA spot -- RNA's own
         # spot silently vanished. This is the root cause of "RNA unassigned
         # spots don't save" whenever DNA also has a pending pool in memory.
-        self._persist_fov_spots(fov)
+        # Per explicit decision, Save is scoped to the CURRENT (hybe,
+        # channel, modality) -- the same scope as every removal control --
+        # so it can never touch a hybe the user never opened. The old
+        # "view-scoped save loses other cells' spots" bug cannot recur
+        # under this scoping: a slice save persists that hybe/channel for
+        # EVERY cell and the unassigned pool together, because they all
+        # live in the one slice.
+        current_slice = None
+        hybe = sp.current_hybe_folder()
+        modality = sp.current_hybe_modality()
+        channel_text = sp.ChannelComboBox.currentText().strip()
+        if hybe and modality and channel_text:
+            current_slice = (modality, hybe, int(channel_text))
+        n_written = self._persist_fov_spots(fov, only_slice=current_slice)
+        sp.LogTextEdit.append(
+            f'FOV{fov:02d} {hybe} ch{channel_text}: {n_written} spot(s) persisted, '
+            f'{assignment.count_unassigned(self._all_transient_spots(fov))} unassigned in FOV.')
 
         skip_note = ' (cell write skipped -- see dialog)' if skip_cell_write else ''
         sp.LogTextEdit.append(f'FOV{fov:02d}: {n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} '
@@ -4149,11 +4166,78 @@ class MainWindow(QtWidgets.QMainWindow):
             cell.num_spots[spot.hybe] = cell.num_spots.get(spot.hybe, 0) + 1
             cell.total_num_spots = len(cell.spots)
 
-    def _persist_fov_spots(self, fov):
+    def _all_transient_spots(self, fov):
+        """Every live in-memory spot for this FOV -- pools + cell-owned."""
+        out = []
+        for (pool_path, pool_fov), pool in self.fov_unassigned_spots.items():
+            if pool_fov == fov:
+                out.extend(pool)
+        if self.cell_container is not None:
+            for cell in self.cell_container.data.get(fov, []):
+                out.extend(cell.spots)
+        return out
+
+    def _clear_current_hybe_channel(self):
         """
-        Write every spot in this FOV into the unified slice store -- one
-        write per (modality, hybe, channel), cell-owned and unassigned
-        together.
+        Remove EVERY spot of the current (hybe, channel, modality) from the
+        transient state -- assigned and unassigned alike, one operation that
+        never asks which kind a spot is. In-memory only, like every other
+        edit here: the emptied slice reaches vlinks.h5 on the next Save,
+        which writes the slice empty. Restores the capability deleted with
+        the old "Remove Spots in View" button, which could only ever reach
+        the unassigned pool because the split store hid assigned spots
+        from it.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        fov = self._current_spot_fov()
+        hybe = sp.current_hybe_folder()
+        modality = sp.current_hybe_modality()
+        channel_text = sp.ChannelComboBox.currentText().strip()
+        if fov is None or not hybe or not modality or not channel_text:
+            return
+        channel = int(channel_text)
+        cell_ids = [c.id for c in (self.cell_container.data.get(fov, []) if self.cell_container else [])]
+        self._push_spot_undo(fov=fov, cell_ids=cell_ids)
+        n = 0
+        for (pool_path, pool_fov), pool in list(self.fov_unassigned_spots.items()):
+            if pool_fov != fov:
+                continue
+            keep = [s for s in pool
+                    if not (s.hybe == hybe and int(s.channel) == channel
+                            and (s.modality or modality) == modality)]
+            n += len(pool) - len(keep)
+            self.fov_unassigned_spots[(pool_path, pool_fov)] = keep
+        if self.cell_container is not None:
+            for cell in self.cell_container.data.get(fov, []):
+                keep = [s for s in cell.spots
+                        if not (s.hybe == hybe and int(s.channel) == channel
+                                and (s.modality or modality) == modality)]
+                if len(keep) != len(cell.spots):
+                    n += len(cell.spots) - len(keep)
+                    cell.spots = keep
+                    cell.num_spots = {}
+                    for s2 in keep:
+                        cell.num_spots[s2.hybe] = cell.num_spots.get(s2.hybe, 0) + 1
+                    cell.total_num_spots = len(keep)
+        sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {n} spot(s) cleared '
+                              f'(in memory -- Save persists the empty slice).')
+        self._refresh_spot_cell_list()
+        if sp.ShowDisplayerPushButton.isChecked():
+            self._show_spot_displayer()
+
+    def _persist_fov_spots(self, fov, only_slice=None):
+        """
+        Write spots into the unified slice store -- one write per
+        (modality, hybe, channel), cell-owned and unassigned together.
+
+        only_slice: optional (modality, hybe, channel). When given, ONLY
+        that slice is written; every other slice on disk is left exactly
+        as it is. This is what makes the Save button (hybe, channel)-
+        scoped, per explicit decision: saving can then never touch a hybe
+        the user never opened, and its scope matches every removal
+        control. When None, every slice in memory is written and stale
+        on-disk slices are cleared -- the full-FOV path used by bulk
+        operations.
 
         Assigned and unassigned spots share a slice and differ only in
         ASpot.cell, so they MUST be written together: a slice write is a
@@ -4218,6 +4302,13 @@ class MainWindow(QtWidgets.QMainWindow):
             for d in vlinks_store.read_spots(any_path, fov):
                 by_slice.setdefault((d.get('modality', ''), d.get('hybe', ''),
                                      int(d.get('channel', 0))), [])
+
+        if only_slice is not None:
+            want = (only_slice[0], only_slice[1], int(only_slice[2]))
+            by_slice = {k: v for k, v in by_slice.items() if k == want}
+            # The slice must exist even if empty, so clearing the last spot
+            # of the CURRENT hybe/channel still reaches disk.
+            by_slice.setdefault(want, by_slice.get(want, []))
 
         for (modality, hybe, channel), spots in by_slice.items():
             path = self._storage_path_for_modality(modality)
