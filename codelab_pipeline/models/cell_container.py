@@ -50,7 +50,7 @@ class CellContainer():
         a LATER call regardless of manual/auto/removal mode -- so an id
         that already existed in self.data[fov] keeps everything about
         itself (reference_hybe, celltype, matrices, matrix_anchors,
-        matrix_provenance, spots, num_spots, total_num_spots, distmap,
+        matrix_provenance, distmap,
         linked, linked_at). Only a genuinely new id (not already present)
         gets `reference_hybe` (this call's own parameter) and starts blank.
 
@@ -103,8 +103,7 @@ class CellContainer():
                                   area=(x, y) if same_frame else old.area,
                                   frame_shape=mask.shape if same_frame else old.frame_shape,
                                   matrices=deepcopy(old.matrices), matrix_anchors=deepcopy(old.matrix_anchors),
-                                  matrix_provenance=deepcopy(old.matrix_provenance), spots=deepcopy(old.spots),
-                                  total_num_spots=old.total_num_spots, num_spots=deepcopy(old.num_spots),
+                                  matrix_provenance=deepcopy(old.matrix_provenance),
                                   distmap=deepcopy(old.distmap), linked=old.linked, linked_at=old.linked_at)
             else:
                 # modality comes from the REFERENCE HYBE, not from the
@@ -140,12 +139,6 @@ class CellContainer():
         for fov, cell_dicts in saved.items():
             container.data[fov] = [_cell_from_dict(d) for d in cell_dicts]
         return container
-
-
-def _spot_from_dict(d):
-    spot = ASpot()
-    spot.set_metadata(**d)
-    return spot
 
 
 def _drop_legacy_matrix_keys(mapping):
@@ -196,6 +189,6 @@ def _cell_from_dict(d):
     # to_cells fills them in after load. A cell written since that change has
     # no 'spots' key at all, so this must tolerate its absence rather than
     # assume the old shape.
-    kwargs['spots'] = [_spot_from_dict(sd) for sd in d.get('spots') or []]
+    kwargs.pop('spots', None)   # legacy key; spots live in the FOV's spot store
     cell.set_metadata(**kwargs)
     return cell

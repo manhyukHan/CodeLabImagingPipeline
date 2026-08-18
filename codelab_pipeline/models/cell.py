@@ -81,10 +81,13 @@ class ACell():
        it (both sides already share the same reference_hybe by
        construction, see matrix_between's own docstring).
      matrix_provenance: dict {(hybe, modality): {'reference_sequence':..., 'steps':...}}
-     spots: list [ASpot, ...]
-     total_num_spots: int
-     num_spots: dict {hybe: int}
-     distmap: ndarray (num_spots x num_spots)
+     (there is deliberately NO spots/num_spots/total_num_spots on a cell:
+       a cell's spots are a QUERY over the FOV's one spot container --
+       SpotContainer.of_cell(fov, cell.id) -- with ASpot.cell as the link.
+       A second, cell-held copy is exactly the split store that made
+       assignment a cross-structure move and hid assigned spots from
+       every control that only knew one home.)
+     distmap: ndarray (n_spots x n_spots), see calculate_distmap
     """
     def __init__(self):
         self.id = 0
@@ -100,9 +103,6 @@ class ACell():
         self.matrices = {}
         self.matrix_anchors = {}
         self.matrix_provenance = {}
-        self.spots = []
-        self.total_num_spots = 0
-        self.num_spots = {}
         self.distmap = np.array([])
         self.linked = False
         self.linked_at = None
@@ -121,9 +121,6 @@ class ACell():
         if 'matrices' in kwargs: self.matrices = dict(kwargs['matrices'])
         if 'matrix_anchors' in kwargs: self.matrix_anchors = dict(kwargs['matrix_anchors'])
         if 'matrix_provenance' in kwargs: self.matrix_provenance = dict(kwargs['matrix_provenance'])
-        if 'spots' in kwargs: self.spots = list(kwargs['spots'])
-        if 'total_num_spots' in kwargs: self.total_num_spots = int(kwargs['total_num_spots'])
-        if 'num_spots' in kwargs: self.num_spots = dict(kwargs['num_spots'])
         if 'distmap' in kwargs: self.distmap = np.array(kwargs['distmap'])
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
@@ -159,9 +156,11 @@ class ACell():
             return True
         return len(self.area[0]) != len(self.nucleus[0])
 
-    def calculate_distmap(self):
-        if self.total_num_spots > 0:
-            pos = np.array([spot.coordinate for spot in self.spots])
+    def calculate_distmap(self, spots):
+        """spots: this cell's spots, queried from the FOV's spot container
+        by the caller (SpotContainer.of_cell) -- the cell holds no copy."""
+        if spots:
+            pos = np.array([spot.coordinate for spot in spots])
             self.distmap = ssd.squareform(ssd.pdist(pos))
 
     def _require_composable(self, key):
@@ -324,14 +323,9 @@ class ACell():
                             for key, m in self.matrices.items()},
                 'matrix_anchors': {modality: np.array(H) for modality, H in self.matrix_anchors.items()},
                 'matrix_provenance': dict(self.matrix_provenance),
-                # Spots are NOT written here. They live in the FOV's own
-                # spot store (/FOV##/spots/{modality}/{hybe}/ch{channel}),
-                # one place for assigned and unassigned alike, so assignment
-                # is a field on a spot rather than a move between two blobs.
-                # self.spots stays as an in-memory cache the load path fills
-                # from that store; total_num_spots/num_spots are recomputed
-                # from it rather than persisted, so they cannot go stale
-                # against the store.
+                # Spots are NOT written here and the cell holds no copy at
+                # all: they live in the FOV's spot store on disk and in the
+                # session's SpotContainer in memory, linked by ASpot.cell.
                 'distmap': np.array(self.distmap),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at}

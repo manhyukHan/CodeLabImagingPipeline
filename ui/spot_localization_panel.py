@@ -339,10 +339,12 @@ class SpotLocalizationPanelUI(object):
         self.ChannelComboBox.blockSignals(False)
         self.ChannelComboBox.currentIndexChanged.emit(self.ChannelComboBox.currentIndex())
 
-    def populate_cell_choices(self, cells):
+    def populate_cell_choices(self, cells, n_spots_by_cell=None):
         """
         Row 0 is always the FOV pseudo-row (the FOV-level unassigned-spot
-        pool view); rows 1+ are real cells (id + current total_num_spots).
+        pool view); rows 1+ are real cells. n_spots_by_cell: {cell.id: n}
+        supplied by the caller from the session's SpotContainer -- cells
+        hold no spot lists of their own.
         Selection preserved by cell id where possible, defaulting to the
         FOV row when nothing else was previously selected (matches the
         old Scope combobox's own default of Whole FOV).
@@ -354,8 +356,10 @@ class SpotLocalizationPanelUI(object):
         fov_item.setData(QtCore.Qt.UserRole, self.FOV_ROW_MARKER)
         self.CellListWidget.addItem(fov_item)
         selected_item = fov_item
+        n_spots_by_cell = n_spots_by_cell or {}
         for cell in cells:
-            item = QtWidgets.QListWidgetItem(f'Cell {cell.id}: {cell.total_num_spots} spot(s)')
+            item = QtWidgets.QListWidgetItem(
+                f'Cell {cell.id}: {n_spots_by_cell.get(cell.id, 0)} spot(s)')
             item.setData(QtCore.Qt.UserRole, cell.id)
             self.CellListWidget.addItem(item)
             if had_selection and cell.id == previous_id:

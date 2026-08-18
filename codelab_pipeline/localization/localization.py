@@ -809,7 +809,7 @@ def localize_cells_2d(cell_container, fov, hybe_records, channel,
     cell_container.get_cells(fov), across every hybe in hybe_records.
     Parameters are an already-confirmed set -- tune interactively via
     LocalizationWidget first, then run this in bulk; not re-tuned per call.
-    Writes results directly into each cell's .spots/.num_spots/.total_num_spots.
+    Returns the localized spots (each carrying its owner in ASpot.cell).
     """
     cells = cell_container.get_cells(fov)
     tasks = [(cell, record['folder']) for cell in cells for record in hybe_records]
@@ -819,15 +819,15 @@ def localize_cells_2d(cell_container, fov, hybe_records, channel,
                                    max_to_background, max_to_average, absolute_threshold,
                                    min_distance, frac, max_num_alleles, pad)
                   for cell, hybe in tasks]
-        cells_by_id = {c.id: c for c in cells}
+        out = []
         for future in as_completed(futures):
             cell_id, hybe, spots = future.result()
-            if len(spots) == 0:
-                continue
-            cell = cells_by_id[cell_id]
-            cell.spots.extend(spots)
-            cell.num_spots[hybe] = cell.num_spots.get(hybe, 0) + len(spots)
-            cell.total_num_spots += len(spots)
+            # Cells hold no spot lists: each returned spot already carries
+            # its owning cell in ASpot.cell, and the caller feeds them into
+            # the session's SpotContainer (with uids allocated at that
+            # door). This function computes; it does not own storage.
+            out.extend(spots)
+        return out
 
 def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
                             max_to_background=1.25, max_to_average=1.25, absolute_threshold=200.0,
@@ -926,15 +926,15 @@ def localize_cells_3d(cell_container, fov, hybe_records, channel,
                                    min_distance, frac, max_num_alleles, max_sigma, pad, spad,
                                    peak_bound, max_uncert, min_hb_ratio, min_ah_ratio)
                   for cell, hybe in tasks]
-        cells_by_id = {c.id: c for c in cells}
+        out = []
         for future in as_completed(futures):
             cell_id, hybe, spots = future.result()
-            if len(spots) == 0:
-                continue
-            cell = cells_by_id[cell_id]
-            cell.spots.extend(spots)
-            cell.num_spots[hybe] = cell.num_spots.get(hybe, 0) + len(spots)
-            cell.total_num_spots += len(spots)
+            # Cells hold no spot lists: each returned spot already carries
+            # its owning cell in ASpot.cell, and the caller feeds them into
+            # the session's SpotContainer (with uids allocated at that
+            # door). This function computes; it does not own storage.
+            out.extend(spots)
+        return out
 
 
 # -- chromatin tracing --

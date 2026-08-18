@@ -33,7 +33,7 @@ from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
-from codelab_pipeline.models.spot_container import SpotContainer
+from codelab_pipeline.models.spot_container import DiffUndo, SpotContainer
 from codelab_pipeline.models.allele import AnAllele
 from codelab_pipeline.models import celltype
 from skimage.feature import peak_local_max
@@ -512,8 +512,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spot_crop_displayer.spots_edited.connect(self._on_spot_crop_edited)
         self.spot_crop_displayer.readonly_point_removed.connect(self._on_readonly_spot_removed)
         self._spot_crop_context = None  # {'cell': ACell, 'hybe': str, 'channel': int, 'rxmin': int, 'rymin': int}
-        self._spot_undo_stack = []  # list of snapshots, see _snapshot_scopes/_push_spot_undo
-        self._spot_redo_stack = []
+        # Diff-based undo over the spot container: two streaks deep,
+        # storing invertible {added, removed, changed} fingerprint deltas.
+        self.spot_undo = DiffUndo(self.spot_container)
         self._current_view_spot_refs = []  # [(ASpot, ACell-or-None), ...] -- see _refresh_localize_3d_spot_choices
 
         self.localize_3d_displayer = Localize3DDisplayer()
@@ -2582,7 +2583,6 @@ class MainWindow(QtWidgets.QMainWindow):
             modality = modality or self._modality_for_storage_path(storage_path)
             if cell_dicts:
                 loaded = CellContainer.load({fov: cell_dicts}, modality=modality)
-                self._attach_stored_spots_to_cells(loaded, storage_path, fov)
                 if self.cell_container_permanent is None:
                     self.cell_container_permanent = loaded
                 else:
@@ -2843,17 +2843,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     for d in vlinks_store.read_spots(any_path, fov):
                         spot = ASpot()
                         spot.set_metadata(**d)
-                        # Permanent mirrors the store completely -- assigned
-                        # and unassigned alike. The transient tier stages
-                        # only the unassigned copies for now: assigned spots
-                        # still travel on cell.spots until step 3, and two
-                        # transient homes for one spot is the false-green
-                        # hazard this design exists to remove.
+                        # Both tiers stage EVERY spot, assigned and
+                        # unassigned alike -- cells hold no spot lists, so
+                        # the container is the one transient home and
+                        # ASpot.cell is the only link to a cell.
                         self.spot_container_permanent.add(fov, spot)
-                        if int(d.get('cell', -1)) == -1:
-                            twin = ASpot()
-                            twin.set_metadata(**d)
-                            self.spot_container.add(fov, twin)
+                        twin = ASpot()
+                        twin.set_metadata(**d)
+                        self.spot_container.add(fov, twin)
                 except Exception:
                     pass
         # Only once per FOV per session (per confirmed real regression):
@@ -2905,7 +2902,6 @@ class MainWindow(QtWidgets.QMainWindow):
             modality = modality or self._modality_for_storage_path(storage_path)
             if cell_dicts:
                 loaded = CellContainer.load({fov: cell_dicts}, modality=modality)
-                self._attach_stored_spots_to_cells(loaded, storage_path, fov)
                 if self.cell_container_permanent is None:
                     self.cell_container_permanent = loaded
                 else:
@@ -3165,7 +3161,11 @@ class MainWindow(QtWidgets.QMainWindow):
             sp.populate_cell_choices([])
         else:
             cells = self.cell_container.data.get(fov, [])
-            sp.populate_cell_choices(cells)
+            n_by_cell = {}
+            for spot in self.spot_container.all(fov):
+                if int(spot.cell) != -1:
+                    n_by_cell[int(spot.cell)] = n_by_cell.get(int(spot.cell), 0) + 1
+            sp.populate_cell_choices(cells, n_by_cell)
             sp.LogTextEdit.append(f'Cell list refreshed: {len(cells)} cell(s) for FOV{fov:02d}.')
         self._refresh_spot_fov_summary()
         self._refresh_spot_breakdown()
@@ -3187,11 +3187,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None or fov is None:
             return
         counts = {}  # (hybe, channel) -> [n_spots, {cell_id, ...}]
-        for cell in self.cell_container.data.get(fov, []):
-            for s in cell.spots:
-                entry = counts.setdefault((s.hybe, s.channel), [0, set()])
-                entry[0] += 1
-                entry[1].add(cell.id)
+        for s in self.spot_container.all(fov):
+            if int(s.cell) == -1:
+                continue
+            entry = counts.setdefault((s.hybe, s.channel), [0, set()])
+            entry[0] += 1
+            entry[1].add(int(s.cell))
         for hybe, channel in sorted(counts.keys()):
             n_spots, cell_ids = counts[(hybe, channel)]
             item = QtWidgets.QListWidgetItem(f'{hybe} ch{channel}: {n_spots} spot(s) across {len(cell_ids)} cell(s)')
@@ -3273,7 +3274,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cell = self._selected_spot_cell()
             if cell is None:
                 return
-            for s in cell.spots:
+            for s in self.spot_container.of_cell(self._current_spot_fov(), cell.id):
                 counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
             suffix = 'spot(s)'
         else:
@@ -3401,10 +3402,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ordered = [(s, None) for s in self.spot_container.unassigned(fov)
                   if s.hybe == hybe and s.channel == channel]
         cells = self.cell_container.data.get(fov, []) if self.cell_container is not None else []
+        cells_by_id = {c.id: c for c in cells}
+        by_cell = {}
+        for s in self.spot_container.all(fov):
+            if int(s.cell) != -1 and s.hybe == hybe and s.channel == channel:
+                by_cell.setdefault(int(s.cell), []).append(s)
         for cell in sorted(cells, key=lambda c: c.id):
-            for s in cell.spots:
-                if s.hybe == hybe and s.channel == channel:
-                    ordered.append((s, cell))
+            for s in by_cell.get(cell.id, []):
+                ordered.append((s, cell))
         return ordered
 
     def _global_spot_index_map(self, storage_path, fov, hybe, channel):
@@ -3433,7 +3438,8 @@ class MainWindow(QtWidgets.QMainWindow):
         rxmin, rymin = crop['rxmin'], crop['rymin']
         self._spot_crop_context = {'kind': 'cell', 'cell': cell, 'hybe': hybe, 'channel': channel,
                                    'modality': sp.current_hybe_modality(), 'rxmin': rxmin, 'rymin': rymin}
-        scoped_spots = [s for s in cell.spots if s.hybe == hybe and s.channel == channel]
+        scoped_spots = [s for s in self.spot_container.of_cell(fov, cell.id)
+                        if s.hybe == hybe and s.channel == channel]
         existing_points = [(s.raw_coordinate[0] - rxmin, s.raw_coordinate[1] - rymin) for s in scoped_spots]
         # EVERY cell in this FOV, not just the selected one -- the left
         # panel exists to orient you, and a single lone contour among a
@@ -3503,11 +3509,11 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_owned_refs = []
         context_masks = []
         if self.cell_container is not None:
-            for cell in self.cell_container.data.get(fov, []):
-                for s in cell.spots:
-                    if s.hybe == hybe and s.channel == channel:
-                        cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1]), cell.id))
-                        cell_owned_refs.append((s, cell))
+            cells = self.cell_container.data.get(fov, [])
+            cells_by_id = {c.id: c for c in cells}
+            # Two independent enumerations: boundaries are per CELL (every
+            # cell draws, spots or not), points are per assigned SPOT.
+            for cell in cells:
                 # _cell_area_in_readout (not cell.get_area_in_readout
                 # directly) -- per confirmed real bug, see that method's
                 # own docstring: this FOV-view "cell masks" overview was
@@ -3518,6 +3524,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
                 if len(x_area):
                     context_masks.append((cell.id, x_area, y_area))
+            for s in self.spot_container.all(fov):
+                cell = cells_by_id.get(int(s.cell)) if int(s.cell) != -1 else None
+                if cell is not None and s.hybe == hybe and s.channel == channel:
+                    cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1]), cell.id))
+                    cell_owned_refs.append((s, cell))
         # The RIGHT (working) panel gets the cell boundaries too, as one
         # combined raster -- per confirmed real bug it was passed mask=None
         # here, so the panel a user actually clicks in showed no cell
@@ -3744,10 +3755,7 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_path, fov, hybe, modality, channel, targets = resolved
         params = self.localize_3d_displayer.params()
 
-        affected_cell_ids = sorted({cell.id for _, cell in targets if cell is not None})
-        has_unassigned = any(cell is None for _, cell in targets)
-        self._push_spot_undo(fov=fov, cell_ids=affected_cell_ids,
-                             fov_key=(storage_path, fov) if has_unassigned else None)
+        fp_undo = self._begin_spot_edit(fov)
 
         n_refined = 0
         n_mixture = 0
@@ -3781,6 +3789,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 spot._z_status = 'rejected'
         elapsed = time.perf_counter() - t0
+        # The whole batch ran synchronously above; one undo step covers it.
+        self._commit_spot_edit(fov, fp_undo)
 
         mode_label = 'mixture' if params['multi_mode'] else 'single'
         mixture_msg = f', {n_mixture} with >1 real component saved as mixture_centroids' if n_mixture else ''
@@ -4002,15 +4012,17 @@ class MainWindow(QtWidgets.QMainWindow):
             # re-reads disk. Deep copies: the tiers must not share objects.
             permanent = [deepcopy(sp) for sp in self.spot_container_permanent.of_cell(fov, cell.id)
                          if sp.hybe == hybe and int(sp.channel) == channel]
-            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
+            fp = self._begin_spot_edit(fov)
             self._replace_cell_spots(cell, hybe, channel, permanent)
+            self._commit_spot_edit(fov, fp)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent spot(s) (transient discarded).')
         else:
             permanent = [deepcopy(sp) for sp in self.spot_container_permanent.unassigned(fov)
                          if sp.hybe == hybe and int(sp.channel) == channel]
-            self._push_spot_undo(fov_key=(storage_path, fov))
+            fp = self._begin_spot_edit(fov)
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, permanent)
+            self._commit_spot_edit(fov, fp)
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent unassigned spot(s) (transient discarded).')
         self._refresh_spot_cell_list()
@@ -4076,7 +4088,7 @@ class MainWindow(QtWidgets.QMainWindow):
         skip_cell_write = False
         n_identified, n_identified_cells = self._reassign_fov_spots(fov)
 
-        n_spots = sum(c.total_num_spots for c in cells_in_memory)
+        n_spots = len(self.spot_container.all(fov))
         n_cells_saved = 0
         # Cell-owned spots only have somewhere to be written when there
         # are real cells in memory for this FOV, and only when the wipe-
@@ -4140,38 +4152,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
 
-    def _attach_stored_spots_to_cells(self, container, storage_path, fov):
-        """
-        Fill cell.spots from the FOV's spot store after cells are loaded.
-
-        Cells no longer serialize their own spots (see ACell.to_dict), so a
-        freshly loaded cell arrives with none. Its spots are whichever ones
-        in the store name it in `cell`. Counts are recomputed here rather
-        than persisted, so they cannot drift from the store.
-        """
-        if container is None:
-            return
-        cells = {c.id: c for c in container.data.get(fov, [])}
-        for c in cells.values():
-            c.spots, c.num_spots, c.total_num_spots = [], {}, 0
-        for d in vlinks_store.read_spots(storage_path, fov):
-            cell_id = int(d.get('cell', -1))
-            cell = cells.get(cell_id)
-            if cell_id == -1 or cell is None:
-                continue
-            spot = ASpot()
-            spot.set_metadata(**d)
-            cell.spots.append(spot)
-            cell.num_spots[spot.hybe] = cell.num_spots.get(spot.hybe, 0) + 1
-            cell.total_num_spots = len(cell.spots)
-
     def _all_transient_spots(self, fov):
         """Every live in-memory spot for this FOV -- pools + cell-owned."""
-        out = list(self.spot_container.unassigned(fov))
-        if self.cell_container is not None:
-            for cell in self.cell_container.data.get(fov, []):
-                out.extend(cell.spots)
-        return out
+        return list(self.spot_container.all(fov))
 
     def _clear_current_hybe_channel(self):
         """
@@ -4192,24 +4175,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if fov is None or not hybe or not modality or not channel_text:
             return
         channel = int(channel_text)
-        cell_ids = [c.id for c in (self.cell_container.data.get(fov, []) if self.cell_container else [])]
-        self._push_spot_undo(fov=fov, cell_ids=cell_ids)
-        doomed = [s.uid for s in self.spot_container.unassigned(fov)
+        fp = self._begin_spot_edit(fov)
+        doomed = [s.uid for s in self.spot_container.all(fov)
                   if s.hybe == hybe and int(s.channel) == channel
                   and (s.modality or modality) == modality]
         n = len(self.spot_container.remove(fov, doomed))
-        if self.cell_container is not None:
-            for cell in self.cell_container.data.get(fov, []):
-                keep = [s for s in cell.spots
-                        if not (s.hybe == hybe and int(s.channel) == channel
-                                and (s.modality or modality) == modality)]
-                if len(keep) != len(cell.spots):
-                    n += len(cell.spots) - len(keep)
-                    cell.spots = keep
-                    cell.num_spots = {}
-                    for s2 in keep:
-                        cell.num_spots[s2.hybe] = cell.num_spots.get(s2.hybe, 0) + 1
-                    cell.total_num_spots = len(keep)
+        self._commit_spot_edit(fov, fp)
         sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {n} spot(s) cleared '
                               f'(in memory -- Save persists the empty slice).')
         self._refresh_spot_cell_list()
@@ -4258,36 +4229,10 @@ class MainWindow(QtWidgets.QMainWindow):
         by_slice = {}
         seen_uids = {}
 
-        def add(spot, modality):
-            """
-            One uid, one spot. The in-memory model still splits spots across
-            the unassigned pool and each cell's own list, so the SAME spot can
-            exist as two objects at once -- _attach_stored_spots_to_cells
-            rebuilds cell.spots from disk while the pool still holds the
-            original. Both carry the same uid, and write_spots rightly refuses
-            that. The spot's own `cell` field is the tie-break: an assigned
-            copy wins over an unassigned one, since assignment is what the
-            reassignment pass just decided.
-            """
-            uid = int(getattr(spot, 'uid', 0) or 0)
-            key = (modality, spot.hybe, int(spot.channel))
-            if uid:
-                prior = seen_uids.get(uid)
-                if prior is not None:
-                    prior_key, prior_spot = prior
-                    if int(prior_spot.cell) != -1 or int(spot.cell) == -1:
-                        return                      # keep the one already held
-                    by_slice[prior_key].remove(prior_spot)
-                seen_uids[uid] = (key, spot)
-            by_slice.setdefault(key, []).append(spot)
-
-        for spot in self.spot_container.unassigned(fov):
-            add(spot, spot.modality)
-        container = self.cell_container
-        if container is not None:
-            for cell in container.data.get(fov, []):
-                for spot in cell.spots:
-                    add(spot, spot.modality)
+        # One home per spot now, so no cross-structure dedup is needed:
+        # the container's own uid uniqueness is the guarantee.
+        for spot in self.spot_container.all(fov):
+            by_slice.setdefault((spot.modality, spot.hybe, int(spot.channel)), []).append(spot)
 
         # Slices on disk with nothing in memory get written empty, so
         # removing a hybe's last spot really removes it. One read is enough:
@@ -4360,9 +4305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cells_by_id = {c.id: c for c in cells}
         frame_shape = cells[0].frame_shape
 
-        spots = list(self.spot_container.unassigned(fov))
-        for cell in cells:
-            spots.extend(cell.spots)
+        spots = list(self.spot_container.all(fov))
         if not spots:
             return 0, 0
 
@@ -4372,24 +4315,11 @@ class MainWindow(QtWidgets.QMainWindow):
         n_assigned, n_unassigned = assignment.assign_spots(
             spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
 
-        # Redistribute: a spot lives wherever its own `cell` now says.
-        # Assigned spots go to their owner's cell.spots (still the assigned
-        # tier until step 3); unassigned ones live in the container. uids
-        # are ensured for the whole batch first, so a cell-view spot that
-        # just LOST its owner can enter the container.
+        # No redistribution: assignment wrote each spot's `cell` in place
+        # and the spot never leaves the container -- that field IS the
+        # whole ownership model. uids only need ensuring for any spot that
+        # entered by a door that predates allocation (none should remain).
         self._ensure_spot_uids(fov, spots)
-        for cell in cells:
-            cell.spots, cell.num_spots, cell.total_num_spots = [], {}, 0
-        fov_spots = self.spot_container.data.setdefault(int(fov), {})
-        for spot in spots:
-            owner = cells_by_id.get(int(spot.cell)) if spot.cell != -1 else None
-            if owner is not None:
-                owner.spots.append(spot)
-                owner.num_spots[spot.hybe] = owner.num_spots.get(spot.hybe, 0) + 1
-                owner.total_num_spots = len(owner.spots)
-                fov_spots.pop(int(spot.uid), None)
-            else:
-                fov_spots[int(spot.uid)] = spot
         return n_assigned, n_unassigned
 
     def _find_cell_by_id(self, fov, cell_id):
@@ -4397,70 +4327,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
 
-    def _snapshot_scopes(self, fov=None, cell_ids=None, fov_key=None):
-        cells_state = {}
-        for cell_id in (cell_ids or []):
-            cell = self._find_cell_by_id(fov, cell_id)
-            if cell is not None:
-                cells_state[cell_id] = deepcopy(cell.spots)
-        # fov_key kept for caller compatibility; any non-None value means
-        # "snapshot the unassigned tier of its FOV" -- a {uid: save-dict}
-        # fingerprint, not a deep object copy.
-        pool_fov = fov_key[1] if fov_key is not None else None
-        return {'fov': fov, 'cells': cells_state, 'fov_key': fov_key,
-                'fov_spots': ({int(sp.uid): sp.save() for sp in self.spot_container.unassigned(pool_fov)}
-                              if fov_key is not None else None)}
+    def _begin_spot_edit(self, fov):
+        """Fingerprint the FOV's transient spots BEFORE an edit; pair with
+        _commit_spot_edit after it. The pair replaces snapshot-taking: the
+        undo stack stores only the invertible diff between the two."""
+        return self.spot_container.fingerprint(fov)
 
-    def _push_spot_undo(self, fov=None, cell_ids=None, fov_key=None):
-        self._spot_undo_stack.append(self._snapshot_scopes(fov=fov, cell_ids=cell_ids, fov_key=fov_key))
-        self._spot_redo_stack.clear()
+    def _commit_spot_edit(self, fov, fp):
+        self.spot_undo.push(fov, fp)
         self._update_undo_redo_buttons()
 
-    def _apply_spot_snapshot(self, snapshot):
-        missing = []
-        for cell_id, spots in snapshot['cells'].items():
-            cell = self._find_cell_by_id(snapshot['fov'], cell_id)
-            if cell is None:
-                missing.append(cell_id)  # cell no longer exists (e.g. cell_container rebuilt) -- nothing sane to restore
-                continue
-            cell.spots = deepcopy(spots)
-            # num_spots keys are never deleted elsewhere in this app (see
-            # _replace_cell_spots) -- recomputing over the union of
-            # existing keys and the restored spots' own hybes correctly
-            # zeroes out a hybe the restore emptied, without needing a
-            # separate "before" reference.
-            for h in set(cell.num_spots.keys()) | {s.hybe for s in cell.spots}:
-                cell.num_spots[h] = sum(1 for s in cell.spots if s.hybe == h)
-            cell.total_num_spots = len(cell.spots)
-        if snapshot['fov_key'] is not None:
-            pool_fov = snapshot['fov_key'][1]
-            current = [sp.uid for sp in self.spot_container.unassigned(pool_fov)]
-            self.spot_container.remove(pool_fov, current)
-            for saved in snapshot['fov_spots'].values():
-                spot = ASpot()
-                spot.set_metadata(**saved)
-                self.spot_container.add(pool_fov, spot)
-        return missing
-
     def _undo_spot_action(self):
-        if not self._spot_undo_stack:
-            return
-        snapshot = self._spot_undo_stack.pop()
-        redo_snapshot = self._snapshot_scopes(fov=snapshot['fov'], cell_ids=list(snapshot['cells'].keys()),
-                                              fov_key=snapshot['fov_key'])
-        missing = self._apply_spot_snapshot(snapshot)
-        self._spot_redo_stack.append(redo_snapshot)
-        self._after_spot_undo_redo('Undo', missing)
+        if self.spot_undo.undo() is not None:
+            self._after_spot_undo_redo('Undo')
 
     def _redo_spot_action(self):
-        if not self._spot_redo_stack:
-            return
-        snapshot = self._spot_redo_stack.pop()
-        undo_snapshot = self._snapshot_scopes(fov=snapshot['fov'], cell_ids=list(snapshot['cells'].keys()),
-                                              fov_key=snapshot['fov_key'])
-        missing = self._apply_spot_snapshot(snapshot)
-        self._spot_undo_stack.append(undo_snapshot)
-        self._after_spot_undo_redo('Redo', missing)
+        if self.spot_undo.redo() is not None:
+            self._after_spot_undo_redo('Redo')
 
     def _after_spot_undo_redo(self, label, missing=None):
         sp = self.ui.SpotLocalizationPanel
@@ -4476,8 +4359,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_undo_redo_buttons(self):
         sp = self.ui.SpotLocalizationPanel
-        sp.UndoPushButton.setEnabled(bool(self._spot_undo_stack))
-        sp.RedoPushButton.setEnabled(bool(self._spot_redo_stack))
+        sp.UndoPushButton.setEnabled(self.spot_undo.can_undo())
+        sp.RedoPushButton.setEnabled(self.spot_undo.can_redo())
 
     def _replace_cell_spots(self, cell, hybe, channel, new_spots, append=False):
         """
@@ -4491,11 +4374,15 @@ class MainWindow(QtWidgets.QMainWindow):
         replacing it -- manual-edit callers never pass append=True, since
         their point list already IS the full current state.
         """
+        fov = cell.fov
         if not append:
-            cell.spots = [s for s in cell.spots if not (s.hybe == hybe and s.channel == channel)]
-        cell.spots.extend(new_spots)
-        cell.num_spots[hybe] = sum(1 for s in cell.spots if s.hybe == hybe)
-        cell.total_num_spots = len(cell.spots)
+            doomed = [s.uid for s in self.spot_container.of_cell(fov, cell.id)
+                      if s.hybe == hybe and s.channel == channel]
+            self.spot_container.remove(fov, doomed)
+        self._ensure_spot_uids(fov, new_spots)
+        for spot in new_spots:
+            spot.cell = int(cell.id)
+            self.spot_container.add(fov, spot)
 
     def _replace_fov_unassigned_spots(self, storage_path, fov, hybe, channel, new_spots, append=False):
         """
@@ -4588,12 +4475,14 @@ class MainWindow(QtWidgets.QMainWindow):
         sp = self.ui.SpotLocalizationPanel
         if ctx['kind'] == 'cell':
             cell = ctx['cell']
-            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
+            fp = self._begin_spot_edit(cell.fov)
             self._replace_cell_spots(cell, hybe, channel, new_spots)
+            self._commit_spot_edit(cell.fov, fp)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) after manual edit.')
         else:
-            self._push_spot_undo(fov_key=(ctx['storage_path'], ctx['fov']))
+            fp = self._begin_spot_edit(ctx['fov'])
             self._replace_fov_unassigned_spots(ctx['storage_path'], ctx['fov'], hybe, channel, new_spots)
+            self._commit_spot_edit(ctx['fov'], fp)
             sp.LogTextEdit.append(f'FOV{ctx["fov"]:02d}, {hybe} ch{channel}: {len(new_spots)} unassigned '
                                   f'spot(s) after manual edit.')
         self._refresh_spot_cell_list()
@@ -4634,14 +4523,15 @@ class MainWindow(QtWidgets.QMainWindow):
         cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
         if cell is None:
             return
-        match = next((s for s in cell.spots if s.hybe == hybe and s.channel == channel
+        match = next((s for s in self.spot_container.of_cell(fov, cell.id)
+                     if s.hybe == hybe and s.channel == channel
                      and abs(s.raw_coordinate[0] - x) < 0.5 and abs(s.raw_coordinate[1] - y) < 0.5), None)
         if match is None:
             return
-        self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
-        cell.spots.remove(match)
-        cell.num_spots[hybe] = sum(1 for s in cell.spots if s.hybe == hybe)
-        cell.total_num_spots = len(cell.spots)
+        fp = self.spot_container.fingerprint(fov)
+        self.spot_container.remove(fov, [match.uid])
+        self.spot_undo.push(fov, fp)
+        self._update_undo_redo_buttons()
         sp = self.ui.SpotLocalizationPanel
         # in-memory only, same "Save Current Spots to persist" convention
         # as every other edit here -- Save Current Spots now covers this
@@ -4719,8 +4609,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(img[y, x]))
                 new_spots.append(spot)
-            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
+            fp = self._begin_spot_edit(cell.fov)
             self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
+            self._commit_spot_edit(cell.fov, fp)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) detected '
                                   f'(Cell view{", appended" if append else ""}).')
             self._load_spot_crop_for_display()
@@ -4758,8 +4649,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))
                 new_spots.append(spot)
-            self._push_spot_undo(fov_key=(storage_path, fov))
+            fp = self._begin_spot_edit(fov)
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, new_spots, append=append)
+            self._commit_spot_edit(fov, fp)
             sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {len(new_spots)} peak(s) detected '
                                   f'(unassigned{", appended" if append else ""} -- run Save Current Spots to identify cell ownership).')
             self._refresh_spot_cell_list()
@@ -5331,7 +5223,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     for cell in cells:
                         cell.celltype = celltype.classify_fov(cell.fov, celltype_from_fov)
                         cell.linked, cell.linked_at = True, now
-                        for spot in cell.spots:
+                        for spot in self.spot_container.of_cell(cell.fov, cell.id):
                             spot.celltype = cell.celltype
                             spot.linked, spot.linked_at = True, now
                         n_cells += 1
@@ -5450,7 +5342,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if is_permanent:
                         permanent_fovs_touched.add(fov)
 
-                    for spot in cell.spots:
+                    for spot in self.spot_container.of_cell(fov, cell.id):
                         xy_by_channel = {}
                         for bch in barcode_channel:
                             hybe, channel_id, modality = bch
