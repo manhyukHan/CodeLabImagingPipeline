@@ -565,7 +565,7 @@ class PipelineCanvas():
 
         raw_zx = zx_via(target_storage_path, target_hybe, target_channel, raw_bounds)
         fov_zx = zx_via(target_storage_path, target_hybe, target_channel, fov_bounds)
-        dz_cell = alignment.entry_dz(cell.matrices.get((target_hybe, target_modality if target_modality is not None else cell.modality)))
+        dz_cell = alignment.entry_dz(cell.matrices.get((target_hybe, target_modality if target_modality is not None else cell.reference_modality)))
         # ZX column 3 reads at column 2's OWN native window (never a
         # residual-moved one), then applies BOTH corrections in one warp:
         # the depth shift (dz_cell) and the SAME float residual_dx the

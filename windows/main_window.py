@@ -296,7 +296,7 @@ class CellAlignmentWorker(QtCore.QThread):
                         # and silently fall back to identity.
                         frame_modality = cell.reference_modality
                         cellref_matrix = p['cellref_fov_matrices'].get(
-                            frame_modality, {}).get(cell.reference_hybe, np.eye(3))
+                            frame_modality, {}).get((cell.reference_hybe, frame_modality), np.eye(3))
                         alignment.compute_cell_alignment(
                             cell, p['storage_path'], fov, hybe_records, fov_matrices,
                             reference_hybe=p['reference_hybe'], channel_type=self.channel_type,
@@ -977,7 +977,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # _switch_current_modality's own docstring). Cell-Based Alignment
         # has no modality selector of its own at all -- which modality a
         # cell belongs to is read directly off the cell itself (cell.
-        # modality) wherever a (FOV, Cell ID) resolves to a real cell.
+        # reference_modality) wherever a (FOV, Cell ID) resolves to a cell.
         ip = self.ui.IngestionPanel
         ip.ModalityComboBox.blockSignals(True)
         ip.ModalityComboBox.clear()
@@ -1653,16 +1653,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 same_modality = [(key[0], _matrix_dxdy_angle(H))
                                  for key, H in sorted(matrices.items())]
                 cross_modal = None
+                # dz is a measured component of the cross-modal result
+                # (stored right beside H_across) -- shown here per explicit
+                # request: the viewer reports the data structure honestly,
+                # never a convenient subset of it.
                 if modality == global_params.get('cross_modal_dna_modality'):
                     H_across = vlinks_store.read_cross_modal_matrix(path, fov)
                     if H_across is not None:
-                        cross_modal = _matrix_dxdy_angle(H_across)
+                        dz_across = vlinks_store.read_cross_modal_z(path, fov)
+                        cross_modal = f'{_matrix_dxdy_angle(H_across)}, dz={dz_across:.2f}'
                 elif modality == global_params.get('cross_modal_rna_modality'):
                     # The RNA side is the cross-modal TARGET frame, never
                     # itself shifted -- shown as an explicit identity row
                     # rather than omitted, so both sides of a link read
                     # consistently.
-                    cross_modal = _matrix_dxdy_angle(np.eye(3))
+                    cross_modal = f'{_matrix_dxdy_angle(np.eye(3))}, dz=0.00'
                 rows.append({'fov': fov, 'modality': modality,
                              'same_modality': same_modality, 'cross_modal': cross_modal})
         d.set_matrix_data(rows)
@@ -2630,16 +2635,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell_container.data.setdefault(fov, {})
 
         # cells always show, regardless of which hybe/channel the panel is
-        # currently displaying -- get_area_in_readout(reference_hybe,
-        # modality) transforms each cell's mask into this hybe's own frame
-        # via whatever matrix is known, defaulting to identity (the cell's
-        # own raw/untransformed position) when cell-based alignment hasn't
-        # been run for it yet, rather than hiding the mask entirely -- an
-        # earlier version suppressed the whole overlay on a hybe mismatch,
-        # which is exactly the behavior this replaces per explicit
-        # correction. get_area_in_readout itself never raises (identity is
-        # a real, valid answer, not an error) -- the "approximate" note
-        # below is a direct membership check, not exception-based, purely
+        # currently displaying -- _cell_area_in_readout (the resolver-
+        # backed projection, NEVER ACell.get_area_in_readout directly:
+        # that raises by design on residual-form matrices once cell
+        # alignment has run for a cell -- confirmed real crash loading
+        # this displayer after alignment) transforms each cell's mask
+        # into this hybe's own frame via whatever matrix is known,
+        # defaulting to identity (the cell's own raw position) when no
+        # layer has been run, rather than hiding the mask entirely. The
+        # "approximate" note below is a direct membership check, purely
         # to tell the user WHY a shown position might be less precise.
         mask = np.zeros(reference_image.shape, dtype=np.uint8)
         if cells:
@@ -2653,7 +2657,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 # cells here can come from either modality.
                 if (reference_hybe, modality) not in cell.matrices:
                     approximate = True
-                x, y = cell.get_area_in_readout(reference_hybe, modality)
+                x, y = self._cell_area_in_readout(cell, reference_hybe, modality, fov)
+                if len(x) == 0:
+                    continue
                 xi, yi = x.astype(int), y.astype(int)
                 valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
                 mask[yi[valid], xi[valid]] = cell.id
@@ -3009,8 +3015,19 @@ class MainWindow(QtWidgets.QMainWindow):
         alone would be ambiguous.
         """
         modality = spec['modality']
+        # Two distinct numbers, both shown -- per explicit correction
+        # ("be honest for viewer"): dx/dy/dz is the TOTAL shift of this
+        # hybe relative to the reference hybe (dominated by the FOV-level
+        # inter-hybe shift, often several px), while res= is this hybe's
+        # own CELL-LEVEL residual (final minus FOV-only -- the only part
+        # the 3-col preview's column 2 -> 3 cyan movement shows, usually
+        # subpixel). Showing only the total made a ~7px row look like a
+        # correction the preview then visibly "failed" to apply.
+        res_dx = spec['final_matrix'][0, 2] - spec['fov_only_matrix'][0, 2]
+        res_dy = spec['final_matrix'][1, 2] - spec['fov_only_matrix'][1, 2]
         return (f"FOV{fov:03d} Cell{cell.id:03d}: {spec['hybe']} ({modality}) | "
-               f"{reference_hybe} ({modality}): dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f}")
+               f"{reference_hybe} ({modality}): dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f} "
+               f"| cell residual dx={res_dx:.2f}, dy={res_dy:.2f}")
 
     def _refresh_cell_preview_reference_choices(self, cells_with_matrices, storage_path):
         """
@@ -3907,7 +3924,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return rx, ry, z
             return coord_xyz
         x, y, z = coord_xyz
-        H = cell.matrix_to_shared(hybe, modality)
+        # Resolver-backed, never ACell.matrix_to_shared directly -- that
+        # raises by design once this cell carries residual-form matrices
+        # (post cell alignment); the resolver composes the FOV leg live.
+        H = self._matrix_to_shared(hybe, modality, cell, cell.fov)
+        if H is None:
+            H = np.eye(3)
         Hinv = la.inv(H)
         rx, ry, _ = Hinv @ np.array([x, y, 1.0])
         Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
@@ -4348,8 +4370,15 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback = owner.reference_modality if owner is not None else None
             return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
 
+        def area_in_frame(cell, hybe, modality):
+            # Resolver-backed projection -- the library default
+            # (cell.get_area_in_readout) raises on residual-form matrices
+            # and would silently DROP every aligned cell from the mask.
+            return self._cell_area_in_readout(cell, hybe, modality, fov)
+
         n_assigned, n_unassigned = assignment.assign_spots(
-            spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
+            spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared,
+            area_in_frame=area_in_frame)
 
         # No redistribution: assignment wrote each spot's `cell` in place
         # and the spot never leaves the container -- that field IS the
@@ -6539,10 +6568,10 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_hybe = frame_hybe or cell.reference_hybe
         frame_modality = frame_modality or cell.reference_modality
         fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-        if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
+        if fov_matrices_for_hybe is None or (hybe, modality) not in fov_matrices_for_hybe:
             return None
         frame_fov_matrices = self._fov_matrices_for_cell_modality(frame_modality, cell, fov)
-        cell_reference_hybe_matrix = (frame_fov_matrices or {}).get(frame_hybe, np.eye(3))
+        cell_reference_hybe_matrix = (frame_fov_matrices or {}).get((frame_hybe, frame_modality), np.eye(3))
         return alignment.hybe_to_cellref_matrix(fov_matrices_for_hybe, cell_reference_hybe_matrix, hybe)
 
     def _live_cell_matrix_anchor(self, modality, cell, fov):
@@ -6576,7 +6605,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
         anchor_hybe = self.ui.AlignmentPanel.current_cell_reference_hybe(modality)
-        live = (fov_matrices_for_hybe or {}).get(anchor_hybe) if anchor_hybe else None
+        live = (fov_matrices_for_hybe or {}).get((anchor_hybe, modality)) if anchor_hybe else None
         return live if live is not None else cell.matrix_anchors.get(modality, np.eye(3))
 
     def _matrix_to_cellref(self, hybe, modality, cell, fov):
@@ -6700,12 +6729,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Cells here are the REAL objects (whichever container has them for
         # this FOV, permanent/saved preferred) -- CellAlignmentWorker mutates
         # them in place, so no staging/deepcopy is needed for an always-save
-        # operation. Modality is read directly off the container (this app
-        # only ever holds ONE modality's cells resident in memory at a
-        # time -- cell_container/cell_container_permanent always share the
-        # same .modality), never a separate picker -- and that modality's
-        # own configured reference hybe (ap.current_cell_reference_hybe)
-        # is what compute_cell_alignment anchors against.
+        # operation. Modality is read directly off the cells themselves
+        # (this app only ever holds ONE modality's cells resident in memory
+        # at a time, so every cell in the container shares one
+        # reference_modality), never a separate picker -- and that
+        # modality's own configured reference hybe
+        # (ap.current_cell_reference_hybe) is what compute_cell_alignment
+        # anchors against.
         container = None
         if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
             container = self.cell_container_permanent
@@ -6717,7 +6747,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         real_cells = container.get_cells(fov)
 
-        cell_modality = ''
+        cell_modality = real_cells[0].reference_modality
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         storage_path = self._storage_path_for_modality(cell_modality)
         hybe_records = self._active_hybe_records_for_modality(cell_modality)
@@ -6836,7 +6866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, hybe_records, channel_type)
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
-            cell.reference_hybe, np.eye(3))
+            (cell.reference_hybe, cell.reference_modality), np.eye(3))
         self.preview_canvas.draw_cell_all_readouts_overlay(
             cell, fov, overlay_reference_hybe, storage_path, reference_channel,
             target_specs, pad=pad, save_path=save_path, mask_anchor_fov_matrix=mask_anchor_fov_matrix)
@@ -6859,7 +6889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._cell_alignment_display_cells:
             QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', 'Run Cell Alignment first.')
             return
-        cell_modality = self._cell_alignment_display_cells[0][1].modality
+        cell_modality = self._cell_alignment_display_cells[0][1].reference_modality
         storage_path = self._storage_path_for_modality(cell_modality)
         if not storage_path:
             QtWidgets.QMessageBox.warning(self, 'Save All Cell Overlays', f'No storage path configured for {cell_modality}.')
@@ -6987,12 +7017,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # reference frame (what draw_cell_alignment_preview_3col's
         # bounds_via now expects -- see ACell.matrix_to_shared).
         target_fov_matrices = self._fov_matrices_for_cell_modality(target_modality, cell, fov)
-        fov_only_matrix = (target_fov_matrices or {}).get(target_hybe)
+        fov_only_matrix = (target_fov_matrices or {}).get((target_hybe, target_modality))
         final_matrix = self._matrix_to_shared(target_hybe, target_modality, cell, fov)
+        # Missing FOV-level alignment is IDENTITY, never a blocker (core
+        # principle: every layer runs standalone) -- say so and proceed.
         if fov_only_matrix is None or final_matrix is None:
             self.statusBar().showMessage(
-                f"Can't preview {target_hybe} ({target_modality}): no FOV-level alignment available for it yet.", 8000)
-            return
+                f'No FOV-level alignment for {target_hybe} ({target_modality}) yet -- previewing with identity.', 8000)
+        if fov_only_matrix is None:
+            fov_only_matrix = np.eye(3)
+        if final_matrix is None:
+            final_matrix = np.eye(3)
         target_channel = alignment.pick_channel_by_type(target_record, channel_type)
 
         reference_specs = []
@@ -7002,9 +7037,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if err:
                 continue
             reference_fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
-            reference_fov_matrix = (reference_fov_matrices or {}).get(reference_hybe)
+            # Missing matrix = identity (never a skip) -- only a genuinely
+            # unresolvable record/storage path (err above) drops a block.
+            reference_fov_matrix = (reference_fov_matrices or {}).get((reference_hybe, modality))
             if reference_fov_matrix is None:
-                continue
+                reference_fov_matrix = np.eye(3)
             # 'final_matrix' deliberately OMITTED -- draw_cell_alignment_
             # preview_3col's own default (spec.get('final_matrix',
             # reference_fov_matrix)) then pins the reference/red side to
@@ -7038,7 +7075,7 @@ class MainWindow(QtWidgets.QMainWindow):
             })
 
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
-            cell.reference_hybe, np.eye(3))
+            (cell.reference_hybe, cell.reference_modality), np.eye(3))
 
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
@@ -7095,7 +7132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Plain FOV-only lookup for the FOV/cross-modal column's own crop
         # -- no cell involvement, no bridge step left to compute.
         reference_fov_matrices = self._fov_matrices_for_cell_modality(reference_modality, cell, fov)
-        reference_matrix = (reference_fov_matrices or {}).get(reference_hybe, np.eye(3))
+        reference_matrix = (reference_fov_matrices or {}).get((reference_hybe, reference_modality), np.eye(3))
         # Computed INDEPENDENTLY for the final column -- see draw_cell_
         # all_readouts_overlay's own docstring for why reference_hybe's
         # final crop needs the SAME KIND of matrix (_matrix_to_shared,
@@ -7106,7 +7143,7 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_final_matrix = np.eye(3)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
-            cell.reference_hybe, np.eye(3))
+            (cell.reference_hybe, cell.reference_modality), np.eye(3))
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
         self.preview_canvas.draw_cell_all_readouts_overlay(
@@ -7222,15 +7259,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if reference_record is not None:
             reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
             reference_fov_matrices = self._fov_matrices_for_cell_modality(cell_modality, staged_cell, fov)
-            reference_matrix = (reference_fov_matrices or {}).get(overlay_reference_hybe, np.eye(3))
+            reference_matrix = (reference_fov_matrices or {}).get((overlay_reference_hybe, cell_modality), np.eye(3))
             # Computed INDEPENDENTLY for the final column -- see draw_cell_
             # all_readouts_overlay's own docstring for why.
             reference_final_matrix = self._matrix_to_shared(overlay_reference_hybe, cell_modality, staged_cell, fov)
             if reference_final_matrix is None:
                 reference_final_matrix = np.eye(3)
             target_specs = self._cell_overlay_target_specs(staged_cell, storage_path, fov, hybe_records, channel_type)
-            mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(staged_cell.modality, staged_cell, fov) or {}).get(
-                staged_cell.reference_hybe, np.eye(3))
+            mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(staged_cell.reference_modality, staged_cell, fov) or {}).get(
+                (staged_cell.reference_hybe, staged_cell.reference_modality), np.eye(3))
             self.alignment_preview_window.show()
             self.alignment_preview_window.raise_()
             self.preview_canvas.draw_cell_all_readouts_overlay(
@@ -7291,7 +7328,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
                 target_specs = self._cell_overlay_target_specs(real_cell, storage_path, fov, hybe_records, channel_type)
                 mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(real_cell.reference_modality, real_cell, fov) or {}).get(
-                    real_cell.reference_hybe, np.eye(3))
+                    (real_cell.reference_hybe, real_cell.reference_modality), np.eye(3))
                 self.preview_canvas.draw_cell_all_readouts_overlay(
                     real_cell, fov, overlay_reference_hybe, storage_path, reference_channel,
                     target_specs, pad=pad, save_path=save_path, mask_anchor_fov_matrix=mask_anchor_fov_matrix)

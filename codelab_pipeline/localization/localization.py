@@ -375,7 +375,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     # belong to the other modality once a cytoplasm is attached (see
     # ACell's own docstring), and pairing it with the cell's home
     # modality would key a (hybe, modality) entry that never exists.
-    reference_modality = cell.reference_modality or cell.modality
+    reference_modality = cell.reference_modality
     self_key = (cell.reference_hybe, reference_modality)
     have_real = (key in cell.matrices and self_key in cell.matrices
                  and modality in cell.matrix_anchors and reference_modality in cell.matrix_anchors)

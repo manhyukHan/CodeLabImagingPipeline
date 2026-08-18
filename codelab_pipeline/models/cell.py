@@ -243,6 +243,15 @@ class ACell():
         _require_composable). New code should go through
         frames.FrameResolver, which composes all three layers.
         """
+        # Self-map short-circuit: for a == b the composition cancels
+        # EXACTLY -- inv(A @ H) @ (A @ H) -- whatever A and H hold, so the
+        # answer is identity for residual-form and legacy entries alike.
+        # Short-circuiting BEFORE the composability guard keeps the one
+        # projection that never needs the FOV layer (a cell's mask in its
+        # own reference frame, e.g. label_mask_for_frame's session-free
+        # default) working on residual cells instead of raising.
+        if (hybe_a, modality_a) == (hybe_b, modality_b):
+            return np.eye(3)
         self._require_composable((hybe_a, modality_a))
         self._require_composable((hybe_b, modality_b))
         H_a_to_anchor = self.matrices.get((hybe_a, modality_a), {}).get('yx', np.eye(3))

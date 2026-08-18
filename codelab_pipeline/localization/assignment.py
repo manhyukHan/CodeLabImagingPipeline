@@ -24,16 +24,26 @@ import numpy as np
 import numpy.linalg as la
 
 
-def label_mask_for_frame(cells, hybe, modality, frame_shape):
+def label_mask_for_frame(cells, hybe, modality, frame_shape, area_in_frame=None):
     """
     A label image of every cell AS SEEN IN (hybe, modality)'s own frame --
     0 background, otherwise the cell's id.
 
-    Each cell is projected from ITS OWN reference hybe via
-    get_area_in_readout, so cells segmented in different hybes (or different
-    modalities) compose correctly into one mask. That per-cell reference does
-    not need to agree with anything: the destination is the SPOT's frame, and
-    every cell is mapped into it independently.
+    Each cell is projected from ITS OWN reference hybe, so cells segmented
+    in different hybes (or different modalities) compose correctly into one
+    mask. That per-cell reference does not need to agree with anything: the
+    destination is the SPOT's frame, and every cell is mapped into it
+    independently.
+
+    area_in_frame: optional callable (cell, hybe, modality) -> (x, y) that
+    does the projection. Session callers MUST pass one backed by the live
+    FrameResolver (MainWindow._cell_area_in_readout): the default,
+    cell.get_area_in_readout, RAISES by design on residual-form matrices
+    (any cell that has run cell alignment), and the except-continue below
+    would then silently drop exactly the best-aligned cells from the mask
+    -- spots inside them would quietly come back unassigned. The default
+    exists only for session-free contexts (tests, legacy composed
+    matrices).
 
     Built once per (hybe, modality) and then indexed per spot, which is what
     makes assignment O(N) in spots with no per-spot matrix work at all --
@@ -46,7 +56,10 @@ def label_mask_for_frame(cells, hybe, modality, frame_shape):
     height, width = labels.shape
     for cell in cells:
         try:
-            x, y = cell.get_area_in_readout(hybe, modality)
+            if area_in_frame is not None:
+                x, y = area_in_frame(cell, hybe, modality)
+            else:
+                x, y = cell.get_area_in_readout(hybe, modality)
         except Exception:
             continue          # this cell has no path into that frame
         x = np.asarray(x).astype(int).ravel()
@@ -62,7 +75,7 @@ def count_unassigned(spots):
 
 
 def assign_spots(spots, cells, frame_shape, cells_by_id=None,
-                 matrix_to_shared=None):
+                 matrix_to_shared=None, area_in_frame=None):
     """
     Assign every spot in `spots` against `cells`, in place.
 
@@ -84,6 +97,9 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
     recomputed through it so shared-frame positions reflect the CURRENT
     matrices rather than whatever they were at localization time.
 
+    area_in_frame: forwarded to label_mask_for_frame (see its docstring --
+    session callers must pass the resolver-backed projection).
+
     Returns (n_assigned, n_unassigned).
     """
     if cells_by_id is None:
@@ -96,7 +112,8 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
 
     n_assigned = n_unassigned = 0
     for (hybe, modality), group in groups.items():
-        mask = label_mask_for_frame(cells, hybe, modality, frame_shape)
+        mask = label_mask_for_frame(cells, hybe, modality, frame_shape,
+                                    area_in_frame=area_in_frame)
         height, width = mask.shape
         for spot in group:
             ix = int(spot.raw_coordinate[0])

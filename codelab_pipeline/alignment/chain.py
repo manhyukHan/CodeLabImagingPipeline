@@ -909,8 +909,8 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     bare-string key would collide the two calls (same-modality and
     cross-modal) this function is meant to be invoked with once each per
     cell, silently dropping whichever one runs second. Defaults to
-    cell.modality (the common, same-modality call); the cross-modal call
-    MUST pass the other modality's own name explicitly.
+    cell.reference_modality (the common, same-modality call); the
+    cross-modal call MUST pass the other modality's own name explicitly.
 
     Writes cell.matrices[(hybe, modality)] = {'yx': H_within_or_across @
     ... composed with the cell's own residual, 'zx': depth correction}
@@ -955,7 +955,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     """
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
-    modality = modality if modality is not None else cell.modality
+    modality = modality if modality is not None else cell.reference_modality
     x_ref, y_ref = cell.area  # always native to cell.reference_hybe's own frame
     if cell_reference_hybe_matrix is None:
         cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
@@ -1006,7 +1006,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # cross-modal hybe_records are always modality-specific, never
         # mixed). Surface the actual mismatch instead.
         raise ValueError(f"reference_hybe '{reference_hybe}' is not in the {len(hybe_records)} "
-                         f"hybe_records passed to compute_cell_alignment (modality={modality or cell.modality}) -- "
+                         f"hybe_records passed to compute_cell_alignment (modality={modality}) -- "
                          f"it likely belongs to a different modality.")
     ref_record = record_by_folder[reference_hybe]
     ref_channel = pick_channel_by_type(ref_record, channel_type)

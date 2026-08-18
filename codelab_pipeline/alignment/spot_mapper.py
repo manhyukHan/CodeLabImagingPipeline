@@ -48,15 +48,15 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     cell.matrices correctly, since it's keyed by (hybe, modality), not
     bare hybe (the cross-modal bridge hybe, e.g. Hyb_130, is a real,
     distinct file in both modalities and would otherwise collide).
-    Defaults to cell.modality when cell is given and modality is omitted
-    -- correct for the common case of a same-modality lookup.
+    Defaults to cell.reference_modality when cell is given and modality is
+    omitted -- correct for the common case of a same-modality lookup.
     """
     if cell is not None:
         # Guard: a bare cell-level residual is only half the transform --
         # the FOV leg is recomposed by frames.FrameResolver, which this
         # module has no access to. Silently composing it here would drop
         # the FOV correction. See ACell._require_composable.
-        key_modality = modality if modality is not None else cell.modality
+        key_modality = modality if modality is not None else cell.reference_modality
         entry = cell.matrices.get((hybe, key_modality))
         if entry is not None and entry.get('yx_is_residual'):
             raise ValueError(

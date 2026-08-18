@@ -76,11 +76,16 @@ def test_assignment_is_correct_before_it_is_fast():
     x, y = target.area
     px, py = int(np.asarray(x).ravel()[0]), int(np.asarray(y).ravel()[0])
 
-    inside = ASpot(); inside.modality = 'RNA'
-    inside.set_metadata(uid=1, fov=FOV, hybe=HYBE, channel=635,
+    # The pixel comes from target.area, which is native to the cell's OWN
+    # reference frame -- so the spot must claim that frame too. The old
+    # hard-coded 'RNA' only ever worked incidentally against legacy
+    # composed matrices; on residual-form cells the mismatched frame has
+    # no session-free projection at all.
+    inside = ASpot(); inside.modality = target.reference_modality
+    inside.set_metadata(uid=1, fov=FOV, hybe=target.reference_hybe, channel=635,
                         raw_coordinate=(float(px), float(py), 0.0))
-    outside = ASpot(); outside.modality = 'RNA'
-    outside.set_metadata(uid=2, fov=FOV, hybe=HYBE, channel=635,
+    outside = ASpot(); outside.modality = target.reference_modality
+    outside.set_metadata(uid=2, fov=FOV, hybe=target.reference_hybe, channel=635,
                          raw_coordinate=(-50.0, -50.0, 0.0))
 
     n_a, n_u = assignment.assign_spots([inside, outside], cells, mask.shape, by_id)
