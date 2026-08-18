@@ -38,6 +38,17 @@ class SpotContainer:
             raise ValueError('spot has uid=0 -- allocate a real uid at creation '
                              '(vlinks_store.allocate_spot_uids); identity cannot '
                              'be retrofitted at save time')
+        # A spot is BY DEFINITION localized on one (FOV, hybe/modality,
+        # channel) -- an empty modality is not a degraded state to tolerate
+        # (it resolves NO frame, so every recast silently becomes identity)
+        # but the signature of an obsolete creation path. Fail loudly and
+        # name the spot; the session load door heals unambiguous legacy
+        # dicts BEFORE they get here.
+        if not getattr(spot, 'modality', ''):
+            raise ValueError(
+                f'spot uid={uid} (hybe={getattr(spot, "hybe", "?")!r}) has no modality -- '
+                f'a spot is defined on a (FOV, hybe/modality, channel); an empty modality '
+                f'means an obsolete creation path that must be fixed, not tolerated')
         fov_spots = self.data.setdefault(int(fov), {})
         if uid in fov_spots and fov_spots[uid] is not spot:
             raise ValueError(f'uid {uid} already present in FOV {fov} -- uids are never reused')

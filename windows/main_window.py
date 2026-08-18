@@ -2878,8 +2878,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._spot_loaded_fovs.add(fov)
             any_path = next(iter(self._all_vlinks_storage_paths()), None)
             if any_path:
+                # Heal legacy modality='' spots at the door where possible:
+                # an empty modality resolves NO frame, so every later
+                # recast silently degrades to identity for that spot. A
+                # hybe present in exactly ONE modality's own records is
+                # unambiguous; the cross-modal bridge hybe (present in
+                # both) genuinely cannot be resolved and is left as-is.
+                hybe_owners = {}
+                for m in self.ui.IngestionPanel.modality_names:
+                    for r in self._active_hybe_records_for_modality(m):
+                        hybe_owners.setdefault(r['folder'], set()).add(m)
+                unambiguous = {h: next(iter(ms)) for h, ms in hybe_owners.items()
+                               if len(ms) == 1}
                 try:
                     for d in vlinks_store.read_spots(any_path, fov):
+                        if not d.get('modality') and d.get('hybe') in unambiguous:
+                            d = dict(d, modality=unambiguous[d['hybe']])
                         spot = ASpot()
                         spot.set_metadata(**d)
                         # Both tiers stage EVERY spot, assigned and
@@ -3015,19 +3029,25 @@ class MainWindow(QtWidgets.QMainWindow):
         alone would be ambiguous.
         """
         modality = spec['modality']
-        # Two distinct numbers, both shown -- per explicit correction
-        # ("be honest for viewer"): dx/dy/dz is the TOTAL shift of this
-        # hybe relative to the reference hybe (dominated by the FOV-level
-        # inter-hybe shift, often several px), while res= is this hybe's
-        # own CELL-LEVEL residual (final minus FOV-only -- the only part
-        # the 3-col preview's column 2 -> 3 cyan movement shows, usually
-        # subpixel). Showing only the total made a ~7px row look like a
-        # correction the preview then visibly "failed" to apply.
+        # Two distinct groups, both shown -- per explicit correction ("be
+        # honest for viewer"): the first dx/dy/dz is the TOTAL shift --
+        # xy relative to this modality's own reference hybe (dominated by
+        # the FOV-level inter-hybe shift, often several px) and z from
+        # the cross-modal layer (dz, the modality->shared drift; within
+        # one modality there is no FOV-level z term, so the reference-
+        # relative z IS the cross-modal one). The trailing group is this
+        # hybe's own CELL-LEVEL residual in full (dx, dy, AND its own dz
+        # from cell.matrices -- the only part the 3-col preview's column
+        # 2 -> 3 cyan movement shows, usually subpixel). Showing only the
+        # total made a ~7px row look like a correction the preview then
+        # visibly "failed" to apply; parking the cell-level dz beside the
+        # total's dx/dy mislabeled which layer it belongs to.
         res_dx = spec['final_matrix'][0, 2] - spec['fov_only_matrix'][0, 2]
         res_dy = spec['final_matrix'][1, 2] - spec['fov_only_matrix'][1, 2]
+        res_dz = spec.get('dz', 0.0)
         return (f"FOV{fov:03d} Cell{cell.id:03d}: {spec['hybe']} ({modality}) | "
                f"{reference_hybe} ({modality}): dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f} "
-               f"| cell residual dx={res_dx:.2f}, dy={res_dy:.2f}")
+               f"| cell residual dx={res_dx:.2f}, dy={res_dy:.2f}, dz={res_dz:.2f}")
 
     def _refresh_cell_preview_reference_choices(self, cells_with_matrices, storage_path):
         """
@@ -3159,7 +3179,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             dx = spec['final_matrix'][0, 2] - reference_final_matrix[0, 2]
             dy = spec['final_matrix'][1, 2] - reference_final_matrix[1, 2]
-            dz = spec.get('dz', 0.0)
+            # The TOTAL group's dz is the cross-modal layer's own z drift
+            # for this row's modality into the shared frame (0 for the
+            # shared side). The cell-level per-hybe z (spec['dz']) belongs
+            # to the trailing "cell residual" group -- the label reads it
+            # off spec itself.
+            dz = self._cross_modal_z(
+                modality, self._shared_frame_modality() or cell.reference_modality, fov)
             item = QtWidgets.QListWidgetItem(self._cell_hybe_result_label(cell, fov, spec, reference_hybe, dx, dy, dz))
             item.setData(QtCore.Qt.UserRole, (fov, cell.id, spec['hybe'], modality))
             ap.CellResultsListWidget.addItem(item)
@@ -3932,8 +3958,12 @@ class MainWindow(QtWidgets.QMainWindow):
             H = np.eye(3)
         Hinv = la.inv(H)
         rx, ry, _ = Hinv @ np.array([x, y, 1.0])
-        Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
-        return float(rx), float(ry), float(z - Hz[1, 2])
+        # entry_dz returns a plain float now -- the old Hz[1, 2] indexing
+        # here was a latent TypeError (floats don't index) that #62's
+        # sweep missed because this path only runs for persisted mixture
+        # siblings.
+        dz_cell = alignment.entry_dz(cell.matrices.get((hybe, modality)))
+        return float(rx), float(ry), float(z - dz_cell)
 
     def _show_3d_crop_only(self):
         """
@@ -4355,11 +4385,6 @@ class MainWindow(QtWidgets.QMainWindow):
         nothing whenever you had not just re-segmented.
         """
         cells = self.cell_container.get_cells(fov) if self.cell_container else []
-        if not cells:
-            return 0, 0
-        cells_by_id = {c.id: c for c in cells}
-        frame_shape = cells[0].frame_shape
-
         spots = list(self.spot_container.all(fov))
         if not spots:
             return 0, 0
@@ -4369,6 +4394,21 @@ class MainWindow(QtWidgets.QMainWindow):
             # cell leg defaults to identity, FOV/cross-modal still compose.
             fallback = owner.reference_modality if owner is not None else None
             return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+
+        if not cells:
+            # No cells LOADED is identity for the CELL leg only -- the FOV/
+            # cross-modal legs must still recast every spot's shared-frame
+            # coordinate (confirmed real bug: this used to return early,
+            # so a save in a session without the cell layer loaded wrote
+            # coordinate == raw_coordinate for every spot). Ownership is
+            # deliberately untouched here: cells existing on disk but not
+            # loaded must never cost a spot its owner.
+            assignment.recast_spots_to_shared(spots, to_shared, {})
+            self._ensure_spot_uids(fov, spots)
+            n_owned = sum(1 for s in spots if int(s.cell) != -1)
+            return n_owned, len(spots) - n_owned
+        cells_by_id = {c.id: c for c in cells}
+        frame_shape = cells[0].frame_shape
 
         def area_in_frame(cell, hybe, modality):
             # Resolver-backed projection -- the library default
@@ -4559,7 +4599,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 val = img[iy, ix]
                 brightness = float(val) if np.isfinite(val) else 0.0
             spot = ASpot()
-            spot.modality = ctx.get('modality') or ''
+            # Never '' -- an empty modality resolves NO frame, so every
+            # later recast silently degrades to identity for this spot.
+            spot.modality = ctx.get('modality') or vlinks_store.modality_of(ctx['storage_path'])
             if ctx['kind'] == 'cell':
                 cell = ctx['cell']
                 # _matrix_to_shared (not spot_mapper.raw_to_reference's own
@@ -4728,7 +4770,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
-                spot.modality = modality or ''
+                # Never '' -- see the manual-click door's own comment.
+                spot.modality = modality or vlinks_store.modality_of(storage_path)
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(img[y, x]))
@@ -4768,7 +4811,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
-                spot.modality = modality or ''
+                # Never '' -- see the manual-click door's own comment.
+                spot.modality = modality or vlinks_store.modality_of(storage_path)
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))
