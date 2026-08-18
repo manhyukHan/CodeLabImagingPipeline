@@ -17,6 +17,13 @@ class ASpot():
        and nothing ever looked a spot up by it. Display numbering lives in
        MainWindow._global_spot_index_map, computed per view.
      fov: int
+     modality: str -- which modality this spot's hybe belongs to. Required
+       alongside `hybe` because a hybe name alone is ambiguous: the
+       cross-modal bridge hybe (e.g. Hyb_130) is a real, distinct
+       acquisition in BOTH modalities, so (hybe, modality) is the key
+       everywhere else in the pipeline and must be here too. One cell's
+       spots can legitimately span modalities, so this cannot be inferred
+       from the owning cell either.
      hybe: str (readout identity, e.g. 'Hyb_105' -- distinct from channel)
      channel: int (physical imaging channel, e.g. 555/635)
      cell: int (owning cell id, -1 if homeless)
@@ -42,6 +49,7 @@ class ASpot():
     def __init__(self):
         self.uid = 0
         self.fov = 0
+        self.modality = ''
         self.hybe = ''
         self.channel = 0
         self.cell = -1
@@ -57,6 +65,7 @@ class ASpot():
     def set_metadata(self, **kwargs):
         if 'uid' in kwargs: self.uid = int(kwargs['uid'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
+        if 'modality' in kwargs: self.modality = str(kwargs['modality'])
         if 'hybe' in kwargs: self.hybe = str(kwargs['hybe'])
         if 'channel' in kwargs: self.channel = int(kwargs['channel'])
         if 'cell' in kwargs: self.cell = int(kwargs['cell'])
@@ -85,6 +94,7 @@ class ASpot():
             return round(float(v), 2)
         return {'uid': int(self.uid),
                 'fov': int(self.fov),
+                'modality': str(self.modality),
                 'hybe': str(self.hybe),
                 'channel': int(self.channel),
                 'cell': int(self.cell),

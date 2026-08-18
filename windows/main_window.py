@@ -4327,6 +4327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 val = img[iy, ix]
                 brightness = float(val) if np.isfinite(val) else 0.0
             spot = ASpot()
+            spot.modality = ctx.get('modality') or ''
             if ctx['kind'] == 'cell':
                 cell = ctx['cell']
                 # _matrix_to_shared (not spot_mapper.raw_to_reference's own
@@ -4492,6 +4493,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
+                spot.modality = modality or ''
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(img[y, x]))
@@ -4530,6 +4532,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     cx, cy = float(raw_x), float(raw_y)
                 spot = ASpot()
+                spot.modality = modality or ''
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel,
                                   coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))

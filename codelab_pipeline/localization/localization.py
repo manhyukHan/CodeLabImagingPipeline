@@ -12,6 +12,7 @@ from ..io import preprocess
 import cv2
 
 from ..alignment import chain as alignment
+from ..io import vlinks_store
 from ..alignment import spot_mapper
 
 def cell_z_offset(cell, hybe, modality, resolver=None):
@@ -790,6 +791,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
         z1 = z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
+        spot.modality = vlinks_store.modality_of(storage_path)
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                           coordinate=(float(x1), float(y1), float(z1)),
                           raw_coordinate=(float(raw_x), float(raw_y), float(z)),
@@ -897,6 +899,7 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
         z1 = raw_z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
+        spot.modality = vlinks_store.modality_of(storage_path)
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
                           coordinate=(float(x1), float(y1), float(z1)),
                           raw_coordinate=(float(raw_x), float(raw_y), float(raw_z)),

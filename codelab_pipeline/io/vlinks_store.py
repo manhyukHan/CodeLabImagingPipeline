@@ -26,7 +26,7 @@ def _vlinks_path(storage_path):
                         'vlinks.h5')
 
 
-def _modality_of(storage_path):
+def modality_of(storage_path):
     """
     Which modality owns this stack directory, read from the `modality` attr
     ingestion writes onto every {hybe}_stack.h5.
@@ -492,7 +492,7 @@ def write_global_params(storage_path, **params):
                 continue
             if k in MODALITY_SCOPED_PARAMS:
                 if modality is None:
-                    modality = _modality_of(storage_path)
+                    modality = modality_of(storage_path)
                 f.require_group(_modality_params_group_path(modality)).attrs[k] = v
             else:
                 shared.attrs[k] = v
@@ -512,7 +512,7 @@ def read_global_params(storage_path):
         grp_path = _params_group_path()
         if grp_path in f:
             out.update(dict(f[grp_path].attrs))
-        mod_path = _modality_params_group_path(_modality_of(storage_path))
+        mod_path = _modality_params_group_path(modality_of(storage_path))
         if mod_path in f:
             out.update(dict(f[mod_path].attrs))
     return out
@@ -644,7 +644,7 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_mip_group_path(fov, _modality_of(storage_path), hybe))
+        grp = f.require_group(_mip_group_path(fov, modality_of(storage_path), hybe))
         for ch, mip in channel_mips.items():
             name = f'ch{ch}'
             if name in grp:
@@ -652,7 +652,7 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
             grp.create_dataset(name, data=np.asarray(mip))
         if fiducial_channel is not None:
             grp.attrs['fiducial_channel'] = int(fiducial_channel)
-        mgrp = f.require_group(_fov_matrix_group_path(fov, _modality_of(storage_path)))
+        mgrp = f.require_group(_fov_matrix_group_path(fov, modality_of(storage_path)))
         if hybe not in mgrp:
             mgrp.create_dataset(hybe, data=np.eye(3, dtype='float32'))
 
@@ -663,7 +663,7 @@ def read_hybe_mip(storage_path, fov, hybe, channel):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
+    grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         name = f'ch{channel}'
         if grp_path not in f or name not in f[grp_path]:
@@ -683,7 +683,7 @@ def fiducial_channel_mip(storage_path, fov, hybe):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
+    grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -703,7 +703,7 @@ def readout_channel_mip(storage_path, fov, hybe):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
+    grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -727,7 +727,7 @@ def mip_channels_present(storage_path, fov, hybe):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
-    grp_path = _mip_group_path(fov, _modality_of(storage_path), hybe)
+    grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
         if grp_path not in f:
             return None
@@ -750,7 +750,7 @@ def ingested_hybes_for_fov(storage_path, fov, hybe_list):
     if not os.path.exists(vlinks_path):
         return []
     with h5py.File(vlinks_path, 'r') as f:
-        modality = _modality_of(storage_path)
+        modality = modality_of(storage_path)
         return [hybe for hybe in hybe_list
                 if _mip_group_path(fov, modality, hybe) in f and len(f[_mip_group_path(fov, modality, hybe)]) > 0]
 
@@ -771,7 +771,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_fov_matrix_group_path(fov, _modality_of(storage_path)))
+        grp = f.require_group(_fov_matrix_group_path(fov, modality_of(storage_path)))
         for hybe, H in matrices.items():
             if hybe in grp:
                 del grp[hybe]
@@ -800,7 +800,7 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
         return {}
     matrices = {}
     with h5py.File(vlinks_path, 'r') as f:
-        modality = _modality_of(storage_path)
+        modality = modality_of(storage_path)
         matrix_grp_path = _fov_matrix_group_path(fov, modality)
         for hybe in hybe_list:
             if _mip_group_path(fov, modality, hybe) not in f:
