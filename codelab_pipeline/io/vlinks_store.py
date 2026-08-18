@@ -743,17 +743,19 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
-    matrices = {}
+    from ..alignment.frames import FrameMatrices
+    matrices = FrameMatrices(modality=modality_of(storage_path))
     with h5py.File(vlinks_path, 'r') as f:
         modality = modality_of(storage_path)
         matrix_grp_path = _fov_matrix_group_path(fov, modality)
         for hybe in hybe_list:
             if _mip_group_path(fov, modality, hybe) not in f:
                 continue  # not ingested yet
+            key = (hybe, modality)
             if matrix_grp_path in f and hybe in f[matrix_grp_path]:
-                matrices[hybe] = f[matrix_grp_path][hybe][:]
+                matrices[key] = f[matrix_grp_path][hybe][:]
             else:
-                matrices[hybe] = np.eye(3)
+                matrices[key] = np.eye(3)
     return matrices
 
 

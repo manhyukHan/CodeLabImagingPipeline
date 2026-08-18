@@ -74,6 +74,59 @@ def assert_translation_only(H, label='matrix', tol=1e-9):
         raise ValueError(f'{label} is not translation-only (|2x2 - I| = {deviation:.3g})')
 
 
+class FrameMatrices(dict):
+    """
+    {(hybe, modality): 3x3} -- the FOV-level alignment matrices for one FOV.
+
+    Keyed by the PAIR, never by hybe alone. A bare hybe name is not a key in
+    this pipeline: the cross-modal bridge hybe (e.g. Hyb_130) is a real,
+    distinct acquisition in both modalities with a different matrix in each,
+    so `matrices['Hyb_130']` has no single correct answer. cell.matrices
+    learned this already; this is the same lesson applied to the FOV layer,
+    which had been carrying modality implicitly in an outer storage_path key.
+
+    Bare-string lookups raise rather than returning None. A silent miss here
+    is indistinguishable from "no alignment", which downstream code treats as
+    identity -- that is how a wrong-frame lookup becomes a wrong picture
+    instead of an error. Failing loudly at the call site is the whole point
+    of the type.
+    """
+
+    def __init__(self, *args, modality=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The modality these matrices were read for. Carried on the dict so a
+        # call site holding only `fov_matrices` and a hybe can still name the
+        # PAIR explicitly -- (hybe, fm.modality) -- instead of every function
+        # in the chain growing a modality parameter it only forwards. None
+        # once a dict spans more than one modality, at which point a caller
+        # must say which it means.
+        self.modality = modality
+
+    @staticmethod
+    def _check(key):
+        if not (isinstance(key, tuple) and len(key) == 2):
+            raise TypeError(
+                f'FrameMatrices is keyed by (hybe, modality), got {key!r}. '
+                f'A bare hybe is ambiguous -- the cross-modal bridge hybe '
+                f'exists in both modalities with different matrices.')
+
+    def __getitem__(self, key):
+        self._check(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._check(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        self._check(key)
+        return super().__contains__(key)
+
+    def hybes_for(self, modality):
+        """Every hybe present for one modality, as a plain sorted list."""
+        return sorted(h for (h, m) in self.keys() if m == modality)
+
+
 class FrameResolver:
     """
     Resolves (hybe, modality) -> (hybe, modality) for one FOV.

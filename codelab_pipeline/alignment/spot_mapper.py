@@ -63,10 +63,10 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
                 f'spot_mapper: cell {cell.id} matrices[({hybe}, {key_modality})] is a bare '
                 f'residual; resolve via frames.FrameResolver instead of passing `cell` here.')
         return cell.matrix_to_shared(hybe, key_modality)
-    if hybe not in fov_matrices:
+    if (hybe, modality or fov_matrices.modality) not in fov_matrices:
         raise KeyError(f"No alignment matrix for hybe '{hybe}' -- pass a fov_matrices entry "
                         f"(or a cell with its own residual for this hybe/modality)")
-    return fov_matrices[hybe]
+    return fov_matrices[(hybe, modality or fov_matrices.modality)]
 
 
 def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None):

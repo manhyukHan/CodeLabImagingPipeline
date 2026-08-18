@@ -379,7 +379,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     self_key = (cell.reference_hybe, reference_modality)
     have_real = (key in cell.matrices and self_key in cell.matrices
                  and modality in cell.matrix_anchors and reference_modality in cell.matrix_anchors)
-    if have_real or fov_matrices is None or hybe not in fov_matrices:
+    if have_real or fov_matrices is None or (hybe, fov_matrices.modality) not in fov_matrices:
         # real cell-level data, or no fallback available -- old behavior
         # (identity-default via cell.get_area_in_readout/matrix_to_shared
         # when neither real data nor a fallback exists).
@@ -391,7 +391,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         # body exactly, substituting the FOV-only H_cellref for cell.
         # matrix_to(hybe, modality).
         if cell_reference_hybe_matrix is None:
-            cell_reference_hybe_matrix = fov_matrices.get(cell.reference_hybe, np.eye(3))
+            cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
         H_cellref = alignment.hybe_to_cellref_matrix(fov_matrices, cell_reference_hybe_matrix, hybe)
         x_lit, y_lit = cell.area
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
@@ -427,8 +427,8 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     # bridging needed here, unlike the area case, since fov_matrices is
     # already expressed in the shared frame) whenever this cell has no
     # real cell-level entry for (hybe, modality).
-    if not have_real and fov_matrices is not None and hybe in fov_matrices:
-        H = fov_matrices[hybe]
+    if not have_real and fov_matrices is not None and (hybe, fov_matrices.modality) in fov_matrices:
+        H = fov_matrices[(hybe, fov_matrices.modality)]
     else:
         H = cell.matrix_to_shared(hybe, modality)
     Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
@@ -711,7 +711,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
             coord = (float(x1), float(y1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
-        elif fov_matrices and hybe in fov_matrices:
+        elif fov_matrices and (hybe, fov_matrices.modality) in fov_matrices:
             x1, y1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe, fov_matrices, modality=modality, cell=None)
             coord = (x1, y1, raw[2])
         else:

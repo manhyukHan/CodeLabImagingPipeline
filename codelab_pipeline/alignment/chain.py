@@ -1,6 +1,8 @@
 import os
 from functools import reduce
 import numpy as np
+
+from .frames import FrameMatrices  # re-exported: callers reach it as alignment.FrameMatrices
 import numpy.linalg as la
 import h5py
 from skimage import filters as skimage_filters
@@ -156,7 +158,7 @@ def hybe_to_cellref_matrix(fov_matrices, H_cellref_to_within, hybe):
     means a hybe/layer with no alignment computed yet contributes nothing
     (identity), not a missing-data error.
     """
-    H_hybe_to_within = fov_matrices.get(hybe, np.eye(3))
+    H_hybe_to_within = fov_matrices.get((hybe, fov_matrices.modality), np.eye(3))
     return compose_chain([H_hybe_to_within, la.inv(H_cellref_to_within)])
 
 def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.5, signal_threshold=10):
@@ -661,8 +663,8 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
                          f'not in vlinks.h5 -- ingest them first.')
 
     h, w = rna_mip.shape
-    H_rna_within = rna_fov_matrices.get(rna_reference_hybe, np.eye(3))
-    H_dna_within = dna_fov_matrices.get(dna_reference_hybe, np.eye(3))
+    H_rna_within = rna_fov_matrices.get((rna_reference_hybe, rna_fov_matrices.modality), np.eye(3))
+    H_dna_within = dna_fov_matrices.get((dna_reference_hybe, dna_fov_matrices.modality), np.eye(3))
     rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), H_rna_within[:2], (w, h))
     dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), H_dna_within[:2], (w, h))
 
@@ -956,7 +958,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     modality = modality if modality is not None else cell.modality
     x_ref, y_ref = cell.area  # always native to cell.reference_hybe's own frame
     if cell_reference_hybe_matrix is None:
-        cell_reference_hybe_matrix = fov_matrices.get(cell.reference_hybe, np.eye(3))
+        cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
 
     def _native_crop(hybe, channel):
         # cell.reference_hybe's frame -> hybe's own native frame, via
@@ -1027,7 +1029,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     # composed into every entry below) -- see this function's own
     # docstring for why, and ACell.matrix_to/matrix_between for how a
     # consumer uses it to bridge across modalities when needed.
-    H_ref_to_shared = fov_matrices.get(reference_hybe, np.eye(3))
+    H_ref_to_shared = fov_matrices.get((reference_hybe, fov_matrices.modality), np.eye(3))
     cell.matrix_anchors[modality] = H_ref_to_shared
 
     for record in hybe_records:
@@ -1067,7 +1069,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # algebra from fov_matrices -- it never needs any image data, so
         # it's always computable regardless of whether a crop can be
         # built below.
-        H1 = compose_chain([fov_matrices[hybe], la.inv(H_ref_to_shared)])
+        H1 = compose_chain([fov_matrices[(hybe, fov_matrices.modality)], la.inv(H_ref_to_shared)])
 
         target_channel = pick_channel_by_type(record, channel_type)
         result = _native_crop(hybe, target_channel)
