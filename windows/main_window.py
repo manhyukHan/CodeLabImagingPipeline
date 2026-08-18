@@ -29,6 +29,7 @@ from codelab_pipeline.alignment import chain as alignment
 from codelab_pipeline.alignment import frames
 from codelab_pipeline.alignment import spot_mapper
 from codelab_pipeline.segmentation import segment
+from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
@@ -1524,22 +1525,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _all_spot_dicts_for_fov(self, storage_path, fov):
         """
-        Every real, persisted ASpot.save()-shaped dict for one FOV --
-        cell-owned (nested inside each cell's own 'spots' list) AND the
-        FOV-level unassigned pool (a separate vlinks.h5 group, see
-        write_fov_spots/read_fov_spots) -- straight off disk, same "what
-        is REALLY there" principle as CellSpotStatusDisplayer's own
-        class docstring. Used by both its Spot panel and the hybe/channel
-        choice-derivation below.
+        Every persisted spot for one FOV, assigned and unassigned alike,
+        straight off disk -- the same "what is REALLY there" principle as
+        CellSpotStatusDisplayer's own class docstring.
+
+        One read. Spots no longer hide in two places: assigned ones used to
+        be nested inside each cell's own 'spots' list and unassigned ones in
+        a separate group, so this had to stitch them together. They share
+        one store now and differ only in ASpot.cell.
         """
-        cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
-        cell_owned = [s for c in (cell_dicts or []) for s in c.get('spots', [])]
-        unassigned = self._read_unassigned_spot_dicts(storage_path, fov)
-        return cell_owned + unassigned
+        return vlinks_store.read_spots(storage_path, fov)
 
     def _show_cell_spot_status_displayer(self):
         d = self.cell_spot_status_displayer
-        d.set_modality_choices(self.modality_names)
         self._refresh_cell_spot_status_full()
         d.show()
         d.raise_()
@@ -4032,7 +4030,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f'cell is loaded, then Save again. The unassigned-spot pool below will still be saved now.')
                 skip_cell_write = True
 
-        n_identified, n_identified_cells = self._identify_fov_unassigned_spots(fov, storage_paths)
+        n_identified, n_identified_cells = self._reassign_fov_spots(fov)
 
         n_spots = sum(c.total_num_spots for c in cells_in_memory)
         n_cells_saved = 0
@@ -4179,6 +4177,70 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             vlinks_store.write_spots(path, fov, modality, hybe, channel, spots)
         return sum(len(v) for v in by_slice.values())
+
+    def _reassign_fov_spots(self, fov):
+        """
+        Recompute ownership for EVERY spot in this FOV, not just the
+        unassigned ones.
+
+        Assignment has to consider spots that already have a cell: cells get
+        deleted, resegmented, or replaced by differently-shaped ones, and a
+        spot whose owner no longer contains it must lose that owner. Walking
+        only the unassigned pool -- what this replaces -- could never notice,
+        so a stale owner survived indefinitely.
+
+        The mask is rasterised from the cells themselves rather than read
+        from self.cell_displayer.mask. That widget only holds a mask for the
+        FOV just segmented in this session, so the old path silently
+        assigned nothing at all whenever you had not just re-segmented --
+        assignment now works whenever cells exist.
+        """
+        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
+        if not cells:
+            return 0, 0
+        mask = assignment.rasterize_cells(cells, cells[0].frame_shape)
+        cells_by_id = {c.id: c for c in cells}
+        ref_cell = cells[0]
+
+        spots = []
+        for (pool_path, pool_fov), pool in self.fov_unassigned_spots.items():
+            if pool_fov == fov:
+                spots.extend(pool)
+        for cell in cells:
+            spots.extend(cell.spots)
+        if not spots:
+            return 0, 0
+
+        def to_mask_frame(hybe, modality):
+            return self._fov_only_matrix_for_hybe(hybe, modality or ref_cell.modality,
+                                                  ref_cell, fov)
+
+        def to_shared(hybe, modality, owner):
+            return self._matrix_to_shared(hybe, modality or owner.modality, owner, fov)
+
+        n_assigned, n_unassigned = assignment.assign_spots(
+            spots, mask, to_mask_frame, cells_by_id, matrix_to_shared=to_shared)
+
+        # Redistribute: a spot lives wherever its own `cell` now says.
+        for cell in cells:
+            cell.spots, cell.num_spots, cell.total_num_spots = [], {}, 0
+        pools = {}
+        for spot in spots:
+            owner = cells_by_id.get(int(spot.cell)) if spot.cell != -1 else None
+            if owner is not None:
+                owner.spots.append(spot)
+                owner.num_spots[spot.hybe] = owner.num_spots.get(spot.hybe, 0) + 1
+                owner.total_num_spots = len(owner.spots)
+            else:
+                path = self._storage_path_for_modality(spot.modality or ref_cell.modality)
+                if path:
+                    pools.setdefault((path, fov), []).append(spot)
+        for key in list(self.fov_unassigned_spots):
+            if key[1] == fov:
+                self.fov_unassigned_spots[key] = []
+        for key, val in pools.items():
+            self.fov_unassigned_spots[key] = val
+        return n_assigned, n_unassigned
 
     def _identify_fov_unassigned_spots(self, fov, storage_paths):
         """

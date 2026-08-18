@@ -119,7 +119,15 @@ class FrameResolver:
         if from_modality == to_modality:
             return IDENTITY
         if self.bridge_xy is None or self.bridge_from is None:
-            return None
+            # No cross-modal alignment accepted yet. That is a real,
+            # answerable state -- "no correction known", i.e. no shift --
+            # not a failure. Per the pipeline's identity-default rule,
+            # absence of alignment at ANY layer is identity, and every
+            # downstream step must still run: returning None here made
+            # callers treat the whole FOV matrix layer as unavailable, so
+            # spot assignment silently assigned nothing at all until a
+            # cross-modal link happened to be accepted.
+            return IDENTITY
         if {from_modality, to_modality} != {self.bridge_from, self.shared}:
             return None
         return self.bridge_xy if from_modality == self.bridge_from else la.inv(self.bridge_xy)
