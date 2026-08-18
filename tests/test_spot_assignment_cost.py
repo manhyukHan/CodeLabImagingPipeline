@@ -171,12 +171,28 @@ def test_matrix_resolution_is_memoized_per_cell():
         return np.eye(3)
     n = assignment.recast_spots_to_shared(spots, to_shared, by_id)
     assert n == 5000
-    assert calls['n'] <= len(by_id), \
+    assert calls['n'] <= len(by_id) + 1, \
         f'{calls["n"]} matrix resolutions for {len(by_id)} cells -- memo is broken'
     calls['n'] = 0
     assignment.assign_spots(spots, cells, mask.shape, by_id, matrix_to_shared=to_shared)
-    assert calls['n'] <= len(by_id), \
+    # +1: owner=None is a real memo entry now (unassigned spots recast
+    # through the same transform, one resolution per (hybe, modality)).
+    assert calls['n'] <= len(by_id) + 1, \
         f'assign_spots resolved {calls["n"]}x -- per-spot resolution is back'
+
+
+def test_unassigned_spots_are_recast_too():
+    """No owner means the cell layer is identity, not that nothing moves:
+    the FOV/cross-modal legs still change with matrices, so unassigned
+    spots' shared coordinates must refresh like everyone else's."""
+    cells, mask = setup()
+    s = ASpot(); s.modality = MODALITY
+    s.set_metadata(uid=1, fov=FOV, hybe=HYBE, channel=635, cell=-1,
+                   raw_coordinate=(10.0, 20.0, 0.0), coordinate=(10.0, 20.0, 0.0))
+    H = np.eye(3); H[0, 2], H[1, 2] = 5.0, -3.0
+    n = assignment.recast_spots_to_shared([s], lambda h, m, o: H, {c.id: c for c in cells})
+    assert n == 1, 'the unassigned spot must be recast'
+    assert s.coordinate[:2] == (15.0, 17.0), s.coordinate
 
 
 def _run_all():

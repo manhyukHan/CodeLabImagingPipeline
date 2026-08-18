@@ -106,6 +106,13 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
             if owner is None:
                 spot.cell = -1
                 spot.celltype = ''
+                if matrix_to_shared is not None:
+                    H = matrix_to_shared(hybe, modality, None)
+                    if H is not None:
+                        cx, cy = (np.asarray(H, dtype=float)[:2]
+                                  @ np.array([float(spot.raw_coordinate[0]),
+                                              float(spot.raw_coordinate[1]), 1.0]))
+                        spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
                 n_unassigned += 1
                 continue
             spot.cell = int(owner.id)
@@ -134,7 +141,7 @@ def _memoized(matrix_to_shared):
     cache = {}
 
     def resolve(hybe, modality, owner):
-        key = (hybe, modality, int(owner.id))
+        key = (hybe, modality, int(owner.id) if owner is not None else -1)
         if key not in cache:
             cache[key] = matrix_to_shared(hybe, modality, owner)
         return cache[key]
@@ -150,15 +157,19 @@ def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
     side effect of assignment): matrix accepts already run full
     reassignment, so this exists for callers that need coordinates
     refreshed without re-deciding ownership -- and as the primitive a lazy
-    per-spot map() could delegate to later. Unassigned spots are left
-    alone: with no owner there is no cell-level leg to compose.
+    per-spot map() could delegate to later.
+
+    UNASSIGNED spots are recast too, through the SAME general transform
+    with owner=None: no owner just means the cell layer contributes
+    identity (FrameResolver's own documented default), not that there is
+    nothing to compose -- the FOV and cross-modal legs still move when
+    matrices change, and skipping these spots left their shared
+    coordinates stale after every matrix accept.
     """
     n = 0
     resolve = _memoized(matrix_to_shared)
     for spot in spots:
         owner = cells_by_id.get(int(spot.cell)) if int(spot.cell) != -1 else None
-        if owner is None:
-            continue
         H = resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)
         if H is None:
             continue

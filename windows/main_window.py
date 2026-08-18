@@ -4321,7 +4321,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0, 0
 
         def to_shared(hybe, modality, owner):
-            return self._matrix_to_shared(hybe, modality or owner.reference_modality, owner, fov)
+            # owner=None is a real case (unassigned spots): the resolver's
+            # cell leg defaults to identity, FOV/cross-modal still compose.
+            fallback = owner.reference_modality if owner is not None else None
+            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
 
         n_assigned, n_unassigned = assignment.assign_spots(
             spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
