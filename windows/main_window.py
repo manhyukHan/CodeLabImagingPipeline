@@ -462,6 +462,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # the unassigned view of this container is authoritative, via
         # spot_container.unassigned(fov).
         self.spot_container = SpotContainer()
+        # The permanent tier: an in-memory mirror of vlinks' spot store,
+        # loaded per FOV alongside the transient tier and updated by every
+        # persist. Revert reads THIS, not disk -- one source of "what was
+        # saved" that cannot drift from what persist just wrote.
+        self.spot_container_permanent = SpotContainer()
         self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
         # Shared celltype identity list (see ui/celltype_determination_
         # panel.py's own docstring) -- default empty, seeded from a loaded
@@ -2836,10 +2841,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if any_path:
                 try:
                     for d in vlinks_store.read_spots(any_path, fov):
+                        spot = ASpot()
+                        spot.set_metadata(**d)
+                        # Permanent mirrors the store completely -- assigned
+                        # and unassigned alike. The transient tier stages
+                        # only the unassigned copies for now: assigned spots
+                        # still travel on cell.spots until step 3, and two
+                        # transient homes for one spot is the false-green
+                        # hazard this design exists to remove.
+                        self.spot_container_permanent.add(fov, spot)
                         if int(d.get('cell', -1)) == -1:
-                            spot = ASpot()
-                            spot.set_metadata(**d)
-                            self.spot_container.add(fov, spot)
+                            twin = ASpot()
+                            twin.set_metadata(**d)
+                            self.spot_container.add(fov, twin)
                 except Exception:
                     pass
         # Only once per FOV per session (per confirmed real regression):
@@ -3983,27 +3997,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if cell is None:
                 QtWidgets.QMessageBox.warning(self, 'Remove Transient Spots', 'Select a cell first.')
                 return
-            # Spots live in the FOV's own store now, not nested inside the
-            # cell -- filter by owning cell AND (hybe, channel) directly.
-            permanent = []
-            for d in vlinks_store.read_spots(storage_path, fov):
-                if (int(d.get('cell', -1)) == cell.id
-                        and d.get('hybe') == hybe and d.get('channel') == channel):
-                    spot = ASpot()
-                    spot.set_metadata(**d)
-                    permanent.append(spot)
+            # "What was saved" is the permanent tier, in memory -- kept
+            # exact by the loader and by every persist -- so Revert never
+            # re-reads disk. Deep copies: the tiers must not share objects.
+            permanent = [deepcopy(sp) for sp in self.spot_container_permanent.of_cell(fov, cell.id)
+                         if sp.hybe == hybe and int(sp.channel) == channel]
             self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
             self._replace_cell_spots(cell, hybe, channel, permanent)
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent spot(s) (transient discarded).')
         else:
-            on_disk = self._read_unassigned_spot_dicts(storage_path, fov)
-            permanent = []
-            for d in on_disk:
-                if d.get('hybe') == hybe and d.get('channel') == channel:
-                    spot = ASpot()
-                    spot.set_metadata(**d)
-                    permanent.append(spot)
+            permanent = [deepcopy(sp) for sp in self.spot_container_permanent.unassigned(fov)
+                         if sp.hybe == hybe and int(sp.channel) == channel]
             self._push_spot_undo(fov_key=(storage_path, fov))
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, permanent)
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
@@ -4135,25 +4140,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
 
-    def _read_unassigned_spot_dicts(self, storage_path, fov):
-        """
-        Unassigned spots for this FOV, straight from the unified store.
-
-        The store keeps assigned and unassigned together -- they differ only
-        in ASpot.cell -- so "unassigned" is a filter here, not a separate
-        location. Callers that want the whole FOV read vlinks_store.
-        read_spots directly.
-
-        Filtered by MODALITY as well as by cell. With one unified vlinks
-        every storage_path resolves to the same file, so an unfiltered read
-        returns both modalities' spots -- and callers key
-        self.fov_unassigned_spots by storage_path, i.e. per modality, so
-        the other modality's spots would leak into this one's pool.
-        """
-        modality = vlinks_store.modality_of(storage_path)
-        return [d for d in vlinks_store.read_spots(storage_path, fov)
-                if int(d.get('cell', -1)) == -1 and d.get('modality') == modality]
-
     def _attach_stored_spots_to_cells(self, container, storage_path, fov):
         """
         Fill cell.spots from the FOV's spot store after cells are loaded.
@@ -4255,6 +4241,14 @@ class MainWindow(QtWidgets.QMainWindow):
         removes it from disk instead of leaving the previous contents
         stranded.
         """
+        # Refuse to persist a FOV whose spots were never staged: with no
+        # transient state, the stale-slice pass below would enumerate every
+        # slice on disk and write it EMPTY -- the accept loops call this for
+        # every FOV that has matrices loaded, which is a superset of the
+        # FOVs whose spots were ever activated. "Not loaded" means "nothing
+        # to say", never "delete everything".
+        if fov not in self._spot_loaded_fovs:
+            return 0
         # Keyed by (modality, hybe, channel) -- the SLICE -- never by
         # storage_path. Since vlinks was unified every storage_path resolves
         # to the same file, so keying by path yields two different keys for
@@ -4317,6 +4311,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if not path or not modality or not hybe:
                 continue
             vlinks_store.write_spots(path, fov, modality, hybe, channel, spots)
+            # Mirror the exact written slice into the permanent tier, so
+            # "what was saved" is answerable in memory and Revert never
+            # re-reads disk.
+            self.spot_container_permanent.replace_slice(
+                fov, modality, hybe, channel, [deepcopy(sp) for sp in spots])
         return sum(len(v) for v in by_slice.values())
 
     def _ensure_spot_uids(self, fov, spots):
