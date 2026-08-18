@@ -33,6 +33,7 @@ from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
+from codelab_pipeline.models.spot_container import SpotContainer
 from codelab_pipeline.models.allele import AnAllele
 from codelab_pipeline.models import celltype
 from skimage.feature import peak_local_max
@@ -452,12 +453,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hybe_records = []
         self.fov_matrices = {}   # {fov: FrameMatrices{(hybe, modality): H}}
         # (storage_path, fov) -> {(hybe, channel): [ASpot, ...]} -- Whole
-        # FOV spot auto-detect peaks that don't land inside any cell's
-        # mask. Not stored on any ACell (there's nothing to own them),
-        # kept per-FOV instead, same shape as fov_matrices itself; each
-        # ASpot here keeps ASpot.cell at its model default (-1, "no
-        # link") since a proper cell link genuinely doesn't apply.
-        self.fov_unassigned_spots = {}
+        # The transient spot tier: ONE container per session holding every
+        # in-memory spot, keyed {fov: {uid: ASpot}}. Replaces the old
+        # fov_unassigned_spots pool outright (no parallel state -- per
+        # explicit decision, keeping the old structure in sync would hand
+        # back false green signs). During the transition to the full
+        # two-tier design, ASSIGNED spots still live on cell.spots; only
+        # the unassigned view of this container is authoritative, via
+        # spot_container.unassigned(fov).
+        self.spot_container = SpotContainer()
+        self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
         # Shared celltype identity list (see ui/celltype_determination_
         # panel.py's own docstring) -- default empty, seeded from a loaded
         # config's celltype_names and/or any real classified celltype
@@ -560,7 +565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # (storage_path, fov) -> [AnAllele, ...] -- chromatin tracing's own
         # session-transient allele list, built from whatever's currently
         # selected in Spot Localization (see _build_chromatin_alleles_
-        # from_selection), same shape/rationale as fov_unassigned_spots
+        # from_selection), same shape/rationale as the old unassigned pool
         # above. Only Fit All FOVs persists these (mirror_write_fov_
         # alleles) -- building/previewing stays in-memory only, same
         # "explicit Save step" convention Spot Localization's own Save
@@ -2800,7 +2805,7 @@ class MainWindow(QtWidgets.QMainWindow):
         (see _storage_path_for_modality's own docstring on this), but this
         method used to only ever activate whichever ONE modality the
         Ingestion tab happened to be showing. Selecting a hybe from the
-        OTHER modality then read an fov_matrices/fov_unassigned_spots key
+        OTHER modality then read an fov_matrices/unassigned-pool key
         that was never loaded at all -- e.g. the FOV-view crop displayer
         showing 0 unassigned spots for a DNA hybe while the Ingestion tab
         was still on RNA, even though real unassigned spots existed on
@@ -2813,23 +2818,28 @@ class MainWindow(QtWidgets.QMainWindow):
             hybe_records = self._hybe_records_for_storage_path(storage_path)
             if not hybe_records:
                 continue
-            key = (storage_path, fov)     # still the unassigned-pool key
             if not self._fov_matrices_for(storage_path, fov):
                 try:
                     self._merge_fov_matrices(
                         fov, alignment.read_same_modality_matrices(storage_path, fov, hybe_records))
                 except Exception:
                     pass
-            if key not in self.fov_unassigned_spots:
+        # ONE fov-level spot load, outside the per-modality loop: the
+        # container is modality-agnostic (each spot carries its own
+        # modality), so the old per-storage-path staging -- which caused
+        # the "0 unassigned spots for the other modality" bug -- has
+        # nothing left to key on. Once per session, so a slice the user
+        # cleared in memory is not resurrected by a later activation.
+        if fov not in self._spot_loaded_fovs:
+            self._spot_loaded_fovs.add(fov)
+            any_path = next(iter(self._all_vlinks_storage_paths()), None)
+            if any_path:
                 try:
-                    spot_dicts = self._read_unassigned_spot_dicts(storage_path, fov)
-                    spots = []
-                    for d in spot_dicts:
-                        spot = ASpot()
-                        spot.set_metadata(**d)
-                        spots.append(spot)
-                    if spots:
-                        self.fov_unassigned_spots[key] = spots
+                    for d in vlinks_store.read_spots(any_path, fov):
+                        if int(d.get('cell', -1)) == -1:
+                            spot = ASpot()
+                            spot.set_metadata(**d)
+                            self.spot_container.add(fov, spot)
                 except Exception:
                     pass
         # Only once per FOV per session (per confirmed real regression):
@@ -3123,11 +3133,11 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.FovSpinBox are two genuinely SEPARATE spinbox widgets (only
         their RANGE is kept in sync, see _refresh_fov_spinbox_bounds, not
         their value), but _activate_fov -- which lazily loads this FOV's
-        cells/fov_matrices/fov_unassigned_spots from vlinks.h5 into the
+        cells/fov_matrices/spot_container from vlinks.h5 into the
         running session -- was only ever wired to cp.FovSpinBox.
         valueChanged. A session that only ever touches Spot Localization
         (never visits Cell Segmentation, or visits a DIFFERENT FOV there)
-        left self.cell_container/self.fov_unassigned_spots never
+        left self.cell_container/self.spot_container never
         populated for Spot Localization's own current FOV -- Refresh Cell
         List showed nothing, and the FOV-view crop displayer showed 0
         unassigned spots, until SOME unrelated action elsewhere happened
@@ -3152,7 +3162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         COUNTS aggregated across every cell currently in this FOV, per
         explicit request ("to see all spots in FOV"), plus a second row
         per (hybe, channel) for spots that don't belong to any cell (see
-        fov_unassigned_spots/_replace_fov_unassigned_spots) -- these are
+        spot_container.unassigned/_replace_fov_unassigned_spots) -- these are
         real, kept spots too, just without a cell link, so they get
         their own visible count rather than being folded silently into
         the cell-owned total. Pure read -- never computes or writes.
@@ -3181,11 +3191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # was actually showing -- e.g. saving DNA-hybe unassigned spots
         # while Ingestion was still on RNA left this list looking
         # unchanged even though real spots were identified/persisted).
-        unassigned = []
-        for modality_name in self.ui.IngestionPanel.modality_names:
-            modality_storage_path = self._storage_path_for_modality(modality_name)
-            if modality_storage_path:
-                unassigned.extend(self.fov_unassigned_spots.get((modality_storage_path, fov), []))
+        unassigned = self.spot_container.unassigned(fov)
         unassigned_counts = {}
         for s in unassigned:
             unassigned_counts[(s.hybe, s.channel)] = unassigned_counts.get((s.hybe, s.channel), 0) + 1
@@ -3262,12 +3268,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # used to only ever read ip.StoragePathLineEdit's CURRENT
             # modality, silently omitting the other modality's spots.
             fov = self._current_spot_fov()
-            for modality_name in self.ui.IngestionPanel.modality_names:
-                modality_storage_path = self._storage_path_for_modality(modality_name)
-                if not modality_storage_path:
-                    continue
-                for s in self.fov_unassigned_spots.get((modality_storage_path, fov), []):
-                    counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
+            for s in self.spot_container.unassigned(fov):
+                counts[(s.hybe, s.channel)] = counts.get((s.hybe, s.channel), 0) + 1
             suffix = 'unassigned spot(s)'
         for hybe, channel in sorted(counts.keys()):
             item = QtWidgets.QListWidgetItem(f'{hybe} ch{channel}: {counts[(hybe, channel)]} {suffix}')
@@ -3382,7 +3384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         selecting cell 65 shows its spots at whatever numbers they
         already hold in the full-FOV count (e.g. 145,146,147...).
         """
-        ordered = [(s, None) for s in self.fov_unassigned_spots.get((storage_path, fov), [])
+        ordered = [(s, None) for s in self.spot_container.unassigned(fov)
                   if s.hybe == hybe and s.channel == channel]
         cells = self.cell_container.data.get(fov, []) if self.cell_container is not None else []
         for cell in sorted(cells, key=lambda c: c.id):
@@ -3445,7 +3447,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_fov_spot_display(self, keep_view=False):
         """
         FOV view -- the full raw hybe/channel MIP with BOTH the current
-        FOV-level unassigned-spot pool (fov_unassigned_spots, yellow --
+        FOV-level unassigned spots (spot_container.unassigned, yellow --
         the EDITABLE list) and already-identified cell-owned spots for
         this FOV (red, read-only context) marked. Only the unassigned
         pool is actually editable here: manual click add/remove and
@@ -3460,7 +3462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rxmin/rymin are 0 here (no crop offset -- this is the raw,
         un-cropped FOV MIP), and _spot_crop_context IS set (kind='fov'),
         unlike the old Whole FOV scope -- manual clicks/removals here now
-        genuinely edit fov_unassigned_spots via _on_spot_crop_edited.
+        genuinely edit the unassigned tier via _on_spot_crop_edited.
         """
         sp = self.ui.SpotLocalizationPanel
         modality = sp.current_hybe_modality()
@@ -3468,7 +3470,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fov = self._current_spot_fov()
         if fov is not None:
             self._activate_fov(fov)  # see _refresh_spot_cell_list's own comment on why -- confirmed real
-                                     # bug: without this, fov_unassigned_spots could still be empty here
+                                     # bug: without this, the spot container could still be empty here
                                      # (0 unassigned spots shown) whenever this ran before ANY FOV-spinbox
                                      # valueChanged had ever fired for this exact FOV this session.
         hybe = sp.current_hybe_folder()
@@ -3480,7 +3482,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if mip is None:
             sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
-        unassigned_spots = [s for s in self.fov_unassigned_spots.get((storage_path, fov), [])
+        unassigned_spots = [s for s in self.spot_container.unassigned(fov)
                            if s.hybe == hybe and s.channel == channel]
         unassigned_points = [(float(s.raw_coordinate[0]), float(s.raw_coordinate[1])) for s in unassigned_spots]
         cell_owned_points = []
@@ -4179,10 +4181,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _all_transient_spots(self, fov):
         """Every live in-memory spot for this FOV -- pools + cell-owned."""
-        out = []
-        for (pool_path, pool_fov), pool in self.fov_unassigned_spots.items():
-            if pool_fov == fov:
-                out.extend(pool)
+        out = list(self.spot_container.unassigned(fov))
         if self.cell_container is not None:
             for cell in self.cell_container.data.get(fov, []):
                 out.extend(cell.spots)
@@ -4209,15 +4208,10 @@ class MainWindow(QtWidgets.QMainWindow):
         channel = int(channel_text)
         cell_ids = [c.id for c in (self.cell_container.data.get(fov, []) if self.cell_container else [])]
         self._push_spot_undo(fov=fov, cell_ids=cell_ids)
-        n = 0
-        for (pool_path, pool_fov), pool in list(self.fov_unassigned_spots.items()):
-            if pool_fov != fov:
-                continue
-            keep = [s for s in pool
-                    if not (s.hybe == hybe and int(s.channel) == channel
-                            and (s.modality or modality) == modality)]
-            n += len(pool) - len(keep)
-            self.fov_unassigned_spots[(pool_path, pool_fov)] = keep
+        doomed = [s.uid for s in self.spot_container.unassigned(fov)
+                  if s.hybe == hybe and int(s.channel) == channel
+                  and (s.modality or modality) == modality]
+        n = len(self.spot_container.remove(fov, doomed))
         if self.cell_container is not None:
             for cell in self.cell_container.data.get(fov, []):
                 keep = [s for s in cell.spots
@@ -4293,11 +4287,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 seen_uids[uid] = (key, spot)
             by_slice.setdefault(key, []).append(spot)
 
-        for (pool_path, pool_fov), spots in self.fov_unassigned_spots.items():
-            if pool_fov != fov or not pool_path:
-                continue
-            for spot in spots:
-                add(spot, spot.modality or vlinks_store.modality_of(pool_path))
+        for spot in self.spot_container.unassigned(fov):
+            add(spot, spot.modality)
         container = self.cell_container
         if container is not None:
             for cell in container.data.get(fov, []):
@@ -4328,6 +4319,25 @@ class MainWindow(QtWidgets.QMainWindow):
             vlinks_store.write_spots(path, fov, modality, hybe, channel, spots)
         return sum(len(v) for v in by_slice.values())
 
+    def _ensure_spot_uids(self, fov, spots):
+        """
+        Batch-allocate real uids for any spot still carrying uid=0.
+
+        Identity is allocated the moment a spot enters the transient
+        container -- never retrofitted at save -- because diff/undo and the
+        container's own duplicate check key on uid. One allocator call for
+        the whole batch (an h5 attr bump), not one per spot. Any configured
+        storage path works: the unified vlinks keeps one per-FOV counter.
+        """
+        missing = [sp for sp in spots if not int(getattr(sp, 'uid', 0))]
+        if not missing:
+            return
+        any_path = next(iter(self._all_vlinks_storage_paths()), None)
+        if any_path is None:
+            raise RuntimeError('no storage path configured -- cannot allocate spot uids')
+        for sp, uid in zip(missing, vlinks_store.allocate_spot_uids(any_path, fov, len(missing))):
+            sp.uid = int(uid)
+
     def _reassign_fov_spots(self, fov):
         """
         Recompute ownership for EVERY spot in this FOV, not just the
@@ -4351,10 +4361,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cells_by_id = {c.id: c for c in cells}
         frame_shape = cells[0].frame_shape
 
-        spots = []
-        for (pool_path, pool_fov), pool in self.fov_unassigned_spots.items():
-            if pool_fov == fov:
-                spots.extend(pool)
+        spots = list(self.spot_container.unassigned(fov))
         for cell in cells:
             spots.extend(cell.spots)
         if not spots:
@@ -4367,24 +4374,23 @@ class MainWindow(QtWidgets.QMainWindow):
             spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
 
         # Redistribute: a spot lives wherever its own `cell` now says.
+        # Assigned spots go to their owner's cell.spots (still the assigned
+        # tier until step 3); unassigned ones live in the container. uids
+        # are ensured for the whole batch first, so a cell-view spot that
+        # just LOST its owner can enter the container.
+        self._ensure_spot_uids(fov, spots)
         for cell in cells:
             cell.spots, cell.num_spots, cell.total_num_spots = [], {}, 0
-        pools = {}
+        fov_spots = self.spot_container.data.setdefault(int(fov), {})
         for spot in spots:
             owner = cells_by_id.get(int(spot.cell)) if spot.cell != -1 else None
             if owner is not None:
                 owner.spots.append(spot)
                 owner.num_spots[spot.hybe] = owner.num_spots.get(spot.hybe, 0) + 1
                 owner.total_num_spots = len(owner.spots)
+                fov_spots.pop(int(spot.uid), None)
             else:
-                path = self._storage_path_for_modality(spot.modality)
-                if path:
-                    pools.setdefault((path, fov), []).append(spot)
-        for key in list(self.fov_unassigned_spots):
-            if key[1] == fov:
-                self.fov_unassigned_spots[key] = []
-        for key, val in pools.items():
-            self.fov_unassigned_spots[key] = val
+                fov_spots[int(spot.uid)] = spot
         return n_assigned, n_unassigned
 
     def _find_cell_by_id(self, fov, cell_id):
@@ -4398,8 +4404,13 @@ class MainWindow(QtWidgets.QMainWindow):
             cell = self._find_cell_by_id(fov, cell_id)
             if cell is not None:
                 cells_state[cell_id] = deepcopy(cell.spots)
+        # fov_key kept for caller compatibility; any non-None value means
+        # "snapshot the unassigned tier of its FOV" -- a {uid: save-dict}
+        # fingerprint, not a deep object copy.
+        pool_fov = fov_key[1] if fov_key is not None else None
         return {'fov': fov, 'cells': cells_state, 'fov_key': fov_key,
-                'fov_spots': deepcopy(self.fov_unassigned_spots.get(fov_key, [])) if fov_key is not None else None}
+                'fov_spots': ({int(sp.uid): sp.save() for sp in self.spot_container.unassigned(pool_fov)}
+                              if fov_key is not None else None)}
 
     def _push_spot_undo(self, fov=None, cell_ids=None, fov_key=None):
         self._spot_undo_stack.append(self._snapshot_scopes(fov=fov, cell_ids=cell_ids, fov_key=fov_key))
@@ -4423,7 +4434,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 cell.num_spots[h] = sum(1 for s in cell.spots if s.hybe == h)
             cell.total_num_spots = len(cell.spots)
         if snapshot['fov_key'] is not None:
-            self.fov_unassigned_spots[snapshot['fov_key']] = deepcopy(snapshot['fov_spots'])
+            pool_fov = snapshot['fov_key'][1]
+            current = [sp.uid for sp in self.spot_container.unassigned(pool_fov)]
+            self.spot_container.remove(pool_fov, current)
+            for saved in snapshot['fov_spots'].values():
+                spot = ASpot()
+                spot.set_metadata(**saved)
+                self.spot_container.add(pool_fov, spot)
         return missing
 
     def _undo_spot_action(self):
@@ -4490,12 +4507,16 @@ class MainWindow(QtWidgets.QMainWindow):
         is no owning cell for these by definition -- see
         _reassign_fov_spots for when that gets decided).
         """
-        key = (storage_path, fov)
-        existing = self.fov_unassigned_spots.get(key, [])
         if not append:
-            existing = [s for s in existing if not (s.hybe == hybe and s.channel == channel)]
-        existing.extend(new_spots)
-        self.fov_unassigned_spots[key] = existing
+            doomed = [s.uid for s in self.spot_container.unassigned(fov)
+                      if s.hybe == hybe and s.channel == channel]
+            self.spot_container.remove(fov, doomed)
+        # Identity at the entry boundary: manual/auto FOV-view spots arrive
+        # with uid=0 and get real uids HERE, not at save.
+        self._ensure_spot_uids(fov, new_spots)
+        for spot in new_spots:
+            spot.modality = spot.modality or vlinks_store.modality_of(storage_path)
+            self.spot_container.add(fov, spot)
 
     def _on_spot_crop_edited(self, points):
         """
