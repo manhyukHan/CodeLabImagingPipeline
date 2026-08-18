@@ -3839,11 +3839,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # two distinct spots sharing an ambiguous crop don't collapse
                                 # onto the same blob -- see refine_spot_z's own docstring
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
-        # ONE resolver for the whole batch: cell_z_offset's z path uses only
-        # bridge_z_between (FOV-bounded) plus the cell's own zx read from the
-        # `cell` argument -- never the resolver's per-cell anchors -- so a
-        # cell-independent resolver is complete here. Without it the
-        # cross-modal Z drift is silently dropped from every refined spot.
+        # ONE resolver for the whole batch, complete for XY and Z alike:
+        # anchors are modality-level and _frame_resolver now carries them
+        # even with cell=None, so to_shared composes each row's own cell
+        # residual from the `cell` argument per spot. (The old claim that
+        # a cell-free resolver was complete held only for Z -- its empty
+        # anchors silently dropped every XY residual to the FOV route.)
         resolver = self._frame_resolver(None, fov)
         t0 = time.perf_counter()
         for spot, cell in targets:
@@ -4749,7 +4750,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
             crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality,
-                                                 fov_matrices=fov_matrices)
+                                                 fov_matrices=fov_matrices, resolver=self._frame_resolver(cell, fov))
             if crop is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', f'Cell {cell.id} has no alignment/overlap for {hybe} yet.')
                 return
@@ -5017,7 +5018,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_chromatin_allele_lists(self, storage_path, fov):
         chp = self.ui.ChromatinTracingPanel
-        alleles = self.chromatin_alleles.get((storage_path, fov), [])
+        alleles = self.chromatin_alleles.get((storage_path, fov))
+        if alleles is None:
+            # Stage persisted alleles once per (storage_path, fov) --
+            # vlinks is the authoritative container (rule 4), and cells/
+            # spots already stage this way at _activate_fov. Without this,
+            # a fresh session's tracing panel showed an empty list even
+            # though the store held real alleles, and only a re-Build
+            # could bring them back.
+            alleles = []
+            for d in vlinks_store.read_fov_alleles(storage_path, fov) or []:
+                a = AnAllele()
+                a.set_metadata(**d)
+                alleles.append(a)
+            self.chromatin_alleles[(storage_path, fov)] = alleles
         rows = [(a.id, f"Allele {a.id}: cell={'unassigned' if a.cell == -1 else a.cell} "
                        f"anchor={a.anchor_hybe}/{a.anchor_channel} @ "
                        f"({a.coordinate[0]:.1f}, {a.coordinate[1]:.1f}, {a.coordinate[2]:.1f}) "
@@ -6289,14 +6303,32 @@ class MainWindow(QtWidgets.QMainWindow):
             if bridge_z is None:
                 bridge_z = vlinks_store.read_cross_modal_z(dna_sp, fov)
 
+        # Anchors are MODALITY-level facts (each modality's own cell-
+        # alignment reference hybe's live FOV matrix, in the shared
+        # frame), not per-cell state -- populate them for every configured
+        # modality unconditionally. The old cell-gated version left
+        # anchors EMPTY whenever the resolver was built with cell=None
+        # (the 3D localization and chromatin-tracing paths), which
+        # silently dropped every residual-bearing cell's own correction
+        # down to the bare FOV route. Derived from THIS resolver's own
+        # within+bridge -- never via _fov_matrices_for_cell_modality,
+        # whose bridge step builds another resolver (confirmed real
+        # RecursionError). The cell's stored snapshot remains the
+        # fallback when the live combo has no pick.
+        resolver = frames.FrameResolver(within, shared, bridge_xy=bridge_xy,
+                                        bridge_z=float(bridge_z or 0.0),
+                                        bridge_from=dna_modality if bridge_xy is not None else None)
         anchors = {}
-        if cell is not None:
-            for modality in self.ui.IngestionPanel.modality_names:
-                if modality in cell.matrix_anchors:
-                    anchors[modality] = self._live_cell_matrix_anchor(modality, cell, fov)
-        return frames.FrameResolver(within, shared, bridge_xy=bridge_xy, bridge_z=float(bridge_z or 0.0),
-                                    bridge_from=dna_modality if bridge_xy is not None else None,
-                                    anchors=anchors)
+        for modality in self.ui.IngestionPanel.modality_names:
+            anchor_hybe = ap.current_cell_reference_hybe(modality)
+            H_a = within.get(modality, {}).get(anchor_hybe) if anchor_hybe else None
+            if H_a is not None:
+                b = resolver.bridge(modality, shared) if shared else None
+                anchors[modality] = (b if b is not None else np.eye(3)) @ np.asarray(H_a, dtype=float)
+            elif cell is not None and modality in cell.matrix_anchors:
+                anchors[modality] = cell.matrix_anchors[modality]
+        resolver.anchors = anchors
+        return resolver
 
     def _cross_modal_bridge(self, from_modality, to_modality, fov):
         """
@@ -6587,7 +6619,11 @@ class MainWindow(QtWidgets.QMainWindow):
         data. Both now go through the same _fov_matrices_in_frame
         primitive with the same frame_modality.
         """
-        frame_modality = self._shared_frame_modality() or cell.reference_modality
+        # cell=None with no shared frame: each modality is its own frame
+        # (nothing to bridge), same fallback _shared_frame_modality's own
+        # docstring names for every caller.
+        frame_modality = self._shared_frame_modality() or (
+            cell.reference_modality if cell is not None else modality)
         return self._fov_matrices_in_frame(modality, frame_modality, fov)
 
     def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov,
@@ -6620,39 +6656,13 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_reference_hybe_matrix = (frame_fov_matrices or {}).get((frame_hybe, frame_modality), np.eye(3))
         return alignment.hybe_to_cellref_matrix(fov_matrices_for_hybe, cell_reference_hybe_matrix, hybe)
 
-    def _live_cell_matrix_anchor(self, modality, cell, fov):
-        """
-        LIVE replacement for cell.matrix_anchors[modality] -- that
-        modality's own CURRENT cell_align_reference hybe's CURRENT FOV/
-        cross-modal matrix, looked up fresh via _fov_matrices_for_cell_
-        modality rather than cell.matrix_anchors' own stored value.
-
-        Confirmed real staleness bug (per explicit correction -- the cell-
-        level RESIDUAL correction legitimately belongs in the cell's own
-        container and was never meant to be dropped from it; only the
-        ANCHOR needs to stop being read from the cell): cell.matrix_
-        anchors[modality] is captured once, at whatever moment compute_
-        cell_alignment last ran for this cell, and PERSISTED. If Same-
-        Modality or Cross-Modal Alignment is later re-run/re-accepted
-        with a different result, every cell's own matrix_anchors silently
-        goes stale until that cell is individually re-fit -- even though
-        cell.matrices[key]['yx'] (the actual residual) is still perfectly
-        valid. ACell.matrix_to_shared/matrix_between (the bare model
-        methods) still read matrix_anchors directly and stay that way on
-        purpose -- they're the right choice for contexts with no live
-        session state (e.g. ACell.get_mip, localization's own internal
-        have_real branch); this live version is for interactive/UI
-        consumers, which always have session state available.
-
-        Falls back to the stored snapshot only when the live lookup has
-        nothing (this modality's own reference-hybe combo was never set,
-        or its FOV-level layer isn't available at all yet) -- never
-        crashes on a cell that still only has the pre-fix stored anchor.
-        """
-        fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-        anchor_hybe = self.ui.AlignmentPanel.current_cell_reference_hybe(modality)
-        live = (fov_matrices_for_hybe or {}).get((anchor_hybe, modality)) if anchor_hybe else None
-        return live if live is not None else cell.matrix_anchors.get(modality, np.eye(3))
+    # (_live_cell_matrix_anchor was folded into _frame_resolver's own
+    # anchor derivation -- anchors are computed from the resolver's own
+    # within+bridge there, the ONE place, because routing the lookup
+    # through _fov_matrices_for_cell_modality builds another resolver and
+    # recursed. The stored cell.matrix_anchors snapshot remains the
+    # fallback for a cell whose modality has no live combo pick; see
+    # _frame_resolver's anchor block for the staleness rationale.)
 
     def _matrix_to_cellref(self, hybe, modality, cell, fov):
         """hybe's raw frame -> the frame cell.area lives in. Wrapper over _matrix_to_frame."""

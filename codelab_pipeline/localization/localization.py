@@ -318,7 +318,7 @@ def fit_gaussian_mixture_3d(cubic, seeds, peak_bound=2.0, init_sigma_xy=1.25, in
     return out
 
 def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
-                     fov_matrices=None, cell_reference_hybe_matrix=None):
+                     fov_matrices=None, cell_reference_hybe_matrix=None, resolver=None):
     """
     Shared crop-building logic for localize_cell_2d_worker/3d_worker AND
     the interactive spot localization panel's "Current Cell" scope --
@@ -379,10 +379,24 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     self_key = (cell.reference_hybe, reference_modality)
     have_real = (key in cell.matrices and self_key in cell.matrices
                  and modality in cell.matrix_anchors and reference_modality in cell.matrix_anchors)
-    if have_real or fov_matrices is None or (hybe, fov_matrices.modality) not in fov_matrices:
+    if resolver is not None:
+        # THE composition for session callers -- handles every storage
+        # form uniformly (residual entries recomposed with the live FOV
+        # layer, legacy composed passed through, missing layers identity),
+        # making the have_real distinction below irrelevant. The ACell-
+        # method branch RAISES by design on residual-form matrices
+        # (confirmed real crash: 3D Localization View/Run on any cell
+        # that had run cell alignment), so a session must never reach it.
+        H_cellref, _dz, _missing = resolver.transform(
+            (hybe, modality), (cell.reference_hybe, cell.reference_modality), cell)
+        x_lit, y_lit = cell.area
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
+        x_area, y_area = cx, cy
+    elif have_real or fov_matrices is None or (hybe, fov_matrices.modality) not in fov_matrices:
         # real cell-level data, or no fallback available -- old behavior
         # (identity-default via cell.get_area_in_readout/matrix_to_shared
-        # when neither real data nor a fallback exists).
+        # when neither real data nor a fallback exists). Legacy composed
+        # entries only: get_area_in_readout raises on residual matrices.
         x_area, y_area = cell.get_area_in_readout(hybe, modality)
     else:
         # No real cell-level entry for (hybe, modality) -- fall back to
@@ -427,7 +441,9 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     # bridging needed here, unlike the area case, since fov_matrices is
     # already expressed in the shared frame) whenever this cell has no
     # real cell-level entry for (hybe, modality).
-    if not have_real and fov_matrices is not None and (hybe, fov_matrices.modality) in fov_matrices:
+    if resolver is not None:
+        H = resolver.to_shared(hybe, modality, cell)
+    elif not have_real and fov_matrices is not None and (hybe, fov_matrices.modality) in fov_matrices:
         H = fov_matrices[(hybe, fov_matrices.modality)]
     else:
         H = cell.matrix_to_shared(hybe, modality)
@@ -707,7 +723,10 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
         raw = (float(xf + xmin), float(yf + ymin), float(zf))
         if cell is not None:
             m = modality if modality is not None else cell.reference_modality
-            H = cell.matrix_to_shared(hybe, m)
+            # Resolver first -- ACell.matrix_to_shared raises by design on
+            # residual-form matrices (post cell alignment).
+            H = (resolver.to_shared(hybe, m, cell) if resolver is not None
+                 else cell.matrix_to_shared(hybe, m))
             Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
             coord = (float(x1), float(y1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
@@ -752,7 +771,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
     """
     from ..models.spot import ASpot
     spots = []
-    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad)
+    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, resolver=resolver)
     if crop is None:
         return cell.id, hybe, spots
     img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']
@@ -819,7 +838,7 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
     """
     from ..models.spot import ASpot
     spots = []
-    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad)
+    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, resolver=resolver)
     if crop is None:
         return cell.id, hybe, spots
     img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']
@@ -921,7 +940,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     plain = missing" convention).
     """
     try:
-        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell)
+        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, fiducial_channel,
                                                                  (raw_x, raw_y), pad=spad, use_stack=True)
     except OSError:
@@ -938,7 +957,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
         return None, cubic, None
     amp, xf, yf, zf = result[:4]
     raw_fx, raw_fy = xf + xmin, yf + ymin
-    sx, sy = spot_mapper.raw_to_reference((raw_fx, raw_fy), hybe, fov_matrices, modality=modality, cell=cell)
+    sx, sy = spot_mapper.raw_to_reference((raw_fx, raw_fy), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
     sz = zf
     if cell is not None:
         m = modality if modality is not None else cell.reference_modality
@@ -980,7 +999,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     in the SAME order as candidates (never includes a rejected component).
     """
     try:
-        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell)
+        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, readout_channel,
                                                                  (raw_x, raw_y), pad=spad, use_stack=True)
     except OSError:
@@ -1018,7 +1037,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
             continue
         amp, xf, yf, zf = r[:4]
         raw_rx, raw_ry = xf + xmin, yf + ymin
-        sx, sy = spot_mapper.raw_to_reference((raw_rx, raw_ry), hybe, fov_matrices, modality=modality, cell=cell)
+        sx, sy = spot_mapper.raw_to_reference((raw_rx, raw_ry), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
         candidates.append((float(sx + dx), float(sy + dy), float(sz + dz), float(amp)))
         crop_local.append((xf, yf, zf))

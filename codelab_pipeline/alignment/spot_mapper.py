@@ -28,7 +28,7 @@ localizer run on the untouched image.
 """
 
 
-def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
+def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None, resolver=None):
     """
     The single 3x3 'yx' matrix mapping `hybe`'s own native (raw) frame to
     the reference frame for this coordinate. If `cell` is given, that
@@ -52,16 +52,23 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     omitted -- correct for the common case of a same-modality lookup.
     """
     if cell is not None:
-        # Guard: a bare cell-level residual is only half the transform --
-        # the FOV leg is recomposed by frames.FrameResolver, which this
-        # module has no access to. Silently composing it here would drop
-        # the FOV correction. See ACell._require_composable.
         key_modality = modality if modality is not None else cell.reference_modality
+        # resolver (frames.FrameResolver, from MainWindow._frame_resolver)
+        # is THE composition that handles every storage form uniformly:
+        # residual entries recomposed with the live FOV layer, legacy
+        # composed entries passed through, missing layers identity.
+        # Session callers must pass it -- the guard below exists exactly
+        # because this module cannot rebuild the FOV leg itself.
+        if resolver is not None:
+            return resolver.to_shared(hybe, key_modality, cell)
+        # Guard: a bare cell-level residual is only half the transform --
+        # silently composing it here would drop the FOV correction. See
+        # ACell._require_composable.
         entry = cell.matrices.get((hybe, key_modality))
         if entry is not None and entry.get('yx_is_residual'):
             raise ValueError(
                 f'spot_mapper: cell {cell.id} matrices[({hybe}, {key_modality})] is a bare '
-                f'residual; resolve via frames.FrameResolver instead of passing `cell` here.')
+                f'residual; pass resolver= (frames.FrameResolver) instead of a bare cell.')
         return cell.matrix_to_shared(hybe, key_modality)
     if (hybe, modality or fov_matrices.modality) not in fov_matrices:
         raise KeyError(f"No alignment matrix for hybe '{hybe}' -- pass a fov_matrices entry "
@@ -69,7 +76,7 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None):
     return fov_matrices[(hybe, modality or fov_matrices.modality)]
 
 
-def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None):
+def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None, resolver=None):
     """
     coordinate: (x, y) in `hybe`'s own native/raw pixel frame -- e.g.
     exactly where a spot was localized on that hybe's own unmodified image.
@@ -77,12 +84,12 @@ def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None):
     ref_point = H @ raw_point. Only the coordinate moves.
     """
     x, y = coordinate
-    H = _resolve_matrix(hybe, fov_matrices, modality, cell)
+    H = _resolve_matrix(hybe, fov_matrices, modality, cell, resolver)
     rx, ry, _ = H @ np.array([x, y, 1.0])
     return float(rx), float(ry)
 
 
-def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None):
+def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None, resolver=None):
     """
     Inverse of raw_to_reference: coordinate is a point already known in the
     shared reference frame (e.g. a fiducial spot selected once on a single
@@ -91,7 +98,7 @@ def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None):
     frame, so a crop can be taken there for localization.
     """
     x, y = coordinate
-    H = _resolve_matrix(hybe, fov_matrices, modality, cell)
+    H = _resolve_matrix(hybe, fov_matrices, modality, cell, resolver)
     rx, ry, _ = la.inv(H) @ np.array([x, y, 1.0])
     return float(rx), float(ry)
 
