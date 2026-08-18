@@ -4124,31 +4124,39 @@ class MainWindow(QtWidgets.QMainWindow):
         removes it from disk instead of leaving the previous contents
         stranded.
         """
+        # Keyed by (modality, hybe, channel) -- the SLICE -- never by
+        # storage_path. Since vlinks was unified every storage_path resolves
+        # to the same file, so keying by path yields two different keys for
+        # one physical slice, and whichever wrote last won. That is exactly
+        # how a populated slice got overwritten by the empty entry the
+        # stale-clearing pass below created for it.
         by_slice = {}
         for (pool_path, pool_fov), spots in self.fov_unassigned_spots.items():
             if pool_fov != fov or not pool_path:
                 continue
             for spot in spots:
                 modality = spot.modality or vlinks_store.modality_of(pool_path)
-                by_slice.setdefault((pool_path, modality, spot.hybe, int(spot.channel)), []).append(spot)
+                by_slice.setdefault((modality, spot.hybe, int(spot.channel)), []).append(spot)
         container = self.cell_container
         if container is not None:
             for cell in container.data.get(fov, []):
                 for spot in cell.spots:
                     modality = spot.modality or cell.modality
-                    path = self._storage_path_for_modality(modality)
-                    if not path:
-                        continue
-                    by_slice.setdefault((path, modality, spot.hybe, int(spot.channel)), []).append(spot)
+                    by_slice.setdefault((modality, spot.hybe, int(spot.channel)), []).append(spot)
 
-        # Clear slices that exist on disk but have nothing in memory now.
-        for path in self._all_vlinks_storage_paths():
-            for d in vlinks_store.read_spots(path, fov):
-                key = (path, d.get('modality', ''), d.get('hybe', ''), int(d.get('channel', 0)))
-                by_slice.setdefault(key, [])
+        # Slices on disk with nothing in memory get written empty, so
+        # removing a hybe's last spot really removes it. One read is enough:
+        # every storage_path resolves to the same file, and a FOV-wide read
+        # already spans both modalities.
+        any_path = next(iter(self._all_vlinks_storage_paths()), None)
+        if any_path:
+            for d in vlinks_store.read_spots(any_path, fov):
+                by_slice.setdefault((d.get('modality', ''), d.get('hybe', ''),
+                                     int(d.get('channel', 0))), [])
 
-        for (path, modality, hybe, channel), spots in by_slice.items():
-            if not modality or not hybe:
+        for (modality, hybe, channel), spots in by_slice.items():
+            path = self._storage_path_for_modality(modality)
+            if not path or not modality or not hybe:
                 continue
             vlinks_store.write_spots(path, fov, modality, hybe, channel, spots)
         return sum(len(v) for v in by_slice.values())

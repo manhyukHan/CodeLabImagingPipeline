@@ -200,6 +200,11 @@ def _cell_from_dict(d, container_modality=''):
         kwargs['matrices'] = _drop_legacy_matrix_keys(kwargs['matrices'])
     if 'matrix_provenance' in kwargs:
         kwargs['matrix_provenance'] = _drop_legacy_matrix_keys(kwargs['matrix_provenance'])
-    kwargs['spots'] = [_spot_from_dict(sd) for sd in d['spots']]
+    # Cells no longer carry spots in their own blob (see ACell.to_dict):
+    # spots live in the FOV's own store and MainWindow._attach_stored_spots_
+    # to_cells fills them in after load. A cell written since that change has
+    # no 'spots' key at all, so this must tolerate its absence rather than
+    # assume the old shape.
+    kwargs['spots'] = [_spot_from_dict(sd) for sd in d.get('spots') or []]
     cell.set_metadata(**kwargs)
     return cell
