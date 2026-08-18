@@ -24,88 +24,96 @@ import numpy as np
 import numpy.linalg as la
 
 
-def assign_spots(spots, mask, matrix_to_mask_frame, cells_by_id,
-                 matrix_to_shared=None):
+def label_mask_for_frame(cells, hybe, modality, frame_shape):
     """
-    Assign every spot in `spots` against `mask`, in place.
+    A label image of every cell AS SEEN IN (hybe, modality)'s own frame --
+    0 background, otherwise the cell's id.
 
-    mask: (height, width) integer label image in the cells' own frame --
-        0 background, any other value a cell id. This is the segmentation
-        output, reused rather than re-derived.
-    matrix_to_mask_frame: callable (hybe, modality) -> 3x3 mapping that
-        readout's RAW coordinates into the mask's frame, or None when no
-        transform is known. None means "cannot place this spot" and leaves
-        it unassigned rather than guessing.
-    cells_by_id: {cell id: ACell}, for reading celltype and for the shared
-        -frame transform.
-    matrix_to_shared: optional callable (hybe, modality, cell) -> 3x3
-        mapping raw coordinates into the pipeline's shared frame. When
-        given, an assigned spot's `coordinate` is recomputed through it, so
-        a spot's shared-frame position always reflects the CURRENT matrices
-        rather than whatever they were when it was first localized.
+    Each cell is projected from ITS OWN reference hybe via
+    get_area_in_readout, so cells segmented in different hybes (or different
+    modalities) compose correctly into one mask. That per-cell reference does
+    not need to agree with anything: the destination is the SPOT's frame, and
+    every cell is mapped into it independently.
 
-    A spot that lands on background, or whose frame cannot be resolved, is
-    set to cell = -1: assignment is recomputed from scratch, so a spot that
-    used to belong to a cell and no longer does must lose it. Silently
-    keeping a stale owner is how assignment and geometry drift apart.
+    Built once per (hybe, modality) and then indexed per spot, which is what
+    makes assignment O(N) in spots with no per-spot matrix work at all --
+    the transform cost is paid once per frame, not once per spot.
 
-    Returns (n_assigned, n_unassigned).
-    """
-    height, width = mask.shape[:2]
-    matrix_cache = {}
-    n_assigned = n_unassigned = 0
-
-    for spot in spots:
-        key = (spot.hybe, getattr(spot, 'modality', '') or '')
-        if key not in matrix_cache:
-            matrix_cache[key] = matrix_to_mask_frame(*key)
-        H = matrix_cache[key]
-        owner = None
-        if H is not None:
-            raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
-            mx, my = (np.asarray(H, dtype=float)[:2] @ np.array([raw_x, raw_y, 1.0]))
-            ix, iy = int(round(mx)), int(round(my))
-            if 0 <= iy < height and 0 <= ix < width:
-                label = int(mask[iy, ix])
-                if label:
-                    owner = cells_by_id.get(label)
-
-        if owner is None:
-            spot.cell = -1
-            spot.celltype = ''
-            n_unassigned += 1
-            continue
-
-        spot.cell = int(owner.id)
-        spot.celltype = str(getattr(owner, 'celltype', '') or '')
-        if matrix_to_shared is not None:
-            H_shared = matrix_to_shared(spot.hybe, key[1], owner)
-            if H_shared is not None:
-                raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
-                cx, cy = (np.asarray(H_shared, dtype=float)[:2]
-                          @ np.array([raw_x, raw_y, 1.0]))
-                spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
-        n_assigned += 1
-
-    return n_assigned, n_unassigned
-
-
-def rasterize_cells(cells, frame_shape):
-    """
-    A label image from a set of cells, in the frame their masks are native
-    to -- 0 background, otherwise the cell's id.
-
-    Built once per assignment run and indexed per spot, which is what makes
-    assign_spots O(N) in spots rather than O(N x cells). Later cells win
-    where masks overlap; segmentation does not normally produce overlap, and
-    a deterministic rule beats an ambiguous one.
+    Later cells win where masks overlap. Segmentation does not normally
+    produce overlap, and a deterministic rule beats an ambiguous one.
     """
     labels = np.zeros(frame_shape[:2], dtype=np.int32)
     height, width = labels.shape
     for cell in cells:
-        x, y = cell.area
+        try:
+            x, y = cell.get_area_in_readout(hybe, modality)
+        except Exception:
+            continue          # this cell has no path into that frame
         x = np.asarray(x).astype(int).ravel()
         y = np.asarray(y).astype(int).ravel()
         keep = (x >= 0) & (y >= 0) & (x < width) & (y < height)
         labels[y[keep], x[keep]] = int(cell.id)
     return labels
+
+
+def count_unassigned(spots):
+    """How many of `spots` currently belong to no cell."""
+    return sum(1 for s in spots if int(getattr(s, 'cell', -1)) == -1)
+
+
+def assign_spots(spots, cells, frame_shape, cells_by_id=None,
+                 matrix_to_shared=None):
+    """
+    Assign every spot in `spots` against `cells`, in place.
+
+    Spots are grouped by their own (hybe, modality); each group gets one
+    label mask built in THAT frame (see label_mask_for_frame), and each spot
+    is then a single integer lookup: mask[int(y), int(x)]. Zero means no
+    cell. No per-spot matrix work, so cost is one projection per frame plus
+    O(N) lookups.
+
+    Takes ALL spots, never just the unassigned ones. Cells get deleted,
+    resegmented, or replaced by differently-shaped ones, so a spot that
+    already has an owner may no longer sit inside it -- assignment is
+    recomputed from scratch and a stale owner is dropped. Walking only the
+    unassigned pool could never notice, which is how a dead owner used to
+    survive indefinitely.
+
+    matrix_to_shared: optional callable (hybe, modality, cell) -> 3x3 into
+    the shared frame; when given, an assigned spot's `coordinate` is
+    recomputed through it so shared-frame positions reflect the CURRENT
+    matrices rather than whatever they were at localization time.
+
+    Returns (n_assigned, n_unassigned).
+    """
+    if cells_by_id is None:
+        cells_by_id = {c.id: c for c in cells}
+    groups = {}
+    for spot in spots:
+        groups.setdefault((spot.hybe, getattr(spot, 'modality', '') or ''), []).append(spot)
+
+    n_assigned = n_unassigned = 0
+    for (hybe, modality), group in groups.items():
+        mask = label_mask_for_frame(cells, hybe, modality, frame_shape)
+        height, width = mask.shape
+        for spot in group:
+            ix = int(spot.raw_coordinate[0])
+            iy = int(spot.raw_coordinate[1])
+            label = int(mask[iy, ix]) if (0 <= iy < height and 0 <= ix < width) else 0
+            owner = cells_by_id.get(label) if label else None
+            if owner is None:
+                spot.cell = -1
+                spot.celltype = ''
+                n_unassigned += 1
+                continue
+            spot.cell = int(owner.id)
+            spot.celltype = str(getattr(owner, 'celltype', '') or '')
+            if matrix_to_shared is not None:
+                H = matrix_to_shared(hybe, modality, owner)
+                if H is not None:
+                    cx, cy = (np.asarray(H, dtype=float)[:2]
+                              @ np.array([float(spot.raw_coordinate[0]),
+                                          float(spot.raw_coordinate[1]), 1.0]))
+                    spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
+            n_assigned += 1
+    return n_assigned, n_unassigned

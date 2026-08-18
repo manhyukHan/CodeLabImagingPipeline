@@ -4189,18 +4189,17 @@ class MainWindow(QtWidgets.QMainWindow):
         only the unassigned pool -- what this replaces -- could never notice,
         so a stale owner survived indefinitely.
 
-        The mask is rasterised from the cells themselves rather than read
-        from self.cell_displayer.mask. That widget only holds a mask for the
-        FOV just segmented in this session, so the old path silently
-        assigned nothing at all whenever you had not just re-segmented --
-        assignment now works whenever cells exist.
+        The mask is built from the cells themselves, in each SPOT's own
+        (hybe, modality) frame, rather than read from
+        self.cell_displayer.mask. That widget only held a mask for the FOV
+        just segmented this session, so the old path silently assigned
+        nothing whenever you had not just re-segmented.
         """
         cells = self.cell_container.data.get(fov, []) if self.cell_container else []
         if not cells:
             return 0, 0
-        mask = assignment.rasterize_cells(cells, cells[0].frame_shape)
         cells_by_id = {c.id: c for c in cells}
-        ref_cell = cells[0]
+        frame_shape = cells[0].frame_shape
 
         spots = []
         for (pool_path, pool_fov), pool in self.fov_unassigned_spots.items():
@@ -4211,15 +4210,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not spots:
             return 0, 0
 
-        def to_mask_frame(hybe, modality):
-            return self._fov_only_matrix_for_hybe(hybe, modality or ref_cell.modality,
-                                                  ref_cell, fov)
-
         def to_shared(hybe, modality, owner):
             return self._matrix_to_shared(hybe, modality or owner.modality, owner, fov)
 
         n_assigned, n_unassigned = assignment.assign_spots(
-            spots, mask, to_mask_frame, cells_by_id, matrix_to_shared=to_shared)
+            spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
 
         # Redistribute: a spot lives wherever its own `cell` now says.
         for cell in cells:
