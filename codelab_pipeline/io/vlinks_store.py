@@ -188,9 +188,10 @@ def _alleles_group_path(fov):
 
 def write_cells(storage_path, fov, cell_container):
     """
-    Real, on-disk persistence for one FOV's cells (with their nested spots
-    and per-hybe alignment matrices -- ACell.save() already includes both,
-    see codelab_pipeline/models/cell.py) into that experiment's own
+    Real, on-disk persistence for one FOV's cells (with their per-hybe
+    alignment matrices -- see ACell.save() in codelab_pipeline/models/
+    cell.py; spots are NOT included, they live in the FOV's own spot
+    store, see write_spots/read_spots) into that experiment's own
     vlinks.h5, at /FOV##/cells/blob.
 
     A single pickled blob, not a hand-rolled HDF5-native array layout --
@@ -215,7 +216,9 @@ def write_cells(storage_path, fov, cell_container):
         grp.create_dataset('blob', data=blob)
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_cells'] = len(cells)
-        grp.attrs['n_spots'] = sum(len(c.spots) for c in cells)
+        # No n_spots attr: spots are not in this blob any more, and a
+        # count taken here would be permanently 0 -- read_spots on the FOV's
+        # own store is the real count.
 
 
 def write_single_cell(storage_path, fov, cell):
@@ -252,7 +255,9 @@ def write_single_cell(storage_path, fov, cell):
         grp.create_dataset('blob', data=blob)
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_cells'] = len(existing)
-        grp.attrs['n_spots'] = sum(len(d.get('spots', [])) for d in existing)
+        # No n_spots attr: spots are not in this blob any more, and a
+        # count taken here would be permanently 0 -- read_spots on the FOV's
+        # own store is the real count.
 
 
 def read_cells(storage_path, fov):
@@ -273,26 +278,6 @@ def read_cells(storage_path, fov):
     payload = pickle.loads(raw)
     return payload['cells'], payload.get('modality', '')
 
-
-def summarize_fov(storage_path, fov):
-    """{'n_cells':, 'n_spots':, 'saved_at':} straight from the group attrs
-    (no need to unpickle the whole blob just to count) -- (None if nothing
-    persisted for this FOV yet."""
-    vlinks_path = _vlinks_path(storage_path)
-    if not os.path.exists(vlinks_path):
-        return None
-    grp_path = _cells_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
-        if grp_path not in f or 'blob' not in f[grp_path]:
-            return None
-        attrs = f[grp_path].attrs
-        return {'n_cells': int(attrs.get('n_cells', 0)),
-                'n_spots': int(attrs.get('n_spots', 0)),
-                'saved_at': attrs.get('saved_at', '')}
-
-
-def summarize_all_fovs(storage_path, fov_list):
-    return {fov: summarize_fov(storage_path, fov) for fov in fov_list}
 
 
 def mirror_write_cells(storage_paths, fov, cell_container):

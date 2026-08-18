@@ -1666,7 +1666,14 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_dicts = cell_dicts or []
         n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
                       for f in fov_list)
-        d.set_cell_data(cell_dicts, n_total, len(fov_list))
+        # Spots are no longer nested in the cell dict; count them per cell
+        # from the FOV's own spot store for the tree's "(N spots)" label.
+        spots_by_cell_id = {}
+        for s in vlinks_store.read_spots(storage_path, fov):
+            cid = int(s.get('cell', -1))
+            if cid != -1:
+                spots_by_cell_id[cid] = spots_by_cell_id.get(cid, 0) + 1
+        d.set_cell_data(cell_dicts, n_total, len(fov_list), spots_by_cell_id)
 
     def _on_cell_spot_status_spot_scope_changed(self):
         """
@@ -1710,10 +1717,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
         cell_dicts = cell_dicts or []
-        unassigned = self._read_unassigned_spot_dicts(storage_path, fov)
-        ordered = [s for s in unassigned if s['hybe'] == hybe and s['channel'] == channel]
+        # Spots live in the FOV's own store now (assigned and unassigned
+        # together, differing only in `cell`), not nested inside each cell's
+        # own dict -- group by owning cell here rather than reading a
+        # 'spots' key that no longer exists on a persisted cell.
+        by_cell = {}
+        for s in vlinks_store.read_spots(storage_path, fov):
+            by_cell.setdefault(int(s.get('cell', -1)), []).append(s)
+        ordered = [s for s in by_cell.get(-1, []) if s['hybe'] == hybe and s['channel'] == channel]
         for c in sorted(cell_dicts, key=lambda c: c['id']):
-            for s in c.get('spots', []):
+            for s in by_cell.get(c['id'], []):
                 if s['hybe'] == hybe and s['channel'] == channel:
                     ordered.append(s)
         return list(enumerate(ordered, start=1))
@@ -3950,11 +3963,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if cell is None:
                 QtWidgets.QMessageBox.warning(self, 'Remove Transient Spots', 'Select a cell first.')
                 return
-            cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
-            on_disk_cell = next((d for d in (cell_dicts or []) if d['id'] == cell.id), None)
+            # Spots live in the FOV's own store now, not nested inside the
+            # cell -- filter by owning cell AND (hybe, channel) directly.
             permanent = []
-            for d in (on_disk_cell or {}).get('spots', []):
-                if d.get('hybe') == hybe and d.get('channel') == channel:
+            for d in vlinks_store.read_spots(storage_path, fov):
+                if (int(d.get('cell', -1)) == cell.id
+                        and d.get('hybe') == hybe and d.get('channel') == channel):
                     spot = ASpot()
                     spot.set_metadata(**d)
                     permanent.append(spot)
@@ -4159,18 +4173,41 @@ class MainWindow(QtWidgets.QMainWindow):
         # how a populated slice got overwritten by the empty entry the
         # stale-clearing pass below created for it.
         by_slice = {}
+        seen_uids = {}
+
+        def add(spot, modality):
+            """
+            One uid, one spot. The in-memory model still splits spots across
+            the unassigned pool and each cell's own list, so the SAME spot can
+            exist as two objects at once -- _attach_stored_spots_to_cells
+            rebuilds cell.spots from disk while the pool still holds the
+            original. Both carry the same uid, and write_spots rightly refuses
+            that. The spot's own `cell` field is the tie-break: an assigned
+            copy wins over an unassigned one, since assignment is what the
+            reassignment pass just decided.
+            """
+            uid = int(getattr(spot, 'uid', 0) or 0)
+            key = (modality, spot.hybe, int(spot.channel))
+            if uid:
+                prior = seen_uids.get(uid)
+                if prior is not None:
+                    prior_key, prior_spot = prior
+                    if int(prior_spot.cell) != -1 or int(spot.cell) == -1:
+                        return                      # keep the one already held
+                    by_slice[prior_key].remove(prior_spot)
+                seen_uids[uid] = (key, spot)
+            by_slice.setdefault(key, []).append(spot)
+
         for (pool_path, pool_fov), spots in self.fov_unassigned_spots.items():
             if pool_fov != fov or not pool_path:
                 continue
             for spot in spots:
-                modality = spot.modality or vlinks_store.modality_of(pool_path)
-                by_slice.setdefault((modality, spot.hybe, int(spot.channel)), []).append(spot)
+                add(spot, spot.modality or vlinks_store.modality_of(pool_path))
         container = self.cell_container
         if container is not None:
             for cell in container.data.get(fov, []):
                 for spot in cell.spots:
-                    modality = spot.modality or cell.modality
-                    by_slice.setdefault((modality, spot.hybe, int(spot.channel)), []).append(spot)
+                    add(spot, spot.modality or cell.modality)
 
         # Slices on disk with nothing in memory get written empty, so
         # removing a hybe's last spot really removes it. One read is enough:

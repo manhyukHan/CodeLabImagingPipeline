@@ -45,17 +45,16 @@ def _add_tree_children(parent_item, value, key_prefix=''):
         parent_item.setText(1, _format_value(value))
 
 
-def populate_cell_tree(tree, cell_dicts):
+def populate_cell_tree(tree, cell_dicts, spots_by_cell_id):
     """
     One top-level item per cell (label: 'Cell {id} ({modality}, N spots)'),
-    every ACell.save() key as an expandable child -- including 'spots'
-    itself, so a cell's own spots are reachable from here too, just
-    collapsed by default (tree items start unexpanded) so a many-spot
-    cell doesn't blow out the initial view.
+    every ACell.save() key as an expandable child. Cells no longer carry a
+    'spots' key -- spots live in the FOV's own store -- so n_spots is passed
+    in per cell rather than read off the dict; see spots_by_cell_id.
     """
     tree.clear()
     for c in cell_dicts:
-        n_spots = len(c.get('spots', []))
+        n_spots = spots_by_cell_id.get(c.get('id'), 0)
         top = QtWidgets.QTreeWidgetItem([f"Cell {c.get('id')} ({c.get('modality', '?')}, {n_spots} spot(s))", ''])
         tree.addTopLevelItem(top)
         _add_tree_children(top, c)
@@ -330,8 +329,8 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         text = self.SpotChannelComboBox.currentText()
         return int(text) if text else None
 
-    def set_cell_data(self, cell_dicts, n_total_cells, n_total_fovs):
-        populate_cell_tree(self.CellTree, cell_dicts)
+    def set_cell_data(self, cell_dicts, n_total_cells, n_total_fovs, spots_by_cell_id=None):
+        populate_cell_tree(self.CellTree, cell_dicts, spots_by_cell_id or {})
         self.CellTree.resizeColumnToContents(0)
         self.CellTree.resizeColumnToContents(1)
         self.CellCountLabel.setText(f'{len(cell_dicts)} cell(s) in this FOV  |  {n_total_cells} cell(s) total across {n_total_fovs} FOV(s)')

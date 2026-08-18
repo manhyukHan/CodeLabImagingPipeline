@@ -23,7 +23,43 @@ from PyQt5 import QtWidgets
 from config import path
 from windows.main_window import MainWindow
 
+def _install_error_dialog_hook():
+    """
+    Show an uncaught exception in a dialog and KEEP RUNNING.
+
+    Without this, any unhandled exception in a slot propagates out of the Qt
+    event loop and aborts the process, losing whatever was in memory --
+    unsaved spots, a loaded cell container, the current view. An uncaught bug
+    is a bug either way, but it should cost a dialog, not the session.
+
+    Deliberately does not catch KeyboardInterrupt/SystemExit: those are the
+    ways the app is legitimately asked to stop.
+    """
+    import traceback
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        detail = ''.join(traceback.format_exception(exc_type, exc, tb))
+        sys.stderr.write(detail)          # still on the console for debugging
+        try:
+            box = QtWidgets.QMessageBox()
+            box.setIcon(QtWidgets.QMessageBox.Critical)
+            box.setWindowTitle('Unexpected error')
+            box.setText(f'{exc_type.__name__}: {exc}')
+            box.setInformativeText('The app is still running. This operation did '
+                                   'not complete -- your in-memory work is intact.')
+            box.setDetailedText(detail)
+            box.exec_()
+        except Exception:
+            pass                          # a dialog failure must not re-raise
+
+    sys.excepthook = hook
+
+
 if __name__ == '__main__':
+    _install_error_dialog_hook()
     question_app = QtWidgets.QApplication(sys.argv)
     question_window = QtWidgets.QMainWindow()
     question_window.show()
