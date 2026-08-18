@@ -79,10 +79,13 @@ def populate_allele_tree(tree, allele_dicts):
 
 def populate_matrix_tree(tree, rows):
     """
-    rows: [{'fov':, 'same_modality': [(hybe, summary_str), ...],
+    rows: [{'fov':, 'modality':, 'same_modality': [(hybe, summary_str), ...],
     'cross_modal': summary_str or None}, ...] -- one top-level item per
-    FOV, children = one per same-modality hybe plus, when this modality
-    has an accepted cross-modal link, one more for it. Pure ground-truth
+    (FOV, modality), children = one per same-modality hybe plus, when that
+    modality has an accepted cross-modal link, one more for it. Keyed by
+    modality as well as FOV because matrices are the one modality-scoped
+    thing in vlinks: the bridge hybe (e.g. Hyb_130) appears under BOTH
+    modalities meaning different things. Pure ground-truth
     display of whatever's persisted (see MainWindow._refresh_cell_spot_
     status_matrix_panel's own docstring for exactly what's read and why)
     -- summary_str is already-formatted text (dx/dy/angle), no further
@@ -92,7 +95,8 @@ def populate_matrix_tree(tree, rows):
     tree.clear()
     for row in rows:
         n_hybes = len(row['same_modality'])
-        top = QtWidgets.QTreeWidgetItem([f"FOV{row['fov']:02d} ({n_hybes} hybe(s))", ''])
+        top = QtWidgets.QTreeWidgetItem(
+            [f"FOV{row['fov']:02d} -- {row.get('modality', '?')} ({n_hybes} hybe(s))", ''])
         tree.addTopLevelItem(top)
         for hybe, summary in row['same_modality']:
             top.addChild(QtWidgets.QTreeWidgetItem([hybe, summary]))
@@ -154,7 +158,6 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     cell_fov_changed = QtCore.pyqtSignal()
     spot_scope_changed = QtCore.pyqtSignal()
     allele_fov_changed = QtCore.pyqtSignal()
-    modality_changed = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -168,14 +171,14 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         topRow = QtWidgets.QWidget()
         topRowLayout = QtWidgets.QHBoxLayout(topRow)
         topRowLayout.setContentsMargins(0, 0, 0, 0)
-        topRowLayout.addWidget(QtWidgets.QLabel('Modality:'))
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        topRowLayout.addWidget(self.ModalityComboBox)
+        # No modality control: vlinks is one file keyed by (modality, hybe),
+        # so every panel shows every modality at once. Toggling a modality
+        # here would hide half the store for no reason -- the split it
+        # mirrored no longer exists.
         self.RefreshPushButton = QtWidgets.QPushButton('Refresh')
         topRowLayout.addWidget(self.RefreshPushButton)
         topRowLayout.addStretch()
         outer.addWidget(topRow)
-        self.ModalityComboBox.currentIndexChanged.connect(self.modality_changed.emit)
         self.RefreshPushButton.clicked.connect(self.refresh_requested.emit)
 
         # -- Matrix panel: ground-truth check, reads directly off vlinks.h5
@@ -273,17 +276,6 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     # -- population helpers (pure UI-state setters, no vlinks/file access here --
     # MainWindow reads vlinks_store and hands the results in) --
 
-    def set_modality_choices(self, names):
-        current = self.ModalityComboBox.currentText()
-        self.ModalityComboBox.blockSignals(True)
-        self.ModalityComboBox.clear()
-        self.ModalityComboBox.addItems(names)
-        if current in names:
-            self.ModalityComboBox.setCurrentText(current)
-        self.ModalityComboBox.blockSignals(False)
-
-    def current_modality(self):
-        return self.ModalityComboBox.currentText()
 
     def _set_fov_choices(self, combo, fov_list):
         current = combo.currentData()
@@ -363,6 +355,8 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         self.MatrixTree.resizeColumnToContents(0)
         self.MatrixTree.resizeColumnToContents(1)
         self.MatrixTree.expandAll()
-        n_fovs = len(rows)
+        n_fovs = len({r['fov'] for r in rows})
         n_cross = sum(1 for r in rows if r['cross_modal'] is not None)
-        self.MatrixCountLabel.setText(f'{n_fovs} FOV(s){f", {n_cross} with a cross-modal matrix" if n_cross else ""}')
+        self.MatrixCountLabel.setText(
+            f'{n_fovs} FOV(s) x {len(rows)} modality row(s)'
+            f'{f", {n_cross} with a cross-modal matrix" if n_cross else ""}')

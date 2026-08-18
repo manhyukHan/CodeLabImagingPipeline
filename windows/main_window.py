@@ -515,7 +515,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell_spot_status_displayer = CellSpotStatusDisplayer()
         cssd = self.cell_spot_status_displayer
         cssd.refresh_requested.connect(self._refresh_cell_spot_status_full)
-        cssd.modality_changed.connect(self._refresh_cell_spot_status_full)
         cssd.cell_fov_changed.connect(self._refresh_cell_spot_status_cell_panel)
         cssd.spot_scope_changed.connect(self._on_cell_spot_status_spot_scope_changed)
         cssd.allele_fov_changed.connect(self._refresh_cell_spot_status_allele_panel)
@@ -1545,6 +1544,22 @@ class MainWindow(QtWidgets.QMainWindow):
         d.show()
         d.raise_()
 
+    def _status_storage_path(self):
+        """
+        Any configured storage path, for the status viewer's reads.
+
+        With one unified vlinks every storage_path resolves to the same
+        file, and the reads this serves -- cells, spots, alleles -- are
+        FOV-scoped rather than modality-scoped, so they already span both
+        modalities. Which path is passed only decides which directory the
+        resolver walks up from, never what comes back.
+        """
+        for name in self.modality_names:
+            path = self._storage_path_for_modality(name)
+            if path:
+                return path
+        return None
+
     def _refresh_cell_spot_status_full(self):
         """
         Re-derives the FOV choices for ALL THREE panels from the Ingestion
@@ -1555,10 +1570,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ends up selected.
         """
         d = self.cell_spot_status_displayer
-        modality = d.current_modality() or (self.modality_names[0] if self.modality_names else '')
-        if not modality:
-            return
-        storage_path = self._storage_path_for_modality(modality)
+        storage_path = self._status_storage_path()
         fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
         d.set_cell_fov_choices(fov_list)
         d.set_spot_fov_choices(fov_list)
@@ -1587,37 +1599,44 @@ class MainWindow(QtWidgets.QMainWindow):
         list already use), scoped only by the shared Modality combo.
         """
         d = self.cell_spot_status_displayer
-        modality = d.current_modality()
-        storage_path = self._storage_path_for_modality(modality) if modality else None
+        storage_path = self._status_storage_path()
         fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
         if not storage_path or not fov_list:
             d.set_matrix_data([])
             return
-        hybe_records = self._active_hybe_records_for_modality(modality)
-        hybes = [r['folder'] for r in hybe_records]
         global_params = vlinks_store.read_global_params(storage_path) or {}
-        is_dna_side = modality == global_params.get('cross_modal_dna_modality')
-        is_rna_side = modality == global_params.get('cross_modal_rna_modality')
         rows = []
+        # One row per (FOV, modality). Matrices are the one thing here that
+        # IS modality-scoped -- /FOV##/matrix/{modality}/{hybe} -- and the
+        # cross-modal bridge hybe appears under both, meaning different
+        # things, so showing a single modality would hide half the store and
+        # make the bridge look unambiguous when it is not.
         for fov in fov_list:
-            matrices = vlinks_store.read_same_modality_matrices(storage_path, fov, hybes)
-            same_modality = [(hybe, _matrix_dxdy_angle(H)) for hybe, H in sorted(matrices.items())]
-            cross_modal = None
-            if is_dna_side:
-                H_across = vlinks_store.read_cross_modal_matrix(storage_path, fov)
-                if H_across is not None:
-                    cross_modal = _matrix_dxdy_angle(H_across)
-            elif is_rna_side:
-                # RNA is the cross-modal TARGET frame, never itself shifted --
-                # shown as an explicit identity row (not just absent) so the
-                # matrix view reads consistently across both sides of a link.
-                cross_modal = _matrix_dxdy_angle(np.eye(3))
-            rows.append({'fov': fov, 'same_modality': same_modality, 'cross_modal': cross_modal})
+            for modality in self.modality_names:
+                path = self._storage_path_for_modality(modality)
+                if not path:
+                    continue
+                hybes = [r['folder'] for r in self._active_hybe_records_for_modality(modality)]
+                matrices = vlinks_store.read_same_modality_matrices(path, fov, hybes)
+                same_modality = [(hybe, _matrix_dxdy_angle(H)) for hybe, H in sorted(matrices.items())]
+                cross_modal = None
+                if modality == global_params.get('cross_modal_dna_modality'):
+                    H_across = vlinks_store.read_cross_modal_matrix(path, fov)
+                    if H_across is not None:
+                        cross_modal = _matrix_dxdy_angle(H_across)
+                elif modality == global_params.get('cross_modal_rna_modality'):
+                    # The RNA side is the cross-modal TARGET frame, never
+                    # itself shifted -- shown as an explicit identity row
+                    # rather than omitted, so both sides of a link read
+                    # consistently.
+                    cross_modal = _matrix_dxdy_angle(np.eye(3))
+                rows.append({'fov': fov, 'modality': modality,
+                             'same_modality': same_modality, 'cross_modal': cross_modal})
         d.set_matrix_data(rows)
 
     def _refresh_cell_spot_status_allele_panel(self):
         d = self.cell_spot_status_displayer
-        storage_path = self._storage_path_for_modality(d.current_modality())
+        storage_path = self._status_storage_path()
         fov = d.current_allele_fov()
         fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
         if not storage_path or fov is None:
@@ -1629,7 +1648,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cell_spot_status_cell_panel(self):
         d = self.cell_spot_status_displayer
-        storage_path = self._storage_path_for_modality(d.current_modality())
+        storage_path = self._status_storage_path()
         fov = d.current_cell_fov()
         fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
         if not storage_path or fov is None:
@@ -1655,7 +1674,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cell_spot_status_spot_choices(self):
         d = self.cell_spot_status_displayer
-        storage_path = self._storage_path_for_modality(d.current_modality())
+        storage_path = self._status_storage_path()
         fov = d.current_spot_fov()
         if not storage_path or fov is None:
             d.set_spot_hybe_choices([])
@@ -1693,7 +1712,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cell_spot_status_spot_panel(self):
         d = self.cell_spot_status_displayer
-        storage_path = self._storage_path_for_modality(d.current_modality())
+        storage_path = self._status_storage_path()
         fov = d.current_spot_fov()
         hybe = d.current_spot_hybe()
         channel = d.current_spot_channel()
