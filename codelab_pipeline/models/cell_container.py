@@ -1,5 +1,7 @@
 from copy import deepcopy
 
+import pickle
+
 import numpy as np
 
 from .cell import ACell
@@ -8,7 +10,23 @@ from .spot import ASpot
 
 class CellContainer():
     """
-    Container for ACell objects, keyed by fov. One container per modality --
+    Container for ACell objects: data = {fov: {cell.id: ACell}}.
+
+    Dict-by-id, mirroring SpotContainer's {fov: {uid: ASpot}} -- one container
+    pattern to reason about, and id lookup stops being a linear scan. Cell
+    identity is SEGMENTATION-BOUND: a fresh run renumbers freely (ids are for
+    identifying cells within one segmentation, nothing more), append mode
+    continues the existing numbering, and a removed id never returns until a
+    new segmentation run. Removal just deletes the key; ids are never
+    compacted or reused within a run.
+
+    fingerprint/apply_inverse/apply_forward give DiffUndo (spot_container.py)
+    everything it needs -- same two-streak diff undo as spots. Fingerprint
+    entries are CANONICAL BYTES (pickle of cell.save()), not the dicts
+    themselves: save() dicts hold ndarrays, and dict equality over ndarrays
+    is numpy's ambiguous-truth comparison -- it returns False for identical
+    cells, which would make every diff a full snapshot and no edit ever a
+    no-op. Bytes compare exactly. One container per modality --
     segmentation happens per-modality today, each in its own reference_hybe
     (mirrors CellClassifier's CellContainer, but object-based from the start
     rather than array-backed: this is a batch/backend pipeline, not an
@@ -73,8 +91,8 @@ class CellContainer():
         frame without a genuine cross-hybe transform, which a raw pixel
         mask can't provide without resampling.
         """
-        existing = {c.id: c for c in self.data.get(fov, [])} if preserve_existing else {}
-        self.data[fov] = []
+        existing = dict(self.data.get(fov, {})) if preserve_existing else {}
+        self.data[fov] = {}
         ids = np.unique(mask)
         ids = ids[ids > 0]
         cell_modality = reference_modality or ''
@@ -117,16 +135,53 @@ class CellContainer():
                                   reference_hybe=reference_hybe, reference_modality=cell_modality,
                                   nucleus_hybe=reference_hybe, nucleus_modality=cell_modality,
                                   area=(x, y), frame_shape=mask.shape)
-            self.data[fov].append(cell)
+            self.data[fov][int(cell.id)] = cell
 
     def get_cell(self, fov, index):
         return self.data[fov][index]
 
     def get_cells(self, fov):
-        return self.data[fov]
+        return list(self.data.get(fov, {}).values())
+
+    def by_id(self, fov, cell_id):
+        return self.data.get(fov, {}).get(int(cell_id))
+
+    def remove(self, fov, cell_ids):
+        """Delete cells outright. The id is gone until a new segmentation
+        run mints it again -- undo (the diff streak) is the only way back."""
+        fov_cells = self.data.get(fov, {})
+        return [fov_cells.pop(int(i)) for i in cell_ids if int(i) in fov_cells]
+
+    # -- diff/undo plumbing (duck-typed for spot_container.DiffUndo) ------
+    def fingerprint(self, fov):
+        return {int(cid): pickle.dumps(cell.save(), protocol=4)
+                for cid, cell in self.data.get(fov, {}).items()}
+
+    def _from_bytes(self, blob):
+        cell = ACell()
+        cell.set_metadata(**pickle.loads(blob))
+        return cell
+
+    def apply_inverse(self, fov, d):
+        fov_cells = self.data.setdefault(fov, {})
+        for cid in d['added']:
+            fov_cells.pop(int(cid), None)
+        for cid, blob in d['removed'].items():
+            fov_cells[int(cid)] = self._from_bytes(blob)
+        for cid, (before_b, _after) in d['changed'].items():
+            fov_cells[int(cid)] = self._from_bytes(before_b)
+
+    def apply_forward(self, fov, d):
+        fov_cells = self.data.setdefault(fov, {})
+        for cid, blob in d['added'].items():
+            fov_cells[int(cid)] = self._from_bytes(blob)
+        for cid in d['removed']:
+            fov_cells.pop(int(cid), None)
+        for cid, (_before, after_b) in d['changed'].items():
+            fov_cells[int(cid)] = self._from_bytes(after_b)
 
     def save(self):
-        return {fov: [cell.save() for cell in cells] for fov, cells in self.data.items()}
+        return {fov: [cell.save() for cell in cells.values()] for fov, cells in self.data.items()}
 
     @classmethod
     def load(cls, saved, modality=''):
@@ -137,7 +192,8 @@ class CellContainer():
         fov_list = list(saved.keys())
         container = cls(fov_list)
         for fov, cell_dicts in saved.items():
-            container.data[fov] = [_cell_from_dict(d) for d in cell_dicts]
+            cells = [_cell_from_dict(d) for d in cell_dicts]
+            container.data[fov] = {int(c.id): c for c in cells}
         return container
 
 

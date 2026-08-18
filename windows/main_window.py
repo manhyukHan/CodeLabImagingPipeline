@@ -496,6 +496,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_segment_context = None  # {'fov': .., 'reference_hybe': ..}
         self.cell_displayer = CellDisplayer()
         self.cell_displayer.mask_edited.connect(self._on_displayer_mask_edited)
+        self.cell_displayer.undo_requested.connect(self._undo_cell_action)
+        self.cell_displayer.redo_requested.connect(self._redo_cell_action)
 
         # ONE displayer for both nucleus segmentation and cytoplasm review
         # -- per explicit request, now that primary segmentation can itself
@@ -515,6 +517,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Diff-based undo over the spot container: two streaks deep,
         # storing invertible {added, removed, changed} fingerprint deltas.
         self.spot_undo = DiffUndo(self.spot_container)
+        # Cell undo: same DiffUndo, duck-typed onto CellContainer's own
+        # fingerprint/apply_inverse/apply_forward (canonical-bytes entries).
+        # Rebound on use because self.cell_container is created lazily and
+        # occasionally replaced wholesale.
+        self.cell_undo = DiffUndo(None)
         self._current_view_spot_refs = []  # [(ASpot, ACell-or-None), ...] -- see _refresh_localize_3d_spot_choices
 
         self.localize_3d_displayer = Localize3DDisplayer()
@@ -2025,8 +2032,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_cell_segment_finished(self, mask, reference_image, fov, reference_hybe, modality, append=False):
         cp = self.ui.CellSegmentPanel
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=modality)
-        self.cell_container.data.setdefault(fov, [])
+            self.cell_container = CellContainer([fov])
+        self.cell_container.data.setdefault(fov, {})
 
         # merged (not just `append`) tracks whether `mask`'s own ids are
         # actually trustworthy as "same physical cell as before" -- only
@@ -2062,8 +2069,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # explicit request, a cell's reference_hybe is fixed at its own
         # definition time, like its own mask coordinates, and never
         # retroactively touched by a later save regardless of mode.
+        fp = self._begin_cell_edit(fov)
         self.cell_container.load_new_cells(fov, mask, reference_hybe, preserve_existing=merged,
                                            reference_modality=modality)
+        self._commit_cell_edit(fov, fp)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         n_cells = len(self.cell_container.get_cells(fov))
         cp.LogTextEdit.append(f'Segmentation complete: {n_cells} cell(s) found.')
@@ -2119,7 +2128,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         for container in (self.cell_container, self.cell_container_permanent):
             if container is not None and container.data.get(fov):
-                return container, container.data[fov]
+                return container, container.get_cells(fov)
         return None, []
 
     def _cells_for_fov(self, fov):
@@ -2490,8 +2499,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if container is not self.cell_container:
             if self.cell_container is None:
                 self.cell_container = CellContainer([fov])
-            self.cell_container.data[fov] = deepcopy(cells)
-            cells = self.cell_container.data[fov]
+            self.cell_container.data[fov] = {int(c.id): c for c in deepcopy(cells)}
+            cells = self.cell_container.get_cells(fov)
 
         # EVERY cell's nucleus, not just the selected ones -- an unselected
         # cell still has to win its own pixels back from any cytoplasm that
@@ -2592,11 +2601,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cells = None
         if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
-            cells = self.cell_container_permanent.data[fov]
+            cells = self.cell_container_permanent.get_cells(fov)
 
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=modality)
-        self.cell_container.data.setdefault(fov, [])
+            self.cell_container = CellContainer([fov])
+        self.cell_container.data.setdefault(fov, {})
 
         # cells always show, regardless of which hybe/channel the panel is
         # currently displaying -- get_area_in_readout(reference_hybe,
@@ -2626,7 +2635,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 xi, yi = x.astype(int), y.astype(int)
                 valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
                 mask[yi[valid], xi[valid]] = cell.id
-            self.cell_container.data[fov] = deepcopy(cells)
+            self.cell_container.data[fov] = {int(c.id): c for c in deepcopy(cells)}
             if approximate:
                 cp.LogTextEdit.append(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
                                       f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
@@ -2660,9 +2669,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         fov = self._last_segment_context['fov']
         reference_hybe = self._last_segment_context['reference_hybe']
+        fp = self._begin_cell_edit(fov)
         self.cell_container.load_new_cells(
             fov, mask, reference_hybe, preserve_existing=True,
             reference_modality=self._last_segment_context.get('modality'))
+        self._commit_cell_edit(fov, fp)
         n_cells = len(self.cell_container.get_cells(fov))
         self.ui.CellSegmentPanel.LogTextEdit.append(f'Mask edited in displayer: {n_cells} cell(s) remain.')
 
@@ -2754,10 +2765,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # cells in one FOV can legitimately disagree, and nothing ever
             # read the FOV-level copy back.
             where = ', '.join(storage_paths)
-            cp.LogTextEdit.append(f'Saved {len(self.cell_container.data[fov])} cell(s) for FOV{fov:02d} to permanent '
+            cp.LogTextEdit.append(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
                                   f'container and vlinks.h5 ({where}).')
         else:
-            cp.LogTextEdit.append(f'Saved {len(self.cell_container.data[fov])} cell(s) for FOV{fov:02d} to permanent '
+            cp.LogTextEdit.append(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
                                   f'container (no storage path set -- not written to vlinks.h5).')
 
     def _discard_cells(self):
@@ -2765,7 +2776,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None or self._last_segment_context is None:
             return
         fov = self._last_segment_context['fov']
-        self.cell_container.data[fov] = []
+        self.cell_container.data[fov] = {}
         if self.cell_displayer.reference_image is not None:
             empty_mask = np.zeros(self.cell_displayer.reference_image.shape, dtype=np.uint8)
             self.cell_displayer.set_data(self.cell_displayer.reference_image, empty_mask)
@@ -2783,7 +2794,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None:
             self.cell_container = CellContainer([fov])
         self.cell_container.data[fov] = deepcopy(self.cell_container_permanent.data[fov])
-        cp.LogTextEdit.append(f'Pulled {len(self.cell_container.data[fov])} cell(s) from permanent for FOV{fov:02d}.')
+        cp.LogTextEdit.append(f'Pulled {len(self.cell_container.get_cells(fov))} cell(s) from permanent for FOV{fov:02d}.')
 
     def _activate_fov(self, fov):
         """
@@ -2915,7 +2926,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if not storage_path:
             return False
-        cells = self.cell_container_permanent.data[fov]
+        cells = self.cell_container_permanent.get_cells(fov)
         reference_hybe = cells[0].reference_hybe
         frame_shape = cells[0].frame_shape
         # same cross-modality mismatch _show_celltype_result guards against
@@ -2947,7 +2958,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.cell_container is None:
             self.cell_container = CellContainer([fov])
-        self.cell_container.data[fov] = deepcopy(cells)
+        self.cell_container.data[fov] = {int(c.id): c for c in deepcopy(cells)}
         # the CELLS' own segmentation modality, not the app's current one
         # (see cell_container.load_new_cells on why these can differ)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
@@ -3026,9 +3037,9 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_path = ip.StoragePathLineEdit.text().strip()
         cells = []
         if self.cell_container_permanent is not None:
-            cells = self.cell_container_permanent.data.get(fov, [])
+            cells = self.cell_container_permanent.get_cells(fov)
         if not cells and self.cell_container is not None:
-            cells = self.cell_container.data.get(fov, [])
+            cells = self.cell_container.get_cells(fov)
         cells_with_matrices = [c for c in cells if c.matrices]
 
         self._cell_alignment_display_cells = [(fov, c) for c in cells_with_matrices]
@@ -3077,9 +3088,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ap = self.ui.AlignmentPanel
         cell = None
         if self.cell_container_permanent is not None:
-            cell = next((c for c in self.cell_container_permanent.data.get(fov, []) if c.id == cell_id), None)
+            cell = next((c for c in self.cell_container_permanent.get_cells(fov) if c.id == cell_id), None)
         if cell is None and self.cell_container is not None:
-            cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+            cell = next((c for c in self.cell_container.get_cells(fov) if c.id == cell_id), None)
 
         ap.CellResultsListWidget.clear()
         if cell is None:
@@ -3160,7 +3171,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None or fov is None:
             sp.populate_cell_choices([])
         else:
-            cells = self.cell_container.data.get(fov, [])
+            cells = self.cell_container.get_cells(fov)
             n_by_cell = {}
             for spot in self.spot_container.all(fov):
                 if int(spot.cell) != -1:
@@ -3304,7 +3315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_id = sp.selected_cell_id()
         if cell_id is None:
             return None
-        for cell in self.cell_container.data.get(fov, []):
+        for cell in self.cell_container.get_cells(fov):
             if cell.id == cell_id:
                 return cell
         return None
@@ -3401,7 +3412,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ordered = [(s, None) for s in self.spot_container.unassigned(fov)
                   if s.hybe == hybe and s.channel == channel]
-        cells = self.cell_container.data.get(fov, []) if self.cell_container is not None else []
+        cells = self.cell_container.get_cells(fov) if self.cell_container is not None else []
         cells_by_id = {c.id: c for c in cells}
         by_cell = {}
         for s in self.spot_container.all(fov):
@@ -3509,7 +3520,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_owned_refs = []
         context_masks = []
         if self.cell_container is not None:
-            cells = self.cell_container.data.get(fov, [])
+            cells = self.cell_container.get_cells(fov)
             cells_by_id = {c.id: c for c in cells}
             # Two independent enumerations: boundaries are per CELL (every
             # cell draws, spots or not), points are per assigned SPOT.
@@ -4054,7 +4065,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Save Current Spots', 'No storage path available.')
             return
 
-        cells_in_memory = self.cell_container.data.get(fov, []) if self.cell_container else []
+        cells_in_memory = self.cell_container.get_cells(fov) if self.cell_container else []
         # No cells loaded in memory is only a wipe HAZARD when real cells
         # already exist on disk for this FOV AND we're about to write_
         # cells below (a bulk write would then silently drop them) -- so
@@ -4299,7 +4310,7 @@ class MainWindow(QtWidgets.QMainWindow):
         just segmented this session, so the old path silently assigned
         nothing whenever you had not just re-segmented.
         """
-        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
+        cells = self.cell_container.get_cells(fov) if self.cell_container else []
         if not cells:
             return 0, 0
         cells_by_id = {c.id: c for c in cells}
@@ -4322,10 +4333,69 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_spot_uids(fov, spots)
         return n_assigned, n_unassigned
 
+    def _begin_cell_edit(self, fov):
+        if self.cell_container is None:
+            return None
+        self.cell_undo.container = self.cell_container
+        return self.cell_container.fingerprint(fov)
+
+    def _commit_cell_edit(self, fov, fp):
+        if fp is None or self.cell_container is None:
+            return
+        self.cell_undo.container = self.cell_container
+        self.cell_undo.push(fov, fp)
+        self._update_cell_undo_buttons()
+
+    def _update_cell_undo_buttons(self):
+        d = self.cell_displayer
+        d.UndoPushButton.setEnabled(self.cell_undo.can_undo())
+        d.RedoPushButton.setEnabled(self.cell_undo.can_redo())
+
+    def _refresh_cell_displayer_from_container(self, fov):
+        """
+        Re-render the segmentation displayer FROM the transient container --
+        never by mutating the displayer's own mask array. The displayed
+        raster is derived state; deriving it fresh after every container
+        change is what makes a stale contour (a removed cell's outline
+        surviving on screen) structurally impossible rather than a bug to
+        chase per edit path.
+        """
+        cells = self.cell_container.get_cells(fov) if self.cell_container else []
+        if not cells:
+            return
+        mask = np.zeros(cells[0].frame_shape, dtype=np.int32)
+        for cell in cells:
+            x, y = cell.area
+            xi, yi = np.asarray(x).astype(int), np.asarray(y).astype(int)
+            keep = (xi >= 0) & (yi >= 0) & (xi < mask.shape[1]) & (yi < mask.shape[0])
+            mask[yi[keep], xi[keep]] = int(cell.id)
+        ref_pair = (cells[0].reference_hybe, cells[0].reference_modality)
+        path = self._storage_path_for_modality(ref_pair[1])
+        reference_image = vlinks_store.fiducial_channel_mip(path, fov, ref_pair[0]) if path else None
+        if reference_image is not None:
+            self.cell_displayer.set_data(reference_image, mask)
+        self._refresh_spot_cell_list()
+
+    def _undo_cell_action(self):
+        self.cell_undo.container = self.cell_container
+        fov = self.cell_undo.undo()
+        if fov is not None:
+            self._refresh_cell_displayer_from_container(fov)
+            self.ui.CellSegmentPanel.LogTextEdit.append('Undo: cell state restored.')
+        self._update_cell_undo_buttons()
+
+    def _redo_cell_action(self):
+        self.cell_undo.container = self.cell_container
+        fov = self.cell_undo.redo()
+        if fov is not None:
+            self._refresh_cell_displayer_from_container(fov)
+            self.ui.CellSegmentPanel.LogTextEdit.append('Redo: cell state restored.')
+        self._update_cell_undo_buttons()
+
     def _find_cell_by_id(self, fov, cell_id):
         if self.cell_container is None:
             return None
-        return next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+        return next((c for c in self.cell_container.get_cells(fov) if c.id == cell_id), None)
 
     def _begin_spot_edit(self, fov):
         """Fingerprint the FOV's transient spots BEFORE an edit; pair with
@@ -4520,7 +4590,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         fov = ctx['fov']
         hybe, channel = ctx['hybe'], ctx['channel']
-        cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+        cell = next((c for c in self.cell_container.get_cells(fov) if c.id == cell_id), None)
         if cell is None:
             return
         match = next((s for s in self.spot_container.of_cell(fov, cell.id)
@@ -5220,7 +5290,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for container in containers:
                 is_permanent = container is self.cell_container_permanent
                 for cells in container.data.values():
-                    for cell in cells:
+                    for cell in cells.values():
                         cell.celltype = celltype.classify_fov(cell.fov, celltype_from_fov)
                         cell.linked, cell.linked_at = True, now
                         for spot in self.spot_container.of_cell(cell.fov, cell.id):
@@ -5298,7 +5368,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     n_cells_skipped += len(cells)
                     continue
 
-                for cell in cells:
+                for cell in cells.values():
                     x_ref, y_ref = cell.area
                     area_by_channel = {}
                     for bch in barcode_channel:
@@ -5419,7 +5489,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cells = None
         for container in self._celltype_cell_containers():
             if container.data.get(fov):
-                cells = container.data[fov]
+                cells = container.get_cells(fov)
                 break
         if not cells:
             QtWidgets.QMessageBox.warning(self, 'Show Celltype Result', f'No cells for FOV{fov:02d}.')
@@ -6620,7 +6690,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment',
                                           'No cells segmented for this FOV yet -- run Cell Segmentation first.')
             return
-        real_cells = container.data[fov]
+        real_cells = container.get_cells(fov)
 
         cell_modality = ''
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
@@ -6975,9 +7045,9 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_id = item.data(QtCore.Qt.UserRole)
         cell = None
         if self.cell_container_permanent is not None:
-            cell = next((c for c in self.cell_container_permanent.data.get(fov, []) if c.id == cell_id), None)
+            cell = next((c for c in self.cell_container_permanent.get_cells(fov) if c.id == cell_id), None)
         if cell is None and self.cell_container is not None:
-            cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+            cell = next((c for c in self.cell_container.get_cells(fov) if c.id == cell_id), None)
         if cell is None:
             return
         channel_type = ap.CellChannelTypeComboBox.currentText()
@@ -7046,9 +7116,9 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_id = ap.CellIdSpinBox.value()
         real_cell = None
         if self.cell_container_permanent is not None:
-            real_cell = next((c for c in self.cell_container_permanent.data.get(fov, []) if c.id == cell_id), None)
+            real_cell = next((c for c in self.cell_container_permanent.get_cells(fov) if c.id == cell_id), None)
         if real_cell is None and self.cell_container is not None:
-            real_cell = next((c for c in self.cell_container.data.get(fov, []) if c.id == cell_id), None)
+            real_cell = next((c for c in self.cell_container.get_cells(fov) if c.id == cell_id), None)
         if real_cell is None:
             QtWidgets.QMessageBox.warning(self, 'Preview This Cell',
                                           f'No segmented cell with ID {cell_id} found in FOV{fov:02d}.')
@@ -7151,6 +7221,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run_params = self._pending_per_cell_alignment_params or {}
         channel_type = run_params.get('channel_type') or ap.CellChannelTypeComboBox.currentText()
         pad = run_params.get('pad', ap.CellPadSpinBox.value())
+        fp_cells = self._begin_cell_edit(fov)
         real_cell.matrices = staged_cell.matrices
         real_cell.matrix_anchors = staged_cell.matrix_anchors
         real_cell.matrix_provenance = staged_cell.matrix_provenance
@@ -7169,12 +7240,13 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay_reference_hybe = run_params.get('reference_hybe') or real_cell.reference_hybe
         storage_path = run_params.get('storage_path') or self._storage_path_for_modality(overlay_modality)
         wrote = False
+        self._commit_cell_edit(fov, fp_cells)
         if storage_path and fov is not None:
             storage_paths = self._all_vlinks_storage_paths()
             container = None
-            if self.cell_container_permanent is not None and real_cell in self.cell_container_permanent.data.get(fov, []):
+            if self.cell_container_permanent is not None and real_cell in self.cell_container_permanent.get_cells(fov):
                 container = self.cell_container_permanent
-            elif self.cell_container is not None and real_cell in self.cell_container.data.get(fov, []):
+            elif self.cell_container is not None and real_cell in self.cell_container.get_cells(fov):
                 container = self.cell_container
             if storage_paths and container is not None:
                 vlinks_store.mirror_write_cells(storage_paths, fov, container)

@@ -88,6 +88,8 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
     """
     if cells_by_id is None:
         cells_by_id = {c.id: c for c in cells}
+    if matrix_to_shared is not None:
+        matrix_to_shared = _memoized(matrix_to_shared)
     groups = {}
     for spot in spots:
         groups.setdefault((spot.hybe, getattr(spot, 'modality', '') or ''), []).append(spot)
@@ -117,3 +119,52 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
                     spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
             n_assigned += 1
     return n_assigned, n_unassigned
+
+
+def _memoized(matrix_to_shared):
+    """
+    Per-run memo over (hybe, modality, owner.id). The transform itself is a
+    2x3 matmul; the COST is the caller's matrix resolution (MainWindow's
+    matrix_to_shared builds a FrameResolver per call -- measured 540 us per
+    spot, 27 SECONDS for a 50k-spot save). One matrix per (hybe, modality,
+    cell) is all a run can ever need; memoized here so every caller
+    inherits the fix rather than each remembering to cache. Never outlives
+    one call: matrices legitimately change between saves.
+    """
+    cache = {}
+
+    def resolve(hybe, modality, owner):
+        key = (hybe, modality, int(owner.id))
+        if key not in cache:
+            cache[key] = matrix_to_shared(hybe, modality, owner)
+        return cache[key]
+    return resolve
+
+
+def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
+    """
+    Rewrite every ASSIGNED spot's shared-frame `coordinate` from its own
+    raw_coordinate under the CURRENT matrices -- ownership untouched.
+
+    The coordinates-only counterpart of assign_spots (which recasts as a
+    side effect of assignment): matrix accepts already run full
+    reassignment, so this exists for callers that need coordinates
+    refreshed without re-deciding ownership -- and as the primitive a lazy
+    per-spot map() could delegate to later. Unassigned spots are left
+    alone: with no owner there is no cell-level leg to compose.
+    """
+    n = 0
+    resolve = _memoized(matrix_to_shared)
+    for spot in spots:
+        owner = cells_by_id.get(int(spot.cell)) if int(spot.cell) != -1 else None
+        if owner is None:
+            continue
+        H = resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)
+        if H is None:
+            continue
+        cx, cy = (np.asarray(H, dtype=float)[:2]
+                  @ np.array([float(spot.raw_coordinate[0]),
+                              float(spot.raw_coordinate[1]), 1.0]))
+        spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
+        n += 1
+    return n

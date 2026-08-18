@@ -36,7 +36,7 @@ SIZES = [1_000, 10_000, 50_000, 100_000]
 def load_cells():
     dicts, modality = V.read_cells(STORAGE, FOV)
     container = CellContainer.load({FOV: dicts}, modality=modality)
-    return container.data[FOV]
+    return container.get_cells(FOV)
 
 
 def make_spots(n, shape, rng):
@@ -143,6 +143,40 @@ def test_cost_scales_linearly_and_is_affordable_per_save():
         f'per-spot cost should amortise downward, got {per_spot}'
     assert timings[big] < 10.0, \
         f'{big:,} spots took {timings[big]:.1f}s -- too slow to re-run per save'
+
+
+def test_matrix_resolution_is_memoized_per_cell():
+    """
+    The transform is a cheap matmul; the caller's matrix RESOLUTION is not
+    (MainWindow builds a FrameResolver per call -- measured 540 us/spot,
+    27 s for a 50k-spot save, before the memo). assign_spots and
+    recast_spots_to_shared must therefore resolve at most once per
+    (hybe, modality, cell), never once per spot.
+    """
+    cells, mask = setup()
+    by_id = {c.id: c for c in cells}
+    rng = np.random.default_rng(1)
+    ids = list(by_id)
+    spots = []
+    for i in range(5000):
+        s = ASpot(); s.modality = MODALITY
+        s.set_metadata(uid=i + 1, fov=FOV, hybe=HYBE, channel=635, cell=int(rng.choice(ids)),
+                       raw_coordinate=(float(rng.uniform(0, 1024)), float(rng.uniform(0, 1024)), 0.0),
+                       coordinate=(0.0, 0.0, 0.0))
+        spots.append(s)
+    calls = {'n': 0}
+
+    def to_shared(hybe, modality, owner):
+        calls['n'] += 1
+        return np.eye(3)
+    n = assignment.recast_spots_to_shared(spots, to_shared, by_id)
+    assert n == 5000
+    assert calls['n'] <= len(by_id), \
+        f'{calls["n"]} matrix resolutions for {len(by_id)} cells -- memo is broken'
+    calls['n'] = 0
+    assignment.assign_spots(spots, cells, mask.shape, by_id, matrix_to_shared=to_shared)
+    assert calls['n'] <= len(by_id), \
+        f'assign_spots resolved {calls["n"]}x -- per-spot resolution is back'
 
 
 def _run_all():

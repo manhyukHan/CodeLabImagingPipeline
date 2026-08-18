@@ -66,6 +66,8 @@ class CellDisplayer(QtWidgets.QMainWindow):
     sync -- one signal, one downstream handler, for every kind of edit.
     """
     mask_edited = QtCore.pyqtSignal(object)
+    undo_requested = QtCore.pyqtSignal()
+    redo_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -118,6 +120,16 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self.RemoveIdsPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveIdsLineEdit)
         removeLayout.addWidget(self.RemoveIdsPushButton)
+        # Undo/redo over the CELL CONTAINER (two diff streaks, wired by
+        # MainWindow) -- this widget only emits; it owns no cell state.
+        self.UndoPushButton = QtWidgets.QPushButton('Undo')
+        self.UndoPushButton.setEnabled(False)
+        removeLayout.addWidget(self.UndoPushButton)
+        self.RedoPushButton = QtWidgets.QPushButton('Redo')
+        self.RedoPushButton.setEnabled(False)
+        removeLayout.addWidget(self.RedoPushButton)
+        self.UndoPushButton.clicked.connect(self.undo_requested.emit)
+        self.RedoPushButton.clicked.connect(self.redo_requested.emit)
         layout.addWidget(removeRow)
 
         self.RemoveIdsPushButton.clicked.connect(self._remove_ids)
