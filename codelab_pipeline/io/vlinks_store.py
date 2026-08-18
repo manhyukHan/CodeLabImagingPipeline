@@ -205,7 +205,7 @@ def write_cells(storage_path, fov, cell_container):
     correct save()/load()) wins over inventing a schema with no second
     consumer.
     """
-    cells = cell_container.data.get(fov, [])
+    cells = cell_container.get_cells(fov)
     payload = {'cells': [cell.save() for cell in cells]}
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
