@@ -206,7 +206,7 @@ def write_cells(storage_path, fov, cell_container):
     consumer.
     """
     cells = cell_container.data.get(fov, [])
-    payload = {'modality': cell_container.modality, 'cells': [cell.save() for cell in cells]}
+    payload = {'cells': [cell.save() for cell in cells]}
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
@@ -245,7 +245,7 @@ def write_single_cell(storage_path, fov, cell):
             break
     else:
         existing.append(cell_dict)
-    payload = {'modality': modality or cell.modality, 'cells': existing}
+    payload = {'cells': existing}
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
@@ -276,7 +276,11 @@ def read_cells(storage_path, fov):
             return None, ''
         raw = bytes(f[grp_path]['blob'][()])
     payload = pickle.loads(raw)
-    return payload['cells'], payload.get('modality', '')
+    # Second element is a legacy slot: containers/cells no longer carry a
+    # modality (frame identity is each cell's own (reference_hybe,
+    # reference_modality) pair). Kept as '' so `cells, _ = read_cells(...)`
+    # unpacking keeps working while call sites migrate.
+    return payload['cells'], ''
 
 
 

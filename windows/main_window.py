@@ -293,7 +293,7 @@ class CellAlignmentWorker(QtCore.QThread):
                         # reference_hybe can belong to the other modality, and
                         # looking it up in the wrong modality's dict would miss
                         # and silently fall back to identity.
-                        frame_modality = cell.reference_modality or cell.modality
+                        frame_modality = cell.reference_modality
                         cellref_matrix = p['cellref_fov_matrices'].get(
                             frame_modality, {}).get(cell.reference_hybe, np.eye(3))
                         alignment.compute_cell_alignment(
@@ -2478,7 +2478,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # rather than mutating what is already on disk.
         if container is not self.cell_container:
             if self.cell_container is None:
-                self.cell_container = CellContainer([fov], modality=container.modality)
+                self.cell_container = CellContainer([fov])
             self.cell_container.data[fov] = deepcopy(cells)
             cells = self.cell_container.data[fov]
 
@@ -2729,7 +2729,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
         if self.cell_container_permanent is None:
-            self.cell_container_permanent = CellContainer([fov], modality=self.cell_container.modality)
+            self.cell_container_permanent = CellContainer([fov])
         self.cell_container_permanent.data[fov] = deepcopy(self.cell_container.data[fov])
         storage_paths = self._all_vlinks_storage_paths()
         if storage_paths:
@@ -2771,7 +2771,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Send Permanent to Transient', f'No saved cells for FOV{fov:02d}.')
             return
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=self.cell_container_permanent.modality)
+            self.cell_container = CellContainer([fov])
         self.cell_container.data[fov] = deepcopy(self.cell_container_permanent.data[fov])
         cp.LogTextEdit.append(f'Pulled {len(self.cell_container.data[fov])} cell(s) from permanent for FOV{fov:02d}.')
 
@@ -2910,7 +2910,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # modality asked DNA_queue for an RNA hybe -> None -> the loader
         # silently bailed and the FOV showed no cells at all.
         cell_storage_path = (self.ui.IngestionPanel.modality_data
-                             .get(cells[0].reference_modality or cells[0].modality, {})
+                             .get(cells[0].reference_modality or '', {})
                              .get('storage_path') or storage_path)
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
@@ -2926,12 +2926,12 @@ class MainWindow(QtWidgets.QMainWindow):
             mask[y.astype(int), x.astype(int)] = cell.id
 
         if self.cell_container is None:
-            self.cell_container = CellContainer([fov], modality=self.cell_container_permanent.modality)
+            self.cell_container = CellContainer([fov])
         self.cell_container.data[fov] = deepcopy(cells)
         # the CELLS' own segmentation modality, not the app's current one
         # (see cell_container.load_new_cells on why these can differ)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
-                                      'modality': cells[0].reference_modality or cells[0].modality}
+                                      'modality': cells[0].reference_modality}
         self.cell_displayer.set_data(reference_image, mask)
         ap = self.ui.AlignmentPanel
         ap.CellOverlayFovSpinBox.blockSignals(True)
@@ -3038,7 +3038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         resolving ITS OWN modality's configured reference hybe (ap.
         cell_align_references()) independently -- per explicit request,
         no modality picker needed: this app only ever holds one modality's
-        cells resident in memory at a time, so cell.modality alone (once
+        cells resident in memory at a time, so a cell's reference pair alone (once
         the cell itself is found) is unambiguous, and showing every
         modality's hybes at once (not just the cell's home one) needs no
         further per-row choice either, since each row's own reference is
@@ -3070,8 +3070,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # modality -- the anchor _resolve_preview_hybe_context/_cell_
         # overlay_target_specs need, resolving every OTHER configured
         # modality's own hybes independently from there.
-        storage_path = self._storage_path_for_modality(cell.modality)
-        hybe_records = self._active_hybe_records_for_modality(cell.modality)
+        storage_path = self._storage_path_for_modality(cell.reference_modality)
+        hybe_records = self._active_hybe_records_for_modality(cell.reference_modality)
         self._cell_per_hybe_context = {'fov': fov, 'cell': cell, 'storage_path': storage_path,
                                        'hybe_records': hybe_records}
         if not storage_path:
@@ -4302,7 +4302,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if container is not None:
             for cell in container.data.get(fov, []):
                 for spot in cell.spots:
-                    add(spot, spot.modality or cell.modality)
+                    add(spot, spot.modality)
 
         # Slices on disk with nothing in memory get written empty, so
         # removing a hybe's last spot really removes it. One read is enough:
@@ -4361,7 +4361,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0, 0
 
         def to_shared(hybe, modality, owner):
-            return self._matrix_to_shared(hybe, modality or owner.modality, owner, fov)
+            return self._matrix_to_shared(hybe, modality or owner.reference_modality, owner, fov)
 
         n_assigned, n_unassigned = assignment.assign_spots(
             spots, cells, frame_shape, cells_by_id, matrix_to_shared=to_shared)
@@ -4377,7 +4377,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 owner.num_spots[spot.hybe] = owner.num_spots.get(spot.hybe, 0) + 1
                 owner.total_num_spots = len(owner.spots)
             else:
-                path = self._storage_path_for_modality(spot.modality or ref_cell.modality)
+                path = self._storage_path_for_modality(spot.modality)
                 if path:
                     pools.setdefault((path, fov), []).append(spot)
         for key in list(self.fov_unassigned_spots):
@@ -5531,7 +5531,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # modality asked DNA_queue for an RNA hybe -> None -> the loader
         # silently bailed and the FOV showed no cells at all.
         cell_storage_path = (self.ui.IngestionPanel.modality_data
-                             .get(cells[0].reference_modality or cells[0].modality, {})
+                             .get(cells[0].reference_modality or '', {})
                              .get('storage_path') or storage_path)
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
@@ -6144,7 +6144,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Reverse-lookup: which configured modality name owns this storage
         path, or None if it doesn't match any. Used wherever cell-level
         alignment matrices need to be tagged/read by (hybe, modality) key
-        but only a storage_path is in scope -- cell.modality is NOT a
+        but only a storage_path is in scope -- a cell's own reference pair is NOT a
         substitute for this (a cell's own segmentation modality doesn't
         tell you which modality a given storage_path/hybe_records
         argument belongs to; those can be the SAME cell's own modality or
@@ -6184,7 +6184,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dna_sp = ap.DnaStoragePathLineEdit.text().strip()
         rna_modality = self._modality_for_storage_path(rna_sp) if rna_sp else None
         dna_modality = self._modality_for_storage_path(dna_sp) if dna_sp else None
-        shared = rna_modality or (cell.modality if cell is not None else None)
+        shared = rna_modality or (cell.reference_modality if cell is not None else None)
 
         within = {}
         for modality in self.ui.IngestionPanel.modality_names:
@@ -6505,7 +6505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         data. Both now go through the same _fov_matrices_in_frame
         primitive with the same frame_modality.
         """
-        frame_modality = self._shared_frame_modality() or cell.modality
+        frame_modality = self._shared_frame_modality() or cell.reference_modality
         return self._fov_matrices_in_frame(modality, frame_modality, fov)
 
     def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov,
@@ -6530,7 +6530,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Defaults to the cell's own `area` frame; cytoplasm-aware callers
         # pass the nucleus frame explicitly (see _matrix_to_frame).
         frame_hybe = frame_hybe or cell.reference_hybe
-        frame_modality = frame_modality or cell.reference_modality or cell.modality
+        frame_modality = frame_modality or cell.reference_modality
         fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
         if fov_matrices_for_hybe is None or hybe not in fov_matrices_for_hybe:
             return None
@@ -6589,7 +6589,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         resolver = self._frame_resolver(cell, fov)
         H, _dz, _missing = resolver.transform((hybe, modality),
-                                              (frame_hybe, frame_modality or cell.modality), cell)
+                                              (frame_hybe, frame_modality or cell.reference_modality), cell)
         return H
 
     def _matrix_to_shared(self, hybe, modality, cell, fov):
@@ -6710,7 +6710,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         real_cells = container.data[fov]
 
-        cell_modality = container.modality
+        cell_modality = ''
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         storage_path = self._storage_path_for_modality(cell_modality)
         hybe_records = self._active_hybe_records_for_modality(cell_modality)
@@ -6804,7 +6804,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Draws + saves one cell's all-readouts overlay PNG. overlay_
         reference_hybe/modality should be the SAME alignment run's own
         anchor hybe/modality this cell was actually aligned against
-        (falls back to cell.reference_hybe/cell.modality -- the
+        (falls back to cell.reference_hybe/reference_modality -- the
         segmentation hybe -- only when not given, matching compute_cell_
         alignment's own reference_hybe=None default) -- using cell.
         reference_hybe unconditionally here previously redrew the overlay
@@ -6814,7 +6814,7 @@ class MainWindow(QtWidgets.QMainWindow):
         resolved reference hybe's record can't be found in that
         modality's own hybe list, matching the automatic-mode skip that
         already existed before this was factored out."""
-        modality = modality or cell.modality
+        modality = modality or cell.reference_modality
         overlay_reference_hybe = overlay_reference_hybe or cell.reference_hybe
         hybe_records = self._active_hybe_records_for_modality(modality) if modality else self.hybe_records
         record_by_folder = {r['folder']: r for r in hybe_records}
@@ -6824,7 +6824,7 @@ class MainWindow(QtWidgets.QMainWindow):
         save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{cell.id}_alignment_overlay.png')
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, hybe_records, channel_type)
-        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
             cell.reference_hybe, np.eye(3))
         self.preview_canvas.draw_cell_all_readouts_overlay(
             cell, fov, overlay_reference_hybe, storage_path, reference_channel,
@@ -7023,10 +7023,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 # the target's drift RELATIVE to it rather than an absolute
                 # value the pinned reference never receives.
                 'cross_modal_z': self._cross_modal_z(
-                    modality, self._shared_frame_modality() or cell.modality, fov),
+                    modality, self._shared_frame_modality() or cell.reference_modality, fov),
             })
 
-        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
             cell.reference_hybe, np.eye(3))
 
         self.alignment_preview_window.show()
@@ -7037,7 +7037,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fov_only_matrix, final_matrix, pad=pad, target_modality=target_modality,
             mask_anchor_fov_matrix=mask_anchor_fov_matrix,
             cross_modal_z=self._cross_modal_z(
-                target_modality, self._shared_frame_modality() or cell.modality, fov))
+                target_modality, self._shared_frame_modality() or cell.reference_modality, fov))
 
     def _show_cell_all_readouts_overlay(self, item=None):
         """
@@ -7094,7 +7094,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if reference_final_matrix is None:
             reference_final_matrix = np.eye(3)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, self.hybe_records, channel_type)
-        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.modality, cell, fov) or {}).get(
+        mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
             cell.reference_hybe, np.eye(3))
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
@@ -7150,7 +7150,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # never from IngestionPanel's current selection (see populate_
         # cell_reference_hybe_choices' own docstring for the crash that
         # used to cause).
-        cell_modality = real_cell.modality
+        cell_modality = real_cell.reference_modality
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         storage_path = self._storage_path_for_modality(cell_modality)
         hybe_records = self._active_hybe_records_for_modality(cell_modality)
@@ -7253,7 +7253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # segmentation hybe/modality only if run_params is somehow empty
         # (matches compute_cell_alignment's own reference_hybe=None
         # default), not as the primary source.
-        overlay_modality = run_params.get('modality') or real_cell.modality
+        overlay_modality = run_params.get('modality') or real_cell.reference_modality
         overlay_reference_hybe = run_params.get('reference_hybe') or real_cell.reference_hybe
         storage_path = run_params.get('storage_path') or self._storage_path_for_modality(overlay_modality)
         wrote = False
@@ -7273,7 +7273,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{real_cell.id}_alignment_overlay.png')
                 reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
                 target_specs = self._cell_overlay_target_specs(real_cell, storage_path, fov, hybe_records, channel_type)
-                mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(real_cell.modality, real_cell, fov) or {}).get(
+                mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(real_cell.reference_modality, real_cell, fov) or {}).get(
                     real_cell.reference_hybe, np.eye(3))
                 self.preview_canvas.draw_cell_all_readouts_overlay(
                     real_cell, fov, overlay_reference_hybe, storage_path, reference_channel,

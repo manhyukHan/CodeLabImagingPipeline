@@ -369,9 +369,9 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     (identity if none), 'Hz': cell's zx matrix for this hybe (identity
     if none)}.
     """
-    modality = modality if modality is not None else cell.modality
+    modality = modality if modality is not None else cell.reference_modality
     key = (hybe, modality)
-    # reference_MODALITY, not cell.modality -- cell.reference_hybe can
+    # reference_MODALITY -- cell.reference_hybe can
     # belong to the other modality once a cytoplasm is attached (see
     # ACell's own docstring), and pairing it with the cell's home
     # modality would key a (hybe, modality) entry that never exists.
@@ -706,7 +706,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
         amp, xf, yf, zf, _, _, _, _ = r
         raw = (float(xf + xmin), float(yf + ymin), float(zf))
         if cell is not None:
-            m = modality if modality is not None else cell.modality
+            m = modality if modality is not None else cell.reference_modality
             H = cell.matrix_to_shared(hybe, m)
             Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
             x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
@@ -999,7 +999,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     sx, sy = spot_mapper.raw_to_reference((raw_fx, raw_fy), hybe, fov_matrices, modality=modality, cell=cell)
     sz = zf
     if cell is not None:
-        m = modality if modality is not None else cell.modality
+        m = modality if modality is not None else cell.reference_modality
         Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
     shared_result = (float(sx), float(sy), float(sz), float(amp))
@@ -1068,7 +1068,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
                                           min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
 
     dx, dy, dz = delta
-    m = modality if modality is not None else (cell.modality if cell is not None else None)
+    m = modality if modality is not None else (cell.reference_modality if cell is not None else None)
     Hz = alignment.entry_dz(cell.matrices.get((hybe, m))) if cell is not None else 0.0
     candidates, crop_local = [], []
     for r in results:

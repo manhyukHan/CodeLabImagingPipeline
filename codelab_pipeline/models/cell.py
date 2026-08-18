@@ -15,7 +15,13 @@ class ACell():
     each cell has attributes:
      id: int
      fov: int
-     modality: str ('RNA'/'DNA') -- this cell's OWN, original modality
+     (there is deliberately NO cell.modality: modality only exists coupled
+       to a hybe. The pairs below -- (reference_hybe, reference_modality)
+       and (nucleus_hybe, nucleus_modality) -- carry every frame identity a
+       cell has. A standalone modality field went stale the moment a
+       cytoplasm from the other modality was incorporated, and caused two
+       real bugs before removal.)
+     _removed_modality_doc: str -- this cell's OWN, original modality
        (the one its container was built under). Deliberately NOT retargeted
        when a cytoplasm from the other modality is attached: it stays the
        cell's stable identity, so cells that never take part in cytoplasmic
@@ -27,10 +33,10 @@ class ACell():
        it, the hybe the cytoplasm search ran in (which can belong to the
        OTHER modality -- see reference_modality).
      reference_modality: str -- the modality reference_hybe belongs to.
-       MUST be used (not self.modality) wherever reference_hybe is looked up
+       MUST be used wherever reference_hybe is looked up
        in a (hybe, modality)-keyed structure: a cytoplasm hybe from the other
        modality would otherwise resolve to a key that never exists and
-       silently fall back to identity. Defaults to self.modality, which is
+       silently fall back to identity. Which is
        exactly right for every pre-cytoplasm cell.
      nucleus: tuple (ndarray x, ndarray y) -- the NUCLEUS mask, native to
        nucleus_hybe's frame. Before cytoplasmic segmentation this is the
@@ -83,7 +89,6 @@ class ACell():
     def __init__(self):
         self.id = 0
         self.fov = 0
-        self.modality = ''
         self.reference_hybe = ''
         self.reference_modality = ''
         self.nucleus = (np.array([]).reshape(-1, 1), np.array([]).reshape(-1, 1))
@@ -105,7 +110,6 @@ class ACell():
     def set_metadata(self, **kwargs):
         if 'id' in kwargs: self.id = int(kwargs['id'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
-        if 'modality' in kwargs: self.modality = str(kwargs['modality'])
         if 'reference_hybe' in kwargs: self.reference_hybe = str(kwargs['reference_hybe'])
         if 'reference_modality' in kwargs: self.reference_modality = str(kwargs['reference_modality'])
         if 'nucleus' in kwargs: self.nucleus = tuple(kwargs['nucleus'])
@@ -131,17 +135,15 @@ class ACell():
         segmentation existed has no value for. Such a cell has `area` =
         its nucleus, native to reference_hybe, in its own modality -- so
         nucleus mirrors area and both modality fields default to
-        self.modality. Idempotent, and never overwrites a real value, so
+        reference_modality. Idempotent, and never overwrites a real value, so
         it is safe to run on every set_metadata (which is how a partial
         update -- e.g. set_metadata(celltype=...) -- keeps these
         consistent instead of silently leaving them blank).
         """
-        if not self.reference_modality:
-            self.reference_modality = self.modality
         if not self.nucleus_hybe:
             self.nucleus_hybe = self.reference_hybe
         if not self.nucleus_modality:
-            self.nucleus_modality = self.nucleus_modality or self.modality
+            self.nucleus_modality = self.reference_modality
         if self.nucleus is None or len(self.nucleus[0]) == 0:
             self.nucleus = self.area
 
@@ -207,7 +209,7 @@ class ACell():
         native to. Thin wrapper over matrix_between; see its docstring
         for the general bridging logic and the self-cancellation
         guarantee that keeps get_area_in_readout(self.reference_hybe,
-        self.modality) byte-exact regardless of matrix_anchors' actual
+        reference_modality) byte-exact regardless of matrix_anchors' actual
         values.
         """
         return self.matrix_between(hybe, modality, self.reference_hybe, self.reference_modality)
@@ -309,7 +311,6 @@ class ACell():
     def save(self):
         return {'id': int(self.id),
                 'fov': int(self.fov),
-                'modality': str(self.modality),
                 'reference_hybe': str(self.reference_hybe),
                 'reference_modality': str(self.reference_modality),
                 'nucleus': tuple(self.nucleus),

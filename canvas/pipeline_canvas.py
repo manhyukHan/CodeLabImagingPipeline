@@ -491,7 +491,7 @@ class PipelineCanvas():
         # window is now identical across every non-literal column,
         # exactly matching what a spot's own transform already does.
         mask_anchor = (mask_anchor_fov_matrix if mask_anchor_fov_matrix is not None
-                      else cell.matrix_to_shared(cell.reference_hybe, cell.modality))
+                      else cell.matrix_to_shared(cell.reference_hybe, cell.reference_modality))
 
         def bounds_via(H, basis='final'):
             # Compose the anchor and this column's own H into ONE matrix
@@ -839,7 +839,7 @@ class PipelineCanvas():
         # only the target moves" exactly.
         x_lit, y_lit = cell.area
         mask_anchor = (mask_anchor_fov_matrix if mask_anchor_fov_matrix is not None
-                      else cell.matrix_to_shared(cell.reference_hybe, cell.modality))
+                      else cell.matrix_to_shared(cell.reference_hybe, cell.reference_modality))
         if reference_matrix is None:
             reference_matrix = np.eye(3)
         if reference_final_matrix is None:
