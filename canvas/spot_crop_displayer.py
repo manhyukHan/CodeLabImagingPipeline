@@ -346,8 +346,16 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         y0, y1 = int(iy.min()) - 1, int(iy.max()) + 1
         local = np.zeros((y1 - y0 + 1, x1 - x0 + 1), dtype=np.uint8)
         local[iy - y0, ix - x0] = 1
-        gx, gy = np.arange(x0, x1 + 1), np.arange(y0, y1 + 1)
-        ax.contour(gx, gy, local, levels=[0.5], colors=color, linewidths=linewidth)
+        # skimage.find_contours + plot, NOT ax.contour: the extraction is the
+        # same marching squares, but ax.contour builds a full ContourSet
+        # artist per call, and with one call per cell per panel that
+        # machinery alone was ~1.2s per redraw on 102 real cells (profiled)
+        # -- the dominant cost of every manual-click redraw. Plain Line2D
+        # artists draw the identical boundary for ~1% of that.
+        from skimage import measure
+        for poly in measure.find_contours(local.astype(float), 0.5):
+            ax.plot(poly[:, 1] + x0, poly[:, 0] + y0,
+                    color=color, linewidth=linewidth)
 
     def _set_manual_mode(self, on):
         self._manual_mode = on
@@ -363,7 +371,10 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
             return
         if event.button == 1:
             self.spot_points.append((float(event.xdata), float(event.ydata)))
-            self._redraw()
+            # No _redraw() here: spots_edited's handler (MainWindow) always
+            # rebuilds this displayer with fresh GLOBAL indices, so drawing
+            # first paid the full canvas twice per click -- half of the
+            # measured manual-mode slowness. Same in _remove_at_local.
             self.spots_edited.emit(list(self.spot_points))
         elif event.button == 3:
             self._remove_nearest(event.xdata, event.ydata)
@@ -423,8 +434,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                 self.spot_points.pop(local_pos)
                 if local_pos < len(self.spot_indices):
                     self.spot_indices.pop(local_pos)
-                self._redraw()
-                self.spots_edited.emit(list(self.spot_points))
+                    self.spots_edited.emit(list(self.spot_points))
             return
         if 0 <= local_pos < len(self.readonly_points):
             p = self.readonly_points.pop(local_pos)
@@ -432,5 +442,4 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                 self.readonly_indices.pop(local_pos)
             x, y = p[0], p[1]
             tag = p[2] if len(p) > 2 else None
-            self._redraw()
             self.readonly_point_removed.emit(tag, x, y)
