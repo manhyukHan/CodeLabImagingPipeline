@@ -43,6 +43,22 @@ class IngestionPanelUI(object):
         self.ActivateModalitiesPushButton = QtWidgets.QPushButton('Activate Modalities')
         modalityLayout.addWidget(self.ActivateModalitiesPushButton)
 
+        # -- The modality registry and mode live HERE, on the ingestion
+        # panel, not on MainWindow. Per explicit principle: the system's
+        # modality is an INGESTION concept -- each modality needs its own
+        # DAX directory and storage path, so the combo below legitimately
+        # exists -- and nothing outside ingestion may hold a "current
+        # modality". Non-ingestion code reads the REGISTRY (which
+        # modalities exist, their storage paths) through MainWindow's
+        # accessor helpers, and derives any per-datum modality from the
+        # datum itself ((hybe, modality) keys, cell.modality,
+        # spot.modality, vlinks_store.modality_of). current_modality is
+        # panel display state: which modality's fields the ingestion tab
+        # is showing. If code outside the ingestion cluster reads it,
+        # that is a bug of the class that stamped every cell 'DNA'.
+        self.modality_names = ['DNA', 'RNA']
+        self.modality_data = {}           # {name: modality-state dict}
+        self.current_modality = None      # panel display state ONLY
         self.ModalityComboBox = QtWidgets.QComboBox()
         modalityLayout.addWidget(QtWidgets.QLabel('Current modality (switches everything below that is not global):'))
         modalityLayout.addWidget(self.ModalityComboBox)

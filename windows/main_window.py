@@ -467,10 +467,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # Names only ever get ADDED here automatically, never removed --
         # Remove Selected in the panel stays a manual, explicit action.
         self.current_celltype_list = []
-        self.modality_names = ['DNA', 'RNA']
-        self.modality_data = {name: self._blank_modality_state() for name in self.modality_names}
+        # modality_names / modality_data / current_modality live on the
+        # IngestionPanel (see its own comment) -- MainWindow deliberately
+        # has no such attributes, so any code still expecting a
+        # system-level modality fails loudly here instead of silently
+        # reading a stale mode.
+        self.ui.IngestionPanel.modality_data = {
+            name: self._blank_modality_state()
+            for name in self.ui.IngestionPanel.modality_names}
         self.total_active_hybe_list = []  # [(hybe_record, modality_name), ...] -- see _refresh_active_hybe_lists
-        self.current_modality = None
         self._job_queue = []
         self._job_queue_index = 0
         self._job_queue_overwrite = True
@@ -734,7 +739,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # separately, e.g. by _refresh_active_hybe_lists) must survive a
         # switch-away/switch-back, not get silently wiped back to the
         # blank-state default just because the user changed tabs.
-        data = self.modality_data.setdefault(self.current_modality, self._blank_modality_state())
+        data = self.ui.IngestionPanel.modality_data.setdefault(self.ui.IngestionPanel.current_modality, self._blank_modality_state())
         data.update({
             'layout_path': ip.LayoutPathLineEdit.text().strip(),
             'dax_directory': ip.DaxDirectoryLineEdit.text().strip(),
@@ -765,10 +770,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not name:
             return
         ip = self.ui.IngestionPanel
-        if self.current_modality is not None and self.current_modality != name:
+        if self.ui.IngestionPanel.current_modality is not None and self.ui.IngestionPanel.current_modality != name:
             self._save_current_modality_fields()
-        self.current_modality = name
-        data = self.modality_data.setdefault(name, self._blank_modality_state())
+        self.ui.IngestionPanel.current_modality = name
+        data = self.ui.IngestionPanel.modality_data.setdefault(name, self._blank_modality_state())
         ip.LayoutPathLineEdit.setText(data['layout_path'])
         ip.DaxDirectoryLineEdit.setText(data['dax_directory'])
         ip.StoragePathLineEdit.setText(data['storage_path'])
@@ -818,7 +823,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         For cross-modal params specifically, the two sides are named by
         modality (cross_modal_rna_modality / cross_modal_dna_modality) and
-        their storage paths come from self.modality_data -- so
+        their storage paths come from self.ui.IngestionPanel.modality_data -- so
         _other_modality_cell_alignment_inputs's other_data lookup and
         H_across itself stay available. There is no paired-storage-path
         param any more: one unified vlinks holds both modalities.
@@ -827,7 +832,7 @@ class MainWindow(QtWidgets.QMainWindow):
         params = vlinks_store.read_global_params(storage_path)
         if not params:
             return
-        data = self.modality_data.get(self.current_modality)
+        data = self.ui.IngestionPanel.modality_data.get(self.ui.IngestionPanel.current_modality)
 
         layout_path = params.get('layout_path')
         if layout_path and data is not None and not data['layout_path']:
@@ -842,7 +847,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # have a same-named hybe folder.
         reference_hybe = params.get('same_modality_reference_hybe')
         if reference_hybe:
-            ap.select_reference_hybe(reference_hybe, self.current_modality)
+            ap.select_reference_hybe(reference_hybe, self.ui.IngestionPanel.current_modality)
         channel_type = params.get('same_modality_channel_type')
         if channel_type:
             ap.SameModalityChannelTypeComboBox.setCurrentText(channel_type)
@@ -867,8 +872,8 @@ class MainWindow(QtWidgets.QMainWindow):
         rna_modality = params.get('cross_modal_rna_modality')
         dna_modality = params.get('cross_modal_dna_modality')
         if rna_modality and dna_modality:
-            rna_path = self.modality_data.get(rna_modality, {}).get('storage_path', '')
-            dna_path = self.modality_data.get(dna_modality, {}).get('storage_path', '')
+            rna_path = self.ui.IngestionPanel.modality_data.get(rna_modality, {}).get('storage_path', '')
+            dna_path = self.ui.IngestionPanel.modality_data.get(dna_modality, {}).get('storage_path', '')
             if rna_path and dna_path:
                 ap.RnaStoragePathLineEdit.setText(rna_path)
                 ap.DnaStoragePathLineEdit.setText(dna_path)
@@ -883,13 +888,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 ap.ChannelTypeComboBox.setCurrentText(cross_channel_type)
 
             other_name = 'DNA' if role == 'RNA' else 'RNA'
-            other_data = self.modality_data.setdefault(other_name, self._blank_modality_state())
+            other_data = self.ui.IngestionPanel.modality_data.setdefault(other_name, self._blank_modality_state())
             other_data['storage_path'] = paired_path
             other_params = vlinks_store.read_global_params(paired_path)
             if not other_data['layout_path'] and other_params.get('layout_path'):
                 other_data['layout_path'] = other_params['layout_path']
-            if other_name not in self.modality_names:
-                self.modality_names = list(self.modality_names) + [other_name]
+            if other_name not in self.ui.IngestionPanel.modality_names:
+                self.ui.IngestionPanel.modality_names = list(self.ui.IngestionPanel.modality_names) + [other_name]
 
             # _other_modality_cell_alignment_inputs also needs
             # self.fov_matrices[(paired_path, fov)] -- normally only
@@ -943,13 +948,13 @@ class MainWindow(QtWidgets.QMainWindow):
         silently ignored rather than erroring.
         """
         modality_fields = modality_fields or {}
-        self.modality_names = names
-        self.modality_data = {}
+        self.ui.IngestionPanel.modality_names = names
+        self.ui.IngestionPanel.modality_data = {}
         for name in names:
             state = self._blank_modality_state()
             state.update({k: v for k, v in modality_fields.get(name, {}).items() if k in state})
-            self.modality_data[name] = state
-        self.current_modality = None
+            self.ui.IngestionPanel.modality_data[name] = state
+        self.ui.IngestionPanel.current_modality = None
         # the Ingestion tab's own combo is the real modality SWITCHER (see
         # _switch_current_modality's own docstring). Cell-Based Alignment
         # has no modality selector of its own at all -- which modality a
@@ -992,10 +997,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ip = self.ui.IngestionPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
-        data = self.modality_data.get(name)
+        data = self.ui.IngestionPanel.modality_data.get(name)
         if not data or not data.get('storage_path') or not fov_list:
             return []
-        if name == self.current_modality and self.hybe_records:
+        if name == self.ui.IngestionPanel.current_modality and self.hybe_records:
             records = self.hybe_records
         elif data.get('layout_path'):
             try:
@@ -1031,14 +1036,14 @@ class MainWindow(QtWidgets.QMainWindow):
         all, just a disk-truth readout, so re-running this is always
         safe and should always reflect disk's current real state).
         """
-        for name in self.modality_names:
-            self.modality_data.setdefault(name, self._blank_modality_state())['active_hybe_list'] = \
+        for name in self.ui.IngestionPanel.modality_names:
+            self.ui.IngestionPanel.modality_data.setdefault(name, self._blank_modality_state())['active_hybe_list'] = \
                 self._active_hybe_records_for_modality(name)
 
         total = []
         seen = set()
-        for name in self.modality_names:
-            for r in self.modality_data[name]['active_hybe_list']:
+        for name in self.ui.IngestionPanel.modality_names:
+            for r in self.ui.IngestionPanel.modality_data[name]['active_hybe_list']:
                 key = (r['folder'], name)
                 if key not in seen:
                     seen.add(key)
@@ -1047,7 +1052,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
         # every one of these now gets the FULL cross-modality union, not
-        # just self.current_modality's own slice -- none of them have
+        # just self.ui.IngestionPanel.current_modality's own slice -- none of them have
         # their own modality selector any more (see _switch_current_
         # modality's own docstring); each combo item carries its own
         # modality tag instead.
@@ -1059,7 +1064,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.populate_cell_reference_hybe_choices(self.total_active_hybe_list)
         for name, populate in (('RNA', ap.populate_rna_reference_hybe_choices),
                                ('DNA', ap.populate_dna_reference_hybe_choices)):
-            populate(self.modality_data.get(name, {}).get('active_hybe_list', []))
+            populate(self.ui.IngestionPanel.modality_data.get(name, {}).get('active_hybe_list', []))
 
         chp = self.ui.ChromatinTracingPanel
         chp.populate_hybe_list(self.total_active_hybe_list, default_checked=self._default_chromatin_tracing_hybes)
@@ -1279,7 +1284,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reference_hybe = ap.current_reference_hybe()
         modality = ap.current_reference_modality()
         storage_path = self._storage_path_for_modality(modality)
-        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
+        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         ap.SameModalityResultsListWidget.clear()
         if not storage_path or not reference_hybe or not fov_list or not hybe_records:
@@ -1508,7 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip = self.ui.IngestionPanel
         if storage_path == ip.StoragePathLineEdit.text().strip():
             return self.hybe_records
-        for data in self.modality_data.values():
+        for data in self.ui.IngestionPanel.modality_data.values():
             if data['storage_path'] == storage_path and data['layout_path']:
                 try:
                     return preprocess.parse_experiment_layout(data['layout_path'])
@@ -1560,7 +1565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         modalities. Which path is passed only decides which directory the
         resolver walks up from, never what comes back.
         """
-        for name in self.modality_names:
+        for name in self.ui.IngestionPanel.modality_names:
             path = self._storage_path_for_modality(name)
             if path:
                 return path
@@ -1618,7 +1623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # things, so showing a single modality would hide half the store and
         # make the bridge look unambiguous when it is not.
         for fov in fov_list:
-            for modality in self.modality_names:
+            for modality in self.ui.IngestionPanel.modality_names:
                 path = self._storage_path_for_modality(modality)
                 if not path:
                     continue
@@ -2796,7 +2801,7 @@ class MainWindow(QtWidgets.QMainWindow):
         was still on RNA, even though real unassigned spots existed on
         disk for that exact (storage_path, fov).
         """
-        for modality_name in self.modality_names:
+        for modality_name in self.ui.IngestionPanel.modality_names:
             storage_path = self._storage_path_for_modality(modality_name)
             if not storage_path:
                 continue
@@ -2894,7 +2899,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # configured modality's own vlinks.h5), so reference_hybe might not
         # exist under the CURRENT storage_path at all. Resolve from the
         # cell's own segmentation modality first.
-        cell_storage_path = self.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
+        cell_storage_path = self.ui.IngestionPanel.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
             cp.LogTextEdit.append(f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d} -- cannot show existing cells.')
@@ -3165,7 +3170,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # while Ingestion was still on RNA left this list looking
         # unchanged even though real spots were identified/persisted).
         unassigned = []
-        for modality_name in self.modality_names:
+        for modality_name in self.ui.IngestionPanel.modality_names:
             modality_storage_path = self._storage_path_for_modality(modality_name)
             if modality_storage_path:
                 unassigned.extend(self.fov_unassigned_spots.get((modality_storage_path, fov), []))
@@ -3181,8 +3186,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _modality_owning_hybe(self, hybe):
         """Which configured modality's own active_hybe_list actually
         contains this hybe folder, or None if it's not in any of them."""
-        for name in self.modality_names:
-            records = self.modality_data.get(name, {}).get('active_hybe_list', [])
+        for name in self.ui.IngestionPanel.modality_names:
+            records = self.ui.IngestionPanel.modality_data.get(name, {}).get('active_hybe_list', [])
             if any(r['folder'] == hybe for r in records):
                 return name
         return None
@@ -3245,7 +3250,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # used to only ever read ip.StoragePathLineEdit's CURRENT
             # modality, silently omitting the other modality's spots.
             fov = self._current_spot_fov()
-            for modality_name in self.modality_names:
+            for modality_name in self.ui.IngestionPanel.modality_names:
                 modality_storage_path = self._storage_path_for_modality(modality_name)
                 if not modality_storage_path:
                     continue
@@ -4088,7 +4093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # versa) means whichever modality is processed LAST in self.
         # modality_names permanently overwrites every OTHER modality's own
         # unassigned pool with its own spots. Reproduced on a scratch
-        # copy: with self.modality_names == ['RNA', 'DNA'], an RNA Hyb_105
+        # copy: with self.ui.IngestionPanel.modality_names == ['RNA', 'DNA'], an RNA Hyb_105
         # spot and a DNA Hyb_010 spot both pending at once resulted in
         # BOTH storage paths ending up with only the DNA spot -- RNA's own
         # spot silently vanished. This is the root cause of "RNA unassigned
@@ -4376,128 +4381,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fov_unassigned_spots[key] = val
         return n_assigned, n_unassigned
 
-    def _identify_fov_unassigned_spots(self, fov, storage_paths):
-        """
-        Identifies each pending FOV-level unassigned spot (ACROSS every
-        hybe/channel ever accumulated in fov_unassigned_spots for this
-        FOV, not just the one currently selected in the Hybe/Channel
-        comboboxes) against the current cell mask. Newly-identified
-        spots are APPENDED onto their owning cell's own spots in memory
-        (the caller, _save_current_spots, is what actually persists
-        them, via its own bulk write_cells call -- this method only
-        persists the LEFTOVER unassigned pool itself, via
-        mirror_write_fov_spots, since that lives in a separate vlinks.h5
-        group write_cells doesn't touch). Returns (n_identified,
-        n_identified_cells).
-
-        The mask lives in the SEGMENTATION's own reference hybe frame
-        (cell.reference_hybe), which is NOT necessarily the same hybe as
-        the Same-Modality FOV alignment's own reference hybe that plain
-        fov_matrices targets -- on this real dataset they're genuinely
-        different (Hyb_500 vs Hyb_101). So the lookup point must be
-        transformed via _fov_only_matrix_for_hybe(spot.hybe, modality,
-        ref_cell, fov) (FOV/cross-modal composition into cell.reference_
-        hybe's frame, no cell-level residual -- there's no owning cell
-        yet to have a residual for), NOT the bare fov_matrices spot_
-        mapper.raw_to_reference(..., cell=None) used to compute a
-        REFERENCE-frame coordinate elsewhere in this app; using the
-        latter here would silently look up the mask at the wrong pixel
-        whenever those two reference hybes differ.
-
-        fov_unassigned_spots is keyed by (storage_path, fov), and
-        storage_path is now each hybe's OWN modality's storage path (see
-        _load_fov_spot_display/_run_spot_auto_detect_body), not one
-        single Ingestion-tab-derived value -- so this FOV can have more
-        than one non-empty pending pool at once (one per modality that's
-        had spots picked in it), all needing identification against the
-        SAME cell mask. Loops over every configured modality's own key
-        rather than assuming just one.
-        """
-        mask = self.cell_displayer.mask
-        mask_matches_fov = bool(self._last_segment_context is not None and self._last_segment_context['fov'] == fov)
-        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
-        cells_by_id = {c.id: c for c in cells}
-        can_identify = mask is not None and mask_matches_fov and bool(cells_by_id)
-        ref_cell = cells[0] if can_identify else None
-
-        total_identified = 0
-        identified_cell_ids = set()
-        for modality_name in self.modality_names:
-            modality_storage_path = self._storage_path_for_modality(modality_name)
-            if not modality_storage_path:
-                continue
-            key = (modality_storage_path, fov)
-            pending = self.fov_unassigned_spots.get(key, [])
-            if not pending:
-                continue
-            mask_lookup_matrix_cache = {}
-            still_unassigned = []
-            for spot in pending:
-                owning_cell = None
-                if can_identify:
-                    H = mask_lookup_matrix_cache.get(spot.hybe)
-                    if H is None and spot.hybe not in mask_lookup_matrix_cache:
-                        H = self._fov_only_matrix_for_hybe(spot.hybe, modality_name, ref_cell, fov)
-                        mask_lookup_matrix_cache[spot.hybe] = H
-                    if H is not None:
-                        rx, ry, _ = H @ np.array([spot.raw_coordinate[0], spot.raw_coordinate[1], 1.0])
-                        iry, irx = int(round(ry)), int(round(rx))
-                        if 0 <= iry < mask.shape[0] and 0 <= irx < mask.shape[1]:
-                            label = int(mask[iry, irx])
-                            owning_cell = cells_by_id.get(label) if label != 0 else None
-                if owning_cell is not None:
-                    # _matrix_to_shared (not spot_mapper.raw_to_reference's
-                    # own cell branch) -- per confirmed real bug, cell.
-                    # matrix_to_shared silently collapses to identity when
-                    # owning_cell has no real cell-level alignment for this
-                    # hybe/modality yet (no fallback of its own);
-                    # _matrix_to_shared already falls back to the live
-                    # FOV/cross-modal matrix in that case.
-                    H_shared = self._matrix_to_shared(spot.hybe, modality_name, owning_cell, fov)
-                    if H_shared is not None:
-                        cx, cy, _ = H_shared @ np.array([spot.raw_coordinate[0], spot.raw_coordinate[1], 1.0])
-                    else:
-                        cx, cy = spot.raw_coordinate[0], spot.raw_coordinate[1]
-                    spot.set_metadata(cell=owning_cell.id, coordinate=(cx, cy, 0.0))
-                    owning_cell.spots.append(spot)
-                    owning_cell.num_spots[spot.hybe] = sum(1 for s in owning_cell.spots if s.hybe == spot.hybe)
-                    owning_cell.total_num_spots = len(owning_cell.spots)
-                    identified_cell_ids.add(owning_cell.id)
-                    total_identified += 1
-                else:
-                    still_unassigned.append(spot)
-            self.fov_unassigned_spots[key] = still_unassigned
-            # No write here: identification only moves spots between the
-            # unassigned pool and cell.spots IN MEMORY, and both land in the
-            # same (modality, hybe, channel) slice anyway. _persist_fov_spots
-            # writes the whole FOV once afterward, so a spot that just gained
-            # a cell is written with its new `cell` value rather than twice
-            # with two different ones.
-
-        return total_identified, len(identified_cell_ids)
-
-    # -- spot-list undo/redo --
-    #
-    # Generalized snapshot stack, not a per-add/remove diff: every
-    # mutating spot action calls _push_spot_undo(...) with whichever
-    # scopes it's ABOUT to touch (one or more cells' .spots lists, and/or
-    # one fov_unassigned_spots key), captured BEFORE the mutation runs.
-    # Undo restores that snapshot and pushes the scope's CURRENT (about
-    # to be overwritten) state onto the redo stack; Redo is the mirror.
-    # Starting any new undo-able action clears the redo stack -- standard
-    # linear undo/redo, not branching.
-    #
-    # Cells are identified by (fov, cell.id) -- plain numeric data, same
-    # as ASpot.cell itself -- not by holding the ACell object reference.
-    # A snapshot only ever needs a spot list plus "which cell does this
-    # belong to", and re-resolving that id against self.cell_container at
-    # APPLY time (not push time) means a snapshot stays valid even if
-    # cell_container itself gets rebuilt from scratch in between (e.g. a
-    # re-run of segmentation creates entirely new ACell objects with the
-    # same ids) -- an id-keyed snapshot still finds the right cell; a
-    # stale object-reference key would silently point at an orphaned
-    # object and undo would do nothing.
-
     def _find_cell_by_id(self, fov, cell_id):
         if self.cell_container is None:
             return None
@@ -4599,7 +4482,7 @@ class MainWindow(QtWidgets.QMainWindow):
         the same append=True escape hatch) as _replace_cell_spots, just
         keyed by (storage_path, fov) instead of living on a cell (there
         is no owning cell for these by definition -- see
-        _identify_fov_unassigned_spots for when that gets decided).
+        _reassign_fov_spots for when that gets decided).
         """
         key = (storage_path, fov)
         existing = self.fov_unassigned_spots.get(key, [])
@@ -4823,7 +4706,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # detected peak becomes an unassigned spot (ASpot.cell stays
             # at its model default, -1) in fov_unassigned_spots; cell
             # ownership is only decided later, at save time (see
-            # _identify_fov_unassigned_spots) -- per explicit request,
+            # _reassign_fov_spots) -- per explicit request,
             # identification is deferred to save, not done eagerly at
             # detect time.
             mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
@@ -5636,7 +5519,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # DNA_queue lookup can't find. Resolve the storage path from the
         # cell's OWN segmentation modality instead, falling back to the
         # current one only if that modality's own path isn't configured.
-        cell_storage_path = self.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
+        cell_storage_path = self.ui.IngestionPanel.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
             QtWidgets.QMessageBox.critical(self, 'Show Celltype Result',
@@ -5678,7 +5561,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # {hybe}_stack.h5 on disk yet. Using checkbox state here let a
         # checked-but-never-ingested hybe reach align_same_modality's
         # bare h5py.File() open and crash.
-        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', [])
+        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', [])
         if not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
                                           'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
@@ -5746,7 +5629,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path and FOV list in the Ingestion tab first.')
             return
 
-        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', [])
+        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', [])
         if not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
                                           'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
@@ -5859,7 +5742,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reference_hybe = ap.current_reference_hybe()
         modality = ap.current_reference_modality()
         storage_path = self._storage_path_for_modality(modality)
-        hybe_records = self.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
+        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
         if not storage_path or not reference_hybe or not hybe_records:
             QtWidgets.QMessageBox.warning(self, 'Show All-Readouts Overlay',
                                           'Set storage path (Ingestion tab) and reference hybe first.')
@@ -6219,7 +6102,7 @@ class MainWindow(QtWidgets.QMainWindow):
         combo happens to be showing right now (those two can now genuinely
         differ, unlike before this modality decoupling).
         """
-        return self.modality_data.get(modality, {}).get('storage_path', '') if modality else ''
+        return self.ui.IngestionPanel.modality_data.get(modality, {}).get('storage_path', '') if modality else ''
 
     def _modality_for_storage_path(self, storage_path):
         """
@@ -6232,7 +6115,7 @@ class MainWindow(QtWidgets.QMainWindow):
         argument belongs to; those can be the SAME cell's own modality or
         the OTHER one, depending on which call site this is).
         """
-        for name, data in self.modality_data.items():
+        for name, data in self.ui.IngestionPanel.modality_data.items():
             if data.get('storage_path') == storage_path:
                 return name
         return None
@@ -6269,7 +6152,7 @@ class MainWindow(QtWidgets.QMainWindow):
         shared = rna_modality or (cell.modality if cell is not None else None)
 
         within = {}
-        for modality in self.modality_names:
+        for modality in self.ui.IngestionPanel.modality_names:
             sp = self._storage_path_for_modality(modality)
             if sp:
                 # FrameResolver's `within` is {modality: {hybe: 3x3}} with BARE
@@ -6291,7 +6174,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         anchors = {}
         if cell is not None:
-            for modality in self.modality_names:
+            for modality in self.ui.IngestionPanel.modality_names:
                 if modality in cell.matrix_anchors:
                     anchors[modality] = self._live_cell_matrix_anchor(modality, cell, fov)
         return frames.FrameResolver(within, shared, bridge_xy=bridge_xy, bridge_z=float(bridge_z or 0.0),
@@ -6473,7 +6356,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
 
         other_modality = self._modality_for_storage_path(other_storage_path)
-        other_data = self.modality_data.get(other_modality) if other_modality else None
+        other_data = self.ui.IngestionPanel.modality_data.get(other_modality) if other_modality else None
         if not other_data or not other_data['layout_path']:
             return None
         # the real, persisted same-modality reference hybe for this
@@ -6724,7 +6607,7 @@ class MainWindow(QtWidgets.QMainWindow):
         this_modality = self._modality_for_storage_path(storage_path)
         record_by_folder_by_modality = {this_modality: {r['folder']: r for r in hybe_records}}
         storage_path_by_modality = {this_modality: storage_path}
-        for name in self.modality_names:
+        for name in self.ui.IngestionPanel.modality_names:
             if name == this_modality:
                 continue
             other_storage_path = self._storage_path_for_modality(name)
@@ -7477,7 +7360,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # from_vlinks, which runs before this line) had nothing real to
         # say -- vlinks-actual values must always win over this stale
         # config default, never get overwritten by it after the fact.
-        for name in self.modality_names:
+        for name in self.ui.IngestionPanel.modality_names:
             config_value = glob.get(f'cell_align_reference_hybe_{name}')
             if config_value and not ap.current_cell_reference_hybe(name):
                 ap.select_cell_reference_hybe(name, config_value)
@@ -7505,13 +7388,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         ip, ap, cp = self.ui.IngestionPanel, self.ui.AlignmentPanel, self.ui.CellSegmentPanel
-        if self.current_modality is not None:
+        if self.ui.IngestionPanel.current_modality is not None:
             self._save_current_modality_fields()  # flush whatever's live in the fields right now
 
         cross_hybe_fields = {'RNA': ap.RnaReferenceHybeComboBox, 'DNA': ap.DnaReferenceHybeComboBox}
         modalities = {}
-        for name in self.modality_names:
-            state = self.modality_data.get(name, self._blank_modality_state())
+        for name in self.ui.IngestionPanel.modality_names:
+            state = self.ui.IngestionPanel.modality_data.get(name, self._blank_modality_state())
             if not state['layout_path'] and not state['storage_path']:
                 continue  # never configured -- omit rather than writing an empty placeholder
             entry = dict(state)
@@ -7521,7 +7404,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cfg = {
             'global': {
-                'num_modalities': len(self.modality_names),
+                'num_modalities': len(self.ui.IngestionPanel.modality_names),
                 'fov_list': self._parse_fov_list(ip.FovListLineEdit.text()),
                 'cross_modality_channel_type': ap.ChannelTypeComboBox.currentText(),
                 # per-modality-suffixed -- see cell_align_references' own
