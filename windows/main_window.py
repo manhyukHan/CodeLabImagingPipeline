@@ -6144,7 +6144,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for modality in self.modality_names:
             sp = self._storage_path_for_modality(modality)
             if sp:
-                within[modality] = dict(self._fov_matrices_for(sp, fov))
+                # FrameResolver's `within` is {modality: {hybe: 3x3}} with BARE
+                # hybe keys -- the outer key already names the modality, so it
+                # is unambiguous there. Strip the pair rather than handing it
+                # tuple keys, which would miss every lookup and silently
+                # resolve to identity.
+                within[modality] = {h: H for (h, _m), H in self._fov_matrices_for(sp, fov).items()}
 
         bridge_xy = None
         bridge_z = 0.0
@@ -6255,8 +6260,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if bridge is None:
             return None
         if np.allclose(bridge, np.eye(3)):
-            return dict(within)
-        return {hybe: alignment.compose_chain([H, bridge]) for hybe, H in within.items()}
+            return alignment.FrameMatrices(within, modality=within.modality)
+        return alignment.FrameMatrices(
+            {key: alignment.compose_chain([H, bridge]) for key, H in within.items()},
+            modality=within.modality)
 
     def _composed_fov_matrices_for_cell_alignment(self, storage_path, fov):
         """
@@ -6605,9 +6612,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if not fov_matrices_for_hybe:
                 continue
             for hybe, record in record_by_folder.items():
-                if hybe not in fov_matrices_for_hybe:
+                if (hybe, modality) not in fov_matrices_for_hybe:
                     continue
-                fov_only_matrix = fov_matrices_for_hybe[hybe]
+                fov_only_matrix = fov_matrices_for_hybe[(hybe, modality)]
                 final_matrix = self._matrix_to_shared(hybe, modality, cell, fov)
                 if final_matrix is None:
                     continue
