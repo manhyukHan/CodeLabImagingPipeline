@@ -55,7 +55,8 @@ def populate_cell_tree(tree, cell_dicts, spots_by_cell_id):
     tree.clear()
     for c in cell_dicts:
         n_spots = spots_by_cell_id.get(c.get('id'), 0)
-        top = QtWidgets.QTreeWidgetItem([f"Cell {c.get('id')} ({c.get('modality', '?')}, {n_spots} spot(s))", ''])
+        top = QtWidgets.QTreeWidgetItem(
+            [f"Cell {c.get('id')} ({c.get('reference_modality', '?')}, {n_spots} spot(s))", ''])
         tree.addTopLevelItem(top)
         _add_tree_children(top, c)
 

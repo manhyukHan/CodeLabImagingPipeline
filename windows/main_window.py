@@ -1765,6 +1765,15 @@ class MainWindow(QtWidgets.QMainWindow):
             for s in by_cell.get(c['id'], []):
                 if s['hybe'] == hybe and s['channel'] == channel:
                     ordered.append(s)
+        # Spots whose owner was PURGED still exist and must stay visible --
+        # hiding them made a stale link invisible instead of inspectable.
+        # They keep their stored cell id in the label; the next save's
+        # reassignment resolves them against the current cells.
+        live_ids = {c['id'] for c in cell_dicts}
+        for cid in sorted(k for k in by_cell if k != -1 and k not in live_ids):
+            for s in by_cell[cid]:
+                if s['hybe'] == hybe and s['channel'] == channel:
+                    ordered.append(s)
         return list(enumerate(ordered, start=1))
 
     def _refresh_cell_spot_status_spot_panel(self):
