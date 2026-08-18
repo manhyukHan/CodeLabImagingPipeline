@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import cv2
 from skimage.draw import polygon as sk_polygon
@@ -7,6 +9,22 @@ import matplotlib.cm as cm
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
+
+
+def _parse_index_list(text):
+    """'1-10', '1,2,3', '1 2 4 5', or any mix -> sorted unique ints.
+    Same grammar as the FOV list field, so every multi-index box in the
+    app parses identically."""
+    out = []
+    for chunk in re.split(r'[,\s]+', text.strip()):
+        if not chunk:
+            continue
+        if '-' in chunk:
+            a, b = chunk.split('-', 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(chunk))
+    return sorted(set(out))
 
 
 class CellDisplayer(QtWidgets.QMainWindow):
@@ -96,7 +114,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         removeLayout = QtWidgets.QHBoxLayout(removeRow)
         removeLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveIdsLineEdit = QtWidgets.QLineEdit()
-        self.RemoveIdsLineEdit.setPlaceholderText('cell IDs to remove, e.g. 3,7,12')
+        self.RemoveIdsLineEdit.setPlaceholderText('cell IDs to remove, e.g. 3,7,12 or 1-10 or 3 7 12')
         self.RemoveIdsPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveIdsLineEdit)
         removeLayout.addWidget(self.RemoveIdsPushButton)
@@ -150,7 +168,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         if not text or self.mask is None:
             return
         try:
-            ids = [int(t.strip()) for t in text.split(',') if t.strip()]
+            ids = _parse_index_list(text)
         except ValueError:
             QtWidgets.QMessageBox.warning(self, 'Remove cell IDs', 'Enter a comma-separated list of integer cell IDs.')
             return

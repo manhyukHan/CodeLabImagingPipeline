@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
@@ -7,6 +9,22 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
+
+
+def _parse_index_list(text):
+    """'1-10', '1,2,3', '1 2 4 5', or any mix -> sorted unique ints.
+    Same grammar as the FOV list field, so every multi-index box in the
+    app parses identically."""
+    out = []
+    for chunk in re.split(r'[,\s]+', text.strip()):
+        if not chunk:
+            continue
+        if '-' in chunk:
+            a, b = chunk.split('-', 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(chunk))
+    return sorted(set(out))
 
 
 class SpotCropDisplayer(QtWidgets.QMainWindow):
@@ -119,7 +137,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         removeLayout = QtWidgets.QHBoxLayout(removeRow)
         removeLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveSpotIndexLineEdit = QtWidgets.QLineEdit()
-        self.RemoveSpotIndexLineEdit.setPlaceholderText('spot index to remove (as shown on screen), e.g. 146')
+        self.RemoveSpotIndexLineEdit.setPlaceholderText('spot indices to remove, e.g. 146 or 1-10 or 3 7 12')
         self.RemoveSpotPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveSpotIndexLineEdit)
         removeLayout.addWidget(self.RemoveSpotPushButton)
@@ -403,19 +421,32 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         if not text:
             return
         try:
-            display_index = int(text)
+            wanted = _parse_index_list(text)
         except ValueError:
-            QtWidgets.QMessageBox.warning(self, 'Remove spot', 'Enter a single spot index (as shown on screen).')
+            QtWidgets.QMessageBox.warning(self, 'Remove spot',
+                                          'Enter spot indices as shown on screen: e.g. 146, 1-10, or 3 7 12.')
             return
-        if display_index in self.spot_indices:
-            self.RemoveSpotIndexLineEdit.clear()
-            self._remove_at_local(False, self.spot_indices.index(display_index))
-            return
-        if display_index in self.readonly_indices:
-            self.RemoveSpotIndexLineEdit.clear()
-            self._remove_at_local(True, self.readonly_indices.index(display_index))
-            return
-        QtWidgets.QMessageBox.warning(self, 'Remove spot', f'Spot index {display_index} not found in the current view.')
+        missing = [i for i in wanted
+                   if i not in self.spot_indices and i not in self.readonly_indices]
+        # Resolve every display index BEFORE removing anything: each removal
+        # shifts local positions, so removing one-at-a-time by re-lookup
+        # would delete the wrong points for any multi-index request.
+        keep = [k for k, di in enumerate(self.spot_indices) if di not in wanted]
+        removed_ro = [(p, di) for p, di in zip(self.readonly_points, self.readonly_indices)
+                      if di in wanted]
+        self.spot_points = [self.spot_points[k] for k in keep]
+        self.spot_indices = [self.spot_indices[k] for k in keep]
+        keep_ro = [k for k, di in enumerate(self.readonly_indices) if di not in wanted]
+        self.readonly_points = [self.readonly_points[k] for k in keep_ro]
+        self.readonly_indices = [self.readonly_indices[k] for k in keep_ro]
+        self.RemoveSpotIndexLineEdit.clear()
+        for p, _di in removed_ro:
+            tag = p[2] if len(p) > 2 else None
+            self.readonly_point_removed.emit(tag, p[0], p[1])
+        self.spots_edited.emit(list(self.spot_points))
+        if missing:
+            QtWidgets.QMessageBox.warning(self, 'Remove spot',
+                                          f'Not in the current view (skipped): {missing}')
 
     def _remove_at_local(self, in_readonly, local_pos):
         """

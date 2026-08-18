@@ -2733,6 +2733,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell_container_permanent.data[fov] = deepcopy(self.cell_container.data[fov])
         storage_paths = self._all_vlinks_storage_paths()
         if storage_paths:
+            # Cells changed -> spot ownership may have changed everywhere in
+            # this FOV. Reassign every spot and persist all slices now, so no
+            # spot is left pointing at a removed or reshaped cell.
+            self._reassign_fov_spots(fov)
+            self._persist_fov_spots(fov)
             vlinks_store.mirror_write_cells(storage_paths, fov, self.cell_container_permanent)
             # No segmentation_reference_hybe param write: each cell already
             # carries its own reference_hybe/nucleus_hybe (with modalities),
@@ -2899,7 +2904,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # configured modality's own vlinks.h5), so reference_hybe might not
         # exist under the CURRENT storage_path at all. Resolve from the
         # cell's own segmentation modality first.
-        cell_storage_path = self.ui.IngestionPanel.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
+        # (reference_hybe, reference_MODALITY) is the pair: after cytoplasm
+        # incorporation a cell's reference is e.g. (Hyb_500, RNA) while its
+        # modality can still read 'DNA'; pairing the hybe with the wrong
+        # modality asked DNA_queue for an RNA hybe -> None -> the loader
+        # silently bailed and the FOV showed no cells at all.
+        cell_storage_path = (self.ui.IngestionPanel.modality_data
+                             .get(cells[0].reference_modality or cells[0].modality, {})
+                             .get('storage_path') or storage_path)
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
             cp.LogTextEdit.append(f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d} -- cannot show existing cells.')
@@ -4046,21 +4058,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # only ever trying to save RNA's own unassigned spots. Scoping
         # to self.cell_container's own modality/storage path, and only
         # skipping write_cells (never returning early), fixes both.
+        # No in-memory-vs-disk count guard: the transient container is
+        # AUTHORITATIVE at save time. Fewer cells in memory than on disk is
+        # the normal result of deliberately removing a cell, and save means
+        # "replace" -- blocking it forced a Refresh that resurrected the
+        # removed cell. Spots that pointed at a removed cell are handled by
+        # the reassignment below, which recomputes every spot's owner from
+        # the current cells (~1.4us/spot measured: cheap enough for EVERY
+        # save -- cell, matrix, and spot alike, per explicit decision).
         skip_cell_write = False
-        if cells_in_memory:
-            container_storage_path = self._storage_path_for_modality(self.cell_container.modality) or storage_paths[0]
-            on_disk_dicts, _ = vlinks_store.read_cells(container_storage_path, fov)
-            n_on_disk = len(on_disk_dicts) if on_disk_dicts else 0
-            n_in_memory = len(cells_in_memory)
-            if n_in_memory < n_on_disk:
-                QtWidgets.QMessageBox.critical(
-                    self, 'Save Current Spots',
-                    f'{n_in_memory} {self.cell_container.modality} cell(s) in memory but {n_on_disk} already '
-                    f'on disk for FOV{fov:02d} -- refusing to overwrite this modality\'s cells (a bulk write '
-                    f'would silently drop the missing cell(s) from vlinks.h5). Refresh the cell list so every '
-                    f'cell is loaded, then Save again. The unassigned-spot pool below will still be saved now.')
-                skip_cell_write = True
-
         n_identified, n_identified_cells = self._reassign_fov_spots(fov)
 
         n_spots = sum(c.total_num_spots for c in cells_in_memory)
@@ -5519,7 +5525,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # DNA_queue lookup can't find. Resolve the storage path from the
         # cell's OWN segmentation modality instead, falling back to the
         # current one only if that modality's own path isn't configured.
-        cell_storage_path = self.ui.IngestionPanel.modality_data.get(cells[0].modality, {}).get('storage_path') or storage_path
+        # (reference_hybe, reference_MODALITY) is the pair: after cytoplasm
+        # incorporation a cell's reference is e.g. (Hyb_500, RNA) while its
+        # modality can still read 'DNA'; pairing the hybe with the wrong
+        # modality asked DNA_queue for an RNA hybe -> None -> the loader
+        # silently bailed and the FOV showed no cells at all.
+        cell_storage_path = (self.ui.IngestionPanel.modality_data
+                             .get(cells[0].reference_modality or cells[0].modality, {})
+                             .get('storage_path') or storage_path)
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
             QtWidgets.QMessageBox.critical(self, 'Show Celltype Result',
@@ -5697,6 +5710,17 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.SameModalityAcceptPushButton.setEnabled(False)
         ap.SameModalityRejectPushButton.setEnabled(False)
         QtWidgets.QMessageBox.information(self, 'FOV alignment accepted', 'Matrices written to H5; overlay image(s) saved.')
+
+        # Matrices changed -> every spot's shared-frame coordinate (and
+        # possibly its owner) is stale. Assignment is cheap; recompute for
+        # every loaded FOV and persist all slices, per explicit decision
+        # that saving cells, matrices, or spots all re-run assignment.
+        for _fov in list(self.fov_matrices.keys()):
+            try:
+                self._reassign_fov_spots(_fov)
+                self._persist_fov_spots(_fov)
+            except Exception as e:
+                self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
     def _reject_same_modality_alignment(self):
         ap = self.ui.AlignmentPanel
@@ -6026,6 +6050,17 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.CrossModalAcceptPushButton.setEnabled(False)
         ap.CrossModalRejectPushButton.setEnabled(False)
         QtWidgets.QMessageBox.information(self, 'Cross-modal alignment accepted', 'Result written to H5; overlay image(s) saved.')
+
+        # Matrices changed -> every spot's shared-frame coordinate (and
+        # possibly its owner) is stale. Assignment is cheap; recompute for
+        # every loaded FOV and persist all slices, per explicit decision
+        # that saving cells, matrices, or spots all re-run assignment.
+        for _fov in list(self.fov_matrices.keys()):
+            try:
+                self._reassign_fov_spots(_fov)
+                self._persist_fov_spots(_fov)
+            except Exception as e:
+                self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
     def _reject_cross_modal(self):
         ap = self.ui.AlignmentPanel
@@ -7254,6 +7289,17 @@ class MainWindow(QtWidgets.QMainWindow):
         saved_msg = 'saved to vlinks.h5; ' if wrote else ''
         QtWidgets.QMessageBox.information(self, 'Cell alignment accepted',
                                           f'Cell {real_cell.id} (FOV{fov:02d}) alignment applied, {saved_msg}overlay image saved.')
+
+        # Matrices changed -> every spot's shared-frame coordinate (and
+        # possibly its owner) is stale. Assignment is cheap; recompute for
+        # every loaded FOV and persist all slices, per explicit decision
+        # that saving cells, matrices, or spots all re-run assignment.
+        for _fov in list(self.fov_matrices.keys()):
+            try:
+                self._reassign_fov_spots(_fov)
+                self._persist_fov_spots(_fov)
+            except Exception as e:
+                self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
     def _reject_per_cell_alignment(self):
         ap = self.ui.AlignmentPanel
