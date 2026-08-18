@@ -691,7 +691,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
         sp.RemoveSpotsInViewPushButton.clicked.connect(self._remove_all_spots_in_view)
-        sp.RemoveAllSpotsPushButton.clicked.connect(self._remove_all_spots_in_fov)
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
@@ -3086,7 +3085,6 @@ class MainWindow(QtWidgets.QMainWindow):
             sp.LogTextEdit.append(f'Cell list refreshed: {len(cells)} cell(s) for FOV{fov:02d}.')
         self._refresh_spot_fov_summary()
         self._refresh_spot_breakdown()
-        sp.RemoveAllSpotsPushButton.setEnabled(sp.current_view() == 'fov')
 
     def _refresh_spot_fov_summary(self):
         """
@@ -3502,7 +3500,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._refresh_spot_breakdown()
         sp = self.ui.SpotLocalizationPanel
-        sp.RemoveAllSpotsPushButton.setEnabled(sp.current_view() == 'fov')
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
 
@@ -3958,10 +3955,10 @@ class MainWindow(QtWidgets.QMainWindow):
         both permanent and transient. Nothing is deleted on disk by this
         alone; the emptied state only reaches vlinks.h5 once Save Current
         Spots is clicked afterward, same as any other in-memory edit
-        here. Not to
-        be confused with _remove_all_spots_in_fov (the FOV-view-only,
-        immediately-persisted, whole-FOV wipe behind the separate
-        "Remove All Spots" button at the very bottom of the panel).
+        here. This is now the widest removal available: the FOV-wide
+        "Remove all spots" button was deleted because saving is scoped to
+        the current (hybe, channel), so a control clearing every hybe at
+        once could destroy spots for hybes never opened this session.
         """
         sp = self.ui.SpotLocalizationPanel
         storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
@@ -3985,66 +3982,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, [])
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: all unassigned spots removed from '
                                   f'view (not yet saved).')
-        self._refresh_spot_cell_list()
-        if sp.ShowDisplayerPushButton.isChecked():
-            self._show_spot_displayer()
-
-    def _remove_all_spots_in_fov(self):
-        """
-        FOV view only (guarded here too, not just via the button's
-        setEnabled state) -- clears BOTH the unassigned pool AND every
-        cell's own spots, but only for the CURRENT (hybe, channel)
-        selection, not every hybe/channel across the whole FOV (per
-        explicit correction -- that was this button's earlier, too-broad
-        scope). "Remove Unassigned spots" already covers the narrower
-        single-category case (just the unassigned pool, or just one
-        selected cell); this is its FOV-view, all-categories-at-once
-        counterpart, still scoped to one (hybe, channel).
-
-        In-memory only, same "Save Current Spots to persist" convention
-        every other edit in this panel follows -- per explicit
-        correction, this used to write to vlinks.h5 immediately, which is
-        no longer correct. Save Current Spots (unlike the old view-scoped
-        Save View) covers every affected cell in one click regardless of
-        which view is open, so there's no longer a "go back to each
-        cell's own Cell view first" gap here. Confirmed via a warning
-        dialog first, since it still touches every cell with spots in
-        this (hybe, channel) at once.
-        """
-        sp = self.ui.SpotLocalizationPanel
-        if sp.current_view() != 'fov':
-            return
-        fov = self._current_spot_fov()
-        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
-        hybe = sp.current_hybe_folder()
-        channel_text = sp.ChannelComboBox.currentText()
-        if not storage_path or fov is None or not hybe or not channel_text:
-            return
-        channel = int(channel_text)
-        key = (storage_path, fov)
-        n_unassigned = sum(1 for s in self.fov_unassigned_spots.get(key, []) if s.hybe == hybe and s.channel == channel)
-        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
-        affected_cells = [c for c in cells if any(s.hybe == hybe and s.channel == channel for s in c.spots)]
-        n_cell_spots = sum(sum(1 for s in c.spots if s.hybe == hybe and s.channel == channel) for c in affected_cells)
-        if n_unassigned == 0 and n_cell_spots == 0:
-            QtWidgets.QMessageBox.information(self, 'Remove all spots',
-                                              f'FOV{fov:02d}, {hybe} ch{channel} has no spots to remove.')
-            return
-        reply = QtWidgets.QMessageBox.warning(
-            self, 'Remove all spots',
-            f'This will clear all spots for FOV{fov:02d}, {hybe} ch{channel} -- {n_unassigned} unassigned '
-            f'spot(s) and {n_cell_spots} spot(s) across {len(affected_cells)} cell(s). Not yet saved to '
-            f'disk (click Save Current Spots afterward to persist). Continue?',
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
-        if reply != QtWidgets.QMessageBox.Yes:
-            return
-        self._push_spot_undo(fov=fov, cell_ids=[c.id for c in affected_cells], fov_key=(storage_path, fov))
-        self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, [])
-        for cell in affected_cells:
-            self._replace_cell_spots(cell, hybe, channel, [])
-        sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: all spots removed from view '
-                              f'({n_unassigned} unassigned + {n_cell_spots} across {len(affected_cells)} '
-                              f'cell(s), not yet saved).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
