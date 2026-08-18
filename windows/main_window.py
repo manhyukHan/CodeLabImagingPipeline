@@ -6603,9 +6603,8 @@ class MainWindow(QtWidgets.QMainWindow):
         _shared_frame_modality) regardless of which modality `cell` itself
         was segmented in. Returns None if that FOV-level layer isn't
         available at all yet (FOV alignment, or the cross-modal link this
-        modality would need, hasn't been run/accepted). Shared by
-        _fov_only_matrix_for_hybe so every caller sources this lookup the
-        same way, rather than re-deriving it.
+        modality would need, hasn't been run/accepted). Every caller
+        sources this lookup here, the one place, rather than re-deriving.
 
         `cell` no longer selects the destination frame -- it only supplies
         the fallback when no cross-modal pair is configured at all (then
@@ -6626,35 +6625,15 @@ class MainWindow(QtWidgets.QMainWindow):
             cell.reference_modality if cell is not None else modality)
         return self._fov_matrices_in_frame(modality, frame_modality, fov)
 
-    def _fov_only_matrix_for_hybe(self, hybe, modality, cell, fov,
-                                  frame_hybe=None, frame_modality=None):
-        """
-        hybe's own FOV/cross-modal-level matrix (no cell-level residual,
-        even if a real one now exists) into cell.reference_hybe's own
-        frame -- used specifically where the pre-cell-alignment state is
-        wanted on purpose (the overlay/preview's 'FOV/cross-modal' column,
-        a deliberate "before" comparison against 'final'), and as
-        _matrix_to_cellref's fallback when real cell-level data isn't
-        (fully) available. hybe/modality can belong to EITHER of the two
-        configured modalities; cell may
-        belong to either too (cell_container_permanent isn't filtered by
-        modality). Returns None if the needed FOV-level layer isn't
-        available at all yet for hybe's own leg -- there's no correction
-        to fall back to in that case, a genuinely different situation
-        from "cell-level just wasn't run" (cell.reference_hybe's own leg
-        stays lenient, defaulting to identity, matching the "before" of
-        an unaligned experiment rather than failing the whole lookup).
-        """
-        # Defaults to the cell's own `area` frame; cytoplasm-aware callers
-        # pass the nucleus frame explicitly (see _matrix_to_frame).
-        frame_hybe = frame_hybe or cell.reference_hybe
-        frame_modality = frame_modality or cell.reference_modality
-        fov_matrices_for_hybe = self._fov_matrices_for_cell_modality(modality, cell, fov)
-        if fov_matrices_for_hybe is None or (hybe, modality) not in fov_matrices_for_hybe:
-            return None
-        frame_fov_matrices = self._fov_matrices_for_cell_modality(frame_modality, cell, fov)
-        cell_reference_hybe_matrix = (frame_fov_matrices or {}).get((frame_hybe, frame_modality), np.eye(3))
-        return alignment.hybe_to_cellref_matrix(fov_matrices_for_hybe, cell_reference_hybe_matrix, hybe)
+    # (_fov_only_matrix_for_hybe was deleted: it had no callers left and
+    # carried its OWN composition (hybe_to_cellref_matrix over two dict
+    # lookups) -- a second resolver in waiting, which is exactly the
+    # divergence class every alignment bug here has been. The FOV-only
+    # "before" view is a plain _fov_matrices_for_cell_modality lookup;
+    # anything needing a frame-to-frame transform goes through
+    # frames.FrameResolver.transform. tests/test_transform_single_source
+    # pins the remaining independent compositions to the resolver
+    # numerically.)
 
     # (_live_cell_matrix_anchor was folded into _frame_resolver's own
     # anchor derivation -- anchors are computed from the resolver's own
