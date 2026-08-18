@@ -204,7 +204,7 @@ class SpotLocalizationPanelUI(object):
 
         layout.addWidget(listsRow)
 
-        # -- Remove transient / Remove unassigned (current view + current hybe/channel only) --
+        # -- Remove transient (current hybe/channel/modality only) --
         # There is deliberately NO FOV-wide wipe button. Saving is scoped to
         # the current (hybe, channel), so a control that clears every hybe at
         # once could destroy spots for hybes the user never opened -- the
@@ -214,8 +214,6 @@ class SpotLocalizationPanelUI(object):
         removeRowLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveTransientSpotsPushButton = QtWidgets.QPushButton('Revert This Hybe/Channel')
         removeRowLayout.addWidget(self.RemoveTransientSpotsPushButton)
-        self.RemoveSpotsInViewPushButton = QtWidgets.QPushButton('Remove Unassigned spots')
-        removeRowLayout.addWidget(self.RemoveSpotsInViewPushButton)
         layout.addWidget(removeRow)
 
         # -- Undo | Redo -- see MainWindow._push_spot_undo_snapshot/_undo_spot_edit/_redo_spot_edit --

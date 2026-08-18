@@ -690,7 +690,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.ShowDisplayerPushButton.toggled.connect(self._toggle_spot_crop_displayer)
         sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
-        sp.RemoveSpotsInViewPushButton.clicked.connect(self._remove_all_spots_in_view)
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
@@ -3945,43 +3944,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, permanent)
             sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent unassigned spot(s) (transient discarded).')
-        self._refresh_spot_cell_list()
-        if sp.ShowDisplayerPushButton.isChecked():
-            self._show_spot_displayer()
-
-    def _remove_all_spots_in_view(self):
-        """
-        Clears the current view's current (hybe, channel) outright --
-        both permanent and transient. Nothing is deleted on disk by this
-        alone; the emptied state only reaches vlinks.h5 once Save Current
-        Spots is clicked afterward, same as any other in-memory edit
-        here. This is now the widest removal available: the FOV-wide
-        "Remove all spots" button was deleted because saving is scoped to
-        the current (hybe, channel), so a control clearing every hybe at
-        once could destroy spots for hybes never opened this session.
-        """
-        sp = self.ui.SpotLocalizationPanel
-        storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
-        fov = self._current_spot_fov()
-        hybe = sp.current_hybe_folder()
-        channel_text = sp.ChannelComboBox.currentText()
-        if not storage_path or fov is None or not hybe or not channel_text:
-            return
-        channel = int(channel_text)
-        if sp.current_view() == 'cell':
-            cell = self._selected_spot_cell()
-            if cell is None:
-                QtWidgets.QMessageBox.warning(self, 'Remove Unassigned spots', 'Select a cell first.')
-                return
-            self._push_spot_undo(fov=cell.fov, cell_ids=[cell.id])
-            self._replace_cell_spots(cell, hybe, channel, [])
-            sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: all spots removed from view '
-                                  f'(not yet saved).')
-        else:
-            self._push_spot_undo(fov_key=(storage_path, fov))
-            self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, [])
-            sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: all unassigned spots removed from '
-                                  f'view (not yet saved).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
