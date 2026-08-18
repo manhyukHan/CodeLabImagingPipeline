@@ -303,12 +303,38 @@ def mirror_write_fov_alleles(storage_paths, fov, alleles):
         write_fov_alleles(path, fov, alleles)
 
 
-def _params_group_path():
-    return '/params'
+MODALITY_SCOPED_PARAMS = frozenset({
+    'layout_path',
+    'dax_directory',
+    'same_modality_reference_hybe',
+    'same_modality_channel_type',
+})
+"""
+Params that describe ONE modality rather than the project. They live under
+/params/modalities/{modality}/ so two modalities cannot overwrite each
+other -- with a single unified vlinks.h5 every storage_path resolves to the
+same file, so a per-modality fact written to the shared /params group is
+destroyed by whichever modality is written second. Everything not listed
+here describes the project or the RELATIONSHIP between modalities (the
+cross-modal reference-hybe pair and channel type, cell-alignment settings)
+and is correctly stored once.
+"""
 
 
 def _fov_params_group_path(fov):
+    """Per-FOV metadata area. No longer holds user params (the only one,
+    segmentation_reference_hybe, was write-only and is now per-cell) -- it
+    remains the home of the reference-hybe-independent cross-modal matrix
+    and Z-shift, which are genuinely per-FOV measurements."""
     return f'/params/FOV{fov:02d}'
+
+
+def _modality_params_group_path(modality):
+    return f'/params/modalities/{modality}'
+
+
+def _params_group_path():
+    return '/params'
 
 
 def write_global_params(storage_path, **params):
@@ -327,16 +353,28 @@ def write_global_params(storage_path, **params):
     skipped), so each caller (same-modality alignment accept, cross-
     modal accept, cell-alignment run/accept) writes just the slice of
     state its own operation just established, without clobbering the
-    others'. Segmentation is deliberately NOT written here -- see
-    write_fov_params, it can legitimately differ per FOV.
+    others'.
+
+    Keys in MODALITY_SCOPED_PARAMS are routed to
+    /params/modalities/{modality} instead of the shared group -- see that
+    table for why. Segmentation reference hybe is NOT stored here or
+    anywhere: it lives on each cell (ACell.reference_hybe /
+    nucleus_hybe with their modalities), and cells in one FOV can
+    legitimately disagree, so no single FOV-level value can represent it.
     """
     vlinks_path = _vlinks_path(storage_path)
+    modality = None
     with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_params_group_path())
+        shared = f.require_group(_params_group_path())
         for k, v in params.items():
             if v is None:
                 continue
-            grp.attrs[k] = v
+            if k in MODALITY_SCOPED_PARAMS:
+                if modality is None:
+                    modality = _modality_of(storage_path)
+                f.require_group(_modality_params_group_path(modality)).attrs[k] = v
+            else:
+                shared.attrs[k] = v
 
 
 def read_global_params(storage_path):
@@ -348,11 +386,15 @@ def read_global_params(storage_path):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
-    grp_path = _params_group_path()
+    out = {}
     with h5py.File(vlinks_path, 'r') as f:
-        if grp_path not in f:
-            return {}
-        return dict(f[grp_path].attrs)
+        grp_path = _params_group_path()
+        if grp_path in f:
+            out.update(dict(f[grp_path].attrs))
+        mod_path = _modality_params_group_path(_modality_of(storage_path))
+        if mod_path in f:
+            out.update(dict(f[mod_path].attrs))
+    return out
 
 
 def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration,
@@ -431,38 +473,6 @@ def mirror_write_celltype_config(storage_paths, fov_ranges_by_celltype, barcode_
             continue
         seen.add(path)
         write_celltype_config(path, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration, barcode_method)
-
-
-def write_fov_params(storage_path, fov, **params):
-    """
-    Per-FOV metadata that can legitimately differ FOV-to-FOV within one
-    experiment -- today just segmentation_reference_hybe (a user can, and
-    did, segment different FOVs against different hybes). Still lives
-    under the SAME top-level /params tree as write_global_params (at
-    /params/FOV##), not inside /FOV##/cells/ alongside the actual pickled
-    cell/spot blob -- one dedicated metadata area, cheap to read
-    regardless of whether any cells have ever been saved for this FOV.
-    """
-    vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_fov_params_group_path(fov))
-        for k, v in params.items():
-            if v is None:
-                continue
-            grp.attrs[k] = v
-
-
-def read_fov_params(storage_path, fov):
-    """{key: value} of whatever's been written via write_fov_params for
-    this FOV, or {} if nothing yet / no vlinks.h5."""
-    vlinks_path = _vlinks_path(storage_path)
-    if not os.path.exists(vlinks_path):
-        return {}
-    grp_path = _fov_params_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
-        if grp_path not in f:
-            return {}
-        return dict(f[grp_path].attrs)
 
 
 def _mip_group_path(fov, modality, hybe):

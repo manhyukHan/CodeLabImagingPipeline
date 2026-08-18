@@ -816,12 +816,12 @@ class MainWindow(QtWidgets.QMainWindow):
         vlinks had it (self.hybe_records/choices don't exist yet in that
         specific case, so nothing else to wait for).
 
-        For cross-modal params specifically, also reconstructs
-        self.modality_data for the OTHER (paired) modality via
-        cross_modal_paired_storage_path -- so
+        For cross-modal params specifically, the two sides are named by
+        modality (cross_modal_rna_modality / cross_modal_dna_modality) and
+        their storage paths come from self.modality_data -- so
         _other_modality_cell_alignment_inputs's other_data lookup and
-        H_across itself are both available even when that OTHER
-        modality's own config was never loaded this session at all.
+        H_across itself stay available. There is no paired-storage-path
+        param any more: one unified vlinks holds both modalities.
         """
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
         params = vlinks_store.read_global_params(storage_path)
@@ -864,12 +864,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if cell_pad is not None:
             ap.CellPadSpinBox.setValue(int(cell_pad))
 
-        role = params.get('cross_modal_role')
-        paired_path = params.get('cross_modal_paired_storage_path')
-        if role and paired_path:
-            rna_path, dna_path = (storage_path, paired_path) if role == 'RNA' else (paired_path, storage_path)
-            ap.RnaStoragePathLineEdit.setText(rna_path)
-            ap.DnaStoragePathLineEdit.setText(dna_path)
+        rna_modality = params.get('cross_modal_rna_modality')
+        dna_modality = params.get('cross_modal_dna_modality')
+        if rna_modality and dna_modality:
+            rna_path = self.modality_data.get(rna_modality, {}).get('storage_path', '')
+            dna_path = self.modality_data.get(dna_modality, {}).get('storage_path', '')
+            if rna_path and dna_path:
+                ap.RnaStoragePathLineEdit.setText(rna_path)
+                ap.DnaStoragePathLineEdit.setText(dna_path)
             rna_ref = params.get('cross_modal_rna_reference_hybe')
             dna_ref = params.get('cross_modal_dna_reference_hybe')
             cross_channel_type = params.get('cross_modal_channel_type')
@@ -1596,9 +1598,8 @@ class MainWindow(QtWidgets.QMainWindow):
         hybe_records = self._active_hybe_records_for_modality(modality)
         hybes = [r['folder'] for r in hybe_records]
         global_params = vlinks_store.read_global_params(storage_path) or {}
-        cross_modal_role = global_params.get('cross_modal_role')
-        is_dna_side = cross_modal_role == 'DNA'
-        is_rna_side = cross_modal_role == 'RNA'
+        is_dna_side = modality == global_params.get('cross_modal_dna_modality')
+        is_rna_side = modality == global_params.get('cross_modal_rna_modality')
         rows = []
         for fov in fov_list:
             matrices = vlinks_store.read_same_modality_matrices(storage_path, fov, hybes)
@@ -1608,7 +1609,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 H_across = vlinks_store.read_cross_modal_matrix(storage_path, fov)
                 if H_across is not None:
                     cross_modal = _matrix_dxdy_angle(H_across)
-            elif is_rna_side and global_params.get('cross_modal_paired_storage_path'):
+            elif is_rna_side:
                 # RNA is the cross-modal TARGET frame, never itself shifted --
                 # shown as an explicit identity row (not just absent) so the
                 # matrix view reads consistently across both sides of a link.
@@ -2644,18 +2645,20 @@ class MainWindow(QtWidgets.QMainWindow):
         _other_modality_cell_alignment_inputs, which today can only find
         any of this via manually-populated UI fields).
         """
-        vlinks_store.write_global_params(rna_storage_path,
-                                         cross_modal_role='RNA',
-                                         cross_modal_paired_storage_path=dna_storage_path,
-                                         cross_modal_rna_reference_hybe=rna_reference_hybe,
-                                         cross_modal_dna_reference_hybe=dna_reference_hybe,
-                                         cross_modal_channel_type=channel_type)
-        vlinks_store.write_global_params(dna_storage_path,
-                                         cross_modal_role='DNA',
-                                         cross_modal_paired_storage_path=rna_storage_path,
-                                         cross_modal_rna_reference_hybe=rna_reference_hybe,
-                                         cross_modal_dna_reference_hybe=dna_reference_hybe,
-                                         cross_modal_channel_type=channel_type)
+        # One write, not one per side. These describe the RELATIONSHIP
+        # between the two modalities, so a single copy is the correct
+        # representation -- and with a unified vlinks both storage paths
+        # resolve to the same /params group, so writing twice with opposite
+        # cross_modal_role values would leave only whichever went last.
+        # The sides are named by modality rather than by a per-file role,
+        # and the paired storage path is gone: there is one file now.
+        vlinks_store.write_global_params(
+            rna_storage_path,
+            cross_modal_rna_modality=self._modality_for_storage_path(rna_storage_path),
+            cross_modal_dna_modality=self._modality_for_storage_path(dna_storage_path),
+            cross_modal_rna_reference_hybe=rna_reference_hybe,
+            cross_modal_dna_reference_hybe=dna_reference_hybe,
+            cross_modal_channel_type=channel_type)
         vlinks_store.write_cross_modal_matrix(rna_storage_path, fov, H)
         vlinks_store.write_cross_modal_matrix(dna_storage_path, fov, H)
 
@@ -2686,9 +2689,10 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_paths = self._all_vlinks_storage_paths()
         if storage_paths:
             vlinks_store.mirror_write_cells(storage_paths, fov, self.cell_container_permanent)
-            segmentation_reference_hybe = self._last_segment_context['reference_hybe']
-            for path in storage_paths:
-                vlinks_store.write_fov_params(path, fov, segmentation_reference_hybe=segmentation_reference_hybe)
+            # No segmentation_reference_hybe param write: each cell already
+            # carries its own reference_hybe/nucleus_hybe (with modalities),
+            # cells in one FOV can legitimately disagree, and nothing ever
+            # read the FOV-level copy back.
             where = ', '.join(storage_paths)
             cp.LogTextEdit.append(f'Saved {len(self.cell_container.data[fov])} cell(s) for FOV{fov:02d} to permanent '
                                   f'container and vlinks.h5 ({where}).')
