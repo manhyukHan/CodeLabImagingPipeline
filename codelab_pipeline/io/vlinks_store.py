@@ -61,6 +61,48 @@ def _cells_group_path(fov):
     return f'/FOV{fov:02d}/cells'
 
 
+def _spots_group_path(fov):
+    """
+    The ONE spot store for a FOV: every spot, assigned or not. ASpot.cell
+    carries the assignment (-1 = unassigned), so assignment is a field
+    write, never a move between stores. Replaces the old split, where
+    assigned spots were serialized inside the /FOV##/cells blob and
+    unassigned ones lived in /FOV##/unassigned_spots -- a partition BY
+    assignment state, which made every reassignment a cross-store move and
+    made any control that wrote one store unable to see the other.
+    """
+    return f'/FOV{fov:02d}/spots'
+
+
+def allocate_spot_uids(storage_path, fov, count):
+    """
+    `count` fresh, never-before-used spot uids for this FOV, as a list.
+
+    A per-FOV monotonic counter kept in the spot group's `next_uid` attr.
+    uids are never reused, so a uid identifies one spot for its whole life:
+    that is what lets a save merge by identity, an undo diff distinguish
+    "moved" from "deleted and re-added", and a staleness mark survive a
+    refit. Nothing derived from a mutable field could do that -- `cell`
+    changes on assignment, `raw_coordinate` changes when 3D localization
+    refines the fit, display numbering is recomputed per view.
+
+    On every call the counter is floored above the highest uid actually
+    present, so a counter that was lost or reset can never hand out a uid
+    that is already in use -- silently reusing one would make two different
+    spots indistinguishable to exactly the machinery uid exists to serve.
+    """
+    vlinks_path = _vlinks_path(storage_path)
+    grp_path = _spots_group_path(fov)
+    with h5py.File(vlinks_path, 'a') as f:
+        grp = f.require_group(grp_path)
+        next_uid = int(grp.attrs.get('next_uid', 1))
+        highest = int(grp.attrs.get('highest_uid_seen', 0))
+        start = max(next_uid, highest + 1, 1)
+        grp.attrs['next_uid'] = start + int(count)
+        grp.attrs['highest_uid_seen'] = start + int(count) - 1
+        return list(range(start, start + int(count)))
+
+
 def _unassigned_spots_group_path(fov):
     return f'/FOV{fov:02d}/unassigned_spots'
 

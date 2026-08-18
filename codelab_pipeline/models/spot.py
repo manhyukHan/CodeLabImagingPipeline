@@ -3,7 +3,19 @@ class ASpot():
     a spot class
 
     each spot has attributes:
-     id: int
+     uid: int -- STABLE identity, assigned once at creation from a per-FOV
+       counter and never rewritten or reused while the spot lives. Nothing
+       else on this object is usable as identity: `cell` changes on
+       assignment, `raw_coordinate` changes when 3D localization refines
+       the fit, and display numbering is recomputed per view. uid is what
+       merge-on-save, undo diffs and staleness marks key on, so it must
+       never be derived from any mutable field. 0 means "not yet allocated"
+       -- see vlinks_store.allocate_spot_uids.
+
+       There is deliberately no `id`: the old one was a display index that
+       got rewritten on every removal, so it could not serve as identity,
+       and nothing ever looked a spot up by it. Display numbering lives in
+       MainWindow._global_spot_index_map, computed per view.
      fov: int
      hybe: str (readout identity, e.g. 'Hyb_105' -- distinct from channel)
      channel: int (physical imaging channel, e.g. 555/635)
@@ -17,7 +29,6 @@ class ASpot():
        re-accessed by locality later without inverting any matrix.
      size: float
      brightness: float
-     neighbors: tuple (variable size)
      mixture_centroids: tuple of (x, y, z, amplitude) -- set only when this
        spot's own Z was refined via the multi-Gaussian mixture path (see
        localization.refine_spot_z) and the crop held more than one real
@@ -29,7 +40,7 @@ class ASpot():
        or Z never refined).
     """
     def __init__(self):
-        self.id = 0
+        self.uid = 0
         self.fov = 0
         self.hybe = ''
         self.channel = 0
@@ -39,13 +50,12 @@ class ASpot():
         self.raw_coordinate = (0.0, 0.0, 0.0)
         self.size = 0.0
         self.brightness = 0.0
-        self.neighbors = ()
         self.linked = False
         self.linked_at = None
         self.mixture_centroids = ()
 
     def set_metadata(self, **kwargs):
-        if 'id' in kwargs: self.id = int(kwargs['id'])
+        if 'uid' in kwargs: self.uid = int(kwargs['uid'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'hybe' in kwargs: self.hybe = str(kwargs['hybe'])
         if 'channel' in kwargs: self.channel = int(kwargs['channel'])
@@ -55,7 +65,6 @@ class ASpot():
         if 'raw_coordinate' in kwargs: self.raw_coordinate = tuple(kwargs['raw_coordinate'])
         if 'size' in kwargs: self.size = float(kwargs['size'])
         if 'brightness' in kwargs: self.brightness = float(kwargs['brightness'])
-        if 'neighbors' in kwargs: self.neighbors = tuple(kwargs['neighbors'])
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
         if 'mixture_centroids' in kwargs: self.mixture_centroids = tuple(kwargs['mixture_centroids'])
@@ -74,7 +83,7 @@ class ASpot():
         """
         def r2(v):
             return round(float(v), 2)
-        return {'id': int(self.id),
+        return {'uid': int(self.uid),
                 'fov': int(self.fov),
                 'hybe': str(self.hybe),
                 'channel': int(self.channel),
@@ -84,7 +93,6 @@ class ASpot():
                 'raw_coordinate': tuple(r2(v) for v in self.raw_coordinate),
                 'size': r2(self.size),
                 'brightness': r2(self.brightness),
-                'neighbors': tuple(self.neighbors),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at,
                 'mixture_centroids': tuple(tuple(r2(v) for v in c) for c in self.mixture_centroids)}

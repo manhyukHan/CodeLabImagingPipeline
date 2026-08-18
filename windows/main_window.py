@@ -4012,7 +4012,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 skip_cell_write = True
 
         n_identified, n_identified_cells = self._identify_fov_unassigned_spots(fov, storage_paths)
-        self._assign_spot_indices(fov)
 
         n_spots = sum(c.total_num_spots for c in cells_in_memory)
         n_cells_saved = 0
@@ -4065,45 +4064,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
-
-    def _assign_spot_indices(self, fov):
-        """
-        Assigns every real spot in this FOV (cell-owned AND the FOV-level
-        unassigned pool) a real, PERSISTED spot.id -- its 1-based position
-        within its own (hybe, channel) group, unassigned-pool spots first
-        then cells sorted by cell id (the SAME ordering _global_spot_order/
-        _global_spot_index_map already use to number spots for display in
-        the crop displayer and 3D-localization popup -- see those for the
-        full rationale). Per explicit request: the index shouldn't only
-        ever exist as a value recomputed fresh in memory for display, it
-        should be saved into vlinks.h5 itself so it's a real, inspectable
-        attribute of the spot -- confirmed real gap, ASpot.id defaults to
-        0 and nothing that creates a spot in this app ever set it to
-        anything else, so every persisted spot showed the same id=0.
-
-        Called right before Save Current Spots writes, so the ids landing
-        on disk reflect the CURRENT ordering/content at save time -- same
-        "recomputed fresh, not a stable-across-edits identity" contract
-        _global_spot_order's own docstring already states: adding/
-        removing a spot elsewhere in the FOV can still shift other spots'
-        ids on the NEXT save, exactly as it already shifts their
-        DISPLAYED number today. This does not itself write anything --
-        the caller (_save_current_spots) persists the result via its own
-        write_cells/mirror_write_fov_spots calls.
-        """
-        cells = self.cell_container.data.get(fov, []) if self.cell_container else []
-        groups = {}  # (hybe, channel) -> [spot, ...], unassigned-pool spots first
-        for (storage_path, spot_fov), spots in self.fov_unassigned_spots.items():
-            if spot_fov != fov:
-                continue
-            for s in spots:
-                groups.setdefault((s.hybe, s.channel), []).append(s)
-        for cell in sorted(cells, key=lambda c: c.id):
-            for s in cell.spots:
-                groups.setdefault((s.hybe, s.channel), []).append(s)
-        for spots in groups.values():
-            for i, s in enumerate(spots, start=1):
-                s.id = i
 
     def _identify_fov_unassigned_spots(self, fov, storage_paths):
         """
