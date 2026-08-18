@@ -182,10 +182,6 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
     return out
 
 
-def _unassigned_spots_group_path(fov):
-    return f'/FOV{fov:02d}/unassigned_spots'
-
-
 def _alleles_group_path(fov):
     return f'/FOV{fov:02d}/alleles'
 
@@ -324,57 +320,6 @@ def mirror_write_single_cell(storage_paths, fov, cell):
             continue
         seen.add(path)
         write_single_cell(path, fov, cell)
-
-
-def write_fov_spots(storage_path, fov, spots):
-    """
-    Persists Whole FOV auto-detect spots that don't belong to any cell
-    (ASpot.cell left at its model default, -1 -- no cell to link to) at
-    a separate top-level location from /FOV##/cells, so this write can
-    never collide with or clobber write_cells/write_single_cell's own
-    per-cell blob. Full-replace of the whole FOV's unassigned-spot list
-    (the caller, _replace_fov_unassigned_spots, already merges per-
-    (hybe, channel) in memory before this is called) -- same shape as
-    write_cells itself, just a plain list of ASpot.save() dicts instead
-    of a {'modality', 'cells'} payload (there's no per-cell modality to
-    carry here).
-    """
-    payload = [spot.save() for spot in spots]
-    blob = np.void(pickle.dumps(payload))
-    vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
-        grp = f.require_group(_unassigned_spots_group_path(fov))
-        if 'blob' in grp:
-            del grp['blob']
-        grp.create_dataset('blob', data=blob)
-        grp.attrs['saved_at'] = datetime.now().isoformat()
-        grp.attrs['n_spots'] = len(spots)
-
-
-def read_fov_spots(storage_path, fov):
-    """Returns a list of ASpot.save()-shaped dicts (feed to ASpot().set_metadata(**d)),
-    or [] if nothing's been persisted for this FOV yet."""
-    vlinks_path = _vlinks_path(storage_path)
-    if not os.path.exists(vlinks_path):
-        return []
-    grp_path = _unassigned_spots_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
-        if grp_path not in f or 'blob' not in f[grp_path]:
-            return []
-        raw = bytes(f[grp_path]['blob'][()])
-    return pickle.loads(raw)
-
-
-def mirror_write_fov_spots(storage_paths, fov, spots):
-    """write_fov_spots into every distinct storage path given -- same
-    dual-modality mirroring rationale as mirror_write_cells/
-    mirror_write_single_cell."""
-    seen = set()
-    for path in storage_paths:
-        if not path or path in seen:
-            continue
-        seen.add(path)
-        write_fov_spots(path, fov, spots)
 
 
 def write_fov_alleles(storage_path, fov, alleles):

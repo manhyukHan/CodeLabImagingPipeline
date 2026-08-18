@@ -1535,7 +1535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
         cell_owned = [s for c in (cell_dicts or []) for s in c.get('spots', [])]
-        unassigned = vlinks_store.read_fov_spots(storage_path, fov)
+        unassigned = self._read_unassigned_spot_dicts(storage_path, fov)
         return cell_owned + unassigned
 
     def _show_cell_spot_status_displayer(self):
@@ -1683,7 +1683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
         cell_dicts = cell_dicts or []
-        unassigned = vlinks_store.read_fov_spots(storage_path, fov)
+        unassigned = self._read_unassigned_spot_dicts(storage_path, fov)
         ordered = [s for s in unassigned if s['hybe'] == hybe and s['channel'] == channel]
         for c in sorted(cell_dicts, key=lambda c: c['id']):
             for s in c.get('spots', []):
@@ -2526,6 +2526,7 @@ class MainWindow(QtWidgets.QMainWindow):
             modality = modality or self._modality_for_storage_path(storage_path)
             if cell_dicts:
                 loaded = CellContainer.load({fov: cell_dicts}, modality=modality)
+                self._attach_stored_spots_to_cells(loaded, storage_path, fov)
                 if self.cell_container_permanent is None:
                     self.cell_container_permanent = loaded
                 else:
@@ -2769,7 +2770,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
             if key not in self.fov_unassigned_spots:
                 try:
-                    spot_dicts = vlinks_store.read_fov_spots(storage_path, fov)
+                    spot_dicts = self._read_unassigned_spot_dicts(storage_path, fov)
                     spots = []
                     for d in spot_dicts:
                         spot = ASpot()
@@ -2828,6 +2829,7 @@ class MainWindow(QtWidgets.QMainWindow):
             modality = modality or self._modality_for_storage_path(storage_path)
             if cell_dicts:
                 loaded = CellContainer.load({fov: cell_dicts}, modality=modality)
+                self._attach_stored_spots_to_cells(loaded, storage_path, fov)
                 if self.cell_container_permanent is None:
                     self.cell_container_permanent = loaded
                 else:
@@ -3933,7 +3935,7 @@ class MainWindow(QtWidgets.QMainWindow):
             sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
                                   f'permanent spot(s) (transient discarded).')
         else:
-            on_disk = vlinks_store.read_fov_spots(storage_path, fov)
+            on_disk = self._read_unassigned_spot_dicts(storage_path, fov)
             permanent = []
             for d in on_disk:
                 if d.get('hybe') == hybe and d.get('channel') == channel:
@@ -4048,11 +4050,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # BOTH storage paths ending up with only the DNA spot -- RNA's own
         # spot silently vanished. This is the root cause of "RNA unassigned
         # spots don't save" whenever DNA also has a pending pool in memory.
-        for modality_name in self.modality_names:
-            modality_storage_path = self._storage_path_for_modality(modality_name)
-            key = (modality_storage_path, fov) if modality_storage_path else None
-            if key is not None and key in self.fov_unassigned_spots:
-                vlinks_store.write_fov_spots(modality_storage_path, fov, self.fov_unassigned_spots[key])
+        self._persist_fov_spots(fov)
 
         skip_note = ' (cell write skipped -- see dialog)' if skip_cell_write else ''
         sp.LogTextEdit.append(f'FOV{fov:02d}: {n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} '
@@ -4064,6 +4062,96 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
+
+    def _read_unassigned_spot_dicts(self, storage_path, fov):
+        """
+        Unassigned spots for this FOV, straight from the unified store.
+
+        The store keeps assigned and unassigned together -- they differ only
+        in ASpot.cell -- so "unassigned" is a filter here, not a separate
+        location. Callers that want the whole FOV read vlinks_store.
+        read_spots directly.
+
+        Filtered by MODALITY as well as by cell. With one unified vlinks
+        every storage_path resolves to the same file, so an unfiltered read
+        returns both modalities' spots -- and callers key
+        self.fov_unassigned_spots by storage_path, i.e. per modality, so
+        the other modality's spots would leak into this one's pool.
+        """
+        modality = vlinks_store.modality_of(storage_path)
+        return [d for d in vlinks_store.read_spots(storage_path, fov)
+                if int(d.get('cell', -1)) == -1 and d.get('modality') == modality]
+
+    def _attach_stored_spots_to_cells(self, container, storage_path, fov):
+        """
+        Fill cell.spots from the FOV's spot store after cells are loaded.
+
+        Cells no longer serialize their own spots (see ACell.to_dict), so a
+        freshly loaded cell arrives with none. Its spots are whichever ones
+        in the store name it in `cell`. Counts are recomputed here rather
+        than persisted, so they cannot drift from the store.
+        """
+        if container is None:
+            return
+        cells = {c.id: c for c in container.data.get(fov, [])}
+        for c in cells.values():
+            c.spots, c.num_spots, c.total_num_spots = [], {}, 0
+        for d in vlinks_store.read_spots(storage_path, fov):
+            cell_id = int(d.get('cell', -1))
+            cell = cells.get(cell_id)
+            if cell_id == -1 or cell is None:
+                continue
+            spot = ASpot()
+            spot.set_metadata(**d)
+            cell.spots.append(spot)
+            cell.num_spots[spot.hybe] = cell.num_spots.get(spot.hybe, 0) + 1
+            cell.total_num_spots = len(cell.spots)
+
+    def _persist_fov_spots(self, fov):
+        """
+        Write every spot in this FOV into the unified slice store -- one
+        write per (modality, hybe, channel), cell-owned and unassigned
+        together.
+
+        Assigned and unassigned spots share a slice and differ only in
+        ASpot.cell, so they MUST be written together: a slice write is a
+        full replace, so writing only one kind would delete the other.
+        That is also the point -- assignment stops being a move between two
+        stores and becomes a field on a spot that never leaves its slice.
+
+        Slices that used to hold spots but no longer do are written empty
+        rather than skipped, so removing the last spot from a hybe actually
+        removes it from disk instead of leaving the previous contents
+        stranded.
+        """
+        by_slice = {}
+        for (pool_path, pool_fov), spots in self.fov_unassigned_spots.items():
+            if pool_fov != fov or not pool_path:
+                continue
+            for spot in spots:
+                modality = spot.modality or vlinks_store.modality_of(pool_path)
+                by_slice.setdefault((pool_path, modality, spot.hybe, int(spot.channel)), []).append(spot)
+        container = self.cell_container
+        if container is not None:
+            for cell in container.data.get(fov, []):
+                for spot in cell.spots:
+                    modality = spot.modality or cell.modality
+                    path = self._storage_path_for_modality(modality)
+                    if not path:
+                        continue
+                    by_slice.setdefault((path, modality, spot.hybe, int(spot.channel)), []).append(spot)
+
+        # Clear slices that exist on disk but have nothing in memory now.
+        for path in self._all_vlinks_storage_paths():
+            for d in vlinks_store.read_spots(path, fov):
+                key = (path, d.get('modality', ''), d.get('hybe', ''), int(d.get('channel', 0)))
+                by_slice.setdefault(key, [])
+
+        for (path, modality, hybe, channel), spots in by_slice.items():
+            if not modality or not hybe:
+                continue
+            vlinks_store.write_spots(path, fov, modality, hybe, channel, spots)
+        return sum(len(v) for v in by_slice.values())
 
     def _identify_fov_unassigned_spots(self, fov, storage_paths):
         """
@@ -4156,11 +4244,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     still_unassigned.append(spot)
             self.fov_unassigned_spots[key] = still_unassigned
-            # write_fov_spots to JUST this modality's own storage_path --
-            # see the matching comment in _save_current_spots' own second
-            # write loop for why mirror_write_fov_spots(storage_paths, ...)
-            # here was a confirmed real bug (cross-modality clobbering).
-            vlinks_store.write_fov_spots(modality_storage_path, fov, still_unassigned)
+            # No write here: identification only moves spots between the
+            # unassigned pool and cell.spots IN MEMORY, and both land in the
+            # same (modality, hybe, channel) slice anyway. _persist_fov_spots
+            # writes the whole FOV once afterward, so a spot that just gained
+            # a cell is written with its new `cell` value rather than twice
+            # with two different ones.
 
         return total_identified, len(identified_cell_ids)
 

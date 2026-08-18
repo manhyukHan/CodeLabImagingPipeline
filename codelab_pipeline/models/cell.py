@@ -323,9 +323,14 @@ class ACell():
                             for key, m in self.matrices.items()},
                 'matrix_anchors': {modality: np.array(H) for modality, H in self.matrix_anchors.items()},
                 'matrix_provenance': dict(self.matrix_provenance),
-                'spots': [spot.save() for spot in self.spots],
-                'total_num_spots': int(self.total_num_spots),
-                'num_spots': dict(self.num_spots),
+                # Spots are NOT written here. They live in the FOV's own
+                # spot store (/FOV##/spots/{modality}/{hybe}/ch{channel}),
+                # one place for assigned and unassigned alike, so assignment
+                # is a field on a spot rather than a move between two blobs.
+                # self.spots stays as an in-memory cache the load path fills
+                # from that store; total_num_spots/num_spots are recomputed
+                # from it rather than persisted, so they cannot go stale
+                # against the store.
                 'distmap': np.array(self.distmap),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at}
