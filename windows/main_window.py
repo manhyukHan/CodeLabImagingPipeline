@@ -2361,12 +2361,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _cell_nucleus_in_readout(self, cell, hybe, modality, fov):
         """
-        (x, y) -- this cell's NUCLEUS projected into `hybe`'s own native
-        frame, using the live FOV/cross-modal matrices rather than
-        ACell.get_nucleus_in_readout's bare lookup, for exactly the reason
-        _cell_area_in_readout exists: the bare model method collapses to
-        identity whenever this cell has no cell-level entry for the pair,
-        which silently mispositions the projection.
+        (y, x) -- this cell's NUCLEUS projected into `hybe`'s own native
+        frame, using the live FOV/cross-modal matrices rather than a bare
+        cell-level lookup, for exactly the reason _cell_area_in_readout
+        exists: the bare model path collapses to identity whenever this
+        cell has no cell-level entry for the pair, which silently
+        mispositions the projection.
 
         Anchors on the cell's OWN nucleus_hybe/nucleus_modality, which can
         differ cell to cell within one FOV -- that is what makes the
@@ -3461,7 +3461,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _cell_area_in_readout(self, cell, hybe, modality, fov):
         """
-        (x_area, y_area) -- this cell's own mask projected into hybe's
+        (y_area, x_area) -- this cell's own mask projected into hybe's
         own native frame, via _matrix_to_cellref (not cell.get_area_in_
         readout directly) -- per confirmed real bug, cell.matrix_to/get_
         area_in_readout silently collapse to IDENTITY (not a real FOV-
@@ -3474,8 +3474,7 @@ class MainWindow(QtWidgets.QMainWindow):
         real, currently-displayed positioning (not internal-only use,
         where ACell's own bare get_area_in_readout -- with no access to
         live session state -- is the correct/only option, e.g. inside
-        ACell.get_mip or localization._build_cell_crop's own have_real
-        branch).
+        localization._build_cell_crop's own have_real branch).
 
         Confirmed real bug this fixes: _load_fov_spot_display's own
         "cell masks" FOV-view overlay called cell.get_area_in_readout

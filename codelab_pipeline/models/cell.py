@@ -2,10 +2,8 @@ import os
 import numpy as np
 import numpy.linalg as la
 import h5py
-import scipy.spatial.distance as ssd
 
 from ..alignment import chain as alignment
-from ..io import vlinks_store
 
 
 def _frozen_xy(xy):
@@ -110,7 +108,9 @@ class ACell():
        A second, cell-held copy is exactly the split store that made
        assignment a cross-structure move and hid assigned spots from
        every control that only knew one home.)
-     distmap: ndarray (n_spots x n_spots), see calculate_distmap
+     distmap: legacy persisted slot, stays EMPTY by design -- distance
+       maps are derived data, computed on demand from the FOV's spot store
+       (Cell/Spot Status Detail's own checkbox), never maintained here
     """
     def __init__(self):
         self.id = 0
@@ -200,18 +200,6 @@ class ACell():
         c.matrix_provenance = dict(self.matrix_provenance)
         c.distmap = self.distmap
         return c
-
-    def calculate_distmap(self, spots):
-        """
-        THE analysis-time computation, per explicit decision: distmap is
-        derived data, computed fresh from the current spots
-        (SpotContainer.of_cell) wherever analysis or inspection needs it --
-        never maintained incrementally, never trusted from an earlier
-        save. The persisted field is a legacy slot that stays empty.
-        """
-        if spots:
-            pos = np.array([spot.coordinate for spot in spots])
-            self.distmap = ssd.squareform(ssd.pdist(pos))
 
     def _require_composable(self, key):
         """
@@ -318,54 +306,6 @@ class ACell():
         y, x = self.area
         cy, cx = alignment.align_cell((y, x), Hinv, self.frame_shape)
         return (cy, cx)
-
-    def get_nucleus_in_readout(self, hybe, modality):
-        """
-        This cell's NUCLEUS coordinates (y, x) transformed into `hybe`'s own
-        native frame -- the nucleus counterpart of get_area_in_readout, and
-        the projection cytoplasmic segmentation needs to render a nucleus
-        seed into the cytoplasm hybe's frame.
-
-        Anchors on nucleus_hybe/nucleus_modality, NOT reference_hybe/
-        reference_modality: once a cytoplasm is attached those two pairs
-        genuinely differ (and can even sit in different modalities), so
-        reusing the area path here would project the nucleus out of the
-        wrong frame. Same identity-default-on-missing-data contract as
-        matrix_between.
-        """
-        H = self.matrix_between(hybe, modality, self.nucleus_hybe, self.nucleus_modality)
-        Hinv = la.inv(H)
-        y, x = self.nucleus
-        cy, cx = alignment.align_cell((y, x), Hinv, self.frame_shape)
-        return (cy, cx)
-
-    def get_mip(self, hybe, storage_path, fov, modality, channel=None, pad=5, use_stack=False):
-        """
-        Crop this cell's region out of `hybe`'s data -- vlinks.h5's real MIP
-        copy by default, or the raw stack file's full Z-stack
-        (height,width,depth) if use_stack=True (the 3D exception: MIP-only
-        reads never need the raw stack file, per explicit principle).
-        channel defaults to that hybe's own fiducial channel if not given.
-        """
-        y, x = self.get_area_in_readout(hybe, modality)
-        if len(x) == 0:
-            raise ValueError(f'Cell {self.id} has no area overlapping hybe {hybe}')
-        height, width = self.frame_shape
-        xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
-        ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
-
-        if not use_stack:
-            mip = (vlinks_store.fiducial_channel_mip(storage_path, fov, hybe) if channel is None
-                   else vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel))
-            if mip is None:
-                raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
-            return mip[ymin:ymax, xmin:xmax]
-
-        h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
-        with h5py.File(h5path, 'r') as f:
-            if channel is None:
-                channel = int(f.attrs['fiducial_channel'])
-            return f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax]
 
     def save(self):
         return {'id': int(self.id),

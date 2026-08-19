@@ -677,27 +677,6 @@ def mip_channels_present(storage_path, fov, hybe):
         return {name[2:]: True for name in f[grp_path].keys() if name.startswith('ch')}
 
 
-def ingested_hybes_for_fov(storage_path, fov, hybe_list):
-    """
-    Which of hybe_list have a real MIP already in vlinks.h5 for this FOV --
-    the vlinks-only replacement for opening every per-hybe {hybe}_stack.h5
-    just to check completeness (see windows/main_window.py's old
-    _ingested_hybes_for_fov, which did exactly that). A hybe counts as
-    ingested once write_hybe_mip has run for it at least once; this never
-    opens a raw stack file, so it's cheap enough to call on every refresh,
-    not just at special trigger moments -- "free refresh" per explicit
-    request, rather than active_hybe_list being gated to rare moments
-    because recomputing it used to be expensive.
-    """
-    vlinks_path = _vlinks_path(storage_path)
-    if not os.path.exists(vlinks_path):
-        return []
-    with h5py.File(vlinks_path, 'r') as f:
-        _require_yx(f, vlinks_path)
-        modality = modality_of(storage_path)
-        return [hybe for hybe in hybe_list
-                if _mip_group_path(fov, modality, hybe) in f and len(f[_mip_group_path(fov, modality, hybe)]) > 0]
-
 
 def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
@@ -731,7 +710,8 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     in hybe_list -- the vlinks-based counterpart to
     codelab_pipeline.alignment.chain's identically-named function.
 
-    A hybe already ingested (real MIP present, see ingested_hybes_for_fov)
+    A hybe already ingested (real MIP present, see MainWindow.
+    _ingested_hybes_for_fov)
     but with no matrix entry yet legitimately gets an identity default
     (write_hybe_mip seeds this at ingestion time, so in practice this only
     matters for a vlinks.h5 written before this seeding existed). A hybe

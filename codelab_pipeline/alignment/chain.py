@@ -580,8 +580,8 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
     reflect whatever alignment has already been computed and written,
     without the user needing to re-run alignment just to see it again.
 
-    Delegates to vlinks_store (see that module's ingested_hybes_for_fov /
-    read_same_modality_matrices) instead of opening each hybe's own raw
+    Delegates to vlinks_store.read_same_modality_matrices instead of
+    opening each hybe's own raw
     {hybe}_stack.h5 -- this is now a single vlinks.h5 open, not N raw file
     opens, so callers can refresh this freely.
     """

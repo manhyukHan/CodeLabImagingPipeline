@@ -176,8 +176,8 @@ def focus_profile(storage_path, fov, hybe, channel, step=1, crop=512):
     a manual guess.
 
     Reads {hybe}_stack.h5 directly. That is deliberate and is the same
-    documented exception ACell.get_mip(use_stack=True) and
-    hybe_zx_projection already take: the standing principle is that
+    documented exception hybe_zx_projection already takes: the
+    standing principle is that
     MIP-ONLY reads never need the raw stack, and a depth-resolved
     projection is by definition not a MIP-only read. Central crop + `step`
     keep it cheap (h5py slices per plane, never materializing the stack).

@@ -47,8 +47,7 @@ Deliberately NOT relied upon: commutativity. All 22 stored matrices are
 currently pure translation, which would make order free -- but the engine
 permits rotation up to MAX_ALIGNMENT_ROTATION_DEG and the ORB/homography
 path can produce it. So composition here is strictly ordered and correct
-for any affine; `assert_translation_only` is offered for callers that
-want the invariant enforced rather than assumed.
+for any affine, and nothing anywhere may assume translation-only.
 """
 
 import numpy as np
@@ -66,19 +65,6 @@ import numpy.linalg as la
 
 IDENTITY = np.eye(3)
 
-
-def assert_translation_only(H, label='matrix', tol=1e-9):
-    """
-    Raise if H carries rotation/scale/shear. Not called automatically --
-    the composition below is correct for any affine. Offered because the
-    pipeline's layers are translation-only in practice, and a caller that
-    depends on that (e.g. reordering, or summing offsets) should FAIL
-    LOUDLY the day a rotated matrix appears rather than silently
-    misaligning.
-    """
-    deviation = float(np.abs(np.asarray(H)[:2, :2] - np.eye(2)).max())
-    if deviation > tol:
-        raise ValueError(f'{label} is not translation-only (|2x2 - I| = {deviation:.3g})')
 
 
 class FrameMatrices(dict):
