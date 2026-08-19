@@ -28,6 +28,7 @@ from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
 from codelab_pipeline.alignment import frames
 from codelab_pipeline.alignment import spot_mapper
+from codelab_pipeline.alignment.convention import as_cv2
 from codelab_pipeline.segmentation import segment
 from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
@@ -3064,7 +3065,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # new limitation introduced here
         mask = np.zeros(frame_shape, dtype=np.uint8)
         for cell in cells:
-            x, y = cell.area
+            y, x = cell.area
             mask[y.astype(int), x.astype(int)] = cell.id
 
         if self.cell_container is None:
@@ -5501,14 +5502,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if img is None:
                 ctp.LogTextEdit.append(f'Overview: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
-            # warp each channel into a common frame for visualization ONLY
-            # (never for stored/analyzed data) -- same established
-            # exception used by every alignment preview in canvas/
-            # pipeline_canvas.py
-            fmats = self._fov_matrices_for(storage_path, fov)
-            if hybe in fmats:
+            # warp each channel into the pipeline's ONE shared frame for
+            # visualization ONLY (never for stored/analyzed data) -- same
+            # established exception used by every alignment preview in
+            # canvas/pipeline_canvas.py. Through the resolver, because the
+            # barcode channels of different celltypes can live in DIFFERENT
+            # modalities: only (hybe, modality) names a frame, and only the
+            # shared frame is common to all of them.
+            H = self._matrix_to_shared(hybe, modality, None, fov)
+            if H is not None:
                 height, width = img.shape
-                img = cv2.warpAffine(img.astype(np.float32), fmats[hybe][:2], (width, height))
+                img = cv2.warpAffine(img.astype(np.float32), as_cv2(H)[:2], (width, height))
             images_by_channel[bch] = img
             labels_by_channel[bch] = f'{name}: {hybe} ch{channel} ({modality})'
         if not images_by_channel:
@@ -5711,7 +5715,13 @@ class MainWindow(QtWidgets.QMainWindow):
                             if H is None:
                                 continue
                             sy, sx, _ = la.inv(H) @ np.array([spot.coordinate[0], spot.coordinate[1], 1.0])
-                            xy_by_channel[bch] = (sx, sy)
+                            # clip exactly like the cell-area path above:
+                            # an aligned position can land a pixel outside
+                            # this channel's own frame, and an unclipped
+                            # index crashed the WHOLE run (IndexError 1024)
+                            height, width = image_cache[fov_key][bch].shape
+                            xy_by_channel[bch] = (float(np.clip(sx, 0, width - 1)),
+                                                  float(np.clip(sy, 0, height - 1)))
                         if len(xy_by_channel) < len(barcode_channel):
                             continue
                         spot.celltype = celltype.classify_spot_barcode(xy_by_channel, cell.fov, image_cache, celltype_determination)
@@ -5809,7 +5819,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mask = np.zeros(frame_shape, dtype=np.uint8)
         for cell in cells:
-            x, y = cell.area
+            y, x = cell.area
             mask[y.astype(int), x.astype(int)] = cell.id
         celltype_by_id = {cell.id: cell.celltype for cell in cells}
 

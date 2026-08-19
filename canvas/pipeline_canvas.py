@@ -327,8 +327,9 @@ class PipelineCanvas():
         reference hybe, all comparing against the SAME target hybe, so a
         single-hybe preview gives a multi-modality context view instead
         of picking just one reference (cell alignment is a real 3D, yx+z
-        correction via cell.matrices[hybe]['zx'], so a YX-only preview
-        can't show whether the z-depth refinement actually helped):
+        correction via cell.matrices[(hybe, modality)]['dz'], so a
+        YX-only preview can't show whether the z-depth refinement
+        actually helped):
 
         reference_specs: [{'modality', 'storage_path', 'hybe', 'channel',
         'fov_matrix', 'final_matrix'}, ...] -- one entry per configured
@@ -406,13 +407,15 @@ class PipelineCanvas():
         alignment's own z-depth refinement -- so the ZX 'raw'/'FOV/
         cross-modal' columns show exactly the state compute_cell_
         alignment measured its Z-offset against, and 'final' additionally
-        applies cell.matrices[target_hybe]['zx'] (a translation on top of
+        applies cell.matrices[(target_hybe, modality)]['dz'] (a plane
+        shift on top of
         the 'FOV/cross-modal'-window projection, matching how that matrix
         was computed) so the actual z-registration result is visible, not
         just the yx one -- each block's own reference-side 'final' ZX row
         uses its own spec['final_matrix']-derived window (no additional
         z-warp of its own -- there is no per-reference z-residual concept
-        here, only the target's own cell.matrices[target_hybe]['zx']).
+        here, only the target's own cell.matrices[(target_hybe,
+        modality)]['dz']).
         The reference row has no cell-mask contour in the ZX row (a depth
         projection has no matching spatial mask).
 
