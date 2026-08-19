@@ -18,10 +18,16 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtGui
 
 from config import path
 from windows.main_window import MainWindow
+
+# The CODE Lab 'O' mark (tools/make_app_icon.py regenerates it) -- set as
+# the application icon so every window and the taskbar/dock entry carry
+# it, on every platform Qt runs on. PNG here (Qt loads it everywhere);
+# the .ico/.icns siblings exist for OS-level shortcuts.
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'codelab_o.png')
 
 def _install_error_dialog_hook():
     """
@@ -61,12 +67,14 @@ def _install_error_dialog_hook():
 if __name__ == '__main__':
     _install_error_dialog_hook()
     question_app = QtWidgets.QApplication(sys.argv)
+    question_app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     question_window = QtWidgets.QMainWindow()
     question_window.show()
     config_file = QtWidgets.QFileDialog.getOpenFileName(question_window, 'Load configuration file (Cancel to start fresh)', path, 'configuration file (*.xml)')[0]
     question_window.close()
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     window = MainWindow(config_file if config_file != '' else None)
     window.show()
     sys.exit(app.exec_())
