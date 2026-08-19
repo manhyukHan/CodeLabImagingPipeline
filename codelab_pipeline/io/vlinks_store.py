@@ -284,30 +284,48 @@ def read_cells(storage_path, fov):
 
 
 
-def mirror_write_cells(storage_paths, fov, cell_container):
-    """write_cells into every distinct storage path given -- the "same
-    cell/spot/matrix data lives in both DNA vlinks and RNA vlinks" mirror
-    the user explicitly asked for, since a cell's spots span whichever
-    hybes/modalities were actually localized for it, not just the modality
-    it happened to be segmented in."""
-    seen = set()
+def distinct_stores(storage_paths):
+    """
+    One representative storage_path per DISTINCT physical vlinks.h5.
+
+    Since the vlinks unification, every storage path inside one project
+    resolves (via _vlinks_path, one level up) to the SAME file -- so
+    deduping by the raw path STRING, as the mirrors used to, still wrote
+    the identical payload once per modality (two writes of the same blob
+    to the same file on every save). Deduping by the RESOLVED file keeps
+    the mirror concept correct for a hypothetical multi-project session
+    while collapsing the normal case to exactly one write. Shared by
+    every mirror_* writer AND by main_window's own per-path read/write
+    loops, so no caller re-derives the rule.
+    """
+    seen, out = set(), []
     for path in storage_paths:
-        if not path or path in seen:
+        if not path:
             continue
-        seen.add(path)
+        resolved = os.path.abspath(_vlinks_path(path))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(path)
+    return out
+
+
+def mirror_write_cells(storage_paths, fov, cell_container):
+    """write_cells into every DISTINCT vlinks store among the given paths
+    (see distinct_stores) -- the "same cell/spot/matrix data lives in both
+    DNA vlinks and RNA vlinks" mirror the user explicitly asked for, since
+    a cell's spots span whichever hybes/modalities were actually localized
+    for it, not just the modality it happened to be segmented in."""
+    for path in distinct_stores(storage_paths):
         write_cells(path, fov, cell_container)
 
 
 def mirror_write_single_cell(storage_paths, fov, cell):
-    """write_single_cell into every distinct storage path given -- the
-    narrow-write counterpart to mirror_write_cells, same dual-modality
-    mirroring rationale (a cell's spots span whichever hybes/modalities
-    were actually localized for it)."""
-    seen = set()
-    for path in storage_paths:
-        if not path or path in seen:
-            continue
-        seen.add(path)
+    """write_single_cell into every DISTINCT vlinks store among the given
+    paths -- the narrow-write counterpart to mirror_write_cells, same
+    dual-modality mirroring rationale (a cell's spots span whichever
+    hybes/modalities were actually localized for it)."""
+    for path in distinct_stores(storage_paths):
         write_single_cell(path, fov, cell)
 
 
@@ -348,13 +366,10 @@ def read_fov_alleles(storage_path, fov):
 
 
 def mirror_write_fov_alleles(storage_paths, fov, alleles):
-    """write_fov_alleles into every distinct storage path given -- same
-    dual-modality mirroring rationale as mirror_write_fov_spots."""
-    seen = set()
-    for path in storage_paths:
-        if not path or path in seen:
-            continue
-        seen.add(path)
+    """write_fov_alleles into every DISTINCT vlinks store among the given
+    paths (see distinct_stores) -- same dual-modality mirroring rationale
+    as mirror_write_cells."""
+    for path in distinct_stores(storage_paths):
         write_fov_alleles(path, fov, alleles)
 
 
@@ -518,15 +533,11 @@ def read_celltype_config(storage_path):
 
 def mirror_write_celltype_config(storage_paths, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration,
                                  barcode_method=None):
-    """write_celltype_config into every distinct storage path given --
-    same dual-modality mirroring rationale as mirror_write_cells (a
-    celltype's barcode channel can belong to either modality, so the
-    whole config belongs in both)."""
-    seen = set()
-    for path in storage_paths:
-        if not path or path in seen:
-            continue
-        seen.add(path)
+    """write_celltype_config into every DISTINCT vlinks store among the
+    given paths (see distinct_stores) -- same dual-modality mirroring
+    rationale as mirror_write_cells (a celltype's barcode channel can
+    belong to either modality, so the whole config belongs in both)."""
+    for path in distinct_stores(storage_paths):
         write_celltype_config(path, fov_ranges_by_celltype, barcode_channel_by_celltype, calibration, barcode_method)
 
 

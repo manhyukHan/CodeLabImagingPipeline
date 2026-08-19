@@ -1176,7 +1176,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_paths:
             return
         n_dropped_legacy = 0
-        for storage_path in storage_paths:
+        for storage_path in vlinks_store.distinct_stores(storage_paths):
             fov_ranges, barcode_channels, calibration, barcode_method = vlinks_store.read_celltype_config(storage_path)
             for name, range_string in fov_ranges.items():
                 if name not in self._fov_ranges_by_celltype:
@@ -1241,7 +1241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         if not storage_paths or not fov_list:
             return
-        for storage_path in storage_paths:
+        for storage_path in vlinks_store.distinct_stores(storage_paths):
             for fov in fov_list:
                 cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
                 if not cell_dicts:
@@ -4187,7 +4187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # gracefully (not a hard return) rather than assume it's always
         # safe/needed to call.
         if cells_in_memory and not skip_cell_write:
-            for storage_path in storage_paths:
+            for storage_path in vlinks_store.distinct_stores(storage_paths):
                 vlinks_store.write_cells(storage_path, fov, self.cell_container)
             n_cells_saved = len(cells_in_memory)
         # The FOV-level unassigned pool needs no cells at all -- always
