@@ -33,6 +33,7 @@ FOV = 1
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 from windows.main_window import MainWindow
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.io import vlinks_store
 
 failures = []
 
@@ -96,16 +97,37 @@ with mock.patch.object(QtWidgets.QMessageBox, 'information', rec('information'))
           f"overview shows both barcode channels ({list(shown.get('labels', {}).values())})")
 
     # -- door 2: Run Celltype Determination (barcode mode) --
-    before_ct = {c.id: c.celltype for c in w.cell_container_permanent.get_cells(FOV)}
+    # expected counts are DISTINCT cells / owned spots: the permanent and
+    # transient containers hold synced copies of the same cells, and the
+    # log once double-counted them (confirmed real: "200 cell(s), 280
+    # spot(s)" reported for a 100-cell, 140-owned-spot FOV).
+    distinct = {(f, int(c.id)) for cont in w._celltype_cell_containers()
+                for f, cells in cont.data.items() for c in cells.values()}
+    n_expected_cells = len(distinct)
+    n_expected_spots = sum(len(w.spot_container.of_cell(f, cid)) for f, cid in distinct)
     with mock.patch.object(w, '_show_celltype_result') as auto_show:
         w._run_celltype_determination()
     check(not dialogs['critical'], f"run raised no error dialog (got {dialogs['critical']})")
-    check(any('classified' in t for t in dialogs['information']),
-          f"run completed with a real summary ({dialogs['information'][-1:] or 'none'})")
+    summary = next((t for t in dialogs['information'] if 'classified' in t), '')
+    import re as _re
+    m = _re.search(r'(\d+) cell\(s\), (\d+) spot\(s\) classified', summary)
+    check(m is not None and (int(m.group(1)), int(m.group(2))) == (n_expected_cells, n_expected_spots),
+          f'summary counts DISTINCT cells/spots: expected {n_expected_cells}/{n_expected_spots}, '
+          f'got {m.groups() if m else summary!r}')
     after = {c.id: c.celltype for c in w.cell_container_permanent.get_cells(FOV)}
     n_typed = sum(1 for v in after.values() if v in ('TypeA', 'TypeB'))
     check(n_typed > 0, f'{n_typed}/{len(after)} cells classified into TypeA/TypeB')
     check(auto_show.called, 'run auto-opened the result view')
+
+    # spot celltypes persist to disk alongside the cells' (per explicit
+    # correction: cells persisted, spots silently did not)
+    sp = w._storage_path_for_modality('DNA') or w._storage_path_for_modality('RNA')
+    disk_ct = {d['uid']: d.get('celltype', '') for d in vlinks_store.read_spots(sp, FOV)}
+    session_ct = {s.uid: s.celltype for s in w.spot_container.all(FOV) if s.uid in disk_ct}
+    n_disk_typed = sum(1 for v in disk_ct.values() if v in ('TypeA', 'TypeB'))
+    check(n_disk_typed > 0, f'{n_disk_typed} spot celltypes persisted to vlinks.h5')
+    check(all(disk_ct[u] == session_ct[u] for u in session_ct),
+          'disk spot celltypes match the session state')
 
     # -- door 3: Show Celltype Result -- orientation ground truth --
     got = {}

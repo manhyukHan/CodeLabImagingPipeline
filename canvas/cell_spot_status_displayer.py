@@ -214,6 +214,12 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         cellLayout.addLayout(cellForm)
         self.CellCountLabel = QtWidgets.QLabel('')
         cellLayout.addWidget(self.CellCountLabel)
+        # default OFF: the distance map is an O(n_spots^2) pdist PER CELL,
+        # recomputed on every refresh -- routine refreshes shouldn't pay
+        # for an analysis product nobody asked for. Ticking it refreshes.
+        self.DistmapCheckBox = QtWidgets.QCheckBox('Compute spot distance maps (on demand)')
+        self.DistmapCheckBox.setChecked(False)
+        cellLayout.addWidget(self.DistmapCheckBox)
         self.CellTree = QtWidgets.QTreeWidget()
         self.CellTree.setColumnCount(2)
         self.CellTree.setHeaderLabels(['Attribute', 'Value'])
@@ -232,6 +238,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         cellLayout.addWidget(self.CellTree, stretch=1)
         splitter.addWidget(cellGroup)
         self.CellFovComboBox.currentIndexChanged.connect(self.cell_fov_changed.emit)
+        self.DistmapCheckBox.toggled.connect(lambda _on: self.cell_fov_changed.emit())
 
         # -- Spots panel --
         spotGroup = QtWidgets.QGroupBox('Spots')

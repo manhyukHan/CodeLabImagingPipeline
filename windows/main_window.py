@@ -1703,18 +1703,22 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         cell_dicts, _ = vlinks_store.read_cells(storage_path, fov)
         cell_dicts = cell_dicts or []
-        # distmap at ANALYSIS TIME: derived fresh from the store's current
-        # spots for display, never read from a persisted copy (the saved
-        # slot is a legacy field that stays empty by design).
-        import scipy.spatial.distance as _ssd
-        spots_by_cell = {}
-        for sd in vlinks_store.read_spots(storage_path, fov):
-            if int(sd.get('cell', -1)) != -1:
-                spots_by_cell.setdefault(int(sd['cell']), []).append(sd['coordinate'])
-        for cell_dict in cell_dicts:
-            pos = spots_by_cell.get(int(cell_dict.get('id', -1)))
-            if pos and len(pos) > 1:
-                cell_dict['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
+        # distmap ON DEMAND only (checkbox, default off): derived fresh
+        # from the store's current spots for display, never read from a
+        # persisted copy (the saved slot is a legacy field that stays
+        # empty by design) -- and never computed on a routine refresh,
+        # per explicit decision: it is an O(n_spots^2) analysis product,
+        # not status.
+        if d.DistmapCheckBox.isChecked():
+            import scipy.spatial.distance as _ssd
+            spots_by_cell = {}
+            for sd in vlinks_store.read_spots(storage_path, fov):
+                if int(sd.get('cell', -1)) != -1:
+                    spots_by_cell.setdefault(int(sd['cell']), []).append(sd['coordinate'])
+            for cell_dict in cell_dicts:
+                pos = spots_by_cell.get(int(cell_dict.get('id', -1)))
+                if pos and len(pos) > 1:
+                    cell_dict['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
         n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
                       for f in fov_list)
         # Spots are no longer nested in the cell dict; count them per cell
@@ -5531,6 +5535,29 @@ class MainWindow(QtWidgets.QMainWindow):
             containers.append(self.cell_container)
         return containers
 
+    def _celltype_distinct_cells(self, containers):
+        """
+        {fov: {cell_id: [every container's copy of that cell]}} --
+        permanent's copy first when both tiers hold it.
+
+        The permanent and transient containers hold synced COPIES of the
+        same cell, so iterating "every cell in every container" classified
+        -- and counted, and logged -- each cell twice (confirmed real:
+        "200 cell(s), 280 spot(s)" for a 100-cell, 140-assigned-spot FOV).
+        Classification happens once per DISTINCT cell; the result is then
+        applied to every copy so the tiers stay in sync.
+        """
+        by_fov = {}
+        for container in containers:
+            for fov, cells in container.data.items():
+                for cell in cells.values():
+                    by_fov.setdefault(fov, {}).setdefault(int(cell.id), []).append(cell)
+        return by_fov
+
+    def _cell_is_permanent(self, fov, cell_id):
+        return (self.cell_container_permanent is not None
+                and self.cell_container_permanent.data.get(fov, {}).get(int(cell_id)) is not None)
+
     def _run_celltype_determination(self):
         ctp = self.ui.CelltypeDeterminationPanel
         containers = self._celltype_cell_containers()
@@ -5577,19 +5604,19 @@ class MainWindow(QtWidgets.QMainWindow):
             n_cells = 0
             last_fov = None
             permanent_fovs_touched = set()
-            for container in containers:
-                is_permanent = container is self.cell_container_permanent
-                for cells in container.data.values():
-                    for cell in cells.values():
-                        cell.celltype = celltype.classify_fov(cell.fov, celltype_from_fov)
+            for fov, cellmap in self._celltype_distinct_cells(containers).items():
+                ct = celltype.classify_fov(fov, celltype_from_fov)
+                for cell_id, copies in cellmap.items():
+                    for cell in copies:
+                        cell.celltype = ct
                         cell.linked, cell.linked_at = True, now
-                        for spot in self.spot_container.of_cell(cell.fov, cell.id):
-                            spot.celltype = cell.celltype
-                            spot.linked, spot.linked_at = True, now
-                        n_cells += 1
-                        last_fov = cell.fov
-                        if is_permanent:
-                            permanent_fovs_touched.add(cell.fov)
+                    for spot in self.spot_container.of_cell(fov, cell_id):
+                        spot.celltype = ct
+                        spot.linked, spot.linked_at = True, now
+                    n_cells += 1
+                    last_fov = fov
+                    if self._cell_is_permanent(fov, cell_id):
+                        permanent_fovs_touched.add(fov)
             self._persist_celltype_results(permanent_fovs_touched)
             ctp.RunCelltypeDeterminationPushButton.setEnabled(True)
             ctp.LogTextEdit.append(f'FOV-mode: {n_cells} cell(s) classified'
@@ -5620,10 +5647,8 @@ class MainWindow(QtWidgets.QMainWindow):
         n_cells, n_spots, n_cells_skipped = 0, 0, 0
         last_fov = None
         permanent_fovs_touched = set()
-        for container in containers:
-            is_permanent = container is self.cell_container_permanent
-            for fov, cells in container.data.items():
-                if cells:
+        for fov, cellmap in self._celltype_distinct_cells(containers).items():
+                if cellmap:
                     last_fov = fov
                 fov_key = str(fov)
                 if fov_key not in image_cache:
@@ -5653,12 +5678,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                        or int(fov) not in self._barcode_calibration['lower_bound'].get(bch, {})
                                        or int(fov) not in self._barcode_calibration['upper_bound'].get(bch, {})]
                 if missing_calibration:
-                    ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cells)} cell(s)) -- no calibration for '
+                    ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no calibration for '
                                            f'{missing_calibration} at this FOV (Apply Calibration first).')
-                    n_cells_skipped += len(cells)
+                    n_cells_skipped += len(cellmap)
                     continue
 
-                for cell in cells.values():
+                for cell_id, copies in cellmap.items():
+                    cell = copies[0]         # permanent's copy when both tiers hold it
                     y_ref, x_ref = cell.area
                     area_by_channel = {}
                     for bch in barcode_channel:
@@ -5695,11 +5721,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     if len(area_by_channel) < len(barcode_channel):
                         n_cells_skipped += 1
                         continue
-                    cell.celltype = celltype.classify_cell_barcode(area_by_channel, cell.fov, image_cache,
-                                                                   celltype_determination, method=ctp.barcode_method())
-                    cell.linked, cell.linked_at = True, now
+                    ct = celltype.classify_cell_barcode(area_by_channel, cell.fov, image_cache,
+                                                        celltype_determination, method=ctp.barcode_method())
+                    for c in copies:         # every tier's copy stays in sync
+                        c.celltype = ct
+                        c.linked, c.linked_at = True, now
                     n_cells += 1
-                    if is_permanent:
+                    if self._cell_is_permanent(fov, cell_id):
                         permanent_fovs_touched.add(fov)
 
                     for spot in self.spot_container.of_cell(fov, cell.id):
@@ -5762,6 +5790,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in fovs:
             if self.cell_container_permanent.data.get(fov):
                 vlinks_store.mirror_write_cells(storage_paths, fov, self.cell_container_permanent)
+            # spot celltypes persist through the SAME door every accept
+            # loop uses (per explicit correction: cells persisted their
+            # celltype here, spots silently did not). _persist_fov_spots
+            # refuses FOVs whose spots were never staged, so a fov with
+            # classified cells but untouched spots stays untouched.
+            self._persist_fov_spots(fov)
 
     def _show_celltype_result(self, fov=None):
         """
