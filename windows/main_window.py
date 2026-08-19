@@ -500,6 +500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_segment_context = None  # {'fov': .., 'reference_hybe': ..}
         self.cell_displayer = CellDisplayer()
         self.cell_displayer.mask_edited.connect(self._on_displayer_mask_edited)
+        self.cell_displayer.ids_removed.connect(self._on_displayer_ids_removed)
         self.cell_displayer.undo_requested.connect(self._undo_cell_action)
         self.cell_displayer.redo_requested.connect(self._redo_cell_action)
 
@@ -2676,6 +2677,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         self.cell_displayer.set_data(reference_image, mask)
         cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(cells) if cells else 0} cell(s).')
+
+    def _on_displayer_ids_removed(self, ids):
+        """
+        Remove-by-ID from the CellDisplayer, as the ID-LIST operation it
+        is -- straight into the container (the authority), then a fresh
+        re-render FROM the container, which is what makes a stale contour
+        structurally impossible (see _refresh_cell_displayer_from_
+        container). Never routed through the raster: rebuilding cells
+        from the DISPLAYED mask redefines their geometry from a
+        projection whenever the display frame differs from a cell's
+        native frame (exactly the post-cytoplasm case), and the old
+        raster path also silently no-oped without a fresh segmentation
+        context, leaving the removed cell alive to resurrect (confirmed
+        real bug: 'contour remains after removing a cell right after
+        incorporating cytoplasmic masks').
+        """
+        if self._cell_displayer_mode == 'cytoplasm':
+            # Cytoplasm review: the staged label raster IS the authority
+            # there; the displayer already zeroed its copy -- mirror that
+            # into the staged result, exactly as the old path did.
+            if self._cytoplasm_result is not None:
+                labels = np.asarray(self._cytoplasm_result['labels']).astype(np.int32).copy()
+                labels[np.isin(labels, ids)] = 0
+                self._cytoplasm_result['labels'] = labels
+            return
+        if self.cell_container is None:
+            return
+        fov = (self._last_segment_context or {}).get('fov',
+                                                     self.ui.CellSegmentPanel.FovSpinBox.value())
+        fp = self._begin_cell_edit(fov)
+        removed = self.cell_container.remove(fov, ids)
+        self._commit_cell_edit(fov, fp)
+        self._refresh_cell_displayer_from_container(fov)
+        self.ui.CellSegmentPanel.LogTextEdit.append(
+            f'Removed {len(removed)} cell(s) ({", ".join(str(c.id) for c in removed) or "none found"}) -- '
+            f'{len(self.cell_container.get_cells(fov))} remain. Undo restores.')
 
     def _on_displayer_mask_edited(self, mask):
         """

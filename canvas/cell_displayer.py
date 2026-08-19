@@ -66,6 +66,15 @@ class CellDisplayer(QtWidgets.QMainWindow):
     sync -- one signal, one downstream handler, for every kind of edit.
     """
     mask_edited = QtCore.pyqtSignal(object)
+    # Remove-by-ID is an ID-LIST operation, not a raster edit: routing it
+    # through mask_edited made MainWindow rebuild the container FROM the
+    # displayed raster -- which is a PROJECTION whenever the display frame
+    # differs from a cell's native frame (exactly the post-cytoplasm
+    # case), and which silently no-oped whenever the segmentation context
+    # wasn't the last thing loaded, leaving the removed cell alive in the
+    # container to resurrect its contour on the next re-render (confirmed
+    # real bug). The ids go out as-is; the container is the authority.
+    ids_removed = QtCore.pyqtSignal(list)
     undo_requested = QtCore.pyqtSignal()
     redo_requested = QtCore.pyqtSignal()
 
@@ -188,7 +197,12 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self.mask[np.isin(self.mask, ids)] = 0
         self.RemoveIdsLineEdit.clear()
         self._redraw()
-        self.mask_edited.emit(self.mask)
+        # ids, not the raster -- see ids_removed's own comment. The local
+        # zeroing above is only the immediate visual echo; the authoritative
+        # state change (container removal, or cytoplasm-label update) is
+        # the receiver's job, and a container-backed receiver re-renders
+        # this displayer from the container afterwards anyway.
+        self.ids_removed.emit([int(i) for i in ids])
 
     def _set_manual_mode(self, on):
         self._manual_mode = on
