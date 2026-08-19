@@ -1063,6 +1063,7 @@ _DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS, min_hb_ratio=1.
 
 def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
+                                 max_fiducial_drift_z=10.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
                                  collect_debug=False, resolver=None):
     """
@@ -1181,6 +1182,15 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                 drift = float(np.hypot(dx, dy))
                 if drift > max_fiducial_drift:
                     reject_reason = f'drift {drift:.1f}px > max {max_fiducial_drift}px'
+                # Z gated separately, in planes -- per explicit request:
+                # a fiducial fit can pass the XY bound while landing on
+                # entirely different content in depth (confirmed real
+                # case: a barcode round's weak fiducial fit 20 planes
+                # from the reference at only 1.4px XY drift), and using
+                # such a fit would "correct" every readout in that hybe
+                # by a bogus dz.
+                elif abs(dz) > max_fiducial_drift_z:
+                    reject_reason = f'z drift {abs(dz):.1f} planes > max {max_fiducial_drift_z}'
 
         readout_channel = hybe_readout_channels.get(hybe)
         if readout_channel is None and reject_reason is None:

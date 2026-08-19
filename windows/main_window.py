@@ -391,7 +391,8 @@ class ChromatinTracingWorker(QtCore.QThread):
 
     def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
-                fiducial_params, readout_params, resolver_by_fov=None):
+                fiducial_params, readout_params, resolver_by_fov=None,
+                max_fiducial_drift_z=10.0):
         super().__init__()
         self.resolver_by_fov = resolver_by_fov or {}
         self.jobs = jobs
@@ -403,6 +404,7 @@ class ChromatinTracingWorker(QtCore.QThread):
         self.fov_matrices_by_fov = fov_matrices_by_fov
         self.cell_lookup = cell_lookup
         self.max_fiducial_drift = max_fiducial_drift
+        self.max_fiducial_drift_z = max_fiducial_drift_z
         self.spad = spad
         self.z_window = z_window
         self.fiducial_params = fiducial_params
@@ -420,7 +422,9 @@ class ChromatinTracingWorker(QtCore.QThread):
                     localization.build_chromatin_trace_allele(
                         allele, self.hybes, self.reference_hybe, self.hybe_fiducial_channels,
                         self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
-                        max_fiducial_drift=self.max_fiducial_drift, spad=self.spad, z_window=self.z_window,
+                        max_fiducial_drift=self.max_fiducial_drift,
+                        max_fiducial_drift_z=self.max_fiducial_drift_z,
+                        spad=self.spad, z_window=self.z_window,
                         fiducial_params=self.fiducial_params, readout_params=self.readout_params,
                         resolver=self.resolver_by_fov.get(fov))
                     done += 1
@@ -5094,6 +5098,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _, debug = localization.build_chromatin_trace_allele(
             allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
             storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
+            max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
             spad=full_params['spad'], z_window=full_params['z_window'],
             fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
             resolver=self._frame_resolver(None, fov))
@@ -5262,7 +5267,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          fov_matrices_by_fov, self._find_cell_by_id,
                                                          full_params['max_fiducial_drift'], full_params['spad'],
                                                          full_params['z_window'], fiducial_params, readout_params,
-                                                         resolver_by_fov=resolver_by_fov)
+                                                         resolver_by_fov=resolver_by_fov,
+                                                         max_fiducial_drift_z=full_params['max_fiducial_drift_z'])
         self._chromatin_worker.progress.connect(self._on_chromatin_fit_progress)
         self._chromatin_worker.finished_ok.connect(self._on_chromatin_fit_finished)
         self._chromatin_worker.failed.connect(self._on_chromatin_fit_failed)

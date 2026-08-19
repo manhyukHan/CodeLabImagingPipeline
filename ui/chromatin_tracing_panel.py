@@ -26,7 +26,8 @@ from PyQt5 import QtWidgets, QtCore
 # purpose is ONE per-hybe drift-correction anchor (see localization.
 # _localize_fiducial_hybe), so there's no legitimate multi-component case
 # for it the way a real genomic-locus readout has.
-CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0}
+CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0,
+                       'max_fiducial_drift_z': 10.0}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.15}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS,
@@ -192,6 +193,13 @@ class ChromatinTracingPanelUI(object):
         # reference hybe's own fiducial is rejected outright -- readout
         # never even fit for that hybe.
         crossForm.addRow('Max fiducial drift vs. reference (px):', self.MaxFiducialDriftSpinBox)
+
+        self.MaxFiducialDriftZSpinBox = double_spin(CROSS_MODE_DEFAULTS['max_fiducial_drift_z'], 0.5, 300.0)
+        # Z gated separately, in PLANES: a fiducial fit can pass the XY
+        # bound while landing on different content in depth (confirmed
+        # real case: 20 planes off at only 1.4px XY), and such a fit
+        # would "correct" every readout in that hybe by a bogus dz.
+        crossForm.addRow('Max fiducial Z drift vs. reference (planes):', self.MaxFiducialDriftZSpinBox)
 
         # -- per-channel: independently tunable fiducial vs. readout
         # columns, per explicit request -- a fiducial bead and a real
@@ -446,6 +454,7 @@ class ChromatinTracingPanelUI(object):
         return {'spad': self.SpadSpinBox.value(),
                 'z_window': self.ZWindowSpinBox.value(),
                 'max_fiducial_drift': self.MaxFiducialDriftSpinBox.value(),
+                'max_fiducial_drift_z': self.MaxFiducialDriftZSpinBox.value(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
 
