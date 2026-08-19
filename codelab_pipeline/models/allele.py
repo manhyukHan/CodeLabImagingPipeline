@@ -17,21 +17,21 @@ class AnAllele():
        on (mirrors ASpot.channel) -- also the one readout channel traced
        through every other hybe for this allele (see
        localization.localize_chromatin_trace_hybe).
-     coordinate: tuple (x, y, z) -- this allele's anchor position in the
+     coordinate: tuple (y, x, z) -- rasterized order (convention.py); anchor position in the
        pipeline's ONE shared reference frame (same frame ASpot.coordinate
        lives in) -- the point every hybe's own crop is centered around
        (via spot_mapper.reference_to_raw), never itself re-fit.
-     raw_coordinate: tuple (x, y, z) -- that same anchor position in
+     raw_coordinate: tuple (y, x, z) -- that same anchor position in
        anchor_hybe's own native (raw, untransformed) frame, before any
        alignment matrix is applied -- mirrors ASpot.raw_coordinate
-     fiducial_trace: dict[hybe (str) -> (x, y, z, amplitude) or None] --
+     fiducial_trace: dict[hybe (str) -> (y, x, z, amplitude) or None] --
        one shared-frame fiducial-channel fit per hybe this allele was
        processed against (None = no real fiducial peak found in that
        hybe's crop). Used to compute each hybe's own local drift
        correction relative to the configured reference hybe (see
        localization.localize_chromatin_trace_hybe) -- not itself the
        chromatin trace, just the per-hybe anchor the trace is corrected by.
-     polymer: dict[hybe (str) -> list of (x, y, z, amplitude) candidate
+     polymer: dict[hybe (str) -> list of (y, x, z, amplitude) candidate
        tuples] -- every ACCEPTED readout-channel detection near this
        allele's anchor for that hybe, already drift-corrected into the
        shared frame, not just the brightest one (multiple real candidates
@@ -44,7 +44,7 @@ class AnAllele():
        hybe, or its local drift vs. the reference hybe exceeded the
        configured bound) -- same visibility every other rejection gate in
        this pipeline already gives (see chain.compute_cell_alignment).
-     final_polymer: ndarray (n_bins x 3) -- one committed (x, y, z) position
+     final_polymer: ndarray (n_bins x 3) -- one committed (y, x, z) position
        per genomic-locus bin, collapsed from `polymer` by brightest-candidate
        selection (mirrors QualityControlORCA.combineFOV's 'maxBrightness'
        selection in /Users/hanmanhyuk/Remote Server/utils.py); empty until

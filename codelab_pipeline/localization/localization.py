@@ -389,7 +389,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         # that had run cell alignment), so a session must never reach it.
         H_cellref, _dz, _missing = resolver.transform(
             (hybe, modality), (cell.reference_hybe, cell.reference_modality), cell)
-        x_lit, y_lit = cell.area
+        y_lit, x_lit = cell.area
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
         x_area, y_area = cx, cy
     elif have_real or fov_matrices is None or (hybe, fov_matrices.modality) not in fov_matrices:
@@ -397,7 +397,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         # (identity-default via cell.get_area_in_readout/matrix_to_shared
         # when neither real data nor a fallback exists). Legacy composed
         # entries only: get_area_in_readout raises on residual matrices.
-        x_area, y_area = cell.get_area_in_readout(hybe, modality)
+        y_area, x_area = cell.get_area_in_readout(hybe, modality)
     else:
         # No real cell-level entry for (hybe, modality) -- fall back to
         # the FOV/cross-modal-only transform instead of silently
@@ -407,7 +407,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         if cell_reference_hybe_matrix is None:
             cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
         H_cellref = alignment.hybe_to_cellref_matrix(fov_matrices, cell_reference_hybe_matrix, hybe)
-        x_lit, y_lit = cell.area
+        y_lit, x_lit = cell.area
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
         x_area, y_area = cx, cy
     if len(x_area) == 0:
@@ -596,10 +596,10 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     per component, per explicit request.
     """
     hybe = hybe or spot.hybe
-    raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
+    raw_y, raw_x = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
     try:
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
-                                                                 (raw_x, raw_y), pad=spad, use_stack=True)
+                                                                 (raw_y, raw_x), pad=spad, use_stack=True)
     except OSError:
         # This hybe's raw stack file doesn't exist (e.g. a spot recorded
         # against a hybe that was never ingested for this storage_path/
@@ -652,8 +652,8 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             def _is_claimed(i):
                 if results[i] is None:
                     return False
-                ax, ay = results[i][1] + xmin, results[i][2] + ymin
-                return any((ax - cx) ** 2 + (ay - cy) ** 2 < min_sep ** 2 for cx, cy in claimed_positions)
+                apy, apx = results[i][2] + ymin, results[i][1] + xmin
+                return any((apy - py) ** 2 + (apx - px) ** 2 < min_sep ** 2 for py, px in claimed_positions)
             unclaimed = [i for i in order if not _is_claimed(i)]
             if unclaimed:
                 primary = unclaimed[0]
@@ -720,7 +720,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
         # one for THIS spot (see this function's own docstring on
         # claimed_positions). Returns (new_coordinate, new_raw_coordinate, amp).
         amp, xf, yf, zf, _, _, _, _ = r
-        raw = (float(xf + xmin), float(yf + ymin), float(zf))
+        raw = (float(yf + ymin), float(xf + xmin), float(zf))
         if cell is not None:
             m = modality if modality is not None else cell.reference_modality
             # Resolver first -- ACell.matrix_to_shared raises by design on
@@ -728,11 +728,11 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
             H = (resolver.to_shared(hybe, m, cell) if resolver is not None
                  else cell.matrix_to_shared(hybe, m))
             Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
-            x1, y1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
-            coord = (float(x1), float(y1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
+            y1, x1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
+            coord = (float(y1), float(x1), float(zf + cell_z_offset(cell, hybe, m, resolver)))
         elif fov_matrices and (hybe, fov_matrices.modality) in fov_matrices:
-            x1, y1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe, fov_matrices, modality=modality, cell=None)
-            coord = (x1, y1, raw[2])
+            y1, x1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe, fov_matrices, modality=modality, cell=None)
+            coord = (y1, x1, raw[2])
         else:
             coord = raw
         return coord, raw, float(amp)
@@ -806,14 +806,14 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
             continue
 
         raw_x, raw_y = x + rxmin, y + rymin
-        x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
+        y1, x1, _ = H @ np.array([raw_y, raw_x, 1]).reshape(3, 1)
         z1 = z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
         spot.modality = vlinks_store.modality_of(storage_path)
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
-                          coordinate=(float(x1), float(y1), float(z1)),
-                          raw_coordinate=(float(raw_x), float(raw_y), float(z)),
+                          coordinate=(float(y1), float(x1), float(z1)),
+                          raw_coordinate=(float(raw_y), float(raw_x), float(z)),
                           brightness=float(brightness[j]))
         spots.append(spot)
 
@@ -885,14 +885,14 @@ def localize_cell_3d_worker(cell, hybe, channel, storage_path, fov,
             continue  # cross-spot relative-brightness filter -- not something fit_gaussian_3d checks itself
 
         raw_x, raw_y, raw_z = x + rxmin, y + rymin, z0 + szmin
-        x1, y1, _ = H @ np.array([raw_x, raw_y, 1]).reshape(3, 1)
+        y1, x1, _ = H @ np.array([raw_y, raw_x, 1]).reshape(3, 1)
         z1 = raw_z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
         spot.modality = vlinks_store.modality_of(storage_path)
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
-                          coordinate=(float(x1), float(y1), float(z1)),
-                          raw_coordinate=(float(raw_x), float(raw_y), float(raw_z)),
+                          coordinate=(float(y1), float(x1), float(z1)),
+                          raw_coordinate=(float(raw_y), float(raw_x), float(raw_z)),
                           brightness=float(brightness[j]))
         spots.append(spot)
 
@@ -940,9 +940,9 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     plain = missing" convention).
     """
     try:
-        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
+        raw_y, raw_x = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, fiducial_channel,
-                                                                 (raw_x, raw_y), pad=spad, use_stack=True)
+                                                                 (raw_y, raw_x), pad=spad, use_stack=True)
     except OSError:
         return None, None, None
     if cubic.size == 0:
@@ -957,13 +957,13 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
         return None, cubic, None
     amp, xf, yf, zf = result[:4]
     raw_fx, raw_fy = xf + xmin, yf + ymin
-    sx, sy = spot_mapper.raw_to_reference((raw_fx, raw_fy), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
+    sy, sx = spot_mapper.raw_to_reference((raw_fy, raw_fx), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
     sz = zf
     if cell is not None:
         m = modality if modality is not None else cell.reference_modality
         Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
-    shared_result = (float(sx), float(sy), float(sz), float(amp))
+    shared_result = (float(sy), float(sx), float(sz), float(amp))
     return shared_result, cubic, (xf, yf, zf)
 
 
@@ -999,9 +999,9 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     in the SAME order as candidates (never includes a rejected component).
     """
     try:
-        raw_x, raw_y = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
+        raw_y, raw_x = spot_mapper.reference_to_raw(shared_xy, hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, readout_channel,
-                                                                 (raw_x, raw_y), pad=spad, use_stack=True)
+                                                                 (raw_y, raw_x), pad=spad, use_stack=True)
     except OSError:
         return [], None, []
     if cubic.size == 0:
@@ -1028,7 +1028,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
                                           init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
                                           min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
 
-    dx, dy, dz = delta
+    dy, dx, dz = delta   # (y, x, z), rasterized order
     m = modality if modality is not None else (cell.reference_modality if cell is not None else None)
     Hz = alignment.entry_dz(cell.matrices.get((hybe, m))) if cell is not None else 0.0
     candidates, crop_local = [], []
@@ -1037,9 +1037,9 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
             continue
         amp, xf, yf, zf = r[:4]
         raw_rx, raw_ry = xf + xmin, yf + ymin
-        sx, sy = spot_mapper.raw_to_reference((raw_rx, raw_ry), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
+        sy, sx = spot_mapper.raw_to_reference((raw_ry, raw_rx), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
-        candidates.append((float(sx + dx), float(sy + dy), float(sz + dz), float(amp)))
+        candidates.append((float(sy + dy), float(sx + dx), float(sz + dz), float(amp)))
         crop_local.append((xf, yf, zf))
     return candidates, cubic, crop_local
 
@@ -1177,8 +1177,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             elif fid is None:
                 reject_reason = 'fiducial not found'
             else:
-                dx, dy, dz = baseline[0] - fid[0], baseline[1] - fid[1], baseline[2] - fid[2]
-                delta = (dx, dy, dz)
+                dy, dx, dz = baseline[0] - fid[0], baseline[1] - fid[1], baseline[2] - fid[2]
+                delta = (dy, dx, dz)
                 drift = float(np.hypot(dx, dy))
                 if drift > max_fiducial_drift:
                     reject_reason = f'drift {drift:.1f}px > max {max_fiducial_drift}px'

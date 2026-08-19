@@ -10,7 +10,7 @@ from ..io import vlinks_store
 
 def _frozen_xy(xy):
     """
-    (x, y) coordinate arrays, WRITE-LOCKED. Per explicit decision: mask
+    (y, x) coordinate arrays, WRITE-LOCKED. Per explicit decision: mask
     coordinates are never partially edited after definition (cytoplasm
     incorporation REPLACES area, demoting the old one to the nucleus
     fields -- it does not edit in place), so the arrays are stored
@@ -61,7 +61,7 @@ class ACell():
        modality would otherwise resolve to a key that never exists and
        silently fall back to identity. Which is
        exactly right for every pre-cytoplasm cell.
-     nucleus: tuple (ndarray x, ndarray y) -- the NUCLEUS mask, native to
+     nucleus: tuple (ndarray y, ndarray x) -- the NUCLEUS mask, native to
        nucleus_hybe's frame. Before cytoplasmic segmentation this is the
        same mask as `area`; after it, `area` becomes the cytoplasm and this
        keeps the original nucleus. Every cell always has one.
@@ -71,7 +71,7 @@ class ACell():
        which is why any nucleus rendered across cells must be projected
        per-cell rather than assumed to share one frame.
      celltype: str
-     area: tuple (ndarray x, ndarray y) -- 2D mask coordinates, in
+     area: tuple (ndarray y, ndarray x) -- 2D mask coordinates, rasterized order (convention.py), in
        reference_hybe's frame. Cytoplasm once a cytoplasmic search has been
        incorporated, otherwise the nucleus.
      frame_shape: tuple (height, width) -- full-frame size, needed to bound-check
@@ -303,8 +303,9 @@ class ACell():
 
     def get_area_in_readout(self, hybe, modality):
         """
-        This cell's mask coordinates (x, y), transformed into `hybe`'s own
-        native (raw, untransformed) frame via matrix_to(hybe, modality).
+        This cell's mask coordinates (y, x) -- rasterized order, see
+        convention.py -- transformed into `hybe`'s own native (raw,
+        untransformed) frame via matrix_to(hybe, modality).
         Only the coordinates move -- raw pixel data is never resampled.
         align_cell itself special-cases the MATRIX (skips its own
         resampling machinery when H is genuinely identity, checked once
@@ -314,13 +315,13 @@ class ACell():
         """
         H = self.matrix_to(hybe, modality)
         Hinv = la.inv(H)
-        x, y = self.area
+        y, x = self.area
         cy, cx = alignment.align_cell((y, x), Hinv, self.frame_shape)
-        return (cx, cy)
+        return (cy, cx)
 
     def get_nucleus_in_readout(self, hybe, modality):
         """
-        This cell's NUCLEUS coordinates (x, y) transformed into `hybe`'s own
+        This cell's NUCLEUS coordinates (y, x) transformed into `hybe`'s own
         native frame -- the nucleus counterpart of get_area_in_readout, and
         the projection cytoplasmic segmentation needs to render a nucleus
         seed into the cytoplasm hybe's frame.
@@ -334,9 +335,9 @@ class ACell():
         """
         H = self.matrix_between(hybe, modality, self.nucleus_hybe, self.nucleus_modality)
         Hinv = la.inv(H)
-        x, y = self.nucleus
+        y, x = self.nucleus
         cy, cx = alignment.align_cell((y, x), Hinv, self.frame_shape)
-        return (cx, cy)
+        return (cy, cx)
 
     def get_mip(self, hybe, storage_path, fov, modality, channel=None, pad=5, use_stack=False):
         """
@@ -346,7 +347,7 @@ class ACell():
         reads never need the raw stack file, per explicit principle).
         channel defaults to that hybe's own fiducial channel if not given.
         """
-        x, y = self.get_area_in_readout(hybe, modality)
+        y, x = self.get_area_in_readout(hybe, modality)
         if len(x) == 0:
             raise ValueError(f'Cell {self.id} has no area overlapping hybe {hybe}')
         height, width = self.frame_shape

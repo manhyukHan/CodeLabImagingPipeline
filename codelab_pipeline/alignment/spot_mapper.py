@@ -78,15 +78,16 @@ def _resolve_matrix(hybe, fov_matrices, modality=None, cell=None, resolver=None)
 
 def raw_to_reference(coordinate, hybe, fov_matrices, modality=None, cell=None, resolver=None):
     """
-    coordinate: (x, y) in `hybe`'s own native/raw pixel frame -- e.g.
-    exactly where a spot was localized on that hybe's own unmodified image.
-    Returns (x, y) in the shared reference frame by forward-applying H:
-    ref_point = H @ raw_point. Only the coordinate moves.
+    coordinate: (y, x) in `hybe`'s own native/raw pixel frame (rasterized
+    order, convention.py) -- e.g. exactly where a spot was localized on
+    that hybe's own unmodified image. Returns (y, x) in the shared
+    reference frame by forward-applying the y-major H. Only the
+    coordinate moves.
     """
-    x, y = coordinate
+    y, x = coordinate
     H = _resolve_matrix(hybe, fov_matrices, modality, cell, resolver)
-    rx, ry, _ = H @ np.array([x, y, 1.0])
-    return float(rx), float(ry)
+    ry, rx, _ = H @ np.array([y, x, 1.0])
+    return float(ry), float(rx)
 
 
 def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None, resolver=None):
@@ -95,17 +96,18 @@ def reference_to_raw(coordinate, hybe, fov_matrices, modality=None, cell=None, r
     shared reference frame (e.g. a fiducial spot selected once on a single
     reference readout's fiducial channel -- never re-derived per hybe).
     Returns where that same physical point sits in `hybe`'s own native/raw
-    frame, so a crop can be taken there for localization.
+    frame ((y, x), rasterized order), so a crop can be taken there for
+    localization.
     """
-    x, y = coordinate
+    y, x = coordinate
     H = _resolve_matrix(hybe, fov_matrices, modality, cell, resolver)
-    rx, ry, _ = la.inv(H) @ np.array([x, y, 1.0])
-    return float(rx), float(ry)
+    ry, rx, _ = la.inv(H) @ np.array([y, x, 1.0])
+    return float(ry), float(rx)
 
 
 def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, pad=5, use_stack=False):
     """
-    native_coordinate: (x, y) already in `hybe`'s own raw frame (typically
+    native_coordinate: (y, x) already in `hybe`'s own raw frame (typically
     from reference_to_raw). Returns a small crop centered there -- the
     "crop nearby" step, ready for a localizer to run on as-is. use_stack=
     False (default, 2D localization) reads vlinks.h5's real MIP copy, never
@@ -116,9 +118,9 @@ def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, p
     Returns (crop, (ymin, xmin)): the offset lets a caller convert a
     within-crop peak back to `hybe`'s native frame (raw_x = x + xmin,
     raw_y = y + ymin), matching localize_cell_2d_worker's own convention,
-    before handing it to raw_to_reference.
+    before handing it to raw_to_reference (as (raw_y, raw_x)).
     """
-    x, y = native_coordinate
+    y, x = native_coordinate
     if not use_stack:
         mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
         if mip is None:

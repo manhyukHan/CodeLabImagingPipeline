@@ -28,9 +28,9 @@ class ASpot():
      channel: int (physical imaging channel, e.g. 555/635)
      cell: int (owning cell id, -1 if homeless)
      celltype: str
-     coordinate: tuple (x, y, z) -- final position, after H_within/H_across/H_cell
+     coordinate: tuple (y, x, z) -- rasterized order (convention.py); final position, after H_within/H_across/H_cell
        composition; z is 0.0 for a 2D-only pipeline, but the field always exists
-     raw_coordinate: tuple (x, y, z) -- position in this spot's own hybe's native
+     raw_coordinate: tuple (y, x, z) -- position in this spot's own hybe's native
        (raw, untransformed) full-frame pixel coordinates, before any alignment
        matrix is applied. Kept alongside coordinate so raw data can be
        re-accessed by locality later without inverting any matrix.

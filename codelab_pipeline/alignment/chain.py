@@ -3,6 +3,7 @@ from functools import reduce
 import numpy as np
 
 from .frames import FrameMatrices  # re-exported: callers reach it as alignment.FrameMatrices
+from .convention import as_cv2, to_yx  # THE y-major<->cv2 adapter (see convention.py)
 import numpy.linalg as la
 import h5py
 from skimage import filters as skimage_filters
@@ -98,7 +99,8 @@ def align_cell(yx, H, shape):
         cx,cy = x.astype(int), y.astype(int)
         bad = (cx < 0) | (cy < 0) | (cx >= width) | (cy >= height)
         return cy[~bad], cx[~bad]
-    cx,cy = (H[:2]@np.array([x,y,np.ones_like(x)])).astype(int)
+    # H is y-major (convention.py): row 0 -> y, row 1 -> x.
+    cy,cx = (H[:2]@np.array([y,x,np.ones_like(x)])).astype(int)
     bad = (cx < 0) | ( cy < 0) | (cx >= width) | (cy >= height)
     cx,cy = cx[~bad],cy[~bad]
     if cx.size == 0:
@@ -178,6 +180,17 @@ def hybe_to_cellref_matrix(fov_matrices, H_cellref_to_within, hybe):
     """
     H_hybe_to_within = fov_matrices.get((hybe, fov_matrices.modality), np.eye(3))
     return compose_chain([H_hybe_to_within, la.inv(H_cellref_to_within)])
+
+def h_angle_degrees(H_yx):
+    """Rotation angle (degrees) of a Y-MAJOR matrix -- the display/report
+    read for every stored/composed H in this pipeline. Numerically equal
+    to the engine-internal x-major read of the same physical rotation
+    (proven in tests/test_convention.py), so reported angles are
+    continuous across the convention flip. _h_rotation_angle_degrees
+    below stays the x-major read and is ENGINE-INTERNAL only."""
+    H_yx = np.asarray(H_yx, dtype=float)
+    return float(np.degrees(np.arctan2(H_yx[0, 1], H_yx[0, 0])))
+
 
 def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.5, signal_threshold=10):
     """
@@ -524,7 +537,10 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
             H_final[0, 2] += float(np.clip(dx, -max_shift, max_shift)) - dx
             H_final[1, 2] += float(np.clip(dy, -max_shift, max_shift)) - dy
 
-    return H_final
+    # THE engine boundary (convention.py): everything above -- ORB, Powell,
+    # residual scoring, bounds -- is cv2-native x-major; everything outside
+    # this function speaks y-major. One conversion, here, nowhere else.
+    return to_yx(H_final)
 
 def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
@@ -683,8 +699,8 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     h, w = rna_mip.shape
     H_rna_within = rna_fov_matrices.get((rna_reference_hybe, rna_fov_matrices.modality), np.eye(3))
     H_dna_within = dna_fov_matrices.get((dna_reference_hybe, dna_fov_matrices.modality), np.eye(3))
-    rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), H_rna_within[:2], (w, h))
-    dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), H_dna_within[:2], (w, h))
+    rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), as_cv2(H_rna_within)[:2], (w, h))
+    dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
     return align_readout_to_reference(dna_mip_aligned, rna_mip_aligned, lb, ub, border_trim=border_trim, max_shift=max_shift)
 
@@ -974,7 +990,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
     modality = modality if modality is not None else cell.reference_modality
-    x_ref, y_ref = cell.area  # always native to cell.reference_hybe's own frame
+    y_ref, x_ref = cell.area  # (y, x), native to cell.reference_hybe's own frame
     if cell_reference_hybe_matrix is None:
         cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
 
@@ -1239,7 +1255,10 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # actually measured keeps the three layers independently updatable,
         # which is the whole point of having layers. Consumers recompose H1
         # from CURRENT matrices -- see frames.FrameResolver.to_shared.
-        H_yx = H2
+        # H2 was fitted x-major (cv2.phaseCorrelate territory); stored
+        # y-major like every persisted matrix. The ZX leg below reads
+        # H2's own x-major dx BEFORE this conversion, deliberately.
+        H_yx = to_yx(H2)
 
         z_shift = 0.0
         z_shift = 0.0

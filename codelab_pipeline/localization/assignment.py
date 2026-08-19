@@ -57,9 +57,9 @@ def label_mask_for_frame(cells, hybe, modality, frame_shape, area_in_frame=None)
     for cell in cells:
         try:
             if area_in_frame is not None:
-                x, y = area_in_frame(cell, hybe, modality)
+                y, x = area_in_frame(cell, hybe, modality)
             else:
-                x, y = cell.get_area_in_readout(hybe, modality)
+                y, x = cell.get_area_in_readout(hybe, modality)
         except Exception:
             continue          # this cell has no path into that frame
         x = np.asarray(x).astype(int).ravel()
@@ -116,8 +116,9 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
                                     area_in_frame=area_in_frame)
         height, width = mask.shape
         for spot in group:
-            ix = int(spot.raw_coordinate[0])
-            iy = int(spot.raw_coordinate[1])
+            # raw_coordinate is (y, x, z) -- rasterized order.
+            iy = int(spot.raw_coordinate[0])
+            ix = int(spot.raw_coordinate[1])
             label = int(mask[iy, ix]) if (0 <= iy < height and 0 <= ix < width) else 0
             owner = cells_by_id.get(label) if label else None
             if owner is None:
@@ -126,10 +127,10 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
                 if matrix_to_shared is not None:
                     H = matrix_to_shared(hybe, modality, None)
                     if H is not None:
-                        cx, cy = (np.asarray(H, dtype=float)[:2]
+                        cy, cx = (np.asarray(H, dtype=float)[:2]
                                   @ np.array([float(spot.raw_coordinate[0]),
                                               float(spot.raw_coordinate[1]), 1.0]))
-                        spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
+                        spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
                 n_unassigned += 1
                 continue
             spot.cell = int(owner.id)
@@ -137,10 +138,10 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
             if matrix_to_shared is not None:
                 H = matrix_to_shared(hybe, modality, owner)
                 if H is not None:
-                    cx, cy = (np.asarray(H, dtype=float)[:2]
+                    cy, cx = (np.asarray(H, dtype=float)[:2]
                               @ np.array([float(spot.raw_coordinate[0]),
                                           float(spot.raw_coordinate[1]), 1.0]))
-                    spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
+                    spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
             n_assigned += 1
     return n_assigned, n_unassigned
 
@@ -190,9 +191,9 @@ def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
         H = resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)
         if H is None:
             continue
-        cx, cy = (np.asarray(H, dtype=float)[:2]
+        cy, cx = (np.asarray(H, dtype=float)[:2]
                   @ np.array([float(spot.raw_coordinate[0]),
                               float(spot.raw_coordinate[1]), 1.0]))
-        spot.coordinate = (float(cx), float(cy), float(spot.coordinate[2]))
+        spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
         n += 1
     return n
