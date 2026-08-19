@@ -104,9 +104,10 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         are omitted by the caller per explicit spec.
 
         entries: [(yx_before, yx_after, zx_before, zx_after, title), ...]
-        -- each an (h,w,3) RGB; the tile is a 2x2 (columns YX | ZX, rows
-        before | after), sharing the fit-status grids' own YX-above-depth
-        convention and z-window.
+        -- each an (h,w,3) RGB; the tile is a 2x2 with ZX UNDER YX (the
+        fit-status grids' own YX-above-depth convention) and before |
+        after as LEFT vs RIGHT columns, so the comparison reads
+        side-by-side per plane.
         """
         self._current_allele_label = allele_label
         self._current_params = dict(params) if params else {}
@@ -125,16 +126,18 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
             row_pair, col = divmod(i, ncols)
             inner = outer[row_pair, col].subgridspec(2, 2, hspace=0.08, wspace=0.08)
             axes = [[fig.add_subplot(inner[r, c]) for c in range(2)] for r in range(2)]
-            for ax, img in ((axes[0][0], yx_b), (axes[1][0], yx_a),
-                            (axes[0][1], zx_b), (axes[1][1], zx_a)):
+            # rows: YX above, ZX below (grid convention); columns:
+            # before left, after right.
+            for ax, img in ((axes[0][0], yx_b), (axes[0][1], yx_a),
+                            (axes[1][0], zx_b), (axes[1][1], zx_a)):
                 ax.imshow(img, aspect='auto')
                 ax.set_xticks([])
                 ax.set_yticks([])
-            axes[0][0].set_title(f'{title}\nYX', fontsize=8)
-            axes[0][1].set_title('ZX', fontsize=8)
+            axes[0][0].set_title(f'{title}\nbefore', fontsize=8)
+            axes[0][1].set_title('after', fontsize=8)
             if col == 0:
-                axes[0][0].set_ylabel('before', fontsize=7)
-                axes[1][0].set_ylabel('after', fontsize=7)
+                axes[0][0].set_ylabel('YX', fontsize=7)
+                axes[1][0].set_ylabel('ZX', fontsize=7)
         width_px = max(self.canvas.minimumWidth(), ncols * col_px)
         height_px = max(self.canvas.minimumHeight(), nrows_pairs * pair_px)
         self._resize_canvas(width_px, height_px)
