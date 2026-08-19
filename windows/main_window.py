@@ -2562,10 +2562,22 @@ class MainWindow(QtWidgets.QMainWindow):
                    + (' ...' if len(skipped) > 20 else ''))
         cw.log('Cell ids and count are unchanged. Alignment matrices were NOT recomputed -- '
                're-run Cell-Based Alignment if you want the residual refit against the cytoplasm.')
-        self._cell_displayer_mode = 'cytoplasm'
+        # Review is OVER: the merge just landed in the transient container,
+        # which is the one authority from here on (per explicit principle:
+        # the raw cytoplasm labels are super-temporal, never stored;
+        # post-integration state lives in the container). Consume the
+        # staged result, return the displayer to segmentation mode, and
+        # render FROM the container via THE one renderer. The old tail
+        # kept showing the merged raster in 'cytoplasm' mode -- the
+        # display stayed sourced from a dead intermediate, and a
+        # subsequent Remove was routed into the cytoplasm-labels branch
+        # where the container never heard of it (confirmed real bug:
+        # cell removed from the store, contour still on screen).
+        self._cytoplasm_result = None
+        self._cell_displayer_mode = 'segmentation'
         self.cell_displayer.setWindowTitle(
-            f'Cytoplasm Displayer -- FOV{fov:02d} {hybe} ({modality}) -- merged (nucleus wins)')
-        self.cell_displayer.set_data(result['image'], merged.astype(float))
+            f'Cell Displayer -- FOV{fov:02d} {hybe} ({modality}) -- cytoplasm incorporated')
+        self._render_cell_displayer(fov, self.cell_container.get_cells(fov), hybe, modality, result['image'])
         self._refresh_cytoplasm_cell_list()
         QtWidgets.QMessageBox.information(
             self, 'Cytoplasmic Segmentation',
