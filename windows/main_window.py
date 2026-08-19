@@ -2640,43 +2640,56 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cell_container = CellContainer([fov])
         self.cell_container.data.setdefault(fov, {})
 
-        # cells always show, regardless of which hybe/channel the panel is
-        # currently displaying -- _cell_area_in_readout (the resolver-
-        # backed projection, NEVER ACell.get_area_in_readout directly:
-        # that raises by design on residual-form matrices once cell
-        # alignment has run for a cell -- confirmed real crash loading
-        # this displayer after alignment) transforms each cell's mask
-        # into this hybe's own frame via whatever matrix is known,
-        # defaulting to identity (the cell's own raw position) when no
-        # layer has been run, rather than hiding the mask entirely. The
-        # "approximate" note below is a direct membership check, purely
-        # to tell the user WHY a shown position might be less precise.
-        mask = np.zeros(reference_image.shape, dtype=np.uint8)
-        if cells:
-            approximate = False
-            height, width = mask.shape
-            for cell in cells:
-                # reference_hybe's own modality (resolved directly from
-                # the Cell Segmentation panel's ReferenceHybeComboBox
-                # selection, see current_reference_modality) -- NOT
-                # necessarily this cell's own segmentation modality, since
-                # cells here can come from either modality.
-                if (reference_hybe, modality) not in cell.matrices:
-                    approximate = True
-                x, y = self._cell_area_in_readout(cell, reference_hybe, modality, fov)
-                if len(x) == 0:
-                    continue
-                xi, yi = x.astype(int), y.astype(int)
-                valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-                mask[yi[valid], xi[valid]] = cell.id
+        # The TRANSIENT tier is authoritative in-session: seed it from the
+        # permanent cells only when it holds NOTHING for this FOV yet.
+        # The old unconditional overwrite here (transient = deepcopy of
+        # permanent on every displayer reload) silently discarded every
+        # in-session container edit -- confirmed real bug: remove a cell,
+        # toggle the displayer, and the cell was resurrected in BOTH the
+        # view and the transient container. Same hazard _try_show_
+        # existing_cells' own once-per-FOV gate already documents.
+        if cells and not self.cell_container.data.get(fov):
             self.cell_container.data[fov] = {int(c.id): c for c in deepcopy(cells)}
-            if approximate:
-                cp.LogTextEdit.append(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
-                                      f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
 
+        display_cells = self.cell_container.get_cells(fov)
+        self._render_cell_displayer(fov, display_cells, reference_hybe, modality, reference_image)
+        cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(display_cells)} cell(s).')
+
+    def _render_cell_displayer(self, fov, cells, reference_hybe, modality, reference_image):
+        """
+        THE one renderer for the segmentation displayer -- every path that
+        needs the mask redrawn (initial load, post-removal refresh, undo/
+        redo) builds it here, from the TRANSIENT container's cells, via
+        _cell_area_in_readout (the resolver-backed projection, NEVER
+        ACell.get_area_in_readout directly: that raises by design on
+        residual-form matrices once cell alignment has run -- confirmed
+        real crash). A second, divergent renderer is exactly how a stale
+        contour survives one path and not another. An empty `cells` list
+        renders an empty mask (removing the last cell must clear the
+        view, never skip the redraw). int32 mask: ids above 255 silently
+        wrapped in the old uint8 raster.
+        """
+        cp = self.ui.CellSegmentPanel
+        mask = np.zeros(reference_image.shape, dtype=np.int32)
+        approximate = False
+        height, width = mask.shape
+        for cell in cells:
+            # reference_hybe's own modality (from the panel selection, see
+            # current_reference_modality) -- NOT necessarily this cell's
+            # own segmentation modality; cells can come from either.
+            if (reference_hybe, modality) not in cell.matrices:
+                approximate = True
+            x, y = self._cell_area_in_readout(cell, reference_hybe, modality, fov)
+            if len(x) == 0:
+                continue
+            xi, yi = x.astype(int), y.astype(int)
+            valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+            mask[yi[valid], xi[valid]] = cell.id
+        if cells and approximate:
+            cp.LogTextEdit.append(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
+                                  f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         self.cell_displayer.set_data(reference_image, mask)
-        cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(cells) if cells else 0} cell(s).')
 
     def _on_displayer_ids_removed(self, ids):
         """
@@ -4500,19 +4513,22 @@ class MainWindow(QtWidgets.QMainWindow):
         chase per edit path.
         """
         cells = self.cell_container.get_cells(fov) if self.cell_container else []
-        if not cells:
+        # Same display context the view was loaded with (falling back to
+        # the panel's live selection), same already-displayed reference
+        # image, and THE same renderer as the initial load -- this used to
+        # rasterize each cell's RAW area (unprojected -- subtly wrong
+        # whenever the display frame differs from a cell's native frame),
+        # silently skip set_data when its own image re-read failed, and
+        # skip entirely on an empty container (removing the LAST cell left
+        # its contour on screen).
+        ctx = self._last_segment_context or {}
+        cp = self.ui.CellSegmentPanel
+        reference_hybe = ctx.get('reference_hybe') or cp.current_reference_hybe()
+        modality = ctx.get('modality') or cp.current_reference_modality()
+        reference_image = self.cell_displayer.reference_image
+        if reference_image is None or not reference_hybe:
             return
-        mask = np.zeros(cells[0].frame_shape, dtype=np.int32)
-        for cell in cells:
-            x, y = cell.area
-            xi, yi = np.asarray(x).astype(int), np.asarray(y).astype(int)
-            keep = (xi >= 0) & (yi >= 0) & (xi < mask.shape[1]) & (yi < mask.shape[0])
-            mask[yi[keep], xi[keep]] = int(cell.id)
-        ref_pair = (cells[0].reference_hybe, cells[0].reference_modality)
-        path = self._storage_path_for_modality(ref_pair[1])
-        reference_image = vlinks_store.fiducial_channel_mip(path, fov, ref_pair[0]) if path else None
-        if reference_image is not None:
-            self.cell_displayer.set_data(reference_image, mask)
+        self._render_cell_displayer(fov, cells, reference_hybe, modality, reference_image)
         self._refresh_spot_cell_list()
 
     def _undo_cell_action(self):
