@@ -26,7 +26,7 @@ from codelab_pipeline.localization import assignment
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
 
-STORAGE = 'data/chr19_downstream_new/RNA_queue'
+STORAGE = os.environ.get('CODELAB_COST_STORE', 'data/chr19_downstream_new/RNA_queue')
 FOV = 1
 HYBE = 'Hyb_400'        # whichever frame the bulk of the real cells live in
 MODALITY = 'DNA'
@@ -73,7 +73,7 @@ def test_assignment_is_correct_before_it_is_fast():
     cells, mask = setup()
     by_id = {c.id: c for c in cells}
     target = cells[0]
-    x, y = target.area
+    y, x = target.area           # (y, x) -- rasterized order
     px, py = int(np.asarray(x).ravel()[0]), int(np.asarray(y).ravel()[0])
 
     # The pixel comes from target.area, which is native to the cell's OWN
@@ -83,7 +83,7 @@ def test_assignment_is_correct_before_it_is_fast():
     # no session-free projection at all.
     inside = ASpot(); inside.modality = target.reference_modality
     inside.set_metadata(uid=1, fov=FOV, hybe=target.reference_hybe, channel=635,
-                        raw_coordinate=(float(px), float(py), 0.0))
+                        raw_coordinate=(float(py), float(px), 0.0))
     outside = ASpot(); outside.modality = target.reference_modality
     outside.set_metadata(uid=2, fov=FOV, hybe=target.reference_hybe, channel=635,
                          raw_coordinate=(-50.0, -50.0, 0.0))

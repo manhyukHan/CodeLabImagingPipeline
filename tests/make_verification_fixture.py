@@ -164,15 +164,15 @@ def main():
             for modality, hybe in SLICES:
                 channel = fid_ch if hybe == 'Hyb_101' else ch[(modality, hybe)]
                 for cell in hosts:
-                    x, y = w._cell_area_in_readout(cell, hybe, modality, fov)
+                    y, x = w._cell_area_in_readout(cell, hybe, modality, fov)
                     if len(x) == 0:
                         continue
                     for k in rng.choice(len(x), size=min(2, len(x)), replace=False):
                         z = float(rng.uniform(6, 22))
                         s = ASpot()
                         s.set_metadata(fov=fov, modality=modality, hybe=hybe, channel=channel,
-                                       raw_coordinate=(float(x[k]), float(y[k]), z),
-                                       coordinate=(float(x[k]), float(y[k]), z),
+                                       raw_coordinate=(float(y[k]), float(x[k]), z),
+                                       coordinate=(float(y[k]), float(x[k]), z),
                                        size=float(rng.uniform(1.1, 2.4)),
                                        brightness=float(rng.uniform(300, 4000)))
                         new_spots.append(s)
@@ -182,7 +182,7 @@ def main():
                     z = float(rng.uniform(6, 22))
                     s = ASpot()
                     s.set_metadata(fov=fov, modality=modality, hybe=hybe, channel=channel,
-                                   raw_coordinate=(bx, by, z), coordinate=(bx, by, z),
+                                   raw_coordinate=(by, bx, z), coordinate=(by, bx, z),
                                    size=float(rng.uniform(1.1, 2.4)),
                                    brightness=float(rng.uniform(200, 1500)))
                     new_spots.append(s)

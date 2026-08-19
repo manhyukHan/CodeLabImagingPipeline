@@ -4,6 +4,7 @@ import cv2
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.alignment.convention import as_cv2  # y-major -> cv2 at warp boundaries
 
 def _sequential_color(i, n):
     """
@@ -79,7 +80,7 @@ def _true_bounds(H_eff, x, y, pad):
     the shift as an actual, visible change in where the real data sits
     within the crop.
     """
-    cx, cy = (H_eff[:2] @ np.array([x, y, np.ones_like(x)])).astype(int)
+    cy, cx = (H_eff[:2] @ np.array([y, x, np.ones_like(x)])).astype(int)
     ymin, ymax = int(cy.min()) - pad, int(cy.max()) + pad + 1
     xmin, xmax = int(cx.min()) - pad, int(cx.max()) + pad + 1
     return ymin, ymax, xmin, xmax
@@ -205,7 +206,7 @@ class PipelineCanvas():
         throughout this session's scripted Phase 1/2 verification.
         """
         h, w = reference_mip.shape
-        moving_aligned = cv2.warpAffine(moving_mip.astype(np.float32), H[:2], (w, h))
+        moving_aligned = cv2.warpAffine(moving_mip.astype(np.float32), as_cv2(H)[:2], (w, h))
         self._draw_before_after(reference_mip, moving_mip, moving_aligned, title_prefix, lb, ub, save_path)
 
     def _draw_three_way(self, rows, title, lb=0.3, ub=0.9999, save_path=None):
@@ -467,7 +468,7 @@ class PipelineCanvas():
 
         """
         height, width = cell.frame_shape
-        x_lit, y_lit = cell.area
+        y_lit, x_lit = cell.area
         # ONE anchor for every non-literal column -- FOV-only, never the
         # cell-residual-bearing version. Per explicit request: the
         # reference side should never move at all between columns ("red
@@ -556,8 +557,8 @@ class PipelineCanvas():
         # disagreed sub-pixel-wise and their X-local maxima stopped being
         # parallel. Warping both keeps the residual at full float
         # precision and keeps the two rows' X in lockstep.
-        residual_dx = float(final_matrix[0, 2] - fov_only_matrix[0, 2])
-        residual_dy = float(final_matrix[1, 2] - fov_only_matrix[1, 2])
+        residual_dx = float(final_matrix[1, 2] - fov_only_matrix[1, 2])
+        residual_dy = float(final_matrix[0, 2] - fov_only_matrix[0, 2])
         T_residual = np.array([[1., 0., residual_dx], [0., 1., residual_dy]])
         col3_source = cv2.warpAffine(target_mip.astype(np.float32), T_residual,
                                      (width, height), borderValue=float('nan'))
@@ -747,7 +748,7 @@ class PipelineCanvas():
             channel = alignment.pick_channel_by_type(record, channel_type)
             mip = _read_mip(storage_path, fov, hybe, channel)
             before_images[hybe] = mip
-            after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), matrices[hybe][:2], (width, height))
+            after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
 
         title = f'FOV{fov:02d}: all readouts vs {reference_hybe} (before/after)'
         self.draw_all_readouts_overlay(before_images, after_images, title, save_path)
@@ -838,7 +839,7 @@ class PipelineCanvas():
         # identical across every column (its own matrix is always
         # identity, being this run's anchor), matching "red never moves,
         # only the target moves" exactly.
-        x_lit, y_lit = cell.area
+        y_lit, x_lit = cell.area
         mask_anchor = (mask_anchor_fov_matrix if mask_anchor_fov_matrix is not None
                       else cell.matrix_to_shared(cell.reference_hybe, cell.reference_modality))
         if reference_matrix is None:
@@ -1070,8 +1071,8 @@ class PipelineCanvas():
         h, w = rna_mip.shape
         H_rna_within = _bare_hybe(rna_fov_matrices).get(rna_reference_hybe, np.eye(3))
         H_dna_within = _bare_hybe(dna_fov_matrices).get(dna_reference_hybe, np.eye(3))
-        rna_mip_corrected = cv2.warpAffine(rna_mip.astype(np.float32), H_rna_within[:2], (w, h))
-        dna_mip_corrected = cv2.warpAffine(dna_mip.astype(np.float32), H_dna_within[:2], (w, h))
+        rna_mip_corrected = cv2.warpAffine(rna_mip.astype(np.float32), as_cv2(H_rna_within)[:2], (w, h))
+        dna_mip_corrected = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
         self.draw_alignment_preview(rna_mip_corrected, dna_mip_corrected, H_across,
                                     f'{dna_reference_hybe} (DNA) -> {rna_reference_hybe} (RNA), {channel_type}',

@@ -81,6 +81,9 @@ def build_scratch():
                 raise AssertionError(f'{path} missing from the real vlinks')
             g = dst.require_group(os.path.dirname(path))
             g.create_dataset(os.path.basename(path), data=src[path][()])
+        # Raw h5py creation bypasses vlinks_store's writers, so stamp the
+        # order ourselves -- MIPs are rasters, truthfully (y, x)-major.
+        dst.attrs['coordinate_order'] = 'yx'
 
 
 def queue_path(queue):

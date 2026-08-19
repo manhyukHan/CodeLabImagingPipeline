@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt5 import QtWidgets
 from unittest import mock
 
-CONFIG = 'configs/chr19_downstream_debug.xml'
+CONFIG = os.environ.get('CODELAB_SMOKE_CONFIG', 'configs/chr19_downstream_debug.xml')
 FOV = 1
 
 # Methods that legitimately need a user, a running worker, or would mutate

@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.alignment.convention import as_cv2, to_yx
 from codelab_pipeline.io import vlinks_store
 
 STORE = os.environ.get('CODELAB_GT_STORE', 'data/chr19_downstream_new/RNA_queue')
@@ -60,8 +61,9 @@ def interior(img, margin=60):
 def closure_error(moving, H_fit, ref):
     """Mean abs interior error of moving warped ONTO ref by H_fit,
     vs. the unaligned error -- direction-sensitive: a sign-flipped H
-    doubles the offset instead of cancelling it."""
-    realigned = warp(moving, H_fit)
+    doubles the offset instead of cancelling it. H_fit is y-major,
+    converted at the cv2 boundary."""
+    realigned = warp(moving, as_cv2(H_fit))
     e_after = float(np.mean(np.abs(interior(realigned) - interior(ref))))
     e_before = float(np.mean(np.abs(interior(moving) - interior(ref))))
     return e_after, e_before
@@ -85,8 +87,8 @@ def M_rotation(angle_deg, shape, dx=0.0, dy=0.0):
 def test_identity_finds_no_spurious_correction():
     ref = ref_image()
     H = alignment.align_readout_to_reference(ref.copy(), ref)
-    dx, dy = H[0, 2], H[1, 2]
-    ang = alignment._h_rotation_angle_degrees(H)
+    dy, dx = H[0, 2], H[1, 2]        # y-major: ty at [0, 2]
+    ang = alignment.h_angle_degrees(H)
     assert abs(dx) < 0.3 and abs(dy) < 0.3 and abs(ang) < 0.1, \
         f'identity pair produced correction dx={dx:.2f} dy={dy:.2f} angle={ang:.2f}'
 
@@ -96,10 +98,10 @@ def test_known_translation_recovered_and_inverts():
     M = M_translation(9.5, -6.25)
     moving = warp(ref, M)
     H = alignment.align_readout_to_reference(moving, ref)
-    prod = H @ M
+    prod = H @ to_yx(M)          # H is y-major; M was built cv2-style
     err = np.abs(prod - np.eye(3))
     assert err[:2, 2].max() < 0.5 and err[:2, :2].max() < 0.01, \
-        f'H_fit @ M != I: recovered t=({H[0,2]:.2f},{H[1,2]:.2f}) for M t=(9.5,-6.25)'
+        f'H_fit @ M != I: recovered t=(tx {H[1,2]:.2f}, ty {H[0,2]:.2f}) for M t=(9.5,-6.25)'
     # 0.35: two bilinear warps blur high-frequency fiducial content, so
     # the floor is interpolation noise, not misalignment (a direction
     # flip would DOUBLE the error -- asserted separately below).
@@ -116,11 +118,13 @@ def test_known_rotation_recovered_and_inverts():
     M = M_rotation(3.0, ref.shape, dx=5.0, dy=-4.0)
     moving = warp(ref, M)
     H = alignment.align_readout_to_reference(moving, ref)
-    ang_M = alignment._h_rotation_angle_degrees(M)
-    ang_H = alignment._h_rotation_angle_degrees(H)
+    # Both angles through the ONE public y-major reader -- mixing it with
+    # the engine-internal x-major reader flips a sign and asserts nothing.
+    ang_M = alignment.h_angle_degrees(to_yx(M))
+    ang_H = alignment.h_angle_degrees(H)
     assert abs(ang_H + ang_M) < 0.3, \
         f'rotation not inverted: M angle={ang_M:.3f}, fit angle={ang_H:.3f}'
-    prod = np.abs(H @ M - np.eye(3))
+    prod = np.abs(H @ to_yx(M) - np.eye(3))
     assert prod[:2, 2].max() < 1.0 and prod[:2, :2].max() < 0.01, \
         f'H_fit @ M != I for rotation case (max t err {prod[:2,2].max():.2f}px)'
     e_after, e_before = closure_error(moving, H, ref)
@@ -139,11 +143,11 @@ def test_point_maps_moving_to_reference():
     M = M_translation(11.0, 7.5)
     moving = warp(ref, M)
     H = alignment.align_readout_to_reference(moving, ref)
-    p_ref = np.array([412.0, 633.0, 1.0])
-    p_moving = M @ p_ref                       # where the feature shows up in moving
-    back = H[:2] @ p_moving
-    err = np.hypot(back[0] - p_ref[0], back[1] - p_ref[1])
-    assert err < 0.6, f'point closure failed: |H @ (M @ p) - p| = {err:.2f}px'
+    p_ref_xy = np.array([412.0, 633.0, 1.0])
+    p_moving_xy = M @ p_ref_xy                 # where the feature shows up in moving (cv2 space)
+    back_yx = H[:2] @ np.array([p_moving_xy[1], p_moving_xy[0], 1.0])
+    err = np.hypot(back_yx[0] - p_ref_xy[1], back_yx[1] - p_ref_xy[0])
+    assert err < 0.6, f'point closure failed: |H_yx @ (M @ p) - p| = {err:.2f}px'
 
 
 def test_z_shift_sign_moves_target_onto_reference():

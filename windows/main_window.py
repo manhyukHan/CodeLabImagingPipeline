@@ -440,8 +440,10 @@ def _matrix_dxdy_angle(H):
     """'dx=, dy=, angle= deg' with no hybe prefix -- same numbers _matrix_
     summary reports, for a caller (Cell/Spot Status Detail's matrix panel)
     that already shows the hybe name in its own tree column."""
-    angle = np.degrees(np.arctan2(H[1, 0], H[0, 0]))
-    return f'dx={H[0,2]:.2f}, dy={H[1,2]:.2f}, angle={angle:.3f} deg'
+    # y-major H (convention.py): ty = H[0,2], tx = H[1,2]. Labels keep
+    # meaning dx=x / dy=y for the user; only the reads move.
+    angle = alignment.h_angle_degrees(H)
+    return f'dx={H[1,2]:.2f}, dy={H[0,2]:.2f}, angle={angle:.3f} deg'
 
 
 def _matrix_summary(hybe, H):
@@ -2369,9 +2371,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                   cell.nucleus_hybe, cell.nucleus_modality)
         if H is None:
             return np.array([]), np.array([])
-        x_lit, y_lit = cell.nucleus
+        y_lit, x_lit = cell.nucleus
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H), cell.frame_shape)
-        return cx, cy
+        return cy, cx
 
     def _build_nucleus_label_mask(self, cells, hybe, modality, fov, shape):
         """
@@ -2389,7 +2391,7 @@ class MainWindow(QtWidgets.QMainWindow):
         label_mask = np.zeros(shape, dtype=np.int32)
         painted = []
         for cell in cells:
-            x, y = self._cell_nucleus_in_readout(cell, hybe, modality, fov)
+            y, x = self._cell_nucleus_in_readout(cell, hybe, modality, fov)
             if len(x) == 0:
                 continue
             painted.append((len(x), cell.id, x, y))
@@ -2691,7 +2693,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # own segmentation modality; cells can come from either.
             if (reference_hybe, modality) not in cell.matrices:
                 approximate = True
-            x, y = self._cell_area_in_readout(cell, reference_hybe, modality, fov)
+            y, x = self._cell_area_in_readout(cell, reference_hybe, modality, fov)
             if len(x) == 0:
                 continue
             xi, yi = x.astype(int), y.astype(int)
@@ -3109,8 +3111,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # total made a ~7px row look like a correction the preview then
         # visibly "failed" to apply; parking the cell-level dz beside the
         # total's dx/dy mislabeled which layer it belongs to.
-        res_dx = spec['final_matrix'][0, 2] - spec['fov_only_matrix'][0, 2]
-        res_dy = spec['final_matrix'][1, 2] - spec['fov_only_matrix'][1, 2]
+        res_dx = spec['final_matrix'][1, 2] - spec['fov_only_matrix'][1, 2]
+        res_dy = spec['final_matrix'][0, 2] - spec['fov_only_matrix'][0, 2]
         res_dz = spec.get('dz', 0.0)
         return (f"FOV{fov:03d} Cell{cell.id:03d}: {spec['hybe']} ({modality}) | "
                f"{reference_hybe} ({modality}): dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f} "
@@ -3244,8 +3246,8 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_final_matrix = self._matrix_to_shared(reference_hybe, modality, cell, fov)
             if reference_final_matrix is None:
                 continue
-            dx = spec['final_matrix'][0, 2] - reference_final_matrix[0, 2]
-            dy = spec['final_matrix'][1, 2] - reference_final_matrix[1, 2]
+            dx = spec['final_matrix'][1, 2] - reference_final_matrix[1, 2]
+            dy = spec['final_matrix'][0, 2] - reference_final_matrix[0, 2]
             # The TOTAL group's dz is the cross-modal layer's own z drift
             # for this row's modality into the shared frame (0 for the
             # shared side). The cell-level per-hybe z (spec['dz']) belongs
@@ -3482,9 +3484,9 @@ class MainWindow(QtWidgets.QMainWindow):
         H_cellref = self._matrix_to_cellref(hybe, modality, cell, fov)
         if H_cellref is None:
             return np.array([]), np.array([])
-        x_lit, y_lit = cell.area
+        y_lit, x_lit = cell.area
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
-        return cx, cy
+        return cy, cx
 
     def _build_cell_display_crop(self, cell, hybe, channel, storage_path, fov, pad, modality):
         """
@@ -3500,7 +3502,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Uses _cell_area_in_readout (see its own docstring for the
         fallback this relies on).
         """
-        x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
+        y_area, x_area = self._cell_area_in_readout(cell, hybe, modality, fov)
         if len(x_area) == 0:
             return None
         x_area, y_area = x_area.astype(int), y_area.astype(int)
@@ -3583,7 +3585,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                    'modality': sp.current_hybe_modality(), 'rxmin': rxmin, 'rymin': rymin}
         scoped_spots = [s for s in self.spot_container.of_cell(fov, cell.id)
                         if s.hybe == hybe and s.channel == channel]
-        existing_points = [(s.raw_coordinate[0] - rxmin, s.raw_coordinate[1] - rymin) for s in scoped_spots]
+        existing_points = [(s.raw_coordinate[1] - rxmin, s.raw_coordinate[0] - rymin) for s in scoped_spots]
         # EVERY cell in this FOV, not just the selected one -- the left
         # panel exists to orient you, and a single lone contour among a
         # field of unmarked cells does not (confirmed: this used to pass
@@ -3591,7 +3593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # The selected cell is still the one the RIGHT panel crops to.
         context_masks = []
         for other in self._cells_for_fov(fov):
-            ox, oy = self._cell_area_in_readout(other, hybe, sp.current_hybe_modality(), fov)
+            oy, ox = self._cell_area_in_readout(other, hybe, sp.current_hybe_modality(), fov)
             if len(ox):
                 context_masks.append((other.id, ox, oy))
         if not context_masks:
@@ -3647,7 +3649,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         unassigned_spots = [s for s in self.spot_container.unassigned(fov)
                            if s.hybe == hybe and s.channel == channel]
-        unassigned_points = [(float(s.raw_coordinate[0]), float(s.raw_coordinate[1])) for s in unassigned_spots]
+        unassigned_points = [(float(s.raw_coordinate[1]), float(s.raw_coordinate[0])) for s in unassigned_spots]
         cell_owned_points = []
         cell_owned_refs = []
         context_masks = []
@@ -3664,13 +3666,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 # modal fallback _build_cell_display_crop's own Cell-view
                 # crop already has, so the two silently disagreed for any
                 # cell without real cell-level alignment for this hybe.
-                x_area, y_area = self._cell_area_in_readout(cell, hybe, modality, fov)
+                y_area, x_area = self._cell_area_in_readout(cell, hybe, modality, fov)
                 if len(x_area):
                     context_masks.append((cell.id, x_area, y_area))
             for s in self.spot_container.all(fov):
                 cell = cells_by_id.get(int(s.cell)) if int(s.cell) != -1 else None
                 if cell is not None and s.hybe == hybe and s.channel == channel:
-                    cell_owned_points.append((float(s.raw_coordinate[0]), float(s.raw_coordinate[1]), cell.id))
+                    cell_owned_points.append((float(s.raw_coordinate[1]), float(s.raw_coordinate[0]), cell.id))
                     cell_owned_refs.append((s, cell))
         # The RIGHT (working) panel gets the cell boundaries too, as one
         # combined raster -- per confirmed real bug it was passed mask=None
@@ -4017,7 +4019,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 rx, ry = spot_mapper.reference_to_raw((x, y), hybe, fov_matrices, modality=modality, cell=None)
                 return rx, ry, z
             return coord_xyz
-        x, y, z = coord_xyz
+        y, x, z = coord_xyz
         # Resolver-backed, never ACell.matrix_to_shared directly -- that
         # raises by design once this cell carries residual-form matrices
         # (post cell alignment); the resolver composes the FOV leg live.
@@ -4025,13 +4027,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if H is None:
             H = np.eye(3)
         Hinv = la.inv(H)
-        rx, ry, _ = Hinv @ np.array([x, y, 1.0])
+        ry, rx, _ = Hinv @ np.array([y, x, 1.0])
         # entry_dz returns a plain float now -- the old Hz[1, 2] indexing
         # here was a latent TypeError (floats don't index) that #62's
         # sweep missed because this path only runs for persisted mixture
         # siblings.
         dz_cell = alignment.entry_dz(cell.matrices.get((hybe, modality)))
-        return float(rx), float(ry), float(z - dz_cell)
+        return float(ry), float(rx), float(z - dz_cell)
 
     def _show_3d_crop_only(self):
         """
@@ -4069,10 +4071,10 @@ class MainWindow(QtWidgets.QMainWindow):
         grid_results = []
         for spot, cell in targets:
             title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
-            raw_x, raw_y = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
+            raw_y, raw_x = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
             try:
                 cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
-                                                                        (raw_x, raw_y), pad=params['spad'], use_stack=True)
+                                                                        (raw_y, raw_x), pad=params['spad'], use_stack=True)
             except OSError:
                 continue
             if cubic.size == 0:
@@ -4688,11 +4690,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 # used to -- resolve the same way here instead of assuming.
                 H_shared = self._matrix_to_shared(hybe, ctx['modality'], cell, cell.fov)
                 if H_shared is not None:
-                    cx, cy, _ = H_shared @ np.array([raw_x, raw_y, 1.0])
+                    cy, cx, _ = H_shared @ np.array([raw_y, raw_x, 1.0])
                 else:
-                    cx, cy = float(raw_x), float(raw_y)
+                    cy, cx = float(raw_y), float(raw_x)
                 spot.set_metadata(fov=cell.fov, hybe=hybe, channel=channel, cell=cell.id,
-                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cy, cx, 0.0), raw_coordinate=(raw_y, raw_x, 0.0),
                                   size=0.0, brightness=brightness)
             else:
                 # No owning cell yet, but still mapped into the SHARED
@@ -4702,12 +4704,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 # raw==coordinate only when this hybe truly has no FOV-level
                 # matrix yet (Same-Modality Alignment never run for it).
                 if (hybe, fov_matrices.modality) in fov_matrices:
-                    cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, fov_matrices,
+                    cy, cx = spot_mapper.raw_to_reference((raw_y, raw_x), hybe, fov_matrices,
                                                           modality=ctx['modality'], cell=None)
                 else:
-                    cx, cy = float(raw_x), float(raw_y)
+                    cy, cx = float(raw_y), float(raw_x)
                 spot.set_metadata(fov=ctx['fov'], hybe=hybe, channel=channel,
-                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cy, cx, 0.0), raw_coordinate=(raw_y, raw_x, 0.0),
                                   size=0.0, brightness=brightness)
             new_spots.append(spot)
 
@@ -4764,7 +4766,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         match = next((s for s in self.spot_container.of_cell(fov, cell.id)
                      if s.hybe == hybe and s.channel == channel
-                     and abs(s.raw_coordinate[0] - x) < 0.5 and abs(s.raw_coordinate[1] - y) < 0.5), None)
+                     and abs(s.raw_coordinate[0] - y) < 0.5 and abs(s.raw_coordinate[1] - x) < 0.5), None)
         if match is None:
             return
         fp = self.spot_container.fingerprint(fov)
@@ -4839,14 +4841,14 @@ class MainWindow(QtWidgets.QMainWindow):
             for y, x in coords:
                 raw_x, raw_y = int(x) + rxmin, int(y) + rymin
                 if H is not None:
-                    cx, cy, _ = H @ np.array([raw_x, raw_y, 1.0])
+                    cy, cx, _ = H @ np.array([raw_y, raw_x, 1.0])
                 else:
-                    cx, cy = float(raw_x), float(raw_y)
+                    cy, cx = float(raw_y), float(raw_x)
                 spot = ASpot()
                 # Never '' -- see the manual-click door's own comment.
                 spot.modality = modality or vlinks_store.modality_of(storage_path)
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
-                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cy, cx, 0.0), raw_coordinate=(raw_y, raw_x, 0.0),
                                   size=0.0, brightness=float(img[y, x]))
                 new_spots.append(spot)
             fp = self._begin_spot_edit(cell.fov)
@@ -4880,14 +4882,14 @@ class MainWindow(QtWidgets.QMainWindow):
             for y, x in coords:
                 raw_x, raw_y = int(x), int(y)
                 if (hybe, fov_matrices.modality) in fov_matrices:
-                    cx, cy = spot_mapper.raw_to_reference((raw_x, raw_y), hybe, fov_matrices, modality=modality, cell=None)
+                    cy, cx = spot_mapper.raw_to_reference((raw_y, raw_x), hybe, fov_matrices, modality=modality, cell=None)
                 else:
-                    cx, cy = float(raw_x), float(raw_y)
+                    cy, cx = float(raw_y), float(raw_x)
                 spot = ASpot()
                 # Never '' -- see the manual-click door's own comment.
                 spot.modality = modality or vlinks_store.modality_of(storage_path)
                 spot.set_metadata(fov=fov, hybe=hybe, channel=channel,
-                                  coordinate=(cx, cy, 0.0), raw_coordinate=(raw_x, raw_y, 0.0),
+                                  coordinate=(cy, cx, 0.0), raw_coordinate=(raw_y, raw_x, 0.0),
                                   size=0.0, brightness=float(mip[y, x]))
                 new_spots.append(spot)
             fp = self._begin_spot_edit(fov)
@@ -5253,7 +5255,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mz1 = min(cubic.shape[2], z1)
             mov_yx = norm2d(np.nanmax(cubic, axis=2))
             mov_zx = norm2d(np.nanmax(cubic[:, :, z0:mz1], axis=0).T)
-            dx, dy, dz = fit[0] - ref_fit[0], fit[1] - ref_fit[1], fit[2] - ref_fit[2]
+            dy, dx, dz = fit[0] - ref_fit[0], fit[1] - ref_fit[1], fit[2] - ref_fit[2]
             entries.append((rgb(ref_yx, mov_yx), rgb(ref_yx, shifted(mov_yx, dx, dy)),
                             rgb(ref_zx, mov_zx), rgb(ref_zx, shifted(mov_zx, dx, dz)),
                             f'{hybe}  d=({dx:+.2f},{dy:+.2f},{dz:+.2f})'))
@@ -5653,7 +5655,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
 
                 for cell in cells.values():
-                    x_ref, y_ref = cell.area
+                    y_ref, x_ref = cell.area
                     area_by_channel = {}
                     for bch in barcode_channel:
                         hybe, channel_id, modality = bch
@@ -5682,8 +5684,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         H = self._matrix_to_cellref(hybe, modality, cell, cell.fov)
                         if H is None:
                             continue
-                        pts = la.inv(H) @ np.vstack([x_ref, y_ref, np.ones_like(x_ref, dtype=float)])
-                        x_h, y_h = pts[0], pts[1]
+                        pts = la.inv(H) @ np.vstack([y_ref, x_ref, np.ones_like(x_ref, dtype=float)])
+                        y_h, x_h = pts[0], pts[1]
                         height, width = img.shape
                         area_by_channel[bch] = (np.clip(x_h, 0, width - 1), np.clip(y_h, 0, height - 1))
                     if len(area_by_channel) < len(barcode_channel):
@@ -5708,7 +5710,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             H = self._matrix_to_shared(hybe, modality, cell, cell.fov)
                             if H is None:
                                 continue
-                            sx, sy, _ = la.inv(H) @ np.array([spot.coordinate[0], spot.coordinate[1], 1.0])
+                            sy, sx, _ = la.inv(H) @ np.array([spot.coordinate[0], spot.coordinate[1], 1.0])
                             xy_by_channel[bch] = (sx, sy)
                         if len(xy_by_channel) < len(barcode_channel):
                             continue

@@ -1,11 +1,10 @@
 """
 Coordinate-convention harness.
 
-Written as the prerequisite for the Y/X (rasterized) coordinate unification:
-the pipeline currently mixes orders -- cell.area is (x, y), frame_shape is
-(height, width), align_cell takes (y, x), and homographies act on (x, y, 1)
--- and flipping that is only safe with a test that fails loudly on a
-transposed axis.
+Written as the prerequisite for the Y/X (rasterized) coordinate
+unification, and now asserting the UNIFIED convention (convention.py):
+points are (y, x), homographies act on [y, x, 1], cv2 is reached only
+through convention.as_cv2. Still fails loudly on any transposed axis.
 
 WHY THIS EXISTS AT ALL: the real dataset is currently all-identity (fresh
 vlinks, no alignment run). Identity is invariant under an axis swap --
@@ -39,6 +38,7 @@ import numpy.linalg as la
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.alignment.convention import as_cv2, to_yx
 
 # Deliberately non-square: a (height, width) vs (width, height) mix-up
 # changes which coordinates survive the bounds check in align_cell.
@@ -47,10 +47,11 @@ DX, DY = 37.0, -11.0       # deliberately different, and opposite signs
 
 
 def _translation(dx, dy):
-    """A pure translation in the pipeline's current (x, y, 1)-major convention."""
+    """A pure translation in the pipeline's y-major convention: ty at
+    [0, 2], tx at [1, 2] (convention.py)."""
     H = np.eye(3)
-    H[0, 2] = dx
-    H[1, 2] = dy
+    H[0, 2] = dy
+    H[1, 2] = dx
     return H
 
 
@@ -150,7 +151,7 @@ def test_coordinate_and_image_paths_agree():
     # Image path: cv2 indexes (col=x, row=y) and takes the 2x3 slice.
     img = np.zeros(FRAME_SHAPE, dtype=np.float32)
     img[y, x] = 1.0
-    warped = cv2.warpAffine(img, H[:2], (FRAME_SHAPE[1], FRAME_SHAPE[0]),
+    warped = cv2.warpAffine(img, as_cv2(H)[:2], (FRAME_SHAPE[1], FRAME_SHAPE[0]),
                             flags=cv2.INTER_NEAREST)
     img_y, img_x = np.where(warped > 0.5)
 
@@ -173,11 +174,12 @@ def test_rotation_is_not_silently_a_transpose():
     """
     y, x = _asymmetric_mask()
     theta = np.deg2rad(90.0)
-    H = np.eye(3)
-    H[:2, :2] = [[np.cos(theta), -np.sin(theta)],
-                 [np.sin(theta), np.cos(theta)]]
+    H_xy = np.eye(3)
+    H_xy[:2, :2] = [[np.cos(theta), -np.sin(theta)],
+                    [np.sin(theta), np.cos(theta)]]
     # Shift back into frame: rotating about the origin sends x>0 to y>0, x<0.
-    H[0, 2] = 450.0
+    H_xy[0, 2] = 450.0
+    H = to_yx(H_xy)   # same physical transform, y-major layout
 
     ry, rx = alignment.align_cell((y, x), H, FRAME_SHAPE)
     assert len(ry) > 0, 'rotation put the entire mask out of frame'
@@ -251,12 +253,12 @@ def test_harness_detects_a_transposed_implementation():
             y, x = yx
             height, width = shape
             if kind == 'matrix_input':
-                # coordinates flipped to Y/X but the matrix left X-major:
-                # the classic "flipped the data model, forgot the matrices"
-                cx, cy = (H[:2] @ np.array([y, x, np.ones_like(x)])).astype(int)
+                # y-major matrix applied to (x, y)-ordered points: the
+                # classic "flipped the data model, forgot a call site"
+                cy, cx = (H[:2] @ np.array([x, y, np.ones_like(x)])).astype(int)
             else:
-                cx, cy = (H[:2] @ np.array([x, y, np.ones_like(x)])).astype(int)
-                cx, cy = cy, cx      # returns (x, y) where (y, x) is expected
+                cy, cx = (H[:2] @ np.array([y, x, np.ones_like(x)])).astype(int)
+                cy, cx = cx, cy      # returns (x, y) where (y, x) is expected
             bad = (cx < 0) | (cy < 0) | (cx >= width) | (cy >= height)
             return cy[~bad], cx[~bad]
         return f
