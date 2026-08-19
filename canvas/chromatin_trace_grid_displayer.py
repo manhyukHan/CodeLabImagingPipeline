@@ -103,7 +103,10 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         hybe's; grey/white = coincident. Hybes whose Gaussian fit failed
         are omitted by the caller per explicit spec.
 
-        entries: [(rgb_before (h,w,3), rgb_after (h,w,3), title), ...]
+        entries: [(yx_before, yx_after, zx_before, zx_after, title), ...]
+        -- each an (h,w,3) RGB; the tile is a 2x2 (columns YX | ZX, rows
+        before | after), sharing the fit-status grids' own YX-above-depth
+        convention and z-window.
         """
         self._current_allele_label = allele_label
         self._current_params = dict(params) if params else {}
@@ -115,23 +118,23 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
             return
         ncols = min(len(entries), MAX_GRID_COLUMNS)
         nrows_pairs = -(-len(entries) // ncols)
-        col_px, pair_px = 190, 300
+        col_px, pair_px = 320, 320
         outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
-                                 left=0.06, right=0.98, top=0.90, bottom=0.03)
-        for i, (before, after, title) in enumerate(entries):
+                                 left=0.05, right=0.98, top=0.90, bottom=0.03)
+        for i, (yx_b, yx_a, zx_b, zx_a, title) in enumerate(entries):
             row_pair, col = divmod(i, ncols)
-            inner = outer[row_pair, col].subgridspec(2, 1, hspace=0.08)
-            ax_b = fig.add_subplot(inner[0])
-            ax_a = fig.add_subplot(inner[1])
-            ax_b.imshow(before)
-            ax_a.imshow(after)
-            ax_b.set_title(title, fontsize=8)
-            if col == 0:
-                ax_b.set_ylabel('before', fontsize=7)
-                ax_a.set_ylabel('after', fontsize=7)
-            for ax in (ax_b, ax_a):
+            inner = outer[row_pair, col].subgridspec(2, 2, hspace=0.08, wspace=0.08)
+            axes = [[fig.add_subplot(inner[r, c]) for c in range(2)] for r in range(2)]
+            for ax, img in ((axes[0][0], yx_b), (axes[1][0], yx_a),
+                            (axes[0][1], zx_b), (axes[1][1], zx_a)):
+                ax.imshow(img, aspect='auto')
                 ax.set_xticks([])
                 ax.set_yticks([])
+            axes[0][0].set_title(f'{title}\nYX', fontsize=8)
+            axes[0][1].set_title('ZX', fontsize=8)
+            if col == 0:
+                axes[0][0].set_ylabel('before', fontsize=7)
+                axes[1][0].set_ylabel('after', fontsize=7)
         width_px = max(self.canvas.minimumWidth(), ncols * col_px)
         height_px = max(self.canvas.minimumHeight(), nrows_pairs * pair_px)
         self._resize_canvas(width_px, height_px)

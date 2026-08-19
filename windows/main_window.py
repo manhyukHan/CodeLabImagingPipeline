@@ -5138,8 +5138,8 @@ class MainWindow(QtWidgets.QMainWindow):
         spec; so is the whole overlay when the reference itself has no
         fit, since every drift is measured against it.
         """
-        def norm(cubic):
-            img = np.nanmax(np.asarray(cubic, dtype=float), axis=2)
+        def norm2d(img):
+            img = np.asarray(img, dtype=float)
             lo, hi = np.nanquantile(img, 0.3), np.nanquantile(img, 0.999)
             return np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
 
@@ -5152,12 +5152,25 @@ class MainWindow(QtWidgets.QMainWindow):
             out[..., 2] = mov_img[:h, :w]
             return out
 
+        def shifted(img, dx_h, dy_v):
+            M = np.array([[1.0, 0.0, -dx_h], [0.0, 1.0, -dy_v]], dtype=np.float64)
+            return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+
+        Z_PAD = 15   # same z display window the fit-status grids use
         fid = allele.fiducial_trace or {}
         ref_fit = fid.get(reference_hybe)
         ref_cubic = (debug.get(reference_hybe) or {}).get('fiducial_cubic')
         if ref_fit is None or ref_cubic is None:
             return []
-        ref_img = norm(ref_cubic)
+        ref_cubic = np.asarray(ref_cubic, dtype=float)
+        # ONE absolute z-window (the reference fit's) applied to BOTH
+        # sides of every pair: windowing each hybe around its OWN fit
+        # would silently re-center the depth axis and hide the very dz
+        # drift the ZX row exists to show.
+        z0 = max(0, int(round(ref_fit[2])) - Z_PAD)
+        z1 = min(ref_cubic.shape[2], int(round(ref_fit[2])) + Z_PAD + 1)
+        ref_yx = norm2d(np.nanmax(ref_cubic, axis=2))
+        ref_zx = norm2d(np.nanmax(ref_cubic[:, :, z0:z1], axis=0).T)
         entries = []
         for hybe in sorted(fid):
             if hybe == reference_hybe:
@@ -5166,12 +5179,14 @@ class MainWindow(QtWidgets.QMainWindow):
             cubic = (debug.get(hybe) or {}).get('fiducial_cubic')
             if fit is None or cubic is None:
                 continue
-            mov = norm(cubic)
-            dx, dy = fit[0] - ref_fit[0], fit[1] - ref_fit[1]
-            M = np.array([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float64)
-            mov_shift = cv2.warpAffine(mov, M, (mov.shape[1], mov.shape[0]))
-            entries.append((rgb(ref_img, mov), rgb(ref_img, mov_shift),
-                            f'{hybe}  d=({dx:+.2f},{dy:+.2f})'))
+            cubic = np.asarray(cubic, dtype=float)
+            mz1 = min(cubic.shape[2], z1)
+            mov_yx = norm2d(np.nanmax(cubic, axis=2))
+            mov_zx = norm2d(np.nanmax(cubic[:, :, z0:mz1], axis=0).T)
+            dx, dy, dz = fit[0] - ref_fit[0], fit[1] - ref_fit[1], fit[2] - ref_fit[2]
+            entries.append((rgb(ref_yx, mov_yx), rgb(ref_yx, shifted(mov_yx, dx, dy)),
+                            rgb(ref_zx, mov_zx), rgb(ref_zx, shifted(mov_zx, dx, dz)),
+                            f'{hybe}  d=({dx:+.2f},{dy:+.2f},{dz:+.2f})'))
         return entries
 
     def _refresh_allele_anchor(self, allele, fov):
