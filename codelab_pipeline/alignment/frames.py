@@ -54,7 +54,14 @@ want the invariant enforced rather than assumed.
 import numpy as np
 import numpy.linalg as la
 
-from . import chain
+# NO module-level `from . import chain`: chain.py re-exports FrameMatrices
+# from THIS module at ITS OWN top, so whichever of the two imports first
+# must not need the other at import time. When frames loaded first, its
+# eager chain import re-entered chain, whose `from .frames import
+# FrameMatrices` then hit this half-initialized module -- confirmed real
+# ImportError, order-dependent so most sessions never saw it. chain is
+# used in exactly one function (z_to_shared's entry_dz call); imported
+# there, at call time, when both modules are fully initialized.
 
 
 IDENTITY = np.eye(3)
@@ -277,6 +284,7 @@ class FrameResolver:
         """
         z_cell = 0.0
         if cell is not None:
+            from . import chain   # call-time import -- see module header
             z_cell = chain.entry_dz(getattr(cell, 'matrices', {}).get((hybe, modality)))
         return z_cell + self.bridge_z_between(modality, self.shared)
 
