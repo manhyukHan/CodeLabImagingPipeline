@@ -586,6 +586,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chromatin_alleles = {}
         self.chromatin_fiducial_grid_displayer = ChromatinTraceGridDisplayer('Fiducial')
         self.chromatin_readout_grid_displayer = ChromatinTraceGridDisplayer('Readout')
+        self.chromatin_fiducial_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Overlay')
 
         self._connect_signals()
         self._switch_current_modality(self.ui.IngestionPanel.ModalityComboBox.currentText())
@@ -5009,7 +5010,8 @@ class MainWindow(QtWidgets.QMainWindow):
         alleles = []
         for i, d in enumerate(selected, start=1):
             allele = AnAllele()
-            allele.set_metadata(id=i, fov=fov, cell=d['cell'], anchor_hybe=d['hybe'], anchor_channel=d['channel'],
+            allele.set_metadata(id=i, fov=fov, cell=d['cell'], anchor_uid=d.get('uid', 0),
+                                anchor_hybe=d['hybe'], anchor_channel=d['channel'],
                                 coordinate=d['coordinate'], raw_coordinate=d['raw_coordinate'])
             alleles.append(allele)
         self.chromatin_alleles[(storage_path, fov)] = alleles
@@ -5081,6 +5083,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # matches every other spot-related method's own guard against
         # exactly that (see _refresh_spot_cell_list).
         self._activate_fov(fov)
+        # Anchor from the source spot's CURRENT position (by anchor_uid),
+        # not the Build-time snapshot -- a 3D refinement moves the spot.
+        self._refresh_allele_anchor(allele, fov)
         cell = self._find_cell_by_id(fov, allele.cell) if allele.cell != -1 else None
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
 
@@ -5105,13 +5110,88 @@ class MainWindow(QtWidgets.QMainWindow):
         allele_label = f'FOV{fov:02d}_allele{allele.id}'
         self.chromatin_fiducial_grid_displayer.show_fit_status_grid(fid_results, allele_label=allele_label, params=full_params)
         self.chromatin_readout_grid_displayer.show_fit_status_grid(readout_results, allele_label=allele_label, params=full_params)
+        overlay_entries = self._build_fiducial_overlay_entries(allele, reference_hybe, debug)
+        self.chromatin_fiducial_overlay_displayer.show_overlay_grid(
+            overlay_entries, allele_label=allele_label, params=full_params)
         self.chromatin_fiducial_grid_displayer.show()
         self.chromatin_fiducial_grid_displayer.raise_()
         self.chromatin_readout_grid_displayer.show()
         self.chromatin_readout_grid_displayer.raise_()
+        self.chromatin_fiducial_overlay_displayer.show()
+        self.chromatin_fiducial_overlay_displayer.raise_()
         self._refresh_chromatin_allele_lists(storage_path, fov)
         chp.StatusLabel.setText(f'Allele {allele.id}: {len(allele.polymer)}/{len(hybes)} hybe(s) traced '
                                 f'({len(allele.rejected_hybes)} rejected).')
+
+    @staticmethod
+    def _build_fiducial_overlay_entries(allele, reference_hybe, debug):
+        """
+        Red-cyan overlay tiles for the Fiducial Overlay popup: per hybe,
+        red = reference hybe's fiducial crop (max-projected), cyan = this
+        hybe's -- BEFORE as the trace actually cut them (centers already
+        carry the modality/cell-residual correction via reference_to_raw)
+        and AFTER with the moving crop shifted by the GAUSSIAN-CENTROID
+        drift (allele.fiducial_trace[h] - fiducial_trace[reference]) --
+        fiducial alignment is centroid matching, never image matching, so
+        the applied shift IS the fit result. A hybe whose Gaussian fit
+        failed (fiducial_trace None / missing) is omitted, per explicit
+        spec; so is the whole overlay when the reference itself has no
+        fit, since every drift is measured against it.
+        """
+        def norm(cubic):
+            img = np.nanmax(np.asarray(cubic, dtype=float), axis=2)
+            lo, hi = np.nanquantile(img, 0.3), np.nanquantile(img, 0.999)
+            return np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
+
+        def rgb(ref_img, mov_img):
+            h = min(ref_img.shape[0], mov_img.shape[0])
+            w = min(ref_img.shape[1], mov_img.shape[1])
+            out = np.zeros((h, w, 3))
+            out[..., 0] = ref_img[:h, :w]
+            out[..., 1] = mov_img[:h, :w]
+            out[..., 2] = mov_img[:h, :w]
+            return out
+
+        fid = allele.fiducial_trace or {}
+        ref_fit = fid.get(reference_hybe)
+        ref_cubic = (debug.get(reference_hybe) or {}).get('fiducial_cubic')
+        if ref_fit is None or ref_cubic is None:
+            return []
+        ref_img = norm(ref_cubic)
+        entries = []
+        for hybe in sorted(fid):
+            if hybe == reference_hybe:
+                continue
+            fit = fid[hybe]
+            cubic = (debug.get(hybe) or {}).get('fiducial_cubic')
+            if fit is None or cubic is None:
+                continue
+            mov = norm(cubic)
+            dx, dy = fit[0] - ref_fit[0], fit[1] - ref_fit[1]
+            M = np.array([[1.0, 0.0, -dx], [0.0, 1.0, -dy]], dtype=np.float64)
+            mov_shift = cv2.warpAffine(mov, M, (mov.shape[1], mov.shape[0]))
+            entries.append((rgb(ref_img, mov), rgb(ref_img, mov_shift),
+                            f'{hybe}  d=({dx:+.2f},{dy:+.2f})'))
+        return entries
+
+    def _refresh_allele_anchor(self, allele, fov):
+        """
+        Re-derive this allele's anchor coordinates from its source spot's
+        CURRENT position (by anchor_uid) -- the anchor fields are a Build-
+        time snapshot, and a later 3D refinement legitimately moves the
+        spot (confirmed real divergence between an allele and its own
+        spot). uid=0 (legacy allele, built before the link existed) or a
+        since-removed spot leaves the snapshot as-is.
+        """
+        uid = int(getattr(allele, 'anchor_uid', 0))
+        if not uid or self.spot_container is None:
+            return False
+        spot = self.spot_container.data.get(fov, {}).get(uid)
+        if spot is None or spot.hybe != allele.anchor_hybe:
+            return False
+        allele.coordinate = tuple(spot.coordinate)
+        allele.raw_coordinate = tuple(spot.raw_coordinate)
+        return True
 
     def _run_chromatin_tracing_fit_all(self):
         """
@@ -5142,6 +5222,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # (_find_cell_by_id) has real data to read from the background
             # thread without touching session state itself.
             self._activate_fov(fov)
+            for a in alleles:
+                # anchor from the source spot's CURRENT position -- see
+                # _refresh_allele_anchor.
+                self._refresh_allele_anchor(a, fov)
             jobs.append((storage_path, fov, alleles))
             fov_matrices_by_fov[fov] = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
             # Built here, on the main thread, for the same reason as

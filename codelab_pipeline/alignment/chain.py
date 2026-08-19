@@ -101,11 +101,29 @@ def align_cell(yx, H, shape):
     cx,cy = (H[:2]@np.array([x,y,np.ones_like(x)])).astype(int)
     bad = (cx < 0) | ( cy < 0) | (cx >= width) | (cy >= height)
     cx,cy = cx[~bad],cy[~bad]
-    adjusted_mask = np.zeros((height,width))
-    adjusted_mask[cy,cx] = 1
-    closed = cv2.morphologyEx(adjusted_mask, cv2.MORPH_CLOSE, kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
-    cy,cx = np.where(closed > 0)
-    return cy,cx
+    if cx.size == 0:
+        return cy, cx
+    # Rasterize + close in a LOCAL bbox, not the full frame: closing with
+    # a 3x3 kernel is a 1px-radius local operation, so a bbox with a 2px
+    # margin of REAL zeros (1 for the dilation reach + 1 for the erosion
+    # neighborhood -- cv2 morphology treats the array border itself with
+    # special +/-inf values, NOT zeros, so a 1px margin left border-
+    # touching pixels uneroded: confirmed 5-extra-point mismatch) yields
+    # the byte-identical point set at a fraction of the cost. Where the
+    # bbox is clipped by the actual frame edge the local border COINCIDES
+    # with the frame border, reproducing the full-frame border behavior
+    # exactly. The full-frame version allocated and morphed height*width
+    # pixels PER CELL, which made the FOV-view "cell masks" overlay the
+    # dominant cost of every hybe/channel switch (101 cells: ~0.9s of a
+    # 1.8s switch, measured).
+    pad = 2
+    x0, y0 = max(0, int(cx.min()) - pad), max(0, int(cy.min()) - pad)
+    x1, y1 = min(width, int(cx.max()) + pad + 1), min(height, int(cy.max()) + pad + 1)
+    local = np.zeros((y1 - y0, x1 - x0))
+    local[cy - y0, cx - x0] = 1
+    closed = cv2.morphologyEx(local, cv2.MORPH_CLOSE, kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
+    ly, lx = np.where(closed > 0)
+    return ly + y0, lx + x0
 
 def compose_chain(matrices):
     """

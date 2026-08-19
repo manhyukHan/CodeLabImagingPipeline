@@ -54,6 +54,12 @@ class AnAllele():
         self.id = 0
         self.fov = 0
         self.cell = -1
+        # uid of the ASpot this allele was built from (0 = unknown/legacy).
+        # The anchor coordinate fields below are a snapshot taken at Build
+        # time; the uid is what lets the session REFRESH them from the
+        # spot's current position (a later 3D refinement moves the spot --
+        # confirmed real divergence) instead of drifting apart silently.
+        self.anchor_uid = 0
         self.anchor_hybe = ''
         self.anchor_channel = 0
         self.coordinate = (0.0, 0.0, 0.0)
@@ -69,6 +75,7 @@ class AnAllele():
         if 'id' in kwargs: self.id = int(kwargs['id'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'cell' in kwargs: self.cell = int(kwargs['cell'])
+        if 'anchor_uid' in kwargs: self.anchor_uid = int(kwargs['anchor_uid'])
         if 'anchor_hybe' in kwargs: self.anchor_hybe = str(kwargs['anchor_hybe'])
         if 'anchor_channel' in kwargs: self.anchor_channel = int(kwargs['anchor_channel'])
         if 'coordinate' in kwargs: self.coordinate = tuple(kwargs['coordinate'])
@@ -95,6 +102,7 @@ class AnAllele():
         return {'id': int(self.id),
                 'fov': int(self.fov),
                 'cell': int(self.cell),
+                'anchor_uid': int(self.anchor_uid),
                 'anchor_hybe': str(self.anchor_hybe),
                 'anchor_channel': int(self.anchor_channel),
                 'coordinate': tuple(self.coordinate),

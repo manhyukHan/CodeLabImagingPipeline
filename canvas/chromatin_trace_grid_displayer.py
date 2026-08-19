@@ -91,6 +91,52 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self._resize_canvas(width_px, height_px)
         self._force_repaint()
 
+    def show_overlay_grid(self, entries, allele_label='', params=None):
+        """
+        Red-cyan fiducial overlay tiles, one per hybe: TOP = before
+        fiducial alignment (each crop cut at its modality/cell-residual-
+        corrected center, exactly as the trace took it), BOTTOM = after
+        (the moving crop shifted by the GAUSSIAN-CENTROID drift measured
+        against the reference hybe -- fiducial alignment is centroid
+        matching, never image matching, so the shift IS the fit result,
+        not a correlation). red = reference hybe's crop, cyan = this
+        hybe's; grey/white = coincident. Hybes whose Gaussian fit failed
+        are omitted by the caller per explicit spec.
+
+        entries: [(rgb_before (h,w,3), rgb_after (h,w,3), title), ...]
+        """
+        self._current_allele_label = allele_label
+        self._current_params = dict(params) if params else {}
+        fig = self.canvas.figure
+        fig.clear()
+        if not entries:
+            self._resize_canvas(self.canvas.minimumWidth(), self.canvas.minimumHeight())
+            self._force_repaint()
+            return
+        ncols = min(len(entries), MAX_GRID_COLUMNS)
+        nrows_pairs = -(-len(entries) // ncols)
+        col_px, pair_px = 190, 300
+        outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
+                                 left=0.06, right=0.98, top=0.90, bottom=0.03)
+        for i, (before, after, title) in enumerate(entries):
+            row_pair, col = divmod(i, ncols)
+            inner = outer[row_pair, col].subgridspec(2, 1, hspace=0.08)
+            ax_b = fig.add_subplot(inner[0])
+            ax_a = fig.add_subplot(inner[1])
+            ax_b.imshow(before)
+            ax_a.imshow(after)
+            ax_b.set_title(title, fontsize=8)
+            if col == 0:
+                ax_b.set_ylabel('before', fontsize=7)
+                ax_a.set_ylabel('after', fontsize=7)
+            for ax in (ax_b, ax_a):
+                ax.set_xticks([])
+                ax.set_yticks([])
+        width_px = max(self.canvas.minimumWidth(), ncols * col_px)
+        height_px = max(self.canvas.minimumHeight(), nrows_pairs * pair_px)
+        self._resize_canvas(width_px, height_px)
+        self._force_repaint()
+
     def save_figure(self):
         """
         Default filename embeds the allele + the live fit-parameter values
