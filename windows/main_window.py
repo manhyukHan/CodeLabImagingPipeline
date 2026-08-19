@@ -2553,7 +2553,7 @@ class MainWindow(QtWidgets.QMainWindow):
             y, x = np.where(merged == cell.id)
             if len(x) == 0:
                 continue
-            cell.set_metadata(area=(x, y), reference_hybe=hybe, reference_modality=modality,
+            cell.set_metadata(area=(y, x), reference_hybe=hybe, reference_modality=modality,
                               frame_shape=merged.shape)
             n_updated += 1
 

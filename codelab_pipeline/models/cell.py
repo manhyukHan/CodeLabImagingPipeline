@@ -18,17 +18,17 @@ def _frozen_xy(xy):
     instead of deep-copying kilobytes per cell: an in-place write anywhere
     now raises instead of silently corrupting the other tier.
     """
-    x, y = xy
-    x = np.asarray(x)
-    y = np.asarray(y)
+    a, b = xy                     # (y, x) -- pass-through, order untouched
+    a = np.asarray(a)
+    b = np.asarray(b)
     try:
-        x.flags.writeable = False
-        y.flags.writeable = False
+        a.flags.writeable = False
+        b.flags.writeable = False
     except ValueError:
         # a view of a still-writeable base cannot be locked; copy then lock
-        x = x.copy(); y = y.copy()
-        x.flags.writeable = False; y.flags.writeable = False
-    return (x, y)
+        a = a.copy(); b = b.copy()
+        a.flags.writeable = False; b.flags.writeable = False
+    return (a, b)
 
 
 class ACell():

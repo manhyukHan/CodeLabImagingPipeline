@@ -118,7 +118,7 @@ class CellContainer():
                                   reference_hybe=old.reference_hybe, celltype=old.celltype,
                                   reference_modality=old.reference_modality,
                                   **nucleus_kwargs,
-                                  area=(x, y) if same_frame else old.area,
+                                  area=(y, x) if same_frame else old.area,
                                   frame_shape=mask.shape if same_frame else old.frame_shape,
                                   matrices=deepcopy(old.matrices), matrix_anchors=deepcopy(old.matrix_anchors),
                                   matrix_provenance=deepcopy(old.matrix_provenance),
@@ -134,11 +134,8 @@ class CellContainer():
                 cell.set_metadata(id=int(cell_id), fov=int(fov),
                                   reference_hybe=reference_hybe, reference_modality=cell_modality,
                                   nucleus_hybe=reference_hybe, nucleus_modality=cell_modality,
-                                  area=(x, y), frame_shape=mask.shape)
+                                  area=(y, x), frame_shape=mask.shape)
             self.data[fov][int(cell.id)] = cell
-
-    def get_cell(self, fov, index):
-        return self.data[fov][index]
 
     def get_cells(self, fov):
         return list(self.data.get(fov, {}).values())

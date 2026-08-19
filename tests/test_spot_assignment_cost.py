@@ -47,8 +47,8 @@ def make_spots(n, shape, rng):
         s = ASpot()
         s.modality = MODALITY
         s.set_metadata(uid=i + 1, fov=FOV, hybe=HYBE, channel=635,
-                       raw_coordinate=(float(xs[i]), float(ys[i]), 0.0),
-                       coordinate=(float(xs[i]), float(ys[i]), 0.0))
+                       raw_coordinate=(float(ys[i]), float(xs[i]), 0.0),
+                       coordinate=(float(ys[i]), float(xs[i]), 0.0))
         out.append(s)
     return out
 

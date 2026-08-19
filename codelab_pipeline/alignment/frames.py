@@ -144,10 +144,6 @@ class FrameMatrices(dict):
         return FrameMatrices({k: v for k, v in self.items() if k[1] == modality},
                              modality=modality)
 
-    def hybes_for(self, modality):
-        """Every hybe present for one modality, as a plain sorted list."""
-        return sorted(h for (h, m) in self.keys() if m == modality)
-
 
 class FrameResolver:
     """

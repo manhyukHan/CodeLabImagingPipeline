@@ -249,41 +249,6 @@ def write_cells(storage_path, fov, cell_container):
         # own store is the real count.
 
 
-def write_single_cell(storage_path, fov, cell):
-    """
-    Merges exactly one cell's current save() state into this FOV's
-    on-disk cell list, leaving every other cell's persisted data
-    untouched. Unlike write_cells (which always serializes the FULL
-    in-memory cell_container.data[fov] and overwrites the whole blob),
-    this reads the existing disk list first, replaces the matching
-    cell.id entry (or appends it, if this cell was never saved before),
-    and writes that back -- the narrow "just this one cell" persistence
-    "Save Current Spot" needs, since the transient container otherwise
-    holds every cell in the FOV and a full-container write would
-    silently also push out whatever's currently in memory for all of
-    them.
-    """
-    existing, modality = read_cells(storage_path, fov)
-    if existing is None:
-        existing = []
-    cell_dict = cell.save()
-    for i, d in enumerate(existing):
-        if d.get('id') == cell.id:
-            existing[i] = cell_dict
-            break
-    else:
-        existing.append(cell_dict)
-    payload = {'cells': existing}
-    blob = np.void(pickle.dumps(payload))
-    vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
-        _stamp_order(f)
-        grp = f.require_group(_cells_group_path(fov))
-        if 'blob' in grp:
-            del grp['blob']
-        grp.create_dataset('blob', data=blob)
-        grp.attrs['saved_at'] = datetime.now().isoformat()
-        grp.attrs['n_cells'] = len(existing)
         # No n_spots attr: spots are not in this blob any more, and a
         # count taken here would be permanently 0 -- read_spots on the FOV's
         # own store is the real count.
@@ -349,14 +314,6 @@ def mirror_write_cells(storage_paths, fov, cell_container):
     for path in distinct_stores(storage_paths):
         write_cells(path, fov, cell_container)
 
-
-def mirror_write_single_cell(storage_paths, fov, cell):
-    """write_single_cell into every DISTINCT vlinks store among the given
-    paths -- the narrow-write counterpart to mirror_write_cells, same
-    dual-modality mirroring rationale (a cell's spots span whichever
-    hybes/modalities were actually localized for it)."""
-    for path in distinct_stores(storage_paths):
-        write_single_cell(path, fov, cell)
 
 
 def write_fov_alleles(storage_path, fov, alleles):

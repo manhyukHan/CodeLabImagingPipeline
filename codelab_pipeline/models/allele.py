@@ -117,7 +117,3 @@ class AnAllele():
                 'linked_at': self.linked_at}
 
 
-def _allele_from_dict(d):
-    allele = AnAllele()
-    allele.set_metadata(**d)
-    return allele

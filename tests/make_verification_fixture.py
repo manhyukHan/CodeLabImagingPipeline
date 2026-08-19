@@ -55,9 +55,10 @@ from codelab_pipeline.alignment import chain as alignment
 
 
 def disk(cx, cy, r):
+    """(y, x) pixel arrays of a filled disk -- rasterized order."""
     yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
     keep = (xx * xx + yy * yy) <= r * r
-    return xx[keep] + cx, yy[keep] + cy
+    return yy[keep] + cy, xx[keep] + cx
 
 
 def build_alleles(w, fov, dna_hybes):
@@ -122,13 +123,13 @@ def main():
         w.cell_container_permanent.data.setdefault(2, {})
         for cid, (rh, rm), (nh, nm), (fx, fy), r, ct in cell_defs:
             cx, cy = int(fx * width), int(fy * height)
-            ax, ay = disk(cx, cy, r)
-            nx, ny = disk(cx, cy, max(4, r // 2))
+            ay, ax = disk(cx, cy, r)
+            ny, nx = disk(cx, cy, max(4, r // 2))
             c = ACell()
             c.set_metadata(id=cid, fov=2, reference_hybe=rh, reference_modality=rm,
-                           nucleus=(nx.astype(float), ny.astype(float)),
+                           nucleus=(ny.astype(float), nx.astype(float)),
                            nucleus_hybe=nh, nucleus_modality=nm, celltype=ct,
-                           area=(ax.astype(float), ay.astype(float)), frame_shape=frame_shape)
+                           area=(ay.astype(float), ax.astype(float)), frame_shape=frame_shape)
             w.cell_container_permanent.data[2][cid] = c
         w.cell_container.sync_from(w.cell_container_permanent, 2)
         vlinks_store.mirror_write_cells(w._all_vlinks_storage_paths(), 2, w.cell_container_permanent)

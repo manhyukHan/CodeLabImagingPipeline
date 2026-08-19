@@ -16,7 +16,7 @@ def mk(cid, npx=6):
     x = np.arange(npx) + cid * 10
     y = np.arange(npx) + cid * 10
     c.set_metadata(id=cid, fov=FOV, reference_hybe='Hyb_400', reference_modality='DNA',
-                   area=(x, y), frame_shape=(64, 64))
+                   area=(y, x), frame_shape=(64, 64))
     return c
 
 def filled():
@@ -100,6 +100,33 @@ def test_sync_from_is_isolated_and_minimal():
     a.remove(FOV, [1])
     b.sync_from(a, FOV)
     assert sorted(b.data[FOV]) == [2, 3]
+
+
+def test_load_new_cells_area_is_y_major():
+    """
+    The mask->cells producer packs area as (y, x). Caught real: after the
+    #69 flip, load_new_cells still packed (x, y) -- invisible on square
+    frames and to every clicked flow that only LOADED existing cells, so
+    this uses a non-square frame where a transposed pack cannot
+    re-rasterize at all. Covers both branches (fresh + carry-over).
+    """
+    mask = np.zeros((40, 90), dtype=np.int32)         # height != width
+    mask[5:9, 60:80] = 7                              # asymmetric, off-center
+    c = CellContainer([FOV])
+    c.load_new_cells(FOV, mask, 'Hyb_400', reference_modality='DNA')
+    cell = c.by_id(FOV, 7)
+    assert cell is not None, 'cell not built from mask'
+    y, x = cell.area
+    rebuilt = np.zeros_like(mask)
+    rebuilt[y.astype(int), x.astype(int)] = 7         # transposed -> IndexError
+    assert np.array_equal(rebuilt, mask), 'area does not re-rasterize the mask'
+    # carry-over branch: re-segment same frame, cell keeps id, area follows new mask
+    mask2 = np.zeros_like(mask); mask2[6:12, 55:70] = 7
+    c.load_new_cells(FOV, mask2, 'Hyb_400', reference_modality='DNA', preserve_existing=True)
+    y2, x2 = c.by_id(FOV, 7).area
+    rebuilt2 = np.zeros_like(mask2)
+    rebuilt2[y2.astype(int), x2.astype(int)] = 7
+    assert np.array_equal(rebuilt2, mask2), 'carry-over branch not (y, x)'
 
 
 def _run_all():

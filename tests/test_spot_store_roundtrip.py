@@ -101,8 +101,8 @@ def detect(hybe, modality, channel, queue):
     for y, x in coords:                      # peak_local_max returns (row, col)
         s = ASpot()
         s.set_metadata(fov=FOV, hybe=hybe, channel=int(channel), cell=-1,
-                       raw_coordinate=(float(x), float(y), 0.0),
-                       coordinate=(float(x), float(y), 0.0),
+                       raw_coordinate=(float(y), float(x), 0.0),
+                       coordinate=(float(y), float(x), 0.0),
                        brightness=float(mip[y, x]))
         spots.append(s)
     return spots
