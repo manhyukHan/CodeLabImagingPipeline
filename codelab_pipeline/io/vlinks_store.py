@@ -26,6 +26,30 @@ def _vlinks_path(storage_path):
                         'vlinks.h5')
 
 
+
+# -- coordinate-order schema guard (convention.py) -------------------------
+
+def _stamp_order(f):
+    """Every write stamps the store as rasterized (y, x)."""
+    f.attrs['coordinate_order'] = 'yx'
+
+
+def _require_yx(f, vlinks_path):
+    """
+    Refuse to read a store that predates the Y/X unification (or was
+    written x-major). Loud by design: silently reading swapped
+    coordinates/matrices produces plausible-looking, wrong positions
+    everywhere. Run tools/migrate_store_to_yx.py once per store (it
+    conjugates every matrix and swaps every coordinate tuple), or remake
+    the store from raw data.
+    """
+    order = f.attrs.get('coordinate_order')
+    if order != 'yx':
+        raise ValueError(
+            f"{vlinks_path} is not stamped coordinate_order='yx' "
+            f"(found {order!r}) -- this store predates the Y/X unification. "
+            f"Run tools/migrate_store_to_yx.py on it once, or remake the data.")
+
 def modality_of(storage_path):
     """
     Which modality owns this stack directory, read from the `modality` attr
@@ -94,6 +118,7 @@ def allocate_spot_uids(storage_path, fov, count):
     vlinks_path = _vlinks_path(storage_path)
     grp_path = _spots_group_path(fov)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(grp_path)
         next_uid = int(grp.attrs.get('next_uid', 1))
         highest = int(grp.attrs.get('highest_uid_seen', 0))
@@ -143,6 +168,7 @@ def write_spots(storage_path, fov, modality, hybe, channel, spots):
         seen[d['uid']] = True
     blob = np.void(pickle.dumps(payload))
     with h5py.File(_vlinks_path(storage_path), 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_spot_slice_path(fov, modality, hybe, channel))
         if 'blob' in grp:
             del grp['blob']
@@ -163,6 +189,7 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
         return []
     out = []
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if modality is not None and hybe is not None and channel is not None:
             gp = _spot_slice_path(fov, modality, hybe, channel)
             if gp in f and 'blob' in f[gp]:
@@ -210,6 +237,7 @@ def write_cells(storage_path, fov, cell_container):
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_cells_group_path(fov))
         if 'blob' in grp:
             del grp['blob']
@@ -249,6 +277,7 @@ def write_single_cell(storage_path, fov, cell):
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_cells_group_path(fov))
         if 'blob' in grp:
             del grp['blob']
@@ -272,6 +301,7 @@ def read_cells(storage_path, fov):
         return None, ''
     grp_path = _cells_group_path(fov)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'blob' not in f[grp_path]:
             return None, ''
         raw = bytes(f[grp_path]['blob'][()])
@@ -342,6 +372,7 @@ def write_fov_alleles(storage_path, fov, alleles):
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_alleles_group_path(fov))
         if 'blob' in grp:
             del grp['blob']
@@ -359,6 +390,7 @@ def read_fov_alleles(storage_path, fov):
         return []
     grp_path = _alleles_group_path(fov)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'blob' not in f[grp_path]:
             return []
         raw = bytes(f[grp_path]['blob'][()])
@@ -435,6 +467,7 @@ def write_global_params(storage_path, **params):
     vlinks_path = _vlinks_path(storage_path)
     modality = None
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         shared = f.require_group(_params_group_path())
         for k, v in params.items():
             if v is None:
@@ -458,6 +491,7 @@ def read_global_params(storage_path):
         return {}
     out = {}
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         grp_path = _params_group_path()
         if grp_path in f:
             out.update(dict(f[grp_path].attrs))
@@ -504,6 +538,7 @@ def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_params_group_path())
         if 'celltype_config_blob' in grp:
             del grp['celltype_config_blob']
@@ -523,6 +558,7 @@ def read_celltype_config(storage_path):
         return {}, {}, empty_calibration, None
     grp_path = _params_group_path()
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'celltype_config_blob' not in f[grp_path]:
             return {}, {}, empty_calibration, None
         raw = bytes(f[grp_path]['celltype_config_blob'][()])
@@ -589,6 +625,7 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_mip_group_path(fov, modality_of(storage_path), hybe))
         for ch, mip in channel_mips.items():
             name = f'ch{ch}'
@@ -610,6 +647,7 @@ def read_hybe_mip(storage_path, fov, hybe, channel):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         name = f'ch{channel}'
         if grp_path not in f or name not in f[grp_path]:
             return None
@@ -630,6 +668,7 @@ def fiducial_channel_mip(storage_path, fov, hybe):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
         channel = int(f[grp_path].attrs['fiducial_channel'])
@@ -650,6 +689,7 @@ def readout_channel_mip(storage_path, fov, hybe):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
         fiducial_ch = int(f[grp_path].attrs['fiducial_channel'])
@@ -674,6 +714,7 @@ def mip_channels_present(storage_path, fov, hybe):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f:
             return None
         return {name[2:]: True for name in f[grp_path].keys() if name.startswith('ch')}
@@ -695,6 +736,7 @@ def ingested_hybes_for_fov(storage_path, fov, hybe_list):
     if not os.path.exists(vlinks_path):
         return []
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         modality = modality_of(storage_path)
         return [hybe for hybe in hybe_list
                 if _mip_group_path(fov, modality, hybe) in f and len(f[_mip_group_path(fov, modality, hybe)]) > 0]
@@ -716,6 +758,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_fov_matrix_group_path(fov, modality_of(storage_path)))
         for hybe, H in matrices.items():
             if hybe in grp:
@@ -746,6 +789,7 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     from ..alignment.frames import FrameMatrices
     matrices = FrameMatrices(modality=modality_of(storage_path))
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         modality = modality_of(storage_path)
         matrix_grp_path = _fov_matrix_group_path(fov, modality)
         for hybe in hybe_list:
@@ -774,6 +818,7 @@ def write_cross_modal_z(storage_path, fov, dz):
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
         grp.attrs['z_across'] = float(dz)
 
@@ -785,6 +830,7 @@ def read_cross_modal_z(storage_path, fov):
         return 0.0
     grp_path = _fov_params_group_path(fov)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f:
             return 0.0
         return float(f[grp_path].attrs.get('z_across', 0.0))
@@ -804,6 +850,7 @@ def write_cross_modal_matrix(storage_path, fov, H):
     """
     vlinks_path = _vlinks_path(storage_path)
     with h5py.File(vlinks_path, 'a') as f:
+        _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
         if 'matrix_across' in grp:
             del grp['matrix_across']
@@ -818,6 +865,7 @@ def read_cross_modal_matrix(storage_path, fov):
         return None
     grp_path = _fov_params_group_path(fov)
     with h5py.File(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
         if grp_path not in f or 'matrix_across' not in f[grp_path]:
             return None
         return f[grp_path]['matrix_across'][:]
