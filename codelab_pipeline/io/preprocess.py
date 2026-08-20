@@ -10,6 +10,106 @@ from scipy.optimize import minimize
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import quoteattr
 
+# One convert_dax_to_h5_worker holds a whole DAX in RAM at once (read_dax
+# does a single np.fromfile of the entire file) plus the channel slice it
+# copies out of it -- ~4.5 GB for this project's real 2048x2048x354 uint16
+# stacks. On a big box that memory, not the core count, is what actually
+# bounds a pooled ingestion, so max_ingestion_workers() takes the smaller
+# of the two.
+DAX_WORKER_PEAK_BYTES = 5 * 1024 ** 3
+
+# Never offer fewer than this many, whatever the arithmetic below says. The
+# work is I/O-bound, so a few conversions in flight is useful even on a
+# 2-core laptop, and 4 is what the spinbox already defaulted to for
+# everyone -- a spec-derived ceiling that took a small machine BELOW its
+# own current default would be a regression dressed up as a fix.
+MIN_WORKER_CEILING = 4
+
+# Fallback memory limit for a machine whose RAM we cannot measure. Same
+# number the spinbox was hard-coded to before it became spec-derived, so an
+# unmeasurable machine keeps exactly the old bound rather than a cap
+# nothing has verified it can survive.
+UNKNOWN_RAM_WORKER_CEILING = 16
+
+
+def total_ram_bytes():
+    """
+    Physical RAM in bytes, or None if this machine will not say.
+
+    psutil first (present in the usual conda env but NOT in
+    requirements.txt, so it has to stay optional), then the POSIX sysconf
+    pair, then the Win32 call. Every path is read-only and cheap.
+    """
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        pass
+    try:
+        return int(os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
+    except (ValueError, AttributeError, OSError):
+        pass
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullTotalPhys)
+    except Exception:
+        pass
+    return None
+
+
+def max_ingestion_workers(hard_ceiling=64):
+    """
+    How many DAX->H5 conversion processes this machine can actually host.
+
+    Was a flat 16, which quietly wasted a workstation -- the 64-logical-core
+    / 352 GB box this was found on could not be asked for a 17th worker --
+    and was equally happy to offer a 4-core laptop more workers than it has
+    cores. Two independent limits, whichever binds first:
+
+      cores  -- os.cpu_count() minus two, leaving room for the coordinator
+                QThread that does the vlinks.h5 MIP writes and for the GUI
+                to stay responsive while a long ingestion runs.
+      memory -- 60% of physical RAM divided by DAX_WORKER_PEAK_BYTES. The
+                40% held back is for the OS file cache, which is doing real
+                work during an ingestion, and for the rest of the app
+                (a loaded cell container is not small).
+
+    then floored at MIN_WORKER_CEILING and capped at hard_ceiling, so no
+    machine is offered less than the old default nor a number so large the
+    spinbox stops meaning anything.
+
+    This is the ceiling the user may dial up to, not a recommendation: the
+    work is I/O-bound, so the useful setting is usually well below it and
+    depends on the storage -- a network share saturates long before a local
+    NVMe does.
+    """
+    cores = os.cpu_count() or 4
+    cap = max(1, cores - 2)
+
+    ram = total_ram_bytes()
+    if ram:
+        cap = min(cap, int(ram * 0.6) // DAX_WORKER_PEAK_BYTES)
+    else:
+        cap = min(cap, UNKNOWN_RAM_WORKER_CEILING)
+
+    return min(max(cap, MIN_WORKER_CEILING), hard_ceiling)
+
+
 def create_or_replace_dataset(group, name, data, dtype):
     """
     Create or replace a dataset in an HDF5 group.

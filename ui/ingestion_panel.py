@@ -1,6 +1,8 @@
 import os
 from PyQt5 import QtWidgets, QtCore, QtGui
 
+from codelab_pipeline.io import preprocess
+
 
 class IngestionPanelUI(object):
     """
@@ -112,13 +114,24 @@ class IngestionPanelUI(object):
         workersLayout.setContentsMargins(0, 0, 0, 0)
         workersLayout.addWidget(QtWidgets.QLabel('Parallel workers:'))
         self.IngestWorkersSpinBox = QtWidgets.QSpinBox()
-        self.IngestWorkersSpinBox.setRange(1, 16)
-        self.IngestWorkersSpinBox.setValue(4)
+        # The ceiling is derived from THIS machine's cores and RAM rather
+        # than the flat 16 it used to be -- see
+        # preprocess.max_ingestion_workers. The DEFAULT deliberately stays
+        # 4: the ceiling describes what the box can host, which is a
+        # different question from what the storage wants, and the storage
+        # is what actually limits this work.
+        worker_ceiling = preprocess.max_ingestion_workers()
+        self.IngestWorkersSpinBox.setRange(1, worker_ceiling)
+        self.IngestWorkersSpinBox.setValue(min(4, worker_ceiling))
         self.IngestWorkersSpinBox.setToolTip(
             'DAX->H5 conversions run in this many separate processes. The work '
             'is I/O-bound (huge sequential reads, often from a network share), '
-            'so 3-4 overlaps read latency well; more mostly thrashes the disk/'
-            'share. 1 = the old sequential behavior.')
+            'so 3-4 overlaps read latency well off a share; a local NVMe on a '
+            'many-core box takes considerably more before extra workers stop '
+            'helping. 1 = the old sequential behavior.\n\n'
+            'The maximum here ({}) comes from this machine: cores minus two, '
+            'and 60% of RAM divided by the ~5 GB one conversion holds '
+            '(read_dax loads an entire DAX at once).'.format(worker_ceiling))
         workersLayout.addWidget(self.IngestWorkersSpinBox)
         workersLayout.addStretch(1)
         layout.addWidget(workersRow)
