@@ -7720,6 +7720,18 @@ class MainWindow(QtWidgets.QMainWindow):
         real_cell.matrices = staged_cell.matrices
         real_cell.matrix_anchors = staged_cell.matrix_anchors
         real_cell.matrix_provenance = staged_cell.matrix_provenance
+        # real_cell lives in ONE tier; the other tier holds an independent
+        # twin of the same cell. Propagate the alignment-owned fields so
+        # the tiers can never disagree about this cell's matrices -- the
+        # same sync the batch door does (per confirmed real wipe: any
+        # later legitimate cell write from the stale tier would destroy
+        # this accept's result on disk).
+        for other in (self.cell_container_permanent, self.cell_container):
+            twin = other.by_id(fov, real_cell.id) if other is not None else None
+            if twin is not None and twin is not real_cell:
+                twin.matrices = deepcopy(real_cell.matrices)
+                twin.matrix_anchors = deepcopy(real_cell.matrix_anchors)
+                twin.matrix_provenance = deepcopy(real_cell.matrix_provenance)
 
         # Re-derive the overlay from the SAME (reference_hybe, modality,
         # storage_path) the Preview step actually ran with (stashed in
