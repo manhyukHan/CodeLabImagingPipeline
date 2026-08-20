@@ -53,6 +53,7 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         self._layout.addWidget(self.canvas)
         zoom_pan.install_scroll_zoom(self.canvas)
         zoom_pan.install_keyboard_zoom(self.canvas)
+        zoom_pan.install_drag_pan(self.canvas)
 
         self._legend_label = QtWidgets.QLabel('')
         self._legend_label.setWordWrap(True)

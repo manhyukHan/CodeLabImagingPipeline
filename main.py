@@ -18,19 +18,63 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtGui
 
 from config import path
 from windows.main_window import MainWindow
 
+# The CODE Lab 'O' mark (tools/make_app_icon.py regenerates it) -- set as
+# the application icon so every window and the taskbar/dock entry carry
+# it, on every platform Qt runs on. PNG here (Qt loads it everywhere);
+# the .ico/.icns siblings exist for OS-level shortcuts.
+ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'codelab_o.png')
+
+def _install_error_dialog_hook():
+    """
+    Show an uncaught exception in a dialog and KEEP RUNNING.
+
+    Without this, any unhandled exception in a slot propagates out of the Qt
+    event loop and aborts the process, losing whatever was in memory --
+    unsaved spots, a loaded cell container, the current view. An uncaught bug
+    is a bug either way, but it should cost a dialog, not the session.
+
+    Deliberately does not catch KeyboardInterrupt/SystemExit: those are the
+    ways the app is legitimately asked to stop.
+    """
+    import traceback
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        detail = ''.join(traceback.format_exception(exc_type, exc, tb))
+        sys.stderr.write(detail)          # still on the console for debugging
+        try:
+            box = QtWidgets.QMessageBox()
+            box.setIcon(QtWidgets.QMessageBox.Critical)
+            box.setWindowTitle('Unexpected error')
+            box.setText(f'{exc_type.__name__}: {exc}')
+            box.setInformativeText('The app is still running. This operation did '
+                                   'not complete -- your in-memory work is intact.')
+            box.setDetailedText(detail)
+            box.exec_()
+        except Exception:
+            pass                          # a dialog failure must not re-raise
+
+    sys.excepthook = hook
+
+
 if __name__ == '__main__':
+    _install_error_dialog_hook()
     question_app = QtWidgets.QApplication(sys.argv)
+    question_app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     question_window = QtWidgets.QMainWindow()
     question_window.show()
     config_file = QtWidgets.QFileDialog.getOpenFileName(question_window, 'Load configuration file (Cancel to start fresh)', path, 'configuration file (*.xml)')[0]
     question_window.close()
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     window = MainWindow(config_file if config_file != '' else None)
     window.show()
     sys.exit(app.exec_())

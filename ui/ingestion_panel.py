@@ -43,6 +43,22 @@ class IngestionPanelUI(object):
         self.ActivateModalitiesPushButton = QtWidgets.QPushButton('Activate Modalities')
         modalityLayout.addWidget(self.ActivateModalitiesPushButton)
 
+        # -- The modality registry and mode live HERE, on the ingestion
+        # panel, not on MainWindow. Per explicit principle: the system's
+        # modality is an INGESTION concept -- each modality needs its own
+        # DAX directory and storage path, so the combo below legitimately
+        # exists -- and nothing outside ingestion may hold a "current
+        # modality". Non-ingestion code reads the REGISTRY (which
+        # modalities exist, their storage paths) through MainWindow's
+        # accessor helpers, and derives any per-datum modality from the
+        # datum itself ((hybe, modality) keys, cell.modality,
+        # spot.modality, vlinks_store.modality_of). current_modality is
+        # panel display state: which modality's fields the ingestion tab
+        # is showing. If code outside the ingestion cluster reads it,
+        # that is a bug of the class that stamped every cell 'DNA'.
+        self.modality_names = ['DNA', 'RNA']
+        self.modality_data = {}           # {name: modality-state dict}
+        self.current_modality = None      # panel display state ONLY
         self.ModalityComboBox = QtWidgets.QComboBox()
         modalityLayout.addWidget(QtWidgets.QLabel('Current modality (switches everything below that is not global):'))
         modalityLayout.addWidget(self.ModalityComboBox)
@@ -73,8 +89,23 @@ class IngestionPanelUI(object):
 
         layout.addWidget(QtWidgets.QLabel('Hybes to ingest:'))
         self.HybeListWidget = QtWidgets.QListWidget()
-        self.HybeListWidget.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        # ExtendedSelection (not NoSelection) -- lets the user click+drag,
+        # shift-click, or ctrl-click to highlight many rows at once, then
+        # batch-toggle them via the two buttons below instead of clicking
+        # each checkbox individually.
+        self.HybeListWidget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         layout.addWidget(self.HybeListWidget)
+
+        hybeCheckButtonsRow = QtWidgets.QWidget()
+        hybeCheckButtonsLayout = QtWidgets.QHBoxLayout(hybeCheckButtonsRow)
+        hybeCheckButtonsLayout.setContentsMargins(0, 0, 0, 0)
+        self.CheckSelectedHybesPushButton = QtWidgets.QPushButton('Check Selected')
+        self.UncheckSelectedHybesPushButton = QtWidgets.QPushButton('Uncheck Selected')
+        hybeCheckButtonsLayout.addWidget(self.CheckSelectedHybesPushButton)
+        hybeCheckButtonsLayout.addWidget(self.UncheckSelectedHybesPushButton)
+        layout.addWidget(hybeCheckButtonsRow)
+        self.CheckSelectedHybesPushButton.clicked.connect(lambda: self._set_selected_hybe_check_state(QtCore.Qt.Checked))
+        self.UncheckSelectedHybesPushButton.clicked.connect(lambda: self._set_selected_hybe_check_state(QtCore.Qt.Unchecked))
 
         self.RunIngestionPushButton = QtWidgets.QPushButton('Run Ingestion')
         self.RunIngestionPushButton.setEnabled(False)
@@ -90,8 +121,8 @@ class IngestionPanelUI(object):
         self.IngestionStatusTextEdit.setMaximumHeight(140)
         layout.addWidget(self.IngestionStatusTextEdit)
 
-        self.ShowMemoryViewerPushButton = QtWidgets.QPushButton('Show Cell/Spot Memory Status...')
-        layout.addWidget(self.ShowMemoryViewerPushButton)
+        self.ShowCellSpotStatusDisplayerPushButton = QtWidgets.QPushButton('Show Cell/Spot Status Detail...')
+        layout.addWidget(self.ShowCellSpotStatusDisplayerPushButton)
 
         viewerGroup = QtWidgets.QGroupBox('MIP Viewer (visually spot-check an ingested FOV/hybe/channel)')
         viewerForm = QtWidgets.QFormLayout(viewerGroup)
@@ -192,6 +223,11 @@ class IngestionPanelUI(object):
             combo.setEnabled(False)
         self.ActivateModalitiesPushButton.setEnabled(False)
 
+    def _set_selected_hybe_check_state(self, check_state):
+        """Batch-apply check_state to every currently-selected (highlighted) row in HybeListWidget."""
+        for item in self.HybeListWidget.selectedItems():
+            item.setCheckState(check_state)
+
     def hybe_checkbox_items(self):
         """Currently-checked hybe folder names from HybeListWidget."""
         checked = []
@@ -234,14 +270,50 @@ class IngestionPanelUI(object):
         hybe_dir = os.path.join(dax_directory, folder)
         return os.path.isdir(hybe_dir) and any(f.endswith('.dax') for f in os.listdir(hybe_dir))
 
-    def populate_viewer_hybe_choices(self, hybe_records):
-        self._viewer_hybe_records = list(hybe_records)
+    def populate_viewer_hybe_choices(self, total_active_hybe_list):
+        """
+        total_active_hybe_list: [(hybe_record, modality_name), ...] --
+        every configured modality's active hybes at once, so MIP Viewer
+        can show a hybe from EITHER modality without first switching
+        Ingestion's own ModalityComboBox (that combo now only drives
+        which modality's layout/dax/storage-path fields are showing, see
+        MainWindow._switch_current_modality). Same itemData-tagged,
+        selection-preserving pattern as SpotLocalizationPanel.
+        populate_hybe_choices.
+        """
+        current = self.current_viewer_hybe_key()
+        self.ViewerHybeComboBox.blockSignals(True)
         self.ViewerHybeComboBox.clear()
-        self.ViewerHybeComboBox.addItems([r['folder'] for r in hybe_records])
+        for record, modality in total_active_hybe_list:
+            self.ViewerHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
+        if self.ViewerHybeComboBox.count():
+            restore_index = next((i for i in range(self.ViewerHybeComboBox.count())
+                                  if self._viewer_hybe_item_key(i) == current), 0)
+            self.ViewerHybeComboBox.setCurrentIndex(restore_index)
+        self.ViewerHybeComboBox.blockSignals(False)
+        self._on_viewer_hybe_changed()
+
+    def _viewer_hybe_item_key(self, index):
+        data = self.ViewerHybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_viewer_hybe_key(self):
+        data = self.ViewerHybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_viewer_hybe(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.ViewerHybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_viewer_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.ViewerHybeComboBox.currentData()
+        return data[1] if data is not None else None
 
     def _on_viewer_hybe_changed(self):
-        folder = self.ViewerHybeComboBox.currentText()
-        record = next((r for r in getattr(self, '_viewer_hybe_records', []) if r['folder'] == folder), None)
+        data = self.ViewerHybeComboBox.currentData()
+        record = data[0] if data is not None else None
         # clear()+addItems() is one logical "channel list changed" update --
         # without blockSignals, clear() alone fires currentIndexChanged(-1)
         # with a momentarily-empty combo, which anything downstream

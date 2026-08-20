@@ -1,3 +1,10 @@
+"""
+Dead code -- see legacy/README.md. A CellClassifier ".smeta" export bridge, never
+imported by anything in this project (the module itself has no importer anywhere;
+its functions only ever call each other). Kept for reference because it documents
+CellClassifier's three pickle formats. Moved here on 2026-08-17, verbatim apart
+from promoting the explanatory string below to a real module docstring.
+"""
 import pickle
 
 import numpy as np

@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import cv2
 from skimage.draw import polygon as sk_polygon
@@ -7,6 +9,22 @@ import matplotlib.cm as cm
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
+
+
+def _parse_index_list(text):
+    """'1-10', '1,2,3', '1 2 4 5', or any mix -> sorted unique ints.
+    Same grammar as the FOV list field, so every multi-index box in the
+    app parses identically."""
+    out = []
+    for chunk in re.split(r'[,\s]+', text.strip()):
+        if not chunk:
+            continue
+        if '-' in chunk:
+            a, b = chunk.split('-', 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(chunk))
+    return sorted(set(out))
 
 
 class CellDisplayer(QtWidgets.QMainWindow):
@@ -19,7 +37,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
 
     Shows the reference image beside the labeled mask overlay (boundary
     scatter + ID text at each cell's centroid -- ports the plotting from
-    codelab_pipeline/segmentation/segment.py's SegmentWidget, cleaned up).
+    legacy/segment_widgets.py's SegmentWidget, cleaned up).
     A "remove cell ID(s)" field lets the user null out bad detections from
     the mask before it's staged/saved.
 
@@ -48,6 +66,17 @@ class CellDisplayer(QtWidgets.QMainWindow):
     sync -- one signal, one downstream handler, for every kind of edit.
     """
     mask_edited = QtCore.pyqtSignal(object)
+    # Remove-by-ID is an ID-LIST operation, not a raster edit: routing it
+    # through mask_edited made MainWindow rebuild the container FROM the
+    # displayed raster -- which is a PROJECTION whenever the display frame
+    # differs from a cell's native frame (exactly the post-cytoplasm
+    # case), and which silently no-oped whenever the segmentation context
+    # wasn't the last thing loaded, leaving the removed cell alive in the
+    # container to resurrect its contour on the next re-render (confirmed
+    # real bug). The ids go out as-is; the container is the authority.
+    ids_removed = QtCore.pyqtSignal(list)
+    undo_requested = QtCore.pyqtSignal()
+    redo_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -69,6 +98,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(self.canvas)
         zoom_pan.install_scroll_zoom(self.canvas)
         zoom_pan.install_keyboard_zoom(self.canvas)
+        zoom_pan.install_drag_pan(self.canvas)
 
         scaleRow = QtWidgets.QWidget()
         scaleRowLayout = QtWidgets.QHBoxLayout(scaleRow)
@@ -84,8 +114,6 @@ class CellDisplayer(QtWidgets.QMainWindow):
         # on toggle-open, but callable directly so picking up a panel change
         # (new FOV, different hybe) doesn't require closing and reopening
         # this window.
-        self.UpdatePushButton = QtWidgets.QPushButton('Update')
-        scaleRowLayout.addWidget(self.UpdatePushButton)
         layout.addWidget(scaleRow)
 
         self.ManualAddModeCheckBox = QtWidgets.QCheckBox(
@@ -97,10 +125,20 @@ class CellDisplayer(QtWidgets.QMainWindow):
         removeLayout = QtWidgets.QHBoxLayout(removeRow)
         removeLayout.setContentsMargins(0, 0, 0, 0)
         self.RemoveIdsLineEdit = QtWidgets.QLineEdit()
-        self.RemoveIdsLineEdit.setPlaceholderText('cell IDs to remove, e.g. 3,7,12')
+        self.RemoveIdsLineEdit.setPlaceholderText('cell IDs to remove, e.g. 3,7,12 or 1-10 or 3 7 12')
         self.RemoveIdsPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveIdsLineEdit)
         removeLayout.addWidget(self.RemoveIdsPushButton)
+        # Undo/redo over the CELL CONTAINER (two diff streaks, wired by
+        # MainWindow) -- this widget only emits; it owns no cell state.
+        self.UndoPushButton = QtWidgets.QPushButton('Undo')
+        self.UndoPushButton.setEnabled(False)
+        removeLayout.addWidget(self.UndoPushButton)
+        self.RedoPushButton = QtWidgets.QPushButton('Redo')
+        self.RedoPushButton.setEnabled(False)
+        removeLayout.addWidget(self.RedoPushButton)
+        self.UndoPushButton.clicked.connect(self.undo_requested.emit)
+        self.RedoPushButton.clicked.connect(self.redo_requested.emit)
         layout.addWidget(removeRow)
 
         self.RemoveIdsPushButton.clicked.connect(self._remove_ids)
@@ -151,7 +189,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         if not text or self.mask is None:
             return
         try:
-            ids = [int(t.strip()) for t in text.split(',') if t.strip()]
+            ids = _parse_index_list(text)
         except ValueError:
             QtWidgets.QMessageBox.warning(self, 'Remove cell IDs', 'Enter a comma-separated list of integer cell IDs.')
             return
@@ -159,7 +197,12 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self.mask[np.isin(self.mask, ids)] = 0
         self.RemoveIdsLineEdit.clear()
         self._redraw()
-        self.mask_edited.emit(self.mask)
+        # ids, not the raster -- see ids_removed's own comment. The local
+        # zeroing above is only the immediate visual echo; the authoritative
+        # state change (container removal, or cytoplasm-label update) is
+        # the receiver's job, and a container-backed receiver re-renders
+        # this displayer from the container afterwards anyway.
+        self.ids_removed.emit([int(i) for i in ids])
 
     def _set_manual_mode(self, on):
         self._manual_mode = on

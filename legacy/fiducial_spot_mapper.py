@@ -1,4 +1,11 @@
 """
+Dead code -- see legacy/README.md. A ChrTracer3 (MATLAB) CSV-import bridge, never
+imported by anything in this project: the live chromatin-tracing path builds
+AnAllele objects from this pipeline's own 3D localization instead
+(codelab_pipeline/localization/localization.py's localize_chromatin_trace_hybe,
+which ui/chromatin_tracing_panel.py drives). Moved here on 2026-08-17, verbatim
+apart from making the AnAllele import absolute so it still resolves from legacy/.
+
 Parses ChrTracer3's AllFits.csv / selectSpots.csv output and reconstructs
 true image-referenced (full-FOV, top-left-origin) coordinates from them, then
 builds AnAllele objects ready to link to ACell/ASpot.
@@ -26,7 +33,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from ..models.allele import AnAllele
+from codelab_pipeline.models.allele import AnAllele
 
 
 def read_box_width(analysis_folder):

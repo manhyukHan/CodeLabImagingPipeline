@@ -1,45 +1,74 @@
 import os
 from functools import reduce
 import numpy as np
-import numpy.linalg as la
-import ipywidgets as widgets
-import time
-import h5py
 
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
+from .frames import FrameMatrices  # re-exported: callers reach it as alignment.FrameMatrices
+from .convention import as_cv2, to_yx  # THE y-major<->cv2 adapter (see convention.py)
+import numpy.linalg as la
+import h5py
+from skimage import filters as skimage_filters
+from skimage.feature import peak_local_max
 
 from ..io import preprocess
+from ..io import vlinks_store
 import cv2
 
-from IPython.display import display, clear_output
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-import warnings
+# Hard, non-configurable engine-level bounds on any fitted alignment matrix
+# -- FOV-level (same-modality, cross-modal, via align_readout_to_reference)
+# and cell-level (the compute_cell_alignment residual) alike -- per explicit
+# request, deliberately NOT exposed as a tunable UI setting: anything a fit
+# claims beyond this is treated as an optimizer artifact, not a real result,
+# regardless of what any particular experiment's own drift tolerance might
+# be. Confirmed via a deliberate bad-value test (dx=1071, dy=42, angle=100
+# deg on a real DNA-RNA cross-modal pair) that fits well outside real
+# biological drift can otherwise be silently accepted and propagated.
+MAX_ALIGNMENT_TRANSLATION_PX = 30.0
+MAX_ALIGNMENT_ROTATION_DEG = 10.0
 
-warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
-colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
-          '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff',
-          '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
-          '#000075', '#808080', '#000000']
+def _center_displacement(H, shape):
+    """
+    How far H actually moves the image centre, in px: (dy, dx).
 
-plt.rcParams['font.family'] = 'arial'
-plt.rcParams['font.size'] = 14
-plt.rcParams['pdf.fonttype'] = 42
+    This, not H's raw translation column, is what "how big is this
+    correction" means. A rotation about the image centre, written as a
+    matrix about the ORIGIN, carries a large translation column that is
+    pure bookkeeping -- an 8 deg rotation of a 1024x1024 frame has
+    t=(70.8, -64.1) while moving the centre not at all. Reading that
+    column as displacement makes rotation magnitude scale with frame size
+    and with distance from the origin, which is meaningless.
+    """
+    cx, cy = shape[1] / 2.0, shape[0] / 2.0
+    nx, ny = (np.asarray(H, dtype=float)[:2] @ np.array([cx, cy, 1.0]))
+    return ny - cy, nx - cx
 
-fontdict_label = {'fontname': 'arial',
-                  'fontsize':16,
-                  }
-fontdict_ticks = {'fontname': 'arial',
-                  'fontsize': 14,
-                  }
-fontdict_title = {'fontname': 'arial',
-                  'fontsize': 24,
-                  'fontweight': 'bold',
-                  }
 
-red_to_cyan_cmap = mcolors.LinearSegmentedColormap.from_list('custom_cmap', ['#FF0000', '#FFFFFF', '#00FFFF'], N=256)
+def _within_hard_alignment_bounds(H, shape=None, max_translation=MAX_ALIGNMENT_TRANSLATION_PX,
+                                  max_rotation=MAX_ALIGNMENT_ROTATION_DEG):
+    """
+    True iff H's translation (dy, dx independently) and rotation stay
+    within the hard engine-level bounds above. Shared by every fitted-
+    matrix gate in this module so they can never independently drift apart
+    on what counts as "plausible."
+
+    `shape` (height, width) makes the translation test measure displacement
+    AT THE IMAGE CENTRE via _center_displacement. Without it the test falls
+    back to H's raw translation column, which is correct only for a pure
+    translation: for any real rotation that column is dominated by the
+    rotation's own origin offset, so the gate rejected correct fits purely
+    for containing rotation. Confirmed on synthetic ground truth -- ORB
+    recovered 8 deg exactly, and this gate threw the result away for
+    "70.8 px of translation" that did not move the centre at all. Pass
+    shape wherever it is available.
+    """
+    if shape is not None:
+        dy, dx = _center_displacement(H, shape)
+    else:
+        dx, dy = H[0, 2], H[1, 2]
+    if abs(dx) > max_translation or abs(dy) > max_translation:
+        return False
+    return abs(_h_rotation_angle_degrees(H)) <= max_rotation
+
 
 def align_cell(yx, H, shape):
     """
@@ -70,14 +99,33 @@ def align_cell(yx, H, shape):
         cx,cy = x.astype(int), y.astype(int)
         bad = (cx < 0) | (cy < 0) | (cx >= width) | (cy >= height)
         return cy[~bad], cx[~bad]
-    cx,cy = (H[:2]@np.array([x,y,np.ones_like(x)])).astype(int)
+    # H is y-major (convention.py): row 0 -> y, row 1 -> x.
+    cy,cx = (H[:2]@np.array([y,x,np.ones_like(x)])).astype(int)
     bad = (cx < 0) | ( cy < 0) | (cx >= width) | (cy >= height)
     cx,cy = cx[~bad],cy[~bad]
-    adjusted_mask = np.zeros((height,width))
-    adjusted_mask[cy,cx] = 1
-    closed = cv2.morphologyEx(adjusted_mask, cv2.MORPH_CLOSE, kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
-    cy,cx = np.where(closed > 0)
-    return cy,cx
+    if cx.size == 0:
+        return cy, cx
+    # Rasterize + close in a LOCAL bbox, not the full frame: closing with
+    # a 3x3 kernel is a 1px-radius local operation, so a bbox with a 2px
+    # margin of REAL zeros (1 for the dilation reach + 1 for the erosion
+    # neighborhood -- cv2 morphology treats the array border itself with
+    # special +/-inf values, NOT zeros, so a 1px margin left border-
+    # touching pixels uneroded: confirmed 5-extra-point mismatch) yields
+    # the byte-identical point set at a fraction of the cost. Where the
+    # bbox is clipped by the actual frame edge the local border COINCIDES
+    # with the frame border, reproducing the full-frame border behavior
+    # exactly. The full-frame version allocated and morphed height*width
+    # pixels PER CELL, which made the FOV-view "cell masks" overlay the
+    # dominant cost of every hybe/channel switch (101 cells: ~0.9s of a
+    # 1.8s switch, measured).
+    pad = 2
+    x0, y0 = max(0, int(cx.min()) - pad), max(0, int(cy.min()) - pad)
+    x1, y1 = min(width, int(cx.max()) + pad + 1), min(height, int(cy.max()) + pad + 1)
+    local = np.zeros((y1 - y0, x1 - x0))
+    local[cy - y0, cx - x0] = 1
+    closed = cv2.morphologyEx(local, cv2.MORPH_CLOSE, kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
+    ly, lx = np.where(closed > 0)
+    return ly + y0, lx + x0
 
 def compose_chain(matrices):
     """
@@ -130,8 +178,19 @@ def hybe_to_cellref_matrix(fov_matrices, H_cellref_to_within, hybe):
     means a hybe/layer with no alignment computed yet contributes nothing
     (identity), not a missing-data error.
     """
-    H_hybe_to_within = fov_matrices.get(hybe, np.eye(3))
+    H_hybe_to_within = fov_matrices.get((hybe, fov_matrices.modality), np.eye(3))
     return compose_chain([H_hybe_to_within, la.inv(H_cellref_to_within)])
+
+def h_angle_degrees(H_yx):
+    """Rotation angle (degrees) of a Y-MAJOR matrix -- the display/report
+    read for every stored/composed H in this pipeline. Numerically equal
+    to the engine-internal x-major read of the same physical rotation
+    (proven in tests/test_convention.py), so reported angles are
+    continuous across the convention flip. _h_rotation_angle_degrees
+    below stays the x-major read and is ENGINE-INTERNAL only."""
+    H_yx = np.asarray(H_yx, dtype=float)
+    return float(np.degrees(np.arctan2(H_yx[0, 1], H_yx[0, 0])))
+
 
 def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.5, signal_threshold=10):
     """
@@ -183,6 +242,143 @@ def _reconstruction_residual(moving_norm, reference_norm, H, min_overlap_frac=0.
         return np.inf  # no real reference signal at all -- nothing meaningful to score
     return float(((warped[valid] - reference_norm[valid].astype(np.float32)) ** 2).mean())
 
+def _clip_background(crop, method='yen'):
+    """
+    Soft background suppression for a cell-level crop, BEFORE it's handed
+    to phase correlation and the reconstruction-residual quality gate --
+    subtracts this crop's own Otsu/Yen threshold and clips below zero,
+    rather than binarizing to 0/1. A hard binary mask would discard the
+    intensity gradient sub-pixel phase correlation actually relies on for
+    its own accuracy; this keeps that gradient intact above threshold
+    while suppressing the diffuse background that can otherwise pull
+    cv2.phaseCorrelate toward a confident-but-wrong correspondence (the
+    same "background dilutes/hides the discriminating signal" failure
+    mode _reconstruction_residual's own docstring identifies for MSD
+    scoring -- addressed here one step earlier, in the FIT itself, not
+    just at scoring time).
+
+    method: 'yen' (default) or 'otsu' -- same two skimage.filters
+    threshold functions already used for cell segmentation (segment.py),
+    kept consistent rather than introducing a third convention.
+
+    Falls back to the crop unchanged (float32) if thresholding fails
+    (skimage raises on a degenerate, e.g. all-constant, crop) -- a
+    pathological crop is exactly the case with no meaningful background
+    to separate out, not a reason to error the whole alignment.
+    """
+    crop_f = crop.astype(np.float32)
+    try:
+        threshold = float(skimage_filters.threshold_yen(crop) if method == 'yen'
+                          else skimage_filters.threshold_otsu(crop))
+    except ValueError:
+        return crop_f
+    return np.clip(crop_f - threshold, 0, None)
+
+def _multi_peak_translation(target_crop, reference_crop, half=12, min_distance=15,
+                            num_peaks=4, threshold_rel=0.3):
+    """
+    Alternative to a single whole-crop phase-correlation fit: finds
+    several DISTINCT bright peaks in reference_crop (mild Gaussian blur
+    first, so a single hot pixel can't register as its own peak), fits
+    translation independently at each via phase correlation on a small
+    window around it, then takes the MEDIAN shift across peaks as the
+    consensus H2.
+
+    Motivation, confirmed on real data (cell 3, Hyb_105 vs Hyb_101): a
+    whole-crop fit pools every pixel together, so it can get pulled
+    toward whichever region is brightest -- but "brightest" isn't the
+    same as "representative." On that real cell, 3 of 4 distinct peaks
+    independently agreed on dy=0, while the single brightest, most
+    isolated peak (a lone fiducial bead, visually distinct from the
+    diffuse chromatin/cell body signal) wanted dy=-2 -- and the whole-
+    crop fit landed near that ONE outlier peak, not the 3-peak majority.
+    Taking the median across several independently-fit peaks is robust
+    to exactly this: one outlier peak can't drag the consensus the way
+    it drags a single pooled fit, without at least half the peaks
+    agreeing with it.
+
+    Falls back to a single whole-crop phase-correlation fit when fewer
+    than 2 peaks are found -- a median of 0 or 1 values has no
+    consensus/robustness benefit over just fitting the whole crop
+    directly, and a low-signal crop legitimately might not have that
+    many distinct bright features to key off of.
+
+    Each peak's OWN fit is gated exactly like the whole-crop fit is
+    gated one level up in compute_cell_alignment -- per explicit
+    feedback, a peak here is just as capable of a bad phase-correlation
+    lock as the whole crop is, and un-gated peaks can drag the median
+    toward a wrong answer as surely as a single un-gated whole-crop fit
+    can. TWO gates per peak: (1) magnitude > half of the peak's own
+    small window -- a shift that size couldn't be real content within
+    that window, only noise/padding (confirmed on real data: cell 49,
+    Hyb_131 vs Hyb_101 -- one peak's fit hit 15px in a half=12 window,
+    clearly a lock onto nothing); (2) _reconstruction_residual doesn't
+    improve on that peak's own small crop -- catches the more common
+    case where the shift is small enough to pass (1) but still makes the
+    local match WORSE, not better (confirmed on the same real cell: the
+    other 3 of 4 peaks all passed the magnitude gate at ~11px < half=12,
+    but EVERY one of the 4 failed the quality gate -- residual got worse
+    at every single peak, correctly signaling this hybe pair has no real
+    correspondence in this crop at all, not just one bad peak among
+    several good ones). Rejected peaks are dropped entirely, not zeroed
+    (a zero would itself bias the median toward "no shift", a claim this
+    function has no basis to make about a peak whose own fit failed).
+    Falls back to identity (dx=dy=0) if EVERY peak is rejected -- same
+    "no no-alignment" principle as the whole-crop reject bound: reject
+    means "no correction found", never a value derived from data the
+    gates themselves flagged as untrustworthy.
+    """
+    height, width = reference_crop.shape
+    ref_smooth = cv2.GaussianBlur(reference_crop.astype(np.float32), (5, 5), 0)
+    peaks = peak_local_max(ref_smooth, min_distance=min_distance, num_peaks=num_peaks,
+                           threshold_rel=threshold_rel)
+    if len(peaks) < 2:
+        return np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
+                          np.array([0, 0, 1])])
+    shifts = []
+    for py, px in peaks:
+        ymin, ymax = max(0, py - half), min(height, py + half + 1)
+        xmin, xmax = max(0, px - half), min(width, px + half + 1)
+        small_ref = reference_crop[ymin:ymax, xmin:xmax]
+        small_tgt = target_crop[ymin:ymax, xmin:xmax]
+        H_peak = preprocess.find_translation_via_phase_correlation(small_tgt, small_ref)
+        dx, dy = H_peak[0, 2], H_peak[1, 2]
+        H_peak3 = np.vstack([H_peak, np.array([0, 0, 1])])
+        magnitude_rejected = np.hypot(dx, dy) > half
+        residual_before = _reconstruction_residual(small_tgt, small_ref, np.eye(3))
+        residual_after = _reconstruction_residual(small_tgt, small_ref, H_peak3)
+        quality_rejected = not (residual_after < residual_before)
+        if not (magnitude_rejected or quality_rejected):
+            shifts.append((dx, dy))
+    if not shifts:
+        return np.eye(3)
+    shifts = np.array(shifts)
+    dx, dy = float(np.median(shifts[:, 0])), float(np.median(shifts[:, 1]))
+    return np.array([[1., 0., dx], [0., 1., dy], [0., 0., 1.]])
+
+def _find_z_shift(target_profile, ref_profile):
+    """
+    1D cross-correlation shift estimate between two depth profiles
+    (already collapsed down to a single Z-axis signal each -- see
+    compute_cell_alignment's own Z-alignment leg). NOT cv2.phaseCorrelate:
+    that's built for 2D images and its internal FFT/Hann-window machinery
+    errors on a genuinely 1D (width-1) array (confirmed on real data --
+    cv2.error out of cv2.phaseCorrelate on a (depth,1)-shaped input). A
+    plain 1D cross-correlation is both the simpler and the more correct
+    tool once X has already been collapsed out of the problem entirely.
+
+    Returns the shift such that target_profile, moved by this amount,
+    best matches ref_profile (same sign convention as
+    find_translation_via_phase_correlation's own translation output).
+    """
+    t = target_profile.astype(np.float64).ravel()
+    r = ref_profile.astype(np.float64).ravel()
+    t = t - t.mean()
+    r = r - r.mean()
+    corr = np.correlate(r, t, mode='full')
+    best_k = int(np.argmax(corr))
+    return float(best_k - (len(t) - 1))
+
 def _h_rotation_angle_degrees(H):
     """
     Degrees such that cv2.getRotationMatrix2D(center, angle, 1.0)'s
@@ -197,6 +393,24 @@ def _h_rotation_angle_degrees(H):
     combinations all gave residual 1500-1950 (visibly wrong direction).
     """
     return float(np.degrees(np.arctan2(H[0, 1], H[0, 0])))
+
+
+def entry_dz(entry):
+    """
+    The Z shift out of an ACell.matrices entry, as a plain float.
+
+    'dz' is the current shape. A legacy 'zx' 3x3 is read at [0, 2] -- the
+    only element it ever carried: Z alignment is a 1D correlation, that
+    matrix was never composed, inverted or multiplied anywhere, and every
+    reader read exactly that one element. The conversion is therefore
+    exact and unambiguous, so legacy data is accepted rather than rejected.
+    """
+    if not entry:
+        return 0.0
+    if 'dz' in entry:
+        return float(entry['dz'])
+    zx = entry.get('zx')
+    return 0.0 if zx is None else float(np.asarray(zx)[0, 2])
 
 
 def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, border_trim=0, max_shift=None,
@@ -257,6 +471,19 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     if it exceeds that bound -- a hard cap, not just a tiebreaker, per
     explicit request for a tunable bound on how much real physical drift
     is plausible between two hybridization rounds/imaging sessions.
+
+    Independently of max_shift (which is opt-in, off by default): every
+    candidate is also checked against the hard, non-configurable engine-
+    level bounds (MAX_ALIGNMENT_TRANSLATION_PX/MAX_ALIGNMENT_ROTATION_DEG,
+    see their own module-level docstring) BEFORE candidate selection --
+    whichever candidate has the lowest reconstruction residual AMONG the
+    ones actually within bounds wins, same "best of the genuinely
+    plausible options" principle used everywhere else in this pipeline
+    (e.g. mixture-fit sibling selection). If NO candidate qualifies (a
+    single-candidate free-angle fit that itself is out of bounds, or --
+    in the ORB/rotation branch -- all three of ORB/fixed-angle-confirm/
+    zero-angle are out of bounds), returns identity: an out-of-bound fit
+    is treated as "no real correction found," never applied partially.
     """
     if border_trim > 0:
         moving_mip = moving_mip[border_trim:-border_trim, border_trim:-border_trim]
@@ -265,80 +492,101 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     moving_norm = preprocess.normalize_to_uint8(moving_mip, lb, ub)
     reference_norm = preprocess.normalize_to_uint8(reference_mip, lb, ub)
 
+    # Native optimizer bounds for the Powell/MSD candidates below -- unlike
+    # ORB+RANSAC (a closed-form/RANSAC estimator with no bounds mechanism
+    # to hook into, see compute_features_affinelike_matrix), Powell's own
+    # scipy implementation supports bounds= directly, constraining the
+    # SEARCH itself rather than only checking its result after the fact.
+    powell_bounds = [(-MAX_ALIGNMENT_TRANSLATION_PX, MAX_ALIGNMENT_TRANSLATION_PX),
+                     (-MAX_ALIGNMENT_TRANSLATION_PX, MAX_ALIGNMENT_TRANSLATION_PX),
+                     (-MAX_ALIGNMENT_ROTATION_DEG, MAX_ALIGNMENT_ROTATION_DEG)]
+
     H_orb = preprocess.compute_features_affinelike_matrix(moving_norm, reference_norm)
     angle_orb = _h_rotation_angle_degrees(H_orb)
 
     if abs(angle_orb) < angle_threshold:
-        H_final = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=False)
+        candidates = [preprocess.compute_msd_homography_matrix(moving_norm, reference_norm,
+                                                                fixed_scale=1.0, fixed_angle=False,
+                                                                bounds=powell_bounds)]
     else:
-        H_confirm = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=angle_orb)
-        H_zero = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0, fixed_angle=True)
+        H_confirm = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
+                                                              fixed_angle=angle_orb, bounds=powell_bounds)
+        H_zero = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
+                                                           fixed_angle=True, bounds=powell_bounds)
         candidates = [H_orb, H_confirm, H_zero]
-        residuals = [_reconstruction_residual(moving_norm, reference_norm, H) for H in candidates]
-        H_final = candidates[int(np.argmin(residuals))]
+
+    # ORB is still checked post-hoc here (no native bounds available for
+    # it); the Powell candidates above are now bounded at the SEARCH level
+    # too, so this is a genuine belt-and-suspenders double-check for them,
+    # not their only safeguard.
+    in_bounds = [H for H in candidates if _within_hard_alignment_bounds(H, moving_norm.shape)]
+    if not in_bounds:
+        return np.eye(3)
+    residuals = [_reconstruction_residual(moving_norm, reference_norm, H) for H in in_bounds]
+    H_final = in_bounds[int(np.argmin(residuals))]
 
     if max_shift is not None:
-        dx, dy = H_final[0, 2], H_final[1, 2]
+        # Clip the CENTRE displacement, not the raw translation column, and
+        # adjust the column by the difference so the rotation block survives
+        # untouched. Clipping the column directly would corrupt any rotation
+        # (whose column is mostly origin offset, not displacement) into a
+        # different, arbitrary transform rather than a smaller one.
+        dy, dx = _center_displacement(H_final, moving_norm.shape)
         if abs(dx) > max_shift or abs(dy) > max_shift:
             H_final = H_final.copy()
-            H_final[0, 2] = np.clip(dx, -max_shift, max_shift)
-            H_final[1, 2] = np.clip(dy, -max_shift, max_shift)
+            H_final[0, 2] += float(np.clip(dx, -max_shift, max_shift)) - dx
+            H_final[1, 2] += float(np.clip(dy, -max_shift, max_shift)) - dy
 
-    return H_final
+    # THE engine boundary (convention.py): everything above -- ORB, Powell,
+    # residual scoring, bounds -- is cv2-native x-major; everything outside
+    # this function speaks y-major. One conversion, here, nowhere else.
+    return to_yx(H_final)
 
 def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
     Persists an already-computed {hybe: matrix} dict (from
     align_same_modality(..., write=False), or a manual-mode staged
-    result the user just accepted) into each hybe's own H5 /matrix/{hybe},
+    result the user just accepted) into vlinks.h5's /FOV##/matrix/{hybe},
     plus reference_sequence/steps provenance attrs -- split out from
     align_same_modality so the write step can be deferred (manual
     review mode) or run standalone.
+
+    Delegates to vlinks_store rather than writing into each hybe's own raw
+    {hybe}_stack.h5 (the previous behavior) -- per explicit principle,
+    vlinks.h5 must be the pipeline's authoritative store for this, not N
+    scattered raw per-hybe files that require heavy I/O (opening every
+    stack file) just to answer "has this FOV been aligned." Outside
+    ingestion and 3D localization, the raw stack files should not need to
+    be touched at all.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
-    for hybe, H in matrices.items():
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
-        with h5py.File(h5path, 'r+') as f:
-            f['/matrix'][hybe][:] = H
-            f['/matrix'][hybe].attrs['reference_sequence'] = np.array([f'{hybe}->{reference_hybe}'], dtype='S')
-            f['/matrix'][hybe].attrs['steps'] = H[None, ...].astype('float32')
+    vlinks_store.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
 
 
 def read_same_modality_matrices(storage_path, fov, hybe_records):
     """
-    Reads back whatever's already on disk in each hybe's own H5
-    /matrix/{hybe} (self-keyed dataset -- see write_same_modality_matrices)
-    without requiring align_same_modality to be re-run. preprocess.py's
-    ingestion always seeds this dataset to identity for every hybe, so a
-    hybe whose H5 DOES exist but has no /matrix/{hybe} yet still legitimately
-    gets an identity default here. A hybe whose H5 doesn't exist AT ALL,
-    though, was simply never ingested -- it's silently SKIPPED (no entry in
-    the returned dict at all), never given a fake identity default. This
-    matters: hybe_records passed in here can be the full parsed
-    ExperimentLayout (declaring far more hybes than were ever actually
-    converted to H5), and a fake identity entry for a non-ingested hybe
-    used to leak into self.fov_matrices, making it look like a real,
-    processable hybe to downstream code (e.g. cell-based alignment), which
-    then crashed trying to open a stack file that genuinely doesn't exist.
-    This is the read-back half of "activation": self.fov_matrices in the
-    GUI should reflect whatever alignment has already been computed and
-    written, without the user needing to re-run alignment just to see it
-    again.
+    Reads back whatever's already in vlinks.h5's /FOV##/matrix/{hybe} (see
+    write_same_modality_matrices) without requiring align_same_modality to
+    be re-run. A hybe already ingested (real MIP present in vlinks.h5) but
+    with no matrix entry yet still legitimately gets an identity default.
+    A hybe never ingested at all is silently SKIPPED (no entry in the
+    returned dict), never given a fake identity default. This matters:
+    hybe_records passed in here can be the full parsed ExperimentLayout
+    (declaring far more hybes than were ever actually ingested), and a
+    fake identity entry for a non-ingested hybe used to leak into
+    self.fov_matrices, making it look like a real, processable hybe to
+    downstream code (e.g. cell-based alignment), which then crashed trying
+    to open a stack file that genuinely doesn't exist. This is the
+    read-back half of "activation": self.fov_matrices in the GUI should
+    reflect whatever alignment has already been computed and written,
+    without the user needing to re-run alignment just to see it again.
+
+    Delegates to vlinks_store.read_same_modality_matrices instead of
+    opening each hybe's own raw
+    {hybe}_stack.h5 -- this is now a single vlinks.h5 open, not N raw file
+    opens, so callers can refresh this freely.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
-    matrices = {}
-    for record in hybe_records:
-        hybe = record['folder']
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
-        try:
-            with h5py.File(h5path, 'r') as f:
-                if f'/matrix/{hybe}' in f:
-                    matrices[hybe] = f[f'/matrix/{hybe}'][:]
-                else:
-                    matrices[hybe] = np.eye(3)
-        except OSError:
-            continue
-    return matrices
+    hybe_list = [record['folder'] for record in hybe_records]
+    return vlinks_store.read_same_modality_matrices(storage_path, fov, hybe_list)
 
 
 def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999, write=True,
@@ -364,22 +612,26 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
     function's docstring. Both default to no-op (0 / None), so existing
     callers see no behavior change unless they opt in.
     """
-    fov_path = os.path.join(storage_path, f'FOV{fov:02d}')
     record_by_folder = {r['folder']: r for r in hybe_records}
     ref_record = record_by_folder[reference_hybe]
 
-    with h5py.File(os.path.join(fov_path, f'{reference_hybe}_stack.h5'), 'r') as f:
-        reference_mip = f[f'/mip/ch{ref_record["fiducial_channel"]}'][:]
+    # FOV-level (same-modality) alignment is not one of the 3D exceptions
+    # (3D spot localization, 3D cell-based alignment, 3D spot-based
+    # alignment) -- reads vlinks.h5's real MIP copy, never the raw stack
+    # file.
+    reference_mip = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, ref_record['fiducial_channel'])
+    if reference_mip is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} not in vlinks.h5 -- ingest it first.')
 
     matrices = {}
     for record in hybe_records:
         hybe = record['folder']
-        h5path = os.path.join(fov_path, f'{hybe}_stack.h5')
         if hybe == reference_hybe:
             H = np.eye(3)
         else:
-            with h5py.File(h5path, 'r') as f:
-                moving_mip = f[f'/mip/ch{record["fiducial_channel"]}'][:]
+            moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, record['fiducial_channel'])
+            if moving_mip is None:
+                raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
             H = align_readout_to_reference(moving_mip, reference_mip, lb, ub, border_trim=border_trim, max_shift=max_shift)
         matrices[hybe] = H
 
@@ -387,20 +639,6 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
         write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
 
     return matrices
-
-def _readout_channel_mip(h5path):
-    """The one non-fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
-    with h5py.File(h5path, 'r') as f:
-        channels = [int(c.decode()) for c in f.attrs['channel_list']]
-        fiducial_ch = int(f.attrs['fiducial_channel'])
-        readout_ch = [c for c in channels if c != fiducial_ch][0]
-        return f[f'/mip/ch{readout_ch}'][:]
-
-def _fiducial_channel_mip(h5path):
-    """The fiducial channel's MIP for a hybe H5 file, read from its own attrs."""
-    with h5py.File(h5path, 'r') as f:
-        fiducial_ch = int(f.attrs['fiducial_channel'])
-        return f[f'/mip/ch{fiducial_ch}'][:]
 
 def link_cross_modal(rna_storage_path, dna_storage_path, fov,
                       rna_fov_matrices, dna_fov_matrices,
@@ -449,67 +687,113 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     align_readout_to_reference for the actual DNA->RNA correlation step --
     see that function's docstring. Both default to no-op (0 / None).
     """
-    mip_fn = _fiducial_channel_mip if channel_type == 'fiducial' else _readout_channel_mip
-    rna_h5path = os.path.join(rna_storage_path, f'FOV{fov:02d}', f'{rna_reference_hybe}_stack.h5')
-    dna_h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    rna_mip = mip_fn(rna_h5path)
-    dna_mip = mip_fn(dna_h5path)
+    # Cross-modality alignment is not one of the 3D exceptions -- reads
+    # vlinks.h5's real MIP copies, never the raw stack file.
+    mip_fn = vlinks_store.fiducial_channel_mip if channel_type == 'fiducial' else vlinks_store.readout_channel_mip
+    rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
+    dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
+    if rna_mip is None or dna_mip is None:
+        raise ValueError(f'FOV{fov:02d}: {rna_reference_hybe} (RNA) and/or {dna_reference_hybe} (DNA) '
+                         f'not in vlinks.h5 -- ingest them first.')
 
     h, w = rna_mip.shape
-    H_rna_within = rna_fov_matrices.get(rna_reference_hybe, np.eye(3))
-    H_dna_within = dna_fov_matrices.get(dna_reference_hybe, np.eye(3))
-    rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), H_rna_within[:2], (w, h))
-    dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), H_dna_within[:2], (w, h))
+    H_rna_within = rna_fov_matrices.get((rna_reference_hybe, rna_fov_matrices.modality), np.eye(3))
+    H_dna_within = dna_fov_matrices.get((dna_reference_hybe, dna_fov_matrices.modality), np.eye(3))
+    rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), as_cv2(H_rna_within)[:2], (w, h))
+    dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
     return align_readout_to_reference(dna_mip_aligned, rna_mip_aligned, lb, ub, border_trim=border_trim, max_shift=max_shift)
 
 
-def write_cross_modal_matrix(dna_storage_path, fov, H, rna_reference_hybe, dna_reference_hybe, channel_type):
-    """
-    Persists an already-computed H_across (from link_cross_modal) into a new
-    /matrix_across dataset in the DNA reference hybe's own H5 file --
-    link_cross_modal itself never wrote anywhere (unlike
-    align_same_modality, which always did), so this closes that gap.
-    Written into the DNA side specifically since H_across is, by
-    link_cross_modal's own convention, the matrix that maps DNA's
-    within-experiment frame onto RNA's -- RNA's own frame is the shared
-    global frame and never needs an /matrix_across entry of its own.
-    Mirrors /matrix/{hybe}'s existing provenance-attrs convention
-    (reference_sequence/steps) so both are discoverable the same way.
-    """
-    h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r+') as f:
-        if '/matrix_across' not in f:
-            f.create_dataset('/matrix_across', shape=(3, 3), dtype='float64')
-        f['/matrix_across'][:] = H
-        f['/matrix_across'].attrs['rna_reference_hybe'] = rna_reference_hybe
-        f['/matrix_across'].attrs['dna_reference_hybe'] = dna_reference_hybe
-        f['/matrix_across'].attrs['channel_type'] = channel_type
+MAX_CROSS_MODAL_Z_PLANES = 80.0
 
 
-def read_cross_modal_matrix(dna_storage_path, fov, dna_reference_hybe):
+def hybe_zy_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     """
-    Reads back an already-computed/written H_across from the DNA reference
-    hybe's own H5 (see write_cross_modal_matrix) -- returns None if nothing
-    has been written yet for this FOV (unlike within-experiment matrices,
-    there's no identity default seeded at ingestion time here: a FOV
-    genuinely hasn't been cross-modal-aligned until this has been run at
-    least once, so None is the honest answer, not a fabricated identity).
-    This is the read-back half needed so a cross-modal overlay can be
-    re-shown without requiring the result to still be in the in-memory
-    cross_modal_result dict from the current session.
+    The ZY counterpart of hybe_zx_projection: max-projects along WIDTH (X)
+    instead of height, giving a (height, depth) "Y-by-Z" image. Same
+    contract and same caller obligations (bounds must already be valid and
+    in-frame) -- see hybe_zx_projection.
     """
-    h5path = os.path.join(dna_storage_path, f'FOV{fov:02d}', f'{dna_reference_hybe}_stack.h5')
-    try:
-        with h5py.File(h5path, 'r') as f:
-            if '/matrix_across' not in f:
-                return None
-            return f['/matrix_across'][:]
-    except OSError:
-        return None
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
+    projection = stack.max(axis=1)  # (height, depth)
+    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
 
 
-def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub):
+def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dna_hybe,
+                           rna_channel, dna_channel, y0=192, y1=832, x0=192, x1=832):
+    """
+    FOV-level cross-modal Z drift, in PLANES, from DNA's frame into RNA's --
+    the same direction the 2D H_across is stored in, so both legs of the
+    cross-modal bridge share one convention.
+
+    METHOD: 1D cross-correlation of the two references' whole-FOV depth
+    profiles, computed from BOTH the ZX and the ZY projection and summed
+    before taking the peak. Summing the two correlation curves (rather
+    than averaging two separately-chosen peaks) lets a weak axis be
+    outvoted instead of contributing its own spurious argmax.
+
+    Focal-plane matching was tried first and is NOT used: measured on real
+    data, the variance-of-Laplacian peak of these fiducial stacks
+    frequently lands on a stack ENDPOINT (RNA Hyb_130 FOV02 z=0, DNA
+    Hyb_400 FOV01 z=161/177, FOV02 z=171/177, prominence 0.20-0.27),
+    because the focus curve has no interior maximum. That produced drift
+    estimates of -51 and -171 planes against a per-cell truth near -12.
+    The focal planes are still REPORTED in `diagnostics` as a cross-check.
+
+    Returns (dz, quality, diagnostics). quality is the peak normalized
+    correlation (1.0 = perfect); gate on it and keep the manual override,
+    since on equal-depth stacks this returns ~0 where the truth was
+    +12/+4 -- a graceful failure (degrades toward no correction) but a
+    real one.
+    """
+    from ..segmentation import segment as _segment
+
+    def depth_profiles(storage_path, hybe, channel):
+        zx = hybe_zx_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
+                                0.3, 0.9999, normalize=False)
+        zy = hybe_zy_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
+                                0.3, 0.9999, normalize=False)
+        return zx.mean(axis=0).astype(np.float64), zy.mean(axis=0).astype(np.float64)
+
+    rna_zx, rna_zy = depth_profiles(rna_storage_path, rna_hybe, rna_channel)
+    dna_zx, dna_zy = depth_profiles(dna_storage_path, dna_hybe, dna_channel)
+
+    def z(v):
+        v = np.asarray(v, dtype=np.float64)
+        return (v - v.mean()) / (v.std() + 1e-9)
+
+    span = int(MAX_CROSS_MODAL_Z_PLANES)
+    lags = list(range(-span, span + 1))
+    totals, per_axis = [], {}
+    for name, (pa, pb) in (('zx', (rna_zx, dna_zx)), ('zy', (rna_zy, dna_zy))):
+        a, b = z(pa), z(pb)
+        curve = []
+        for lag in lags:
+            ia = np.arange(len(a)); ib = ia + lag
+            m = (ib >= 0) & (ib < len(b))
+            curve.append(float(np.mean(a[ia[m]] * b[ib[m]])) if m.sum() >= 50 else -np.inf)
+        curve = np.array(curve)
+        per_axis[name] = -float(lags[int(np.argmax(curve))])
+        totals.append(curve)
+    combined = np.where(np.isfinite(totals[0]) & np.isfinite(totals[1]),
+                        totals[0] + totals[1], -np.inf)
+    best_i = int(np.argmax(combined))
+    dz = -float(lags[best_i])
+    quality = float(combined[best_i] / 2.0)
+
+    zs_r, v_r = _segment.focus_profile(rna_storage_path, fov, rna_hybe, rna_channel)
+    zs_d, v_d = _segment.focus_profile(dna_storage_path, fov, dna_hybe, dna_channel)
+    focal_rna, focal_dna = int(zs_r[int(np.argmax(v_r))]), int(zs_d[int(np.argmax(v_d))])
+    diagnostics = {'focal_rna': focal_rna, 'focal_dna': focal_dna,
+                   'focal_dz': -float(focal_dna - focal_rna),
+                   'zx_dz': per_axis['zx'], 'zy_dz': per_axis['zy']}
+    return dz, quality, diagnostics
+
+
+def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     """
     A cell-region Z-stack crop, max-projected along the height (Y) axis to
     give an (width, depth) "X-by-Z" image usable for a 1D phase-correlation
@@ -519,6 +803,24 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     AlignmentWidget.cell_based_align uses; conceptually the same idea
     (project out one in-plane axis, compare what's left via phase
     correlation), just adapted to this project's own stack shape.
+
+    ymin/ymax/xmin/xmax must already be valid (real, non-negative,
+    in-frame) slice bounds -- this never clamps them itself. A caller
+    building a true (possibly out-of-frame) window -- e.g. pipeline_
+    canvas.py's true-extent cell crops -- must clip to the real frame
+    before calling this, then place the result into its own larger
+    canvas; passing a negative index straight through would silently
+    wrap via Python/h5py's own negative-index convention instead of
+    raising, corrupting the read.
+
+    normalize=True (default): returns a uint8 image, unchanged behavior
+    for every existing caller. normalize=False returns the raw float32
+    projection instead -- for a caller (pipeline_canvas.py) that needs
+    to place this into a NaN-padded true-extent canvas and defer
+    normalization until final compositing, matching how the YX crops
+    it's paired with are handled (normalizing a uint8-already image a
+    second time, or baking in a fixed 0-255 range before it's known
+    which pixels end up NaN-masked, would double-stretch contrast).
 
     Public (not module-private) since canvas/pipeline_canvas.py's
     draw_cell_alignment_preview_3col reuses it directly to show the ZX
@@ -530,7 +832,7 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     with h5py.File(h5path, 'r') as f:
         stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
     projection = stack.max(axis=0)  # (width, depth)
-    return preprocess.normalize_to_uint8(projection, lb, ub)
+    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
 
 def pick_channel_by_type(record, channel_type):
     """'readout' -> that hybe's one non-fiducial channel (falls back to
@@ -545,7 +847,9 @@ def pick_channel_by_type(record, channel_type):
 def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            reference_hybe=None, channel_type='readout',
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
-                           cell_reference_hybe_matrix=None, modality=None):
+                           cell_reference_hybe_matrix=None, modality=None,
+                           background_clip=None, fit_method='phase_correlation',
+                           integer_shift=False):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -596,6 +900,42 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     the caller must resolve it from the SAME-MODALITY fov_matrices it
     already has in scope and pass it through explicitly instead.
 
+    background_clip: None (default, no behavior change), 'yen', or 'otsu'
+    -- soft-subtracts each crop's own background threshold (see
+    _clip_background) before the phase-correlation fit AND the
+    reconstruction-residual quality gate, on EVERY hybe's target crop and
+    once on the shared reference crop. Never affects `reference_crop`/
+    `target_crop` themselves (matrix_provenance, callers) -- only the
+    fitting/scoring inputs. Opt-in: still experimental, not yet the
+    pipeline's own default.
+
+    fit_method: 'phase_correlation' (default, no behavior change -- one
+    whole-crop cv2.phaseCorrelate fit, as before) or 'multi_peak' (see
+    _multi_peak_translation) -- fits several distinct bright peaks
+    independently and takes their median as a consensus H2, robust to a
+    single unusually bright/isolated feature dominating a whole-crop fit.
+    Opt-in: still experimental, not yet the pipeline's own default.
+
+    integer_shift: False (default, no behavior change) or True -- rounds
+    H2 to the nearest whole pixel immediately after fitting (either
+    method), BEFORE both reject gates score it. Per explicit request,
+    this cell-level step is meant to be a small translation-only
+    REFINEMENT, not a free continuous optimization -- rounding keeps it
+    "no sub-pixel" the same way it's already "no rotation". Opt-in: still
+    experimental, not yet the pipeline's own default.
+
+    NOTE: this option's ORIGINAL second justification is now obsolete and
+    deliberately no longer claimed here. It used to argue that the
+    preview could only reposition an integer-rounded crop window, so a
+    sub-pixel H2 would render as anywhere from invisible to a blunt 1px
+    snap, and rounding made the gate score what the preview could
+    actually draw. draw_cell_alignment_preview_3col now applies the
+    residual to the IMAGE via warpAffine (float, both the YX and the ZX
+    row) instead of moving an int() window, so it displays a sub-pixel
+    residual at full precision -- the display no longer constrains the
+    fit, and rounding is now purely a modelling choice about what a
+    cell-level refinement should be allowed to express.
+
     modality: which modality hybe_records/fov_matrices/storage_path belong
     to for THIS call -- cell.matrices/cell.matrix_provenance are keyed by
     (hybe, modality), never bare hybe, because the cross-modal "bridge"
@@ -603,8 +943,8 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     bare-string key would collide the two calls (same-modality and
     cross-modal) this function is meant to be invoked with once each per
     cell, silently dropping whichever one runs second. Defaults to
-    cell.modality (the common, same-modality call); the cross-modal call
-    MUST pass the other modality's own name explicitly.
+    cell.reference_modality (the common, same-modality call); the
+    cross-modal call MUST pass the other modality's own name explicitly.
 
     Writes cell.matrices[(hybe, modality)] = {'yx': H_within_or_across @
     ... composed with the cell's own residual, 'zx': depth correction}
@@ -621,6 +961,21 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     to identity would silently discard that real correction rather
     than apply it.
 
+    The cell-level residual (H2, fitted via phase correlation between the
+    target and reference crops) is rejected -- falls back to identity,
+    keeping the FOV/cross-modal-only alignment -- under THREE independent
+    gates: (1) its magnitude exceeds `pad` (the crop couldn't have
+    contained real content that far out), (2) its magnitude exceeds the
+    hard, non-configurable engine-level bound (see this module's own
+    MAX_ALIGNMENT_TRANSLATION_PX -- independent of `pad`, which is user-
+    tunable and sometimes intentionally larger), and (3) it doesn't
+    actually improve the crop match (_reconstruction_residual after
+    applying H2 isn't strictly better than before, both measured on the
+    same target/reference crops this residual was fitted from) -- phase
+    correlation can converge to a local minimum that's a worse match than
+    no correction at all, which neither magnitude bound alone catches
+    since the bad shift can still be small.
+
     cell.matrix_anchors[modality] is ALSO written here (once per call) --
     reference_hybe's own transform into fov_matrices' shared frame
     (what used to be folded into every cell.matrices entry). A consumer
@@ -634,10 +989,10 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     """
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
-    modality = modality if modality is not None else cell.modality
-    x_ref, y_ref = cell.area  # always native to cell.reference_hybe's own frame
+    modality = modality if modality is not None else cell.reference_modality
+    y_ref, x_ref = cell.area  # (y, x), native to cell.reference_hybe's own frame
     if cell_reference_hybe_matrix is None:
-        cell_reference_hybe_matrix = fov_matrices.get(cell.reference_hybe, np.eye(3))
+        cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
 
     def _native_crop(hybe, channel):
         # cell.reference_hybe's frame -> hybe's own native frame, via
@@ -668,18 +1023,39 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             return None  # cell doesn't overlap this hybe's frame at all
         ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
         xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
-        with h5py.File(os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5'), 'r') as f:
-            mip = f[f'/mip/ch{channel}'][:]
+        # YX (2D) residual fit -- not one of the 3D exceptions (only the
+        # ZX/depth leg below, via hybe_zx_projection, genuinely needs the
+        # raw Z-stack) -- reads vlinks.h5's real MIP copy.
+        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        if mip is None:
+            return None  # not ingested -- same graceful "no crop" path as no-overlap
         crop = preprocess.normalize_to_uint8(mip[ymin:ymax, xmin:xmax], lb, ub)
         return crop, (ymin, ymax, xmin, xmax)
 
     record_by_folder = {r['folder']: r for r in hybe_records}
+    if reference_hybe not in record_by_folder:
+        # A bare dict lookup here raised an opaque KeyError -- e.g. when a
+        # caller's reference_hybe belongs to a different modality than the
+        # hybe_records passed in (this project's own same-modality vs.
+        # cross-modal hybe_records are always modality-specific, never
+        # mixed). Surface the actual mismatch instead.
+        raise ValueError(f"reference_hybe '{reference_hybe}' is not in the {len(hybe_records)} "
+                         f"hybe_records passed to compute_cell_alignment (modality={modality}) -- "
+                         f"it likely belongs to a different modality.")
     ref_record = record_by_folder[reference_hybe]
     ref_channel = pick_channel_by_type(ref_record, channel_type)
     ref_result = _native_crop(reference_hybe, ref_channel)
     if ref_result is None:
         raise ValueError(f"Cell {cell.id} doesn't overlap reference hybe {reference_hybe}'s frame")
     reference_crop, (rymin, rymax, rxmin, rxmax) = ref_result
+    # Optional background suppression, computed ONCE for reference_crop
+    # (fixed for the whole call) -- see _clip_background's own docstring.
+    # Only affects the phase-correlation fit and the quality gate below;
+    # never applied to `reference_crop`/`target_crop` themselves, which
+    # stay the plain quantile-normalized crops everywhere else (matrix_
+    # provenance, callers) that might reasonably expect them.
+    reference_crop_for_fit = (_clip_background(reference_crop, background_clip)
+                              if background_clip else reference_crop)
     # relative transform FROM reference_hybe's native frame TO the shared
     # FOV frame -- identity when reference_hybe is also the FOV-alignment's
     # own reference hybe (fov_matrices always carries a real entry per
@@ -687,7 +1063,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     # composed into every entry below) -- see this function's own
     # docstring for why, and ACell.matrix_to/matrix_between for how a
     # consumer uses it to bridge across modalities when needed.
-    H_ref_to_shared = fov_matrices.get(reference_hybe, np.eye(3))
+    H_ref_to_shared = fov_matrices.get((reference_hybe, fov_matrices.modality), np.eye(3))
     cell.matrix_anchors[modality] = H_ref_to_shared
 
     for record in hybe_records:
@@ -719,7 +1095,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # other hybe whenever it ISN'T this run's reference_hybe, and
             # forcing it to identity in that case would silently discard
             # that real correction rather than compute it.
-            cell.matrices[key] = {'yx': np.eye(3), 'zx': np.eye(3)}
+            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
             continue
 
         # H1 (hybe's native frame -> shared frame -> reference_hybe's
@@ -727,7 +1103,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # algebra from fov_matrices -- it never needs any image data, so
         # it's always computable regardless of whether a crop can be
         # built below.
-        H1 = compose_chain([fov_matrices[hybe], la.inv(H_ref_to_shared)])
+        H1 = compose_chain([fov_matrices[(hybe, fov_matrices.modality)], la.inv(H_ref_to_shared)])
 
         target_channel = pick_channel_by_type(record, channel_type)
         result = _native_crop(hybe, target_channel)
@@ -739,8 +1115,11 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # was this code's own earlier, WRONG behavior) -- H1 above is
             # still fully valid, so fall back to H1-only (H2=identity)
             # exactly like a rejected residual does.
-            H_yx = H1
-            cell.matrices[key] = {'yx': H_yx, 'zx': np.eye(3)}
+            # BARE residual (identity here -- no crop, so nothing fitted).
+            # H1 is deliberately NOT baked in: it is recomposed at read
+            # time from the CURRENT FOV matrices, so re-running FOV
+            # alignment updates this cell without a re-fit.
+            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
             cell.matrix_provenance[key] = {
                 'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe} '
                                       f'[cell-level residual SKIPPED: cell does not overlap this hybe\'s frame, '
@@ -749,9 +1128,57 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             }
             continue
         target_crop, (cymin, cymax, cxmin, cxmax) = result
+        target_crop_for_fit = (_clip_background(target_crop, background_clip)
+                               if background_clip else target_crop)
 
-        H2_fitted = np.vstack([preprocess.find_translation_via_phase_correlation(target_crop, reference_crop),
-                               np.array([0, 0, 1])])
+        if fit_method == 'multi_peak':
+            H2_fitted = _multi_peak_translation(target_crop_for_fit, reference_crop_for_fit)
+        else:
+            H2_fitted = np.vstack([preprocess.find_translation_via_phase_correlation(
+                                       target_crop_for_fit, reference_crop_for_fit),
+                                   np.array([0, 0, 1])])
+        if integer_shift:
+            # Snap to a WHOLE pixel, before gating -- per explicit
+            # request: this cell-level step is meant as a small
+            # translation-only REFINEMENT (no rotation already; this
+            # keeps it "no sub-pixel" too), not a free continuous
+            # optimization. Also closes a real, confirmed gap between
+            # what the quality gate scores and what the preview can
+            # actually show: cv2.phaseCorrelate returns a sub-pixel
+            # shift, _reconstruction_residual evaluates it via a genuine
+            # bilinear-interpolated warpAffine, but the preview crops
+            # never resample pixel content -- they only reposition an
+            # INTEGER-rounded crop window. A sub-pixel H2 the gate scores
+            # as an improvement can render as anywhere from no visible
+            # change to a blunt, un-interpolated 1px snap once displayed.
+            #
+            # NOT plain round() -- confirmed on real data (cell 3, Hyb_105
+            # vs Hyb_101) that nearest-integer rounding can land on the
+            # WRONG side of a close call: the continuous fit found
+            # dx=0.91, which rounds to 1, but an exhaustive integer sweep
+            # found dx=0 scores meaningfully better (reconstruction
+            # residual 310 vs 357) -- round() only ever asks "which whole
+            # pixel is numerically closest," never "which whole pixel
+            # actually reconstructs the reference better," and those two
+            # questions can have different answers near a 0.5 boundary.
+            # Instead, evaluate all 4 combinations of floor/ceil per axis
+            # (the immediate integer neighborhood around the continuous
+            # estimate -- exactly where a close call like this lives) via
+            # the SAME _reconstruction_residual the outer gate already
+            # trusts, and keep whichever actually wins. This is a local
+            # search around the continuous fit's own estimate, not a
+            # blind wide grid search -- the continuous fit still supplies
+            # the neighborhood to search, just not the final answer
+            # within it.
+            fx, fy = H2_fitted[0, 2], H2_fitted[1, 2]
+            candidates = {(dx, dy) for dx in (np.floor(fx), np.ceil(fx))
+                                   for dy in (np.floor(fy), np.ceil(fy))}
+            best_dx, best_dy = min(
+                candidates,
+                key=lambda dxdy: _reconstruction_residual(
+                    target_crop_for_fit, reference_crop_for_fit,
+                    np.array([[1., 0., dxdy[0]], [0., 1., dxdy[1]], [0., 0., 1.]])))
+            H2_fitted = np.array([[1., 0., best_dx], [0., 1., best_dy], [0., 0., 1.]])
         # This residual is a FINE-TUNING correction on top of an already-
         # good FOV/cross-modal alignment -- the crop itself only extends
         # `pad` px beyond the cell's expected position, so the true
@@ -773,27 +1200,76 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         # residual means falling back to identity for H2 specifically --
         # the FOV/cross-modal layer this refinement was built on top of
         # is still valid and must still be written.
-        rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        magnitude_rejected = np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]) > pad
+        # Independent of pad (which bounds how far the crop itself could
+        # even show real content, and is user-tunable, sometimes larger
+        # than the hard cap below for legitimate reasons): the hard,
+        # non-configurable engine-level translation bound (see this
+        # module's own MAX_ALIGNMENT_TRANSLATION_PX) applies here too --
+        # a cell-level residual is meant to be a SMALL correction on top
+        # of already-good FOV/cross-modal alignment, so anything beyond
+        # this bound is an optimizer artifact regardless of what pad
+        # happens to be configured to.
+        # No `shape` argument here, deliberately: a cell-level residual is
+        # translation-only by construction -- every producer of H2_fitted
+        # above (_multi_peak_translation, find_translation_via_phase_
+        # correlation, and the brute-force dx/dy search) returns a matrix
+        # whose 2x2 block is exactly identity. Centre displacement and the
+        # raw translation column are therefore identically equal, so the
+        # column read is correct and passing shape would be a no-op. Rotation
+        # is not expected at this layer at all; it belongs to the FOV/cross-
+        # modal fits, which is where _center_displacement matters.
+        hard_bound_rejected = not _within_hard_alignment_bounds(H2_fitted)
+        # Second, independent gate: phase correlation can lock onto a
+        # local minimum that's a worse match than doing nothing at all
+        # (a real cv2.phaseCorrelate failure mode -- it doesn't return
+        # 0,0 when the target crop is already well-aligned, it can return
+        # a small, pad-bound-passing shift that still makes the overlap
+        # WORSE). The pad-magnitude bound above only catches wildly wrong
+        # shifts; it says nothing about whether a small, plausible-looking
+        # shift actually helped. Directly compare image match quality
+        # before (H2=identity, i.e. the FOV/cross-modal crop as-is) vs
+        # after (H2_fitted applied) on the SAME target_crop/reference_crop
+        # this residual was fitted from -- via _reconstruction_residual
+        # (the same signal-gated, overlap-guarded metric align_readout_
+        # to_reference already uses to pick between candidate transforms,
+        # see its own docstring), not a naive nonzero-background MSD --
+        # background-to-background pixels are the majority of a real
+        # crop and dilute exactly the handful of pixels that would show a
+        # bad shift. Reject (fall back to H2=identity) whenever it didn't
+        # strictly improve the reconstruction of the reference's real
+        # content.
+        residual_before = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, np.eye(3))
+        residual_after = _reconstruction_residual(target_crop_for_fit, reference_crop_for_fit, H2_fitted)
+        quality_rejected = not (residual_after < residual_before)
+        rejected = magnitude_rejected or hard_bound_rejected or quality_rejected
         H2 = np.eye(3) if rejected else H2_fitted
-        # H2 outermost (this cell's own residual refinement measured
-        # against reference_hybe's own crop) -- H1@H2 lands directly in
-        # reference_hybe's own frame, this run's natural resting place;
-        # no further push to a shared frame (see this function's own
-        # docstring for why that's a consumer-side concern now, via
-        # matrix_anchors).
-        H_yx = compose_chain([H1, H2])
+        # Stored BARE, per explicit decision. H2 is the residual measured
+        # against reference_hybe's own crop, in that reference frame.
+        #
+        # This used to store compose_chain([H1, H2]) -- H1 baked in. That
+        # made a stored cell entry a COMPLETE hybe->anchor transform, and
+        # therefore froze the FOV matrix as it stood at fit time: re-running
+        # FOV alignment changed nothing for any already-fitted cell until it
+        # was individually re-fit, silently. Storing only what this step
+        # actually measured keeps the three layers independently updatable,
+        # which is the whole point of having layers. Consumers recompose H1
+        # from CURRENT matrices -- see frames.FrameResolver.to_shared.
+        # H2 was fitted x-major (cv2.phaseCorrelate territory); stored
+        # y-major like every persisted matrix. The ZX leg below reads
+        # H2's own x-major dx BEFORE this conversion, deliberately.
+        H_yx = to_yx(H2)
 
-        H_zx = np.eye(3)
-        zx_rejected = False
-        secondary_x_shift = 0.0
+        z_shift = 0.0
         z_shift = 0.0
         if including_z:
-            # z-depth correction stays fiducial-based regardless of
-            # channel_type -- structural (bead/fiducial) depth alignment,
-            # not signal-dependent, so the yx channel choice doesn't apply here
-            ref_zx = hybe_zx_projection(storage_path, fov, reference_hybe, ref_record['fiducial_channel'],
+            # z-depth correction uses the same channel_type-resolved
+            # channel as the YX fit (ref_channel/target_channel) -- a
+            # readout-channel Z crop should show the readout signal, not
+            # silently fall back to fiducial regardless of channel_type.
+            ref_zx = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
                                         rymin, rymax, rxmin, rxmax, lb, ub)
-            target_zx = hybe_zx_projection(storage_path, fov, hybe, record['fiducial_channel'],
+            target_zx = hybe_zx_projection(storage_path, fov, hybe, target_channel,
                                            cymin, cymax, cxmin, cxmax, lb, ub)
             # hybe_zx_projection returns (width, depth), not (height,
             # width) like every other crop in this module -- H2 (a YX-
@@ -809,416 +1285,87 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # (depth) untouched.
             H2_to_zx = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, H2[0, 2]]])
             target_zx_aligned = cv2.warpAffine(target_zx, H2_to_zx, (target_zx.shape[1], target_zx.shape[0]))
-            A3 = preprocess.find_translation_via_phase_correlation(target_zx_aligned, ref_zx)
-            # Same (width, depth) convention as above: A3[0,2] is this
-            # array's axis1 (depth) shift -- the real z-correction.
-            # A3[1,2] is axis0 (width) -- a SECOND, independent
-            # measurement of the x-shift left over after H2's own x-shift
-            # was already applied above, not a depth value. A confidently-
-            # reported large leftover x-shift here is the same "locked
-            # onto noise, not real content" signal H2's own reject bound
-            # guards against -- distrust BOTH this z-correction and the
-            # x-refinement together when that happens, rather than
-            # keeping one and discarding the other.
-            secondary_x_shift = float(A3[1, 2])
-            z_shift = float(A3[0, 2])
-            zx_rejected = abs(secondary_x_shift) > 3
-            if not zx_rejected:
-                # This leftover x-shift is a second, independent
-                # measurement of the SAME physical x-drift H2 already
-                # estimated -- fold it into H_yx as an additive
-                # refinement, making this the cell's real, final x-
-                # position. H_zx carries the z-correction alone; its own
-                # x-component is intentionally zeroed here, not double-
-                # applied on top of the x already folded into H_yx.
-                H_yx[0, 2] += secondary_x_shift
-                H_zx[0, 2] = z_shift
-
-        zx_note = ''
-        if including_z:
-            if zx_rejected:
-                zx_note = (f' [z-alignment REJECTED: secondary x-shift {secondary_x_shift:.1f}px > 3px, '
-                          f'z left uncorrected]')
-            else:
-                zx_note = f' [z-alignment applied: z={z_shift:.1f}px, yx x refined by {secondary_x_shift:.1f}px]'
-
-        cell.matrices[key] = {'yx': H_yx, 'zx': H_zx}
-        cell.matrix_provenance[key] = {
-            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}'
-                                  + (f' [cell-level residual REJECTED: '
-                                     f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}, '
-                                     f'fell back to FOV/cross-modal only]' if rejected else '')
-                                  + zx_note,
-            'steps': np.stack([H1, H2]),
-        }
-
-def crop_or_pad_to_shape(img, target_shape, pad_value=0):
-    h, w = img.shape[:2]
-    H, W = target_shape
-    dh, dw = H - h, W - w
-
-    # Compute crop or pad for height
-    if dh < 0:
-        top = (-dh) // 2
-        bottom = top + H
-        img = img[top:bottom, :]
-    else:
-        top_pad = dh // 2
-        bottom_pad = dh - top_pad
-        img = np.pad(img, ((top_pad, bottom_pad), (0, 0)), constant_values=pad_value)
-
-    # Compute crop or pad for width
-    if dw < 0:
-        left = (-dw) // 2
-        right = left + W
-        img = img[:, left:right]
-    else:
-        left_pad = dw // 2
-        right_pad = dw - left_pad
-        img = np.pad(img, ((0, 0), (left_pad, right_pad)), constant_values=pad_value)
-
-    return img
-
-class AlignmentWidget(object):
-    """
-    A widget for aligning multispot microscopy images using Cellpose segmentation.
-    """
-    def __init__(self, reference_hybe, h5_save_path, filename='vlinks.h5'):
-        self.h5_save_path = h5_save_path
-        self.filename = filename
-        with h5py.File(os.path.join(h5_save_path,self.filename), 'r') as f:
-            self.fov_list = f.attrs['fov_list'][:].tolist()
-            self.channels_list = f.attrs['channels_list'][:].tolist()
-            self.hybe_list = [str(h.decode()) for h in f.attrs['hybe_list']]
-
-        self.total_channel_list = np.unique(np.ravel(self.channels_list)).tolist()
-        self.reference_hybe = reference_hybe
-
-
-        self.create_widgets()
-
-    def generate_colormap(self, sub_hybe_list):
-        colormaps = {
-            hybe: mcolors.LinearSegmentedColormap.from_list(
-                f'{hybe}',
-                [(0, 0, 0, 1), red_to_cyan_cmap(int(hid / len(sub_hybe_list) * 256))],
-                256,
-                gamma=1.8
-            )
-            for hid, hybe in enumerate(sub_hybe_list)
-        }
-        return colormaps
-
-    def create_widgets(self):
-        self.widgets = {}
-        self.widgets['including_z'] = widgets.Checkbox(value=True, description='Including Z:',)
-        self.widgets['reference_hybe'] = widgets.Dropdown(value=self.reference_hybe, options=self.hybe_list, description='Reference Hybe:',)
-        self.widgets['sub_hybe_list'] = widgets.SelectMultiple(options=self.hybe_list, value=tuple(self.hybe_list), description='Hybes to Align:',)
-
-        self.widgets['reference_channel'] = widgets.Dropdown(value=self.total_channel_list[0], options=self.total_channel_list, description='reference Channel:',)
-        self.widgets['fov_list'] = widgets.BoundedIntText(value=self.fov_list[0], min=1, max=max(self.fov_list)+1, step=1, description='FOV:',)
-        self.widgets['pad'] = widgets.BoundedIntText(value=0, min=0, max=100, step=5, description='Pad:',)
-        self.widgets['id_spinbox'] = widgets.BoundedIntText(value=1, min=1, max=10000, step=1, description='Cell ID:',)
-        self.widgets['lb'] = widgets.BoundedFloatText(value=85, min=0, max=90, step=0.01, description='Lower Bound:',)
-        self.widgets['ub'] = widgets.BoundedFloatText(value=99.99, min=90, max=100, step=0.01, description='Upper Bound:',)
-        
-        self.widgets['align_button'] = widgets.Button(description='Align', button_style='success',)
-        self.widgets['save_and_pass_button'] = widgets.Button(description='Save and Pass', button_style='success',)
-        self.widgets['discard_button'] = widgets.Button(description='Discard', button_style='danger',)
-        self.widgets['spinbox_align_buttons'] = widgets.HBox([self.widgets['id_spinbox'], self.widgets['align_button']])
-        
-        self.widgets['loading_label'] = widgets.Label(value='Push "Align" to start aligning cell... please wait.',)
-        
-        self.output = widgets.Output()
-
-        self.mips_by_hybe = {hybe:None for hybe in self.hybe_list}
-
-        self.figure = None
-        self.axes = None
-        self.current_image_parameters = {'lb':0, 'ub':0, 'fov':0, 'reference_channel':0}
-
-        self.ui = widgets.VBox([
-            widgets.Text(value=self.h5_save_path, description='Save Directory:',),
-            self.widgets['including_z'],
-            self.widgets['reference_hybe'],
-            self.widgets['sub_hybe_list'],
-            self.widgets['fov_list'],
-            self.widgets['reference_channel'],
-            self.widgets['pad'],
-            self.widgets['lb'],
-            self.widgets['ub'],
-            self.widgets['spinbox_align_buttons'],
-            widgets.HBox([self.widgets['save_and_pass_button'], self.widgets['discard_button']]),
-            self.widgets['loading_label'],
-            self.output
-        ])
-
-        self.widgets['save_and_pass_button'].on_click(lambda b: self.run_save_and_pass())
-        self.widgets['discard_button'].on_click(lambda b: self.run_discard())
-        self.widgets['align_button'].on_click(lambda b: self.run_cell_based_align())
-
-    def show(self):
-        display(self.ui)
-
-    def run_cell_based_align(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Aligning cell... please wait."
-            start = time.time()
-            try:
-                lb = self.widgets['lb'].value/100
-                ub = self.widgets['ub'].value/100
-                
-                fov = self.widgets['fov_list'].value
-                reference_channel = self.widgets['reference_channel'].value
-                id = self.widgets['id_spinbox'].value
-
-                cell_align_dir = os.path.join(self.h5_save_path, f'FOV{fov:02d}/Aligned_Cells')
-                os.makedirs(cell_align_dir, exist_ok=True)
-                os.makedirs(os.path.join(cell_align_dir, 'Pass'), exist_ok=True)
-                os.makedirs(os.path.join(cell_align_dir, 'Discard'), exist_ok=True)
-                
-                t0 = time.time()
-                with h5py.File(os.path.join(self.h5_save_path, self.filename), 'r') as f:
-                    mask = f[f'FOV{fov:02d}/cells/mask'][:]
-                    id_list = np.unique(mask[mask > 0]).tolist()
-                    if (id == 1) and (id not in id_list):
-                        id = id_list[0]
-                        self.widgets['id_spinbox'].value = id
-                    elif id not in id_list:
-                        id = np.array(id_list)[np.array(id_list) > id][0]
-                        self.widgets['loading_label'].value = f'⚠️ Cell ID {self.widgets["id_spinbox"].value} not found in FOV {fov}. Loading next available ID {id}.'
-                        self.widgets['id_spinbox'].value = id
-                    condition = f[f'FOV{fov:02d}/cells/cellbarcodes'][id_list.index(id)].decode('utf-8')
-
-                    matrices_fov = np.zeros((len(self.hybe_list),3,3))
-                    for hid,hybe in enumerate(self.hybe_list): matrices_fov[hid] = f[f'FOV{fov:02d}/matrix/{hybe}'][:]
-                        
-                    if (fov != self.current_image_parameters['fov']) or (reference_channel != self.current_image_parameters['reference_channel']):  
-                        self.current_image_parameters['lb'] = lb
-                        self.current_image_parameters['ub'] = ub
-                        self.current_image_parameters['fov'] = fov
-                        self.current_image_parameters['reference_channel'] = reference_channel
-                        
-                        for hid,hybe in enumerate(self.hybe_list): self.mips_by_hybe[hybe] = preprocess.normalize_to_uint8(f[f'FOV{fov:02d}/mip/ch{reference_channel}'][hid,...],lb,ub)
-                    print(f'Loading time: {time.time()-t0:.2f} seconds')
-                        
-                if id == 1 and id not in id_list:
-                    id = id_list[0]
-                    self.widgets['id_spinbox'].value = id
-                if np.sum(mask == id) == 0:
-                    self.widgets['loading_label'].value = f'❌ No cells found with ID {id} in FOV {fov}.'
-                    return
-                self.cell_based_align(id, condition, mask, matrices_fov, )
-            finally:
-                self.widgets['loading_label'].value = f"✅ Cell aligned successfully. {time.time()-start:.2f} seconds."
-                display(self.figure)
-
-    def cell_based_align(self, id, condition, mask, matrices_fov, ):
-        # parameters
-        lb,ub = self.current_image_parameters['lb'], self.current_image_parameters['ub']
-        pad = self.widgets['pad'].value
-        including_z = self.widgets['including_z'].value
-        reference_hybe = str(self.widgets['reference_hybe'].value)
-        id_list = np.unique(mask[mask > 0])
-        id_of_mask = np.where(id_list == id)[0][0]
-        height,width = mask.shape
-        reference_channel = self.widgets['reference_channel'].value
-        fov = self.widgets['fov_list'].value
-        sub_hybe_list = list(self.widgets['sub_hybe_list'].value)
-        colormaps = self.generate_colormap(sub_hybe_list)
-
-        H1 = matrices_fov[self.hybe_list.index(reference_hybe)]
-        y,x = np.where(mask == id)
-        ry,rx = align_cell((y,x), la.inv(H1), (height,width))
-        rymin,rymax,rxmin,rxmax = max(0,ry.min()-pad), min(height,ry.max()+pad+1), max(0,rx.min()-pad), min(width,rx.max()+pad+1)
-        reference_image_norm = self.mips_by_hybe[reference_hybe]
-        reference_image_crop = reference_image_norm[rymin:rymax,rxmin:rxmax]
-
-        ycomp1,ycomp2,ycomp3 = [np.zeros((rymax-rymin,rxmax-rxmin,4,len(sub_hybe_list)),dtype=float) for _ in range(3)]
-
-        with h5py.File(os.path.join(self.h5_save_path,self.filename ), 'r') as f:
-            matrices_yx = f[f'FOV{fov:02d}/cells/matrix/yx'][id_of_mask,:]
-            matrices_zx = f[f'FOV{fov:02d}/cells/matrix/zx'][id_of_mask,:]
-
-        for shid,hybe in enumerate(sub_hybe_list):
-            hid = self.hybe_list.index(hybe)
-            cmap = colormaps[hybe]
-            if hybe != reference_hybe:
-                target_image_norm = self.mips_by_hybe[hybe]
-                H1 = matrices_fov[hid]
-                cy,cx = align_cell((ry,rx), la.inv(H1), (height,width))
-                cymin,cymax,cxmin,cxmax = max(0,cy.min()-pad), min(height,cy.max()+pad+1), max(0,cx.min()-pad), min(width,cx.max()+pad+1)
-                target_image_crop = target_image_norm[rymin:rymax,rxmin:rxmax]
-                target_image_crop_first = target_image_norm[cymin:cymax,cxmin:cxmax]
-
-                H2 = np.vstack([preprocess.find_translation_via_phase_correlation(target_image_crop_first,
-                                                                                  reference_image_crop),
-                                                                                  np.array([0,0,1])])
-                matrices_yx[hid] = H2
-                target_image_crop_final = cv2.warpAffine(target_image_crop_first, H2[:2], (cxmax-cxmin,cymax-cymin), )
-
-                target_image_crop_ = target_image_crop.astype(float) / target_image_crop.max() * 255
-                target_image_crop_first_ = target_image_crop_first.astype(float) / target_image_crop_first.max() * 255
-                target_image_crop_final_ = target_image_crop_final.astype(float) / target_image_crop_final.max() * 255
-                ycomp1[...,shid] = cmap(target_image_crop_.astype(np.uint8))
-                ycomp2[...,shid] = cmap(crop_or_pad_to_shape(target_image_crop_first_.astype(np.uint8),(rymax-rymin,rxmax-rxmin)))
-                ycomp3[...,shid] = cmap(crop_or_pad_to_shape(target_image_crop_final_.astype(np.uint8),(rymax-rymin,rxmax-rxmin)))
-            else:
-                reference_image_crop_ = reference_image_crop.astype(float) / reference_image_crop.max() * 255
-                ycomp1[...,shid] = cmap(reference_image_crop_.astype(np.uint8))
-                ycomp2[...,shid] = ycomp1[...,shid]
-                ycomp3[...,shid] = ycomp1[...,shid]
-            
-        if including_z:
-            with h5py.File(os.path.join(self.h5_save_path,self.filename), 'r') as f:
-                depth = f.attrs['stack_shape'][0]
-                hid = self.hybe_list.index(reference_hybe)
-                stacks = f[f'FOV{fov:02d}/stack/ch{reference_channel}'][hid,:,rymin:rymax,rxmin:rxmax].squeeze()
-                zcomp1,zcomp2,zcomp3 = [np.zeros((depth,rxmax-rxmin,4,len(sub_hybe_list)),dtype=float) for _ in range(3)]
-                stack_ref_zx = preprocess.normalize_to_uint8(stacks.max(1),lb,ub)
-                
-                for shid,hybe in enumerate(sub_hybe_list):
-                    hid = self.hybe_list.index(hybe)
-                    cmap = colormaps[hybe]
-                    
-                    if hybe != reference_hybe:
-                        stacks = f[f'FOV{fov:02d}/stack/ch{reference_channel}'][hid,:,rymin:rymax,rxmin:rxmax].squeeze()
-                        stack_hyb_zx = preprocess.normalize_to_uint8(stacks.max(1),lb,ub)
-                        H1 = matrices_fov[hid]
-                        cy,cx = align_cell((ry,rx), la.inv(H1), (height,width))
-                        cymin,cymax,cxmin,cxmax = max(0,cy.min()-pad), min(height,cy.max()+pad+1), max(0,cx.min()-pad), min(width,cx.max()+pad+1)
-
-                        stacks = f[f'FOV{fov:02d}/stack/ch{reference_channel}'][hid,:,cymin:cymax,cxmin:cxmax].squeeze()
-                        stack_fov_zx = preprocess.normalize_to_uint8(stacks.max(1),lb,ub)
-
-                        H2 = matrices_yx[hid]
-                        stack_mip_zx = preprocess.normalize_to_uint8(np.concatenate([cv2.warpAffine(stacks[j], H2[:2],
-                                                                                                    (cxmax-cxmin,cymax-cymin),)[None,...]
-                                                                                                      for j in range(depth)], axis=0).max(1),lb,ub)
-
-                        A3 = preprocess.find_translation_via_phase_correlation(stack_mip_zx, stack_ref_zx)
-                        zcomp1[...,shid] = cmap(stack_hyb_zx)
-                        zcomp2[...,shid] = cmap(crop_or_pad_to_shape(stack_fov_zx, (depth,rxmax-rxmin)))
-                        zcomp3[...,shid] = cmap(crop_or_pad_to_shape(cv2.warpAffine(stack_mip_zx, A3, (cxmax-cxmin,depth)),(depth,rxmax-rxmin)))
-                        H3 = np.vstack([A3[:2],np.array([0,0,1])])
-                        matrices_zx[hid] = H3
-                    else:
-                        zcomp1[...,shid] = cmap(stack_ref_zx)
-                        zcomp2[...,shid] = zcomp1[...,shid]
-                        zcomp3[...,shid] = zcomp1[...,shid]
-                
-        with h5py.File(os.path.join(self.h5_save_path,self.filename), 'r+') as f:
-            f[f'/FOV{fov:02d}/cells/matrix/yx'][id_of_mask,:] = matrices_yx
-            f[f'/FOV{fov:02d}/cells/matrix/zx'][id_of_mask,:] = matrices_zx
+            # Per explicit request: restrict this leg to Z ONLY,
+            # algorithmically -- not by fitting a full 2D (x,z) shift and
+            # discarding/gating an unwanted x-component after the fact
+            # (that was this code's own earlier design: a real x-shift
+            # could still slip through whenever it stayed under the 3px
+            # reject bound, silently overriding a correctly-chosen H2 --
+            # confirmed on real data, cell 3 Hyb_105 vs Hyb_101, where a
+            # gate-verified best H2 of (0,-1) still ended up displaced to
+            # (1,-1) by this leg's own independent x measurement). X
+            # alignment is already H2's own job; collapsing the WIDTH
+            # axis away entirely (max-project) before correlating leaves
+            # no axis left for an x-shift to exist on, not just one that
+            # gets checked and possibly rejected afterward.
+            ref_z_profile = ref_zx.max(axis=0)
+            target_z_profile = target_zx_aligned.max(axis=0)
+            z_shift_fitted = _find_z_shift(target_z_profile, ref_z_profile)
+            if integer_shift:
+                # Same "no sub-pixel" constraint as H2 -- this leg is a
+                # small, whole-pixel-only depth refinement, not a free
+                # continuous fit.
+                z_shift_fitted = round(z_shift_fitted)
+            # Same two-gate treatment as H2 just above, ported to the Z
+            # leg -- _find_z_shift is a raw np.correlate(mode='full')
+            # argmax with no rejection path of its own, so it was free to
+            # lock onto noise exactly the way phase correlation on a
+            # low-signal H2 crop was (see that gate's own comment above).
+            # Confirmed on real data: cell 16, Hyb_130 vs Hyb_101, where
+            # H2 was correctly quality-rejected (residual 1840.3 >= 1840.3,
+            # no improvement) on this SAME crop, yet the ungated Z leg
+            # still applied z=-35.0px -- a shift nowhere near physically
+            # plausible for one hybridization round's worth of Z drift.
+            #
+            # Magnitude gate: half of H2's own `> pad` bound -- per
+            # explicit request, `pad` itself was still too permissive for
+            # Z (Z drift between hybridization rounds should be smaller
+            # than the XY search radius this refinement crop was built
+            # with). Same underlying reasoning as H2's bound: the
+            # 'full'-mode correlation can return anything up to the whole
+            # profile length as its "best" lag, which is exactly the
+            # noise-locking failure mode, not a real registration.
+            z_magnitude_rejected = abs(z_shift_fitted) > pad / 2
+            # Quality gate: mirrors H2's own reconstruction-residual check,
+            # applied on the SAME (width, depth) ZX crops the shift was
+            # fitted from -- reject unless the shift strictly improves the
+            # reconstruction of the reference's real content over doing
+            # nothing.
+            H_zx_fitted = np.array([[1., 0., z_shift_fitted], [0., 1., 0.], [0., 0., 1.]])
+            z_residual_before = _reconstruction_residual(target_zx_aligned, ref_zx, np.eye(3))
+            z_residual_after = _reconstruction_residual(target_zx_aligned, ref_zx, H_zx_fitted)
+            z_quality_rejected = not (z_residual_after < z_residual_before)
+            z_rejected = z_magnitude_rejected or z_quality_rejected
+            # Reject rather than clamp, same as H2 -- "reject" here just
+            # means z=0 (identity), never dropping the hybe.
+            z_shift = 0.0 if z_rejected else z_shift_fitted
 
         if not including_z:
-            fig,ax = plt.subplots(1,3,figsize=(18,6))
-            ax[0].imshow(ycomp1.max(-1),)
-            ax[1].imshow(ycomp2.max(-1),)
-            ax[2].imshow(ycomp3.max(-1),)
-            cell = np.zeros((rymax-rymin,rxmax-rxmin),dtype=np.uint8)
-            cell[ry-rymin,rx-rxmin] = 1
-            boundaries = (cell).astype(np.uint8) - cv2.erode((cell).astype(np.uint8), np.ones((3,3),np.uint8), iterations=1)
-            y,x = np.where(boundaries > 0)
-            ax[0].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[1].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[2].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[0].axis('off')
-            ax[1].axis('off')
-            ax[2].axis('off')
-            ax[0].set_title(f'Original Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
-            ax[1].set_title(f'FOV Aligned Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
-            ax[2].set_title(f'Final Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
+            zx_note = ''
+        elif z_rejected:
+            if z_magnitude_rejected:
+                z_reject_reason = f'{abs(z_shift_fitted):.1f}px > pad/2={pad / 2}'
+            else:
+                z_reject_reason = (f'reconstruction residual {z_residual_after:.1f} >= {z_residual_before:.1f} '
+                                   f'(no improvement over FOV/cross-modal)')
+            zx_note = f' [z-alignment REJECTED: {z_reject_reason}, fell back to z=0.0px]'
         else:
-            fig,ax = plt.subplots(2,3,figsize=(18,12))
-            ax[0,0].imshow(ycomp1.max(-1),aspect='auto')
-            ax[0,1].imshow(ycomp2.max(-1),aspect='auto')
-            ax[0,2].imshow(ycomp3.max(-1),aspect='auto')
-            cell = np.zeros((rymax-rymin,rxmax-rxmin),dtype=np.uint8)
-            cell[ry-rymin,rx-rxmin] = 1
-            boundaries = (cell).astype(np.uint8) - cv2.erode((cell).astype(np.uint8), np.ones((3,3),np.uint8), iterations=1)
-            y,x = np.where(boundaries > 0)
-            ax[0,0].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[0,1].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[0,2].scatter(x,y, color='yellow', s=10, marker='s', alpha=.5)
-            ax[0,0].set_title(f'Original Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
-            ax[0,1].set_title(f'FOV Aligned Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
-            ax[0,2].set_title(f'Final Image\nRED: {sub_hybe_list[0]} CYAN: {sub_hybe_list[-1]}\nFOV: {fov} Cell ID: {id} Barcode {condition}', fontdict=fontdict_label)
-            ax[1,0].imshow(zcomp1.max(-1),aspect='auto')
-            ax[1,1].imshow(zcomp2.max(-1),aspect='auto')
-            ax[1,2].imshow(zcomp3.max(-1),aspect='auto')
-        
-            ax[0,0].set_xticks([])
-            ax[0,1].set_xticks([])
-            ax[0,2].set_xticks([])
-            ax[0,0].set_yticks([])
-            ax[0,1].set_yticks([])
-            ax[0,2].set_yticks([])
-            ax[1,0].set_xticks([])
-            ax[1,1].set_xticks([])
-            ax[1,2].set_xticks([])
-            ax[1,0].set_yticks([])
-            ax[1,1].set_yticks([])
-            ax[1,2].set_yticks([])
-            ax[0,0].set_ylabel('Y',rotation=0,ha='right',**fontdict_label)
-            ax[0,1].set_ylabel('Y',rotation=0,ha='right',**fontdict_label)
-            ax[0,2].set_ylabel('Y',rotation=0,ha='right',**fontdict_label)
-            ax[1,0].set_ylabel('Z',rotation=0,ha='right',**fontdict_label)
-            ax[1,1].set_ylabel('Z',rotation=0,ha='right',**fontdict_label)
-            ax[1,2].set_ylabel('Z',rotation=0,ha='right',**fontdict_label)
-            ax[1,0].set_xlabel('X',**fontdict_label)
-            ax[1,1].set_xlabel('X',**fontdict_label)
-            ax[1,2].set_xlabel('X',**fontdict_label)
+            zx_note = f' [z-alignment applied: z={z_shift:.1f}px]'
 
-        plt.tight_layout()
-        self.figure = fig
-        self.axes = ax
-        plt.close(fig)
-
-    def run_save_and_pass(self):
-        with self.output:
-            clear_output(wait=True)
-            start = time.time()
-            fov = self.widgets['fov_list'].value
-            id = self.widgets['id_spinbox'].value
-            cell_align_dir = os.path.join(self.h5_save_path, f'FOV{fov:02d}/Aligned_Cells')
-
-            with h5py.File(os.path.join(self.h5_save_path,self.filename), 'r+') as f:
-                mask = f[f'FOV{fov:02d}/cells/mask'][:]
-                id_list = np.unique(mask)[1:].tolist()
-                if id not in f[f'FOV{fov:02d}/cells'].attrs['good'] and id in id_list:
-                    f[f'FOV{fov:02d}/cells'].attrs['good'] = np.unique(np.concatenate((f[f'FOV{fov:02d}/cells'].attrs['good'], [id])))
-                
-                self.figure.savefig(os.path.join(cell_align_dir,'Pass',
-                                                 f'aligned_reference_{self.widgets["reference_hybe"].value}_FOV{fov:02d}_ID{id}.png'))
-            if id_list.index(id)+1 < len(id_list):
-                new_id = id_list[id_list.index(id)+1]
-                self.widgets['id_spinbox'].value = new_id
-                self.run_cell_based_align()
+        if rejected:
+            if magnitude_rejected:
+                reject_reason = (f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > pad={pad}')
+            elif hard_bound_rejected:
+                reject_reason = (f'{np.hypot(H2_fitted[0, 2], H2_fitted[1, 2]):.1f}px > hard cap='
+                                 f'{MAX_ALIGNMENT_TRANSLATION_PX}px')
             else:
-                self.widgets['loading_label'].value = f'✅ All cells aligned in FOV {fov}. {time.time()-start:.2f} seconds.'
-                return
-            
-    def run_discard(self):
-        with self.output:
-            clear_output(wait=True)
-            start = time.time()
-            fov = self.widgets['fov_list'].value
-            id = self.widgets['id_spinbox'].value
-            cell_align_dir = os.path.join(self.h5_save_path, f'FOV{fov:02d}/Aligned_Cells')
-
-            with h5py.File(os.path.join(self.h5_save_path,self.filename), 'r+') as f:
-                mask = f[f'FOV{fov:02d}/cells/mask'][:]
-                id_list = np.unique(mask)[1:].tolist()
-                if id in id_list:
-                    f[f'FOV{fov:02d}/cells'].attrs['good'] = np.unique(np.array([i for i in f[f'FOV{fov:02d}/cells'].attrs['good'] if i != id]))
-                self.figure.savefig(os.path.join(cell_align_dir,'Discard',
-                                                 f'aligned_reference_{self.widgets["reference_hybe"].value}_FOV{fov:02d}_ID{id}.png'))
-            if id_list.index(id)+1 < len(id_list):
-                new_id = id_list[id_list.index(id)+1]
-                self.widgets['id_spinbox'].value = new_id
-                self.run_cell_based_align()
-            else:
-                print(f'No more cells to align in FOV {fov}.')
-                return
+                reject_reason = (f'reconstruction residual {residual_after:.1f} >= {residual_before:.1f} '
+                                 f'(no improvement over FOV/cross-modal)')
+            reject_note = f' [cell-level residual REJECTED: {reject_reason}, fell back to FOV/cross-modal only]'
+        else:
+            reject_note = ''
+        cell.matrices[key] = {'yx': H_yx, 'dz': float(z_shift), 'yx_is_residual': True}
+        cell.matrix_provenance[key] = {
+            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}' + reject_note + zx_note,
+            'steps': np.stack([H1, H2]),
+        }

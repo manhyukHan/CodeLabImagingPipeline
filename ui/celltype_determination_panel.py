@@ -31,15 +31,6 @@ class CelltypeDeterminationPanelUI(object):
         Widget.setObjectName('CelltypeDeterminationPanel')
         layout = QtWidgets.QVBoxLayout(Widget)
 
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        self.ModalityComboBox.addItems(['DNA', 'RNA'])
-        modalityRow = QtWidgets.QWidget()
-        modalityRowLayout = QtWidgets.QHBoxLayout(modalityRow)
-        modalityRowLayout.setContentsMargins(0, 0, 0, 0)
-        modalityRowLayout.addWidget(QtWidgets.QLabel('Modality:'))
-        modalityRowLayout.addWidget(self.ModalityComboBox)
-        layout.addWidget(modalityRow)
-
         celltypeGroup = QtWidgets.QGroupBox('Celltypes (shared identity for both modes)')
         celltypeLayout = QtWidgets.QVBoxLayout(celltypeGroup)
         self.CelltypeNamesListWidget = QtWidgets.QListWidget()
@@ -95,8 +86,6 @@ class CelltypeDeterminationPanelUI(object):
         self.LogTextEdit.setReadOnly(True)
         layout.addWidget(self.LogTextEdit)
 
-        self._hybe_records = []
-
     def _build_fov_page(self):
         page = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(page)
@@ -117,6 +106,11 @@ class CelltypeDeterminationPanelUI(object):
 
         self.BarcodeHybeComboBox = QtWidgets.QComboBox()
         form.addRow('Barcode hybe:', self.BarcodeHybeComboBox)
+        # connected exactly ONCE, here -- populate_hybe_choices used to
+        # reconnect this on every single repopulation (every modality
+        # switch), silently stacking up duplicate connections so
+        # _on_barcode_hybe_changed fired multiple times per index change.
+        self.BarcodeHybeComboBox.currentIndexChanged.connect(self._on_barcode_hybe_changed)
         self.BarcodeChannelComboBox = QtWidgets.QComboBox()
         form.addRow('Barcode channel:', self.BarcodeChannelComboBox)
         self.AssignBarcodeChannelPushButton = QtWidgets.QPushButton('Assign to Selected Celltype')
@@ -179,26 +173,55 @@ class CelltypeDeterminationPanelUI(object):
         form.addRow(self.ShowBarcodeOverviewPushButton)
         return page
 
-    def populate_hybe_choices(self, hybe_records):
+    def populate_hybe_choices(self, total_active_hybe_list):
         """
-        Restricted to datatype == 'B' (ExperimentLayout's own barcode-
-        readout classification, e.g. Hyb_130/Hyb_131 in the DNA layout)
-        -- a barcode channel is specifically a barcode-type readout, not
-        just any active hybe. hybe_records is already scoped to the
-        currently active modality (see MainWindow._refresh_active_hybe_
-        lists); switching the (mirrored) ModalityComboBox to whichever
-        modality actually has 'B' hybes is how those become available
-        here -- this panel doesn't re-derive modality on its own.
+        total_active_hybe_list: [(hybe_record, modality_name), ...] --
+        the union of every configured modality's active hybes, filtered
+        to datatype == 'B' (ExperimentLayout's own barcode-readout
+        classification, e.g. Hyb_130/Hyb_131 in the DNA layout) -- a
+        barcode channel is specifically a barcode-type readout, not just
+        any active hybe. No Modality selector on this panel any more --
+        every modality's own 'B' hybes are offered together, each combo
+        item tagged with its owning modality (same itemData pattern as
+        SpotLocalizationPanel.populate_hybe_choices), so assigning a
+        barcode channel from either modality needs no switch first.
+        Preserves the current selection across a refresh by (folder,
+        modality).
         """
-        self._hybe_records = [r for r in hybe_records if r.get('datatype') == 'B']
+        barcode_records = [(r, m) for r, m in total_active_hybe_list if r.get('datatype') == 'B']
+        current = self.current_barcode_hybe_key()
+        self.BarcodeHybeComboBox.blockSignals(True)
         self.BarcodeHybeComboBox.clear()
-        self.BarcodeHybeComboBox.addItems([r['folder'] for r in self._hybe_records])
-        self.BarcodeHybeComboBox.currentIndexChanged.connect(self._on_barcode_hybe_changed)
+        for record, modality in barcode_records:
+            self.BarcodeHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
+        if self.BarcodeHybeComboBox.count():
+            restore_index = next((i for i in range(self.BarcodeHybeComboBox.count())
+                                  if self._barcode_hybe_item_key(i) == current), 0)
+            self.BarcodeHybeComboBox.setCurrentIndex(restore_index)
+        self.BarcodeHybeComboBox.blockSignals(False)
         self._on_barcode_hybe_changed()
 
+    def _barcode_hybe_item_key(self, index):
+        data = self.BarcodeHybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_barcode_hybe_key(self):
+        data = self.BarcodeHybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_barcode_hybe(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.BarcodeHybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_barcode_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.BarcodeHybeComboBox.currentData()
+        return data[1] if data is not None else None
+
     def _on_barcode_hybe_changed(self):
-        folder = self.BarcodeHybeComboBox.currentText()
-        record = next((r for r in self._hybe_records if r['folder'] == folder), None)
+        data = self.BarcodeHybeComboBox.currentData()
+        record = data[0] if data is not None else None
         # blockSignals so clear()+addItems() reads as one atomic "channel
         # list changed" update, not a transient empty-then-refilled state
         self.BarcodeChannelComboBox.blockSignals(True)
@@ -232,9 +255,10 @@ class CelltypeDeterminationPanelUI(object):
         return 'median' if self.BarcodeMethodComboBox.currentText() == 'Median' else 'vote'
 
     def get_barcode_calibration_inputs(self):
-        """Everything needed to compute+store one (hybe,channel)'s calibration -- main_window does the actual image I/O."""
+        """Everything needed to compute+store one (hybe,channel,modality)'s calibration -- main_window does the actual image I/O."""
         return {
-            'hybe': self.BarcodeHybeComboBox.currentText(),
+            'hybe': self.current_barcode_hybe(),
+            'modality': self.current_barcode_modality(),
             'channel': int(self.BarcodeChannelComboBox.currentText()) if self.BarcodeChannelComboBox.currentText() else None,
             'fov_scope_text': self.CalibrationFovLineEdit.text().strip(),
             'scale': self.ScaleDoubleSpinBox.value(),

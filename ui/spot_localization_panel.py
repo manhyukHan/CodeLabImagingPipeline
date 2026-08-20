@@ -42,29 +42,38 @@ class SpotLocalizationPanelUI(object):
     for combining multiple detection passes (e.g. different thresholds)
     without losing earlier results.
 
-    Remove Transient Spots / Remove spots in view: both scoped to the
+    Remove Transient Spots / Remove Unassigned spots: both scoped to the
     current view's current (hybe, channel), matching auto-detect's own
     scoping. "Transient" means "not yet written to vlinks.h5" -- Remove
     Transient Spots re-reads the on-disk state for this (hybe, channel)
     and reverts the in-memory view to exactly that (so anything already
     saved survives; anything added/edited since the last save doesn't).
-    Remove spots in view clears the view outright (both permanent and
+    Remove Unassigned spots clears the view outright (both permanent and
     transient) for this (hybe, channel) -- if Save View is then clicked,
     the now-empty state is what gets written, i.e. this really does
-    delete them from vlinks.h5 once saved.
+    delete them from vlinks.h5 once saved. (Named for its primary FOV-view
+    use -- clearing the unassigned pool; in Cell view it clears that
+    cell's own spots for this hybe/channel instead.)
 
-    Remove All Spots (bottom, FOV view only): a much bigger, separate
-    action -- a COMPLETE wipe of every spot in the current FOV, both the
-    unassigned pool AND every cell's own spots, across every hybe/
-    channel (not just the one currently selected). Confirmed via a
-    warning dialog and immediately persisted as part of the same click
-    (not staged for a later Save View), since a plain in-memory clear
-    here wouldn't actually reach already-saved cells the way Save View's
-    FOV-view branch normally would (that branch only ever writes cells
-    it just identified new spots INTO, not ones being emptied out).
-    Disabled outside FOV view -- there's no equivalent single-cell
-    "wipe everything" button; Remove spots in view already covers that
-    narrower case for a selected cell.
+    Remove all spots (FOV view only): a bigger, separate action -- clears
+    every spot for the CURRENT (hybe, channel), both the unassigned pool
+    AND every cell's own spots (not just whichever single category
+    "Remove Unassigned spots" would touch from this view). Confirmed via
+    a warning dialog. In-memory only, same "Save View to persist"
+    convention as every other edit here -- a cell's own spots removed
+    this way still need THAT cell's own Cell view + Save View to actually
+    reach vlinks.h5. Disabled outside FOV view -- there's no equivalent
+    single-cell "wipe everything" button; Remove Unassigned spots already
+    covers that narrower case for a selected cell.
+
+    Undo/Redo: a generalized snapshot stack over this view's own spot
+    list (see MainWindow._push_spot_undo_snapshot) -- every mutating
+    action (auto-detect, manual click add/remove, 3D localization, the
+    Remove buttons above) pushes a pre-action snapshot, with no
+    distinction between "was this an add or a remove." Undo restores the
+    previous snapshot and pushes the current state onto the redo stack;
+    any new action after an Undo clears the redo stack (standard linear
+    undo/redo, not branching history).
 
     Two list views (a third, per-cell "Spot" breakdown, is informational
     only and not a selector):
@@ -77,18 +86,62 @@ class SpotLocalizationPanelUI(object):
     FOV_ROW_MARKER = '__fov_view__'
 
     def setupUi(self, Widget):
+        """
+        Layout order (per explicit request): Modality -> Hybe -> Channel ->
+        Threshold%/Absolute pair -> Min distance/Pad pair -> FOV -> Append
+        Mode -> Run Auto-Detect -> [Refresh/Show Displayer/3D Localization]
+        -> the 3 list views -> [Remove Transient/Remove Unassigned/Remove
+        all] -> [Undo/Redo] -> Save View -> (info label, progress, log).
+        """
         Widget.setObjectName('SpotLocalizationPanel')
         layout = QtWidgets.QVBoxLayout(Widget)
 
         form = QtWidgets.QFormLayout()
         layout.addLayout(form)
 
-        # -- 1. Modality --
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        self.ModalityComboBox.addItems(['DNA', 'RNA'])
-        form.addRow('Modality:', self.ModalityComboBox)
+        # -- Hybe | Channel -- no separate Modality selector: HybeComboBox
+        # itself offers every configured modality's hybes at once (see
+        # populate_hybe_choices), each item tagged with its own owning
+        # modality, so there's nothing left for a modality picker to do
+        # here.
+        self.HybeComboBox = QtWidgets.QComboBox()
+        form.addRow('Hybe:', self.HybeComboBox)
 
-        # -- 2. FOV spinbox --
+        self.ChannelComboBox = QtWidgets.QComboBox()
+        form.addRow('Channel:', self.ChannelComboBox)
+
+        # -- Threshold (%) | Threshold (absolute) -- kept live-linked,
+        # see MainWindow._sync_threshold_from_percent/_from_absolute.
+        thresholdRow = QtWidgets.QWidget()
+        thresholdLayout = QtWidgets.QHBoxLayout(thresholdRow)
+        thresholdLayout.setContentsMargins(0, 0, 0, 0)
+        self.ThresholdPercentLineEdit = QtWidgets.QLineEdit('50')
+        self.ThresholdPercentLineEdit.setPlaceholderText('% of scope max, e.g. 50')
+        thresholdLayout.addWidget(QtWidgets.QLabel('Threshold (% of scope max):'))
+        thresholdLayout.addWidget(self.ThresholdPercentLineEdit)
+        self.ThresholdAbsoluteLineEdit = QtWidgets.QLineEdit()
+        self.ThresholdAbsoluteLineEdit.setPlaceholderText('absolute value -- kept in sync with % above')
+        thresholdLayout.addWidget(QtWidgets.QLabel('Absolute value:'))
+        thresholdLayout.addWidget(self.ThresholdAbsoluteLineEdit)
+        form.addRow(thresholdRow)
+
+        # -- Min distance | Cell crop padding --
+        distancePadRow = QtWidgets.QWidget()
+        distancePadLayout = QtWidgets.QHBoxLayout(distancePadRow)
+        distancePadLayout.setContentsMargins(0, 0, 0, 0)
+        self.MinDistanceSpinBox = QtWidgets.QSpinBox()
+        self.MinDistanceSpinBox.setRange(1, 100)
+        self.MinDistanceSpinBox.setValue(3)
+        distancePadLayout.addWidget(QtWidgets.QLabel('Min distance (px):'))
+        distancePadLayout.addWidget(self.MinDistanceSpinBox)
+        self.PadSpinBox = QtWidgets.QSpinBox()
+        self.PadSpinBox.setRange(0, 100)
+        self.PadSpinBox.setValue(10)
+        distancePadLayout.addWidget(QtWidgets.QLabel('Cell crop padding (px, Cell view only):'))
+        distancePadLayout.addWidget(self.PadSpinBox)
+        form.addRow(distancePadRow)
+
+        # -- FOV spinbox --
         fovRow = QtWidgets.QWidget()
         fovRowLayout = QtWidgets.QHBoxLayout(fovRow)
         fovRowLayout.setContentsMargins(0, 0, 0, 0)
@@ -100,7 +153,16 @@ class SpotLocalizationPanelUI(object):
         fovRowLayout.addStretch()
         layout.addWidget(fovRow)
 
-        # -- 3. Refresh cell list | Show spot crop displayer --
+        # -- Append mode --
+        self.AppendModeCheckBox = QtWidgets.QCheckBox(
+            'Append Mode (Run Auto-Detect adds to the current view instead of replacing it)')
+        layout.addWidget(self.AppendModeCheckBox)
+
+        # -- Run auto-detect --
+        self.AutoDetectPushButton = QtWidgets.QPushButton('Run Auto-Detect')
+        layout.addWidget(self.AutoDetectPushButton)
+
+        # -- Refresh cell list | Show spot crop displayer | 3D localization --
         actionRow = QtWidgets.QWidget()
         actionLayout = QtWidgets.QHBoxLayout(actionRow)
         actionLayout.setContentsMargins(0, 0, 0, 0)
@@ -109,15 +171,18 @@ class SpotLocalizationPanelUI(object):
         self.ShowDisplayerPushButton = QtWidgets.QPushButton('Show Spot Crop Displayer')
         self.ShowDisplayerPushButton.setCheckable(True)
         actionLayout.addWidget(self.ShowDisplayerPushButton)
+        self.Show3DLocalizationPushButton = QtWidgets.QPushButton('3D Localization...')
+        self.Show3DLocalizationPushButton.setCheckable(True)
+        actionLayout.addWidget(self.Show3DLocalizationPushButton)
         layout.addWidget(actionRow)
 
-        # -- 4. FOV listview | Cell/FOV-view listview | Spot listview --
+        # -- FOV listview | Cell/FOV-view listview | Spot listview --
         listsRow = QtWidgets.QWidget()
         listsLayout = QtWidgets.QHBoxLayout(listsRow)
         listsLayout.setContentsMargins(0, 0, 0, 0)
 
         fovListCol = QtWidgets.QVBoxLayout()
-        fovListCol.addWidget(QtWidgets.QLabel('FOV (all spots, this FOV):'))
+        fovListCol.addWidget(QtWidgets.QLabel('FOV (all spots, this FOV) -- click to jump hybe/channel:'))
         self.FovListWidget = QtWidgets.QListWidget()
         self.FovListWidget.setMaximumHeight(120)
         fovListCol.addWidget(self.FovListWidget)
@@ -139,78 +204,48 @@ class SpotLocalizationPanelUI(object):
 
         layout.addWidget(listsRow)
 
-        # -- 5. Hybe | Channel --
-        self.HybeComboBox = QtWidgets.QComboBox()
-        form.addRow('Hybe:', self.HybeComboBox)
-
-        self.ChannelComboBox = QtWidgets.QComboBox()
-        form.addRow('Channel:', self.ChannelComboBox)
-
-        # -- 6. Threshold (%) | Threshold (absolute) -- kept live-linked,
-        # see MainWindow._sync_threshold_from_percent/_from_absolute.
-        thresholdRow = QtWidgets.QWidget()
-        thresholdLayout = QtWidgets.QHBoxLayout(thresholdRow)
-        thresholdLayout.setContentsMargins(0, 0, 0, 0)
-        self.ThresholdPercentLineEdit = QtWidgets.QLineEdit('50')
-        self.ThresholdPercentLineEdit.setPlaceholderText('% of scope max, e.g. 50')
-        thresholdLayout.addWidget(QtWidgets.QLabel('Threshold (% of scope max):'))
-        thresholdLayout.addWidget(self.ThresholdPercentLineEdit)
-        self.ThresholdAbsoluteLineEdit = QtWidgets.QLineEdit()
-        self.ThresholdAbsoluteLineEdit.setPlaceholderText('absolute value -- kept in sync with % above')
-        thresholdLayout.addWidget(QtWidgets.QLabel('Absolute value:'))
-        thresholdLayout.addWidget(self.ThresholdAbsoluteLineEdit)
-        form.addRow(thresholdRow)
-
-        # -- 7. Min distance --
-        self.MinDistanceSpinBox = QtWidgets.QSpinBox()
-        self.MinDistanceSpinBox.setRange(1, 100)
-        self.MinDistanceSpinBox.setValue(3)
-        form.addRow('Min distance between spots (px):', self.MinDistanceSpinBox)
-
-        # -- 8. Cell crop padding --
-        self.PadSpinBox = QtWidgets.QSpinBox()
-        self.PadSpinBox.setRange(0, 100)
-        self.PadSpinBox.setValue(10)
-        form.addRow('Cell crop padding (px, Cell view only):', self.PadSpinBox)
-
-        # -- Append mode --
-        self.AppendModeCheckBox = QtWidgets.QCheckBox(
-            'Append Mode (Run Auto-Detect adds to the current view instead of replacing it)')
-        layout.addWidget(self.AppendModeCheckBox)
-
-        # -- 9. Run auto-detect --
-        self.AutoDetectPushButton = QtWidgets.QPushButton('Run Auto-Detect')
-        layout.addWidget(self.AutoDetectPushButton)
-
-        # -- Remove transient / Remove spots in view (current view + current hybe/channel only) --
+        # -- Remove transient (current hybe/channel/modality only) --
+        # There is deliberately NO FOV-wide wipe button. Saving is scoped to
+        # the current (hybe, channel), so a control that clears every hybe at
+        # once could destroy spots for hybes the user never opened -- the
+        # remove and save scopes are kept identical on purpose.
         removeRow = QtWidgets.QWidget()
         removeRowLayout = QtWidgets.QHBoxLayout(removeRow)
         removeRowLayout.setContentsMargins(0, 0, 0, 0)
-        self.RemoveTransientSpotsPushButton = QtWidgets.QPushButton('Remove Transient Spots')
+        self.RemoveTransientSpotsPushButton = QtWidgets.QPushButton('Revert This Hybe/Channel')
         removeRowLayout.addWidget(self.RemoveTransientSpotsPushButton)
-        self.RemoveSpotsInViewPushButton = QtWidgets.QPushButton('Remove spots in view')
-        removeRowLayout.addWidget(self.RemoveSpotsInViewPushButton)
+        # One operation over one store: clears assigned and unassigned alike
+        # for the current hybe/channel/modality -- the capability the old
+        # "Remove Unassigned spots" button could not provide because the
+        # split store hid assigned spots from it. In-memory; Save persists
+        # the emptied slice.
+        self.ClearHybeChannelPushButton = QtWidgets.QPushButton('Clear This Hybe/Channel')
+        removeRowLayout.addWidget(self.ClearHybeChannelPushButton)
         layout.addWidget(removeRow)
 
-        # -- 10. Save view --
-        self.SaveViewPushButton = QtWidgets.QPushButton('Save View')
-        layout.addWidget(self.SaveViewPushButton)
+        # -- Undo | Redo -- see MainWindow._push_spot_undo_snapshot/_undo_spot_edit/_redo_spot_edit --
+        undoRedoRow = QtWidgets.QWidget()
+        undoRedoLayout = QtWidgets.QHBoxLayout(undoRedoRow)
+        undoRedoLayout.setContentsMargins(0, 0, 0, 0)
+        self.UndoPushButton = QtWidgets.QPushButton('Undo')
+        self.UndoPushButton.setEnabled(False)
+        undoRedoLayout.addWidget(self.UndoPushButton)
+        self.RedoPushButton = QtWidgets.QPushButton('Redo')
+        self.RedoPushButton.setEnabled(False)
+        undoRedoLayout.addWidget(self.RedoPushButton)
+        layout.addWidget(undoRedoRow)
 
-        # -- Complete wipe: FOV view only, every cell + the unassigned pool,
-        # confirmed + immediately persisted (see MainWindow._remove_all_spots_in_fov).
-        # Deliberately below Save View and disabled outside FOV view -- this
-        # is a much bigger, irreversible action than Remove spots in view.
-        self.RemoveAllSpotsPushButton = QtWidgets.QPushButton('Remove All Spots')
-        self.RemoveAllSpotsPushButton.setEnabled(False)
-        layout.addWidget(self.RemoveAllSpotsPushButton)
+        # -- Save current spots --
+        self.SaveCurrentSpotsPushButton = QtWidgets.QPushButton('Save Current Spots')
+        layout.addWidget(self.SaveCurrentSpotsPushButton)
 
         infoLabel = QtWidgets.QLabel(
-            'Spots are attached to the current view immediately. Save View writes ONLY the current '
-            'view to vlinks.h5: for a Cell view, just that cell (every other cell on disk untouched); '
-            'for the FOV view, its unassigned spots are first identified against the current cell mask '
-            '(newly-identified ones are added to their owning cell, the rest stay unassigned) and both '
-            'the affected cells and the remaining unassigned pool are saved. The Cell Segmentation '
-            'tab\'s Send/Save buttons still promote/persist transient cells more broadly.')
+            'Spots are attached to the current view immediately. Save Current Spots writes EVERY '
+            'cell\'s current spots for this FOV to vlinks.h5 in one pass -- not just whichever cell/view '
+            'happens to be open -- so picking spots across many cells in Cell view and then saving once '
+            'is enough. The FOV-level unassigned pool is identified against the current cell mask first '
+            '(newly-identified ones join their owning cell, the rest stay unassigned) and saved too. The '
+            'Cell Segmentation tab\'s Send/Save buttons still promote/persist transient cells more broadly.')
         infoLabel.setWordWrap(True)
         layout.addWidget(infoLabel)
 
@@ -222,17 +257,70 @@ class SpotLocalizationPanelUI(object):
         self.LogTextEdit.setReadOnly(True)
         layout.addWidget(self.LogTextEdit)
 
-        self._hybe_records = []
         self.HybeComboBox.currentIndexChanged.connect(self._on_hybe_changed)
 
-    def populate_hybe_choices(self, hybe_records):
-        self._hybe_records = list(hybe_records)
+    def populate_hybe_choices(self, total_active_hybe_list):
+        """
+        total_active_hybe_list: [(hybe_record, modality_name), ...] -- the
+        union of every configured modality's active hybes (MainWindow.
+        total_active_hybe_list), NOT one modality's own list. Each combo
+        item's data is the (record, modality) pair itself, so a hybe
+        folder name that happens to collide across modalities still
+        resolves unambiguously (see current_hybe_folder/current_hybe_
+        modality) and this panel never needs its own modality selector.
+
+        Preserves the current selection across a refresh by matching
+        (folder, modality) -- same pattern MainWindow.
+        _refresh_cell_preview_reference_choices already uses for
+        CellPreviewReferenceHybeComboBox -- so re-populating with THE SAME
+        content (e.g. every redundant call after a modality that isn't
+        even part of this list changes) never resets what's selected.
+        This is the fix for a real bug: the old version's unconditional
+        clear()+addItems() reset HybeComboBox's selection on every single
+        modality switch, silently navigating the crop displayer away from
+        whatever hybe the user's in-progress spot picks were on.
+        """
+        current_key = self._current_key()
+        self.HybeComboBox.blockSignals(True)
         self.HybeComboBox.clear()
-        self.HybeComboBox.addItems([r['folder'] for r in hybe_records])
+        for record, modality in total_active_hybe_list:
+            label = f"{record['folder']} ({modality})"
+            self.HybeComboBox.addItem(label, (record, modality))
+        if self.HybeComboBox.count():
+            restore_index = next((i for i in range(self.HybeComboBox.count())
+                                  if self._item_key(i) == current_key), 0)
+            self.HybeComboBox.setCurrentIndex(restore_index)
+        self.HybeComboBox.blockSignals(False)
+        self._on_hybe_changed()
+
+    def _item_key(self, index):
+        data = self.HybeComboBox.itemData(index)
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def _current_key(self):
+        data = self.HybeComboBox.currentData()
+        return (data[0]['folder'], data[1]) if data is not None else (None, None)
+
+    def current_hybe_folder(self):
+        """Real hybe folder name for whatever's currently selected, or '' if nothing is."""
+        data = self.HybeComboBox.currentData()
+        return data[0]['folder'] if data is not None else ''
+
+    def current_hybe_modality(self):
+        """Owning modality name for whatever's currently selected, or None if nothing is."""
+        data = self.HybeComboBox.currentData()
+        return data[1] if data is not None else None
+
+    def select_hybe(self, folder, modality):
+        """Finds and selects the combo item matching (folder, modality) exactly. No-op if not found."""
+        for i in range(self.HybeComboBox.count()):
+            if self._item_key(i) == (folder, modality):
+                self.HybeComboBox.setCurrentIndex(i)
+                return
 
     def _on_hybe_changed(self):
-        folder = self.HybeComboBox.currentText()
-        record = next((r for r in self._hybe_records if r['folder'] == folder), None)
+        data = self.HybeComboBox.currentData()
+        record = data[0] if data is not None else None
         # blockSignals so clear()+addItems() reads as one atomic "channel
         # list changed" update, not a transient empty-then-refilled state
         self.ChannelComboBox.blockSignals(True)
@@ -251,10 +339,12 @@ class SpotLocalizationPanelUI(object):
         self.ChannelComboBox.blockSignals(False)
         self.ChannelComboBox.currentIndexChanged.emit(self.ChannelComboBox.currentIndex())
 
-    def populate_cell_choices(self, cells):
+    def populate_cell_choices(self, cells, n_spots_by_cell=None):
         """
         Row 0 is always the FOV pseudo-row (the FOV-level unassigned-spot
-        pool view); rows 1+ are real cells (id + current total_num_spots).
+        pool view); rows 1+ are real cells. n_spots_by_cell: {cell.id: n}
+        supplied by the caller from the session's SpotContainer -- cells
+        hold no spot lists of their own.
         Selection preserved by cell id where possible, defaulting to the
         FOV row when nothing else was previously selected (matches the
         old Scope combobox's own default of Whole FOV).
@@ -266,8 +356,10 @@ class SpotLocalizationPanelUI(object):
         fov_item.setData(QtCore.Qt.UserRole, self.FOV_ROW_MARKER)
         self.CellListWidget.addItem(fov_item)
         selected_item = fov_item
+        n_spots_by_cell = n_spots_by_cell or {}
         for cell in cells:
-            item = QtWidgets.QListWidgetItem(f'Cell {cell.id}: {cell.total_num_spots} spot(s)')
+            item = QtWidgets.QListWidgetItem(
+                f'Cell {cell.id}: {n_spots_by_cell.get(cell.id, 0)} spot(s)')
             item.setData(QtCore.Qt.UserRole, cell.id)
             self.CellListWidget.addItem(item)
             if had_selection and cell.id == previous_id:

@@ -1,14 +1,12 @@
 import os
-import sys
-import numpy as np
-import ipywidgets as widgets
 import h5py
+import numpy as np
 from skimage import filters as skimage_filters, morphology as skimage_morphology, segmentation as skimage_segmentation
 from skimage.feature import peak_local_max
 from scipy import ndimage as scind
-
-from IPython.display import display, clear_output, HTML
 import warnings
+
+from ..io import vlinks_store
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
 
@@ -22,54 +20,31 @@ def get_model_cyto():
         _model_cyto = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
     return _model_cyto
 
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import matplotlib.cm as cm
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-from ..io import preprocess
-
-import time
-import cv2
-
-red_to_cyan_cmap = mcolors.LinearSegmentedColormap.from_list('custom_cmap', ['#FF0000', '#FFFFFF', '#00FFFF'], N=256)
-
-plt.rcParams['font.family'] = 'arial'
-plt.rcParams['font.size'] = 14
-plt.rcParams['pdf.fonttype'] = 42
-
-fontdict_label = {'fontname': 'arial',
-                  'fontsize':16,
-                  }
-fontdict_ticks = {'fontname': 'arial',
-                  'fontsize': 14,
-                  }
-fontdict_title = {'fontname': 'arial',
-                  'fontsize': 24,
-                  'fontweight': 'bold',
-                  }
-colors = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
-          '#46f0f0', '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff',
-          '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
-          '#000075', '#808080', '#000000']
-
-def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_size=1000, max_size=10000):
+def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_size=1000, max_size=10000,
+                projection_mode='MIP (stored)', z_plane=None, z_range=None):
     """
     Bulk (non-interactive) cell segmentation for one FOV -- reads the
-    reference MIP straight from that hybe's per-hybe H5 file (the current
-    ingestion convention: {storage_path}/FOV{fov:02d}/{hybe}_stack.h5,
-    /mip/ch{channel}), not the old vlinks.h5-based layout SegmentWidget used.
+    reference MIP from vlinks.h5 (vlinks_store.read_hybe_mip), a real copy
+    written by ingestion, not the raw per-hybe {hybe}_stack.h5 -- per
+    explicit principle, segmentation is display/2D-analysis, not ingestion
+    or 3D localization, so it should never need the raw stack file.
     Returns (mask, reference_image); doesn't display or save anything itself
     -- matches localize_cells_2d's separation of computation from I/O, so the
     GUI can run this off the main thread and review the result before saving.
 
     Core Cellpose-call + size-filter + relabel logic mirrors
-    SegmentWidget.create_mask_in_reference_hybe below, minus its
-    Jupyter/plotting/H5-write scaffolding.
+    legacy/segment_widgets.py's SegmentWidget.create_mask_in_reference_hybe,
+    minus its Jupyter/plotting/H5-write scaffolding.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        reference_image = f[f'/mip/ch{channel}'][:]
+    # projection_mode defaults to the stored MIP, so existing behaviour is
+    # untouched. The depth-resolved modes are here for the same reason
+    # cytoplasm search needed them: on a brightfield-like stack a full-depth
+    # MIP piles every plane's halo on top of the boundaries you are trying
+    # to segment. See read_projection.
+    reference_image = read_projection(storage_path, fov, reference_hybe, channel,
+                                      mode=projection_mode, z_plane=z_plane, z_range=z_range)
+    if reference_image is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
 
     # eval()'s return tuple length varies by cellpose version/model class
     # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
@@ -114,12 +89,12 @@ def _filter_and_relabel(mask, min_size, max_size):
 
 
 def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='otsu',
-                          absolute_cutoff=None, min_distance=7, min_size=1000, max_size=10000):
+                          absolute_cutoff=None, min_distance=7, min_size=1000, max_size=10000,
+                          projection_mode='MIP (stored)', z_plane=None, z_range=None):
     """
     Bulk (non-interactive) classical threshold+watershed cell segmentation
-    for one FOV -- same I/O contract as segment_fov (reads
-    {storage_path}/FOV{fov:02d}/{reference_hybe}_stack.h5's /mip/ch{channel},
-    returns (mask, reference_image)). Ports
+    for one FOV -- same I/O contract as segment_fov (reads reference_hybe's
+    MIP from vlinks.h5, returns (mask, reference_image)). Ports
     CellClassifier/canvas/main_image_canvas.py::_runCellSegment's classical
     branch (method in {'otsu','yen','li','triangle','manual'}), minus its
     pyqtgraph/live-canvas coupling. 'manual' there meant "type an absolute
@@ -134,9 +109,10 @@ def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='ot
     passes indices=). The boolean marker mask is rebuilt manually from the
     returned peak coordinates instead.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{reference_hybe}_stack.h5')
-    with h5py.File(h5path, 'r') as f:
-        reference_image = f[f'/mip/ch{channel}'][:]
+    reference_image = read_projection(storage_path, fov, reference_hybe, channel,
+                                      mode=projection_mode, z_plane=z_plane, z_range=z_range)
+    if reference_image is None:
+        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
 
     if method == 'absolute':
         cutoff = float(absolute_cutoff)
@@ -165,461 +141,291 @@ def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='ot
     return mask, reference_image
 
 
-class SegmentWidget(object):
-    """Base class for creating widgets in Jupyter Notebooks.
+PROJECTION_MODES = ('MIP (stored)', 'single plane', 'range MIP', 'range mean')
+
+
+def describe_projection(mode, z_plane=None, z_range=None):
     """
-    def __init__(self, fov_list, hybe_list, channel_list, reference_hybe, h5_save_path, filename='vlinks.h5'):
-        self.fov_list = fov_list
-        self.hybe_list = hybe_list
-        self.channel_list = channel_list
-        self.reference_hybe = reference_hybe
-        self.h5_save_path = h5_save_path
-        self.filename = filename
-        self.create_widgets()
+    Short human-readable form of a projection choice, e.g.
+    'MIP (stored)' / 'single plane z=76' / 'range MIP z=69-80'.
 
-    def create_widgets(self):
-        self.widgets = {}
-        self.widgets['fov_list'] = widgets.BoundedIntText(value=min(self.fov_list),min=min(self.fov_list),max=max(self.fov_list)+1,step=1,description='FOV:',)
-        self.widgets['reference_hybe'] = widgets.Dropdown(value=self.reference_hybe,options=self.hybe_list,description='Reference Hybe:',)
-        self.widgets['channel_list'] = widgets.Dropdown(value=self.channel_list[0],options=self.channel_list,description='Channel:',)
-        self.widgets['diameter'] = widgets.IntSlider(value=40,min=10,max=100,step=5,description='Diameter:',)
-        self.widgets['min_size'] = widgets.IntSlider(value=1000,min=500,max=10000,step=100,description='Min Size:',)
-        self.widgets['max_size'] = widgets.IntSlider(value=10000,min=10000,max=20000,step=1000,description='Max Size:',)
-        self.widgets['bad_indices'] = widgets.Text(value='',description='Bad Indices:',)
-        self.widgets['create_mask_button'] = widgets.Button(description='Create Cells', button_style='success',)
-        self.widgets['update_mask_button'] = widgets.Button(description='Update Cells', button_style='success',)
-        self.widgets['save_mask_button'] = widgets.Button(description='Save Cells', button_style='success',)
-        self.widgets['loading_label'] = widgets.Label(value='Press "Create Cells" value')
-        
-        self.output = widgets.Output()
-
-        self.figure = None
-        self.axes = None
-        self.cells_and_align_matrices_fov = {fov:{'image':None, 'mask':None, 'hybe': None, 'channel': None,} for fov in self.fov_list}
-        self.reference_image = np.zeros((1024,1024),dtype=np.uint16)
-
-        self.ui = widgets.VBox([self.widgets['fov_list'],self.widgets['reference_hybe'],self.widgets['channel_list'],self.widgets['diameter'],self.widgets['min_size'],self.widgets['max_size'],self.widgets['bad_indices'],
-                                widgets.HBox([self.widgets['create_mask_button'], self.widgets['update_mask_button'], self.widgets['save_mask_button']]),
-                                self.widgets['loading_label'],
-                                self.output])
-
-        
-        self.widgets['create_mask_button'].on_click(lambda b: self.run_segmentation())
-        self.widgets['update_mask_button'].on_click(lambda b: self.run_update_mask())
-        self.widgets['save_mask_button'].on_click(lambda b: self.run_save_mask())
-        
-    def show(self):
-        display(self.ui)
-
-    def run_segmentation(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Segmenting cell... please wait."
-            start = time.time()
-            
-            try:
-                fig,ax = plt.subplots(1,2,figsize=(22,10))
-                fov = self.widgets['fov_list'].value
-                reference_hybe = self.widgets['reference_hybe'].value
-                channel = self.widgets['channel_list'].value
-                diameter = self.widgets['diameter'].value
-                min_size = self.widgets['min_size'].value
-                max_size = self.widgets['max_size'].value
-                
-                mask,reference_image = self.create_mask_in_reference_hybe(ax,fov, reference_hybe, channel, self.h5_save_path, diameter, min_size, max_size)
-                self.cells_and_align_matrices_fov[fov]['image'] = reference_image
-                self.cells_and_align_matrices_fov[fov]['mask'] = mask
-                self.cells_and_align_matrices_fov[fov]['hybe'] = reference_hybe
-                self.cells_and_align_matrices_fov[fov]['channel'] = channel
-                plt.show()
-                self.figure = fig
-                self.axes = ax
-            finally:
-                self.widgets['loading_label'].value = f"✅ Done.  {time.time()-start:.2f} seconds."
-
-    def create_mask_in_reference_hybe(self, ax, fov, reference_hybe, channel, h5path, diameter, min_size, max_size,):
-        with h5py.File(os.path.join(h5path,f'vlinks.h5'),'r') as f:
-            hybe_list = [str(h.decode()) for h in f.attrs['hybe_list']]
-            reference_image = f[f'/FOV{fov:02d}/mip/ch{channel}'][hybe_list.index(reference_hybe),...]
-
-        ax[0].set_title('Reference Image', **fontdict_label)
-        ax[1].set_title('Cell Mask', **fontdict_label)
-        ax[0].axis('off')
-        ax[1].axis('off')
-        ax[0].imshow(reference_image, cmap=cm.gray,
-                      vmin=np.quantile(reference_image,0.3),
-                      vmax=np.quantile(reference_image,0.999), )
-        ax[1].imshow(reference_image, cmap=cm.gray,
-                    vmin=np.quantile(reference_image,0.3),
-                    vmax=np.quantile(reference_image,0.999), )
-
-        # eval()'s return tuple length varies by cellpose version/model class
-        # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
-        # Cellpose/cyto3 class used here) -- take masks by position only,
-        # matching CellClassifier/utils/cellpose_segmentation.py's approach,
-        # so this doesn't break if that changes.
-        result = get_model_cyto().eval([reference_image], diameter=diameter, channels=[0,0], do_3D=False)
-        masks = result[0]
-        mask = masks[0].astype(float)
-        v,c = np.unique(mask, return_counts=True)
-        mask[np.isin(mask, v[c < min_size])] = 0
-        mask[np.isin(mask, v[c > max_size])] = 0
-        for i,id in enumerate(np.unique(mask)[1:]):
-            mask[mask == id] = -i
-        mask = (-1*mask).astype(np.uint8)
-        
-        for id in np.unique(mask)[1:]:
-            cb = (mask == id).astype(np.uint8) - cv2.erode((mask == id).astype(np.uint8), np.ones((3,3),np.uint8), iterations=1)
-            y,x = np.where(cb > 0)
-            ax[1].scatter(x,y, color='yellow', s=.5, alpha=.5)
-            ax[1].text(x.mean(),y.mean(), str(id), color='red', fontsize=12, ha='center', va='center')
-
-        return mask, reference_image
-                
-    def run_update_mask(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Updating cell mask... please wait."
-            start = time.time()
-
-            try:
-                fig,ax = plt.subplots(1,2,figsize=(22,10))
-                fov = self.widgets['fov_list'].value
-                bad_indices = [int(i) for i in self.widgets['bad_indices'].value.split() if i.strip()]
-                mask = self.cells_and_align_matrices_fov[fov]['mask']
-                reference_image = self.cells_and_align_matrices_fov[fov]['image']
-                mask = self.update_mask(ax, reference_image, mask, bad_indices)
-                self.cells_and_align_matrices_fov[fov]['mask'] = mask
-                plt.show()
-                self.figure = fig
-                self.axes = ax
-
-            finally:
-                self.widgets['loading_label'].value = f"✅ Done. {time.time()-start:.2f} seconds."
-
-    def update_mask(self, ax, reference_image, mask, bad_indices):
-        ax[0].set_title('Reference Image', **fontdict_label)
-        ax[1].set_title('Cell Mask', **fontdict_label)
-        ax[0].axis('off')
-        ax[1].axis('off')
-        ax[0].imshow(reference_image, cmap=cm.gray,
-                    vmin=np.quantile(reference_image,0.3),
-                    vmax=np.quantile(reference_image,0.999), )
-        # Replot the updated mask
-        ax[1].imshow(reference_image, cmap=cm.gray,
-                    vmin=np.quantile(reference_image,0.3),
-                    vmax=np.quantile(reference_image,0.999), )
-
-        # Update the mask with bad indices
-        for id in bad_indices:
-            mask[mask == id] = 0
-
-        for id in np.unique(mask)[1:]:
-            cb = (mask == id).astype(np.uint8) - cv2.erode((mask == id).astype(np.uint8), np.ones((3,3),np.uint8), iterations=1)
-            y,x = np.where(cb > 0)
-            ax[1].scatter(x,y, color='yellow', s=.5, alpha=.5)
-            ax[1].text(x.mean(),y.mean(), str(id), color='red', fontsize=12, ha='center', va='center')
-
-        return mask
-
-    def run_save_mask(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Saving cell mask... please wait."
-            start = time.time()
-            fov = self.widgets['fov_list'].value
-            reference_hybe = self.widgets['reference_hybe'].value
-            channel = self.widgets['channel_list'].value
-            h5_save_path = self.h5_save_path
-            mask = self.cells_and_align_matrices_fov[fov]['mask']
-            
-            with h5py.File(os.path.normpath(os.path.join(h5_save_path, self.filename)), 'r+') as f:
-                cell_group = f[f'/FOV{fov:02d}/cells']
-                cell_group.attrs['defined_hybe'] = reference_hybe
-                cell_group.attrs['defined_channel'] = channel
-                cell_group['mask'][:] = mask
-                id_list = np.unique(mask[mask > 0])
-
-                cell_group['matrix/yx'].resize((len(id_list),len(self.hybe_list),3,3))
-                cell_group['matrix/zx'].resize((len(id_list),len(self.hybe_list),3,3))
-                cell_group['cellbarcodes'].resize((len(id_list),))
-
-                for i in range(len(id_list)):
-                    cell_group['cellbarcodes'][i] = 'NA'
-                    for j in range(len(self.hybe_list)):
-                        cell_group['matrix/yx'][i,j] = np.eye(3)
-                        cell_group['matrix/zx'][i,j] = np.eye(3)
-
-            self.widgets['loading_label'].value = f"✅ Mask saved. {time.time()-start:.2f} seconds."
-            fig = self.figure
-            
-            fig.savefig(os.path.normpath(os.path.join(h5_save_path,f'FOV{fov:02d}','CellSegmented.png')),)
-
-            if fov == max(self.fov_list):
-                self.widgets['loading_label'].value = "✅ All done."
-            else:
-                next_fov = fov + 1
-                self.widgets['fov_list'].value = next_fov
-                self.widgets['bad_indices'].value = ''
-                self.run_segmentation()
-
-class CellbarcodeWidget(object):
-    """Base class for creating widgets in Jupyter Notebooks.
+    One formatter so a Run button's label, its confirmation dialog and the
+    log line can never disagree about what is about to happen -- which
+    matters here because the choice is not cosmetic: on real data the same
+    FOV/hybe/channel/parameters yielded 33 cells from the stored MIP versus
+    91 from single plane z=76.
     """
-    def __init__(self, fov_list, hybe_list, channel_list, datatype_list, h5_save_path, filename='vlinks.h5'):
-        self.fov_list = fov_list
-        self.hybe_list = hybe_list
-        self.channel_list = channel_list
-        self.datatype_list = datatype_list
-        self.h5_save_path = h5_save_path
-        self.filename = filename
-        self.create_widgets()
-        self.hex2rgba = lambda hex: tuple(int(hex[i:i+2], 16)/255 for i in (1, 3, 5)) + (1,)
+    if mode == 'single plane':
+        return f'{mode} z={z_plane}'
+    if mode in ('range MIP', 'range mean'):
+        z0, z1 = z_range if z_range else (None, None)
+        return f'{mode} z={z0}-{z1}'
+    return mode
 
-    def create_widgets(self):
-        self.cellbarcodes = np.array(self.hybe_list)[np.isin(self.datatype_list, 'B')]
-        self.output = widgets.Output()
-        self.widgets = {}
-        self.widgets['if_fov_barcode'] = widgets.Dropdown(value='Barcode',options=['Barcode','FOV'], description='From:',)
-        self.widgets['fov_list'] = widgets.BoundedIntText(value=min(self.fov_list), min=min(self.fov_list), max=max(self.fov_list)+1, step=1, description='FOV:',)
-        self.widgets['channel_list'] = widgets.Dropdown(value=self.channel_list[0], options=self.channel_list, description='Channel:',)
-        self.widgets['text_fov_list'] = widgets.Text(value='', description='FOV elements: ')
-        self.widgets['current_barcode'] = widgets.Dropdown(value=self.cellbarcodes[0], options=self.cellbarcodes, description='Current Barcode:',)
-        self.widgets['min_slider'] = widgets.IntText(value=1000, min=0, max=65535, step=1, description='Min:',)
-        self.widgets['max_slider'] = widgets.IntText(value=40000, min=0, max=65535, step=1, description='Max:',)
-        self.widgets['rescale_button'] = widgets.Button(description='Rescale', button_style='success',)
-        self.widgets['cellbarcodes_list'] = widgets.SelectMultiple(value=self.cellbarcodes, options=self.cellbarcodes, description='cellbarcodes:',)
-        self.widgets['bad_indices'] = widgets.Text(value='', description='Bad Indices:',)
-        self.widgets['initialize_images_button'] = widgets.Button(description='Initialize Images', button_style='success',)
-        self.widgets['determine_cellbarcodes_button'] = widgets.Button(description='Determine cellbarcodes', button_style='success',)
-        self.widgets['save_current_cellbarcode_button'] = widgets.Button(description='Save cellbarcodes', button_style='success',)
-        self.widgets['loading_label'] = widgets.Label(value='Press "Initialize Images" value')
-        self.ui = widgets.VBox([self.widgets['if_fov_barcode'], self.widgets['fov_list'], 
-                                widgets.HBox([self.widgets['current_barcode'], self.widgets['text_fov_list']]),
-                                widgets.HBox([self.widgets['min_slider'], self.widgets['max_slider'], self.widgets['rescale_button']]),
-                                self.widgets['bad_indices'], self.widgets['cellbarcodes_list'],
-                                widgets.HBox([self.widgets['initialize_images_button'], self.widgets['determine_cellbarcodes_button'], self.widgets['save_current_cellbarcode_button']]),
-                                self.widgets['loading_label'],
-                                widgets.HTML(value=self.display_color_legend().data),self.output])
-        
-        self.figure = None
-        self.axes = None
-        self.initialize_images()
-        self.widgets['rescale_button'].on_click(lambda b: self.rescale_and_update(self.widgets['min_slider'].value, 
-                                                                                  self.widgets['max_slider'].value))
-        self.widgets['initialize_images_button'].on_click(lambda b: self.initialize_images())
-        self.widgets['determine_cellbarcodes_button'].on_click(lambda b: self.determine_cellbarcode())
-        self.widgets['current_barcode'].observe(lambda change: self.on_dropdown_change(change), names='value')
-        self.widgets['save_current_cellbarcode_button'].on_click(lambda b: self.save_current_cellbarcode())
 
-    def initialize_images(self,):
-        self.current_image_parameters = {'raw_images':[], 'images': [], 'bounds':[]}
+def focus_profile(storage_path, fov, hybe, channel, step=1, crop=512):
+    """
+    (z_indices, sharpness) for every step-th plane of this hybe's raw
+    Z-stack -- variance of the Laplacian on a central `crop`-square window,
+    the standard passive autofocus metric.
 
-    def show(self):
-        display(self.ui)
+    Exists because "the middle plane is the focal plane" is an ASSUMPTION
+    that measurably fails: on FOV01/Hyb_500/ch635 the stack is 130 planes,
+    so the middle is z=65, but the sharpest plane is z=76 -- off by 11.
+    Detecting the peak removes the assumption instead of replacing it with
+    a manual guess.
 
-    def rescale_and_update(self,lb,ub):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Rescaling image... please wait."
-            if lb > ub:
-                self.widgets['input_min_slider'].value = ub
-            current_barcode = self.widgets['input_current_barcode'].value
-            barcode_index = self.cellbarcodes.tolist().index(current_barcode)
-            self.current_image_parameters['bounds'][barcode_index] = [lb, ub]
-            image_rescaled = preprocess.normalize_to_uint8(self.current_image_parameters['raw_images'][barcode_index], lb, ub)
-            self.current_image_parameters['images'][barcode_index] = image_rescaled
-            self.update_image()
+    Reads {hybe}_stack.h5 directly. That is deliberate and is the same
+    documented exception hybe_zx_projection already takes: the
+    standing principle is that
+    MIP-ONLY reads never need the raw stack, and a depth-resolved
+    projection is by definition not a MIP-only read. Central crop + `step`
+    keep it cheap (h5py slices per plane, never materializing the stack).
+    """
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        ds = f[f'/stack/ch{channel}']
+        height, width, depth = ds.shape
+        half = min(crop, height, width) // 2
+        y0, y1 = height // 2 - half, height // 2 + half
+        x0, x1 = width // 2 - half, width // 2 + half
+        zs = list(range(0, depth, max(step, 1)))
+        vals = [float(scind.laplace(ds[y0:y1, x0:x1, z].astype(np.float32)).var()) for z in zs]
+    return np.array(zs), np.array(vals)
 
-    def initialize_images(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Initializing images... please wait."
 
-            try:
-                self.initialize_images()
-                for barcode in self.cellbarcodes:
-                    lb,ub = self.current_image_parameters['bounds'][self.cellbarcodes.tolist().index(barcode)]
-                    with h5py.File(os.path.join(self.h5_save_path, self.filename), 'r') as f:
-                        self.current_image_parameters['raw_images'].append(f[f'/FOV{self.widgets["fov_list"].value:02d}/mip/{barcode}/ch{self.widgets["channel_list"].value}'][:])
-                        self.current_image_parameters['images'].append(preprocess.normalize_to_uint8(self.current_image_parameters['raw_images'][-1],lb,ub))
-                if self.figure is None:
-                    fig,ax = plt.subplots(1,1,figsize=(20,20))
-                    divider = make_axes_locatable(ax)
-                    caxes = []
+def read_projection(storage_path, fov, hybe, channel, mode='MIP (stored)', z_plane=None, z_range=None):
+    """
+    The 2D image to run cytoplasm segmentation on, per PROJECTION_MODES.
 
-                    for i in range(len(self.cellbarcodes)):
-                        if i == 0: caxes.append(divider.append_axes('right', size='5%', pad=0.15))
-                        else: caxes.append(divider.append_axes('right', size='5%', pad=0.75))
-                        cmap = mcolors.LinearSegmentedColormap.from_list(f'{i}',[(0,0,0,1),self.hex2rgba(colors[i])],256,gamma=1.5)
-                        cbar = fig.colorbar(cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(0,255)), cax=caxes[i], orientation='vertical')
-                    rax = divider.append_axes('right', size='100%', pad=1.5)
-                    ax.axis('off')
-                    rax.axis('off')
-                    ax.set_title('Composite Image', fontdict=fontdict_label)
-                    self.figure = fig
-                    self.axes = [ax,caxes,rax]
-                    plt.close(fig)
-                else:
-                    ax,caxes,rax = self.axes
-                    ax.cla()
-                    rax.cla()
-                self.update_image()
-            finally:
-                self.widgets['loading_label'].value = "✅ Images initialized."
+    'MIP (stored)' returns vlinks.h5's own MIP -- unchanged default, and
+    the only mode that touches no raw stack. The others read
+    {hybe}_stack.h5 (see focus_profile on why that exception applies).
 
-    def update_image(self):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Updating image... please wait."
-            try:
-                height, width = self.current_image_parameters['images'][-1].shape
-                composites = np.zeros((height, width, 4, len(self.current_image_parameters['images'])), dtype=np.uint8)
-                for i in range(len(self.current_image_parameters['images'])):
-                    cmap = mcolors.LinearSegmentedColormap.from_list(f'{i}',[(0,0,0,1),self.hex2rgba(colors[i])],256,gamma=1.5)
-                    composites[...,i] = cmap(self.current_image_parameters['images'][i]) * 255
-                ax,caxes,rax = self.axes
-                ax.cla()
-                ax.imshow(composites.max(-1))
-                for i in range(len(self.current_image_parameters['bounds'])):
-                    lb,ub = self.current_image_parameters['bounds'][i]
-                    caxes[i].set_yticks([0,255],[f'{lb}', f'{ub}'])
-                ax.axis('off')
-                rax.axis('off')
-            finally:
-                self.widgets['loading_label'].value = "✅ Image updated."
-                display(self.current_image_parameters['figure'])
+    A max projection over the FULL depth accumulates the brightest halo
+    from every plane, which on real brightfield data visibly destroys the
+    phase contrast that defines a cell boundary -- which is the whole
+    reason the depth-resolved modes exist. 'range MIP'/'range mean' over
+    the focus plateau are usually more robust than a single plane, because
+    focus varies ACROSS the field (curvature/tilt) and focus_profile's own
+    metric only samples the centre.
+    """
+    if mode == 'MIP (stored)':
+        return vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    with h5py.File(h5path, 'r') as f:
+        ds = f[f'/stack/ch{channel}']
+        depth = ds.shape[2]
+        if mode == 'single plane':
+            z = int(np.clip(z_plane if z_plane is not None else depth // 2, 0, depth - 1))
+            return ds[:, :, z].astype(np.float32)
+        z0, z1 = z_range if z_range else (0, depth - 1)
+        z0, z1 = int(np.clip(z0, 0, depth - 1)), int(np.clip(z1, 0, depth - 1))
+        if z1 < z0:
+            z0, z1 = z1, z0
+        sub = ds[:, :, z0:z1 + 1].astype(np.float32)
+    return sub.max(axis=2) if mode == 'range MIP' else sub.mean(axis=2)
 
-    def determine_cellbarcode(self,):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Determining cellbarcodes... please wait."
 
-            try:
-                fov = self.widgets['fov_list'].value
-                cellbarcodes = self.widgets['cellbarcodes_list'].value
-                bad_indices = [int(i) for i in self.widgets['bad_indices'].value.split() if i.strip()]
-                with h5py.File(os.path.normpath(os.path.normpath(os.path.join(self.h5_save_path, self.filename))), 'r+') as f:
-                    mask = f[f'/cells/mask'][:]
-                    id_list = np.unique(mask)[1:]
-                    good_id = np.isin(id_list, bad_indices, invert=True)
-                    
-                    ct_list = []
-                    for j,id in enumerate(id_list):
-                        barcode_channel_values = [np.median(self.current_image_parameters['images'][i][mask == id])
-                                                   for i in range(len(self.current_image_parameters['images']))]
-                        if max(barcode_channel_values) == 0:
-                            ct = 'NA'
-                        else:
-                            ct = cellbarcodes[np.argmax(barcode_channel_values)]                
-                        ct_list.append(ct)
-                    ct_array = np.array(ct_list, dtype=h5py.string_dtype(encoding='utf-8'))
-                    height, width = self.current_image_parameters['images'][0].shape
+def stack_depth(storage_path, fov, hybe, channel):
+    """Number of z planes, so the UI can bound its own spinboxes to reality."""
+    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    if not os.path.exists(h5path):
+        return 0
+    with h5py.File(h5path, 'r') as f:
+        key = f'/stack/ch{channel}'
+        return f[key].shape[2] if key in f else 0
 
-                    composite = np.zeros((height, width, 4, len(self.current_image_parameters['images'])), dtype=np.uint8)
-                    for i in range(len(self.current_image_parameters['images'])):
-                        cmap = mcolors.LinearSegmentedColormap.from_list(f'{i}',[(0,0,0,1),self.hex2rgba(colors[i])],256,gamma=1.5)
-                        which_id = id_list[(ct_array == cellbarcodes[i]) & good_id]
-                        composite[...,i] = cmap(np.isin(mask, which_id).astype(int) * 255) * 255
 
-                fig = self.figure
-                ax,caxes,rax = self.axes
-                rax.cla()
-                rax.imshow(composite.max(-1))
-                for id in id_list:
-                    if id in bad_indices:
-                        continue
-                    y,x = np.where(mask == id)
-                    rax.text(x.mean(),y.mean(), str(id), color='white', fontsize=14, ha='center', va='center')
-                rax.axis('off')
-            finally:
-                self.widgets['loading_label'].value = "✅ cellbarcodes determined."
-                display(self.figure)
+SEED_MODES = ('rim emphasis', 'seam-separated', 'binary')
 
-    def save_current_cellbarcode(self):
-        with self.output:
-            clear_output(wait=True)
-            self.widgets['loading_label'].value = "🔄 Saving cellbarcodes... please wait."
 
-            try:
-                fov = self.widgets['fov_list'].value
-                cellbarcodes = self.widgets['cellbarcodes_list'].value
-                bad_indices = [int(i) for i in self.widgets['bad_indices'].value.split() if i.strip()]
-                with h5py.File(os.path.normpath(os.path.normpath(os.path.join(self.h5_save_path,self.filename))), 'r+') as f:
-                    mask = f[f'/cells/mask'][:]
-                    mask[np.isin(mask, bad_indices)] = 0
-                    f[f'/cells/mask'][:] = mask
-                    id_list = np.unique(mask)[1:]
-                    hybe_list = f.attrs['hybe_list']
+def render_nucleus_seed(label_mask, mode='rim emphasis'):
+    """
+    Turn a nucleus LABEL mask into the synthetic nuclear channel cellpose
+    is seeded with (see segment_cytoplasm on why a real image, not labels).
 
-                    f[f'/cells/matrix/yx'].resize((len(id_list),len(hybe_list),3,3))
-                    f[f'/cells/matrix/xz'].resize((len(id_list),len(hybe_list),3,3))
+    Never encodes cell ids as intensity: cellpose normalizes this channel
+    and reads it as a stain, so id-valued pixels would become a meaningless
+    brightness ramp (cell 67 sixty-seven times brighter than cell 1) and the
+    low-id nuclei would normalize into the background. Instance separation
+    comes from cellpose's own predicted flows, i.e. from SHAPE and gaps --
+    which is what every mode below manipulates.
 
-                    for j in range(len(hybe_list)):
-                        for i in range(len(id_list)):
-                            f[f'/cells/matrix/yx'][i,j] = np.eye(3)
-                            f[f'/cells/matrix/xz'][i,j] = np.eye(3)
+    Modes, measured on real data (FOV01, 2x50 random nuclei, Hyb_500 BF):
+      'rim emphasis'   -- dim body + bright 1px outline. 100/100 nuclei
+        recovered, the only mode that lost none; median cytoplasm/nucleus
+        area 1.50. The bright rim reads as an edge and pulls the predicted
+        boundary slightly inward, which is the price for that recovery.
+      'seam-separated' -- plain binary, except the 1px seam where two
+        DIFFERENT labels touch is cut to background. 99/100 recovered with
+        the largest cytoplasm extent (1.57). Most conservative: isolated
+        nuclei are untouched.
+      'binary'         -- the naive fill. 97/100, extent 1.56. Kept for
+        comparison; its weakness is real and measured -- projecting 50
+        nuclei fused them into 45 and 40 connected blobs in two trials, and
+        a fused nucleus loses its cytoplasm to whichever neighbour claims
+        the merged blob.
 
-                    ct_list = []
-                    for j,id in enumerate(id_list):
-                        barcode_channel_values = [np.median(self.current_image_parameters['images'][i][mask == id]) for i in range(len(self.current_image_parameters['images']))]
-                        if max(barcode_channel_values) == 0:
-                            ct = 'NA'
-                        else:
-                            ct = cellbarcodes[np.argmax(barcode_channel_values)]                
-                        ct_list.append(ct)
-                    f[f'/cells/cellbarcodes'].resize((len(id_list),))
-                    f[f'/cells/cellbarcodes'][:] = ct_list#np.array(ct_list, dtype=h5py.string_dtype(encoding='utf-8'))
-                    height, width = self.current_image_parameters['images'][0].shape
+    Plain erosion was also tested and is WORSE than doing nothing (1px:
+    94/100, 2px: 96/100) -- it shrinks every nucleus including the isolated
+    ones that had no contact, while often not breaking a real contact.
 
-                    composite = np.zeros((height, width, 4, len(self.current_image_parameters['images'])), dtype=np.uint8)
-                    for i in range(len(self.current_image_parameters['images'])):
-                        cmap = mcolors.LinearSegmentedColormap.from_list(f'{i}',[(0,0,0,1),self.hex2rgba(colors[i])],256,gamma=1.5)
-                        which_id = id_list[(f[f'/cells/cellbarcodes'][:] == cellbarcodes[i])]
-                        composite[...,i] = cmap(np.isin(mask, which_id).astype(int) * 255) * 255
+    Returns a float32 image in [0, 1]; the caller scales it to the
+    cytoplasm image's own dynamic range.
+    """
+    body = label_mask > 0
+    if mode == 'binary':
+        return body.astype(np.float32)
 
-                fig = self.figure
-                ax,caxes,rax = self.axes
-                rax.cla()
-                rax.imshow(composite.max(-1))
-                for id in id_list:
-                    if id in bad_indices:
-                        continue
-                    y,x = np.where(mask == id)
-                    rax.text(x.mean(),y.mean(), str(id), color='white', fontsize=14, ha='center', va='center')
-                rax.axis('off')
-                fig.savefig(os.path.normpath(os.path.join(self.h5_save_path, f'H5',f'FOV{fov:02d}',f'cellbarcodes.png')), bbox_inches='tight')
-                
-            finally:
-                self.widgets['loading_label'].value = "✅ cellbarcodes determined."
-                display(self.figure)
-                if fov < max(self.fov_list):
-                    next_fov = fov + 1
-                    self.widgets['fov_list'].value = next_fov
-                    self.widgets['bad_indices'].value = ''
-                    self.widgets['current_barcode'].value = self.cellbarcodes[0]
-                    self.initialize_images()
-                    self.determine_cellbarcode()
-                else:
-                    self.widgets['loading_label'].value = "✅ All done."
+    # Where a pixel's 3x3 neighbourhood holds two DIFFERENT nonzero labels,
+    # i.e. exactly the inter-nucleus contacts (never a nucleus/background
+    # edge, which min/max agree on).
+    big = np.where(body, label_mask, np.iinfo(np.int32).max)
+    contact = body & (scind.maximum_filter(label_mask, size=3) != scind.minimum_filter(big, size=3))
 
-    def display_color_legend(self):
-        legend_html = "<div style='display:flex; flex-wrap:wrap; gap:8px;'>"
-        for i, barcode in enumerate(self.cellbarcodes):
-            rgba = self.hex2rgba(colors[i])
-            rgba_str = f"rgba({int(rgba[0]*255)}, {int(rgba[1]*255)}, {int(rgba[2]*255)}, 1.0)"
-            legend_html += f"""
-            <div style='display:flex; align-items:center; gap:4px;'>
-                <div style='width:16px; height:16px; background:{rgba_str}; border:1px solid #ccc;'></div>
-                <span style='font-family:monospace;'>{barcode}</span>
-            </div>
-            """
-        legend_html += "</div>"
-        return HTML(legend_html)
+    if mode == 'seam-separated':
+        return (body & ~contact).astype(np.float32)
 
-    def on_dropdown_change(self, change):
-        current_barcode = change['new']
-        barcode_index = self.cellbarcodes.tolist().index(current_barcode)
-        self.widgets['input_min_slider'].value = self.current_image_parameters['bounds'][barcode_index][0]
-        self.widgets['input_max_slider'].value = self.current_image_parameters['bounds'][barcode_index][1]
+    out = body.astype(np.float32) * 0.45
+    outer = body & (scind.minimum_filter(body.astype(np.uint8), size=3) == 0)
+    out[outer | contact] = 1.0
+    return out
 
+
+_model_cyto_nuc = None
+
+
+def get_model_cyto_nuclear():
+    """
+    Lazily load a Cellpose cyto3 model for NUCLEUS-SEEDED cytoplasm
+    segmentation. Separate singleton from get_model_cyto() only so the two
+    call paths can't fight over one instance's internal state; the weights
+    are the same cyto3 model.
+    """
+    global _model_cyto_nuc
+    if _model_cyto_nuc is None:
+        import cellpose.models
+        _model_cyto_nuc = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
+    return _model_cyto_nuc
+
+
+def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000, max_size=100000):
+    """
+    Cellpose cytoplasm segmentation SEEDED by a nuclear channel.
+
+    Cellpose has no API that takes a label mask as a seed -- its nucleus-
+    assisted mode takes a second IMAGE channel (channels=[cyto, nuc]). So
+    `nucleus_seed_image` is a SYNTHETIC nuclear image the caller renders
+    from the real, already-segmented nuclei (see MainWindow._build_nucleus_
+    seed_image), projected into cyto_image's own frame. That synthetic
+    channel is genuinely stitched: each cell's nucleus is projected from
+    ITS OWN nucleus_hybe, which can differ cell to cell.
+
+    Stacked into an explicit 3-channel RGB-like array (R=cytoplasm,
+    G=nucleus, B=0) with channels=[1, 2] rather than a bare 2-channel
+    array -- cellpose's channel indices are 1-based into RGB, and the
+    (H,W,2) form is ambiguous across versions.
+
+    Returns cellpose's own raw labels, deliberately NOT relabeled: the
+    caller has to match them back to real nucleus ids (see
+    incorporate_cytoplasm), and _filter_and_relabel's renumbering would
+    destroy exactly the correspondence that matching depends on. Size
+    filtering here therefore drops labels in place, keeping ids intact.
+    """
+    cyto = np.asarray(cyto_image, dtype=np.float32)
+    nuc = np.asarray(nucleus_seed_image, dtype=np.float32)
+    if cyto.shape != nuc.shape:
+        raise ValueError(f'cyto image {cyto.shape} and nucleus seed {nuc.shape} must share a frame')
+    rgb = np.zeros((*cyto.shape, 3), dtype=np.float32)
+    rgb[..., 0] = cyto
+    rgb[..., 1] = nuc
+
+    try:
+        result = get_model_cyto_nuclear().eval([rgb], diameter=diameter, channels=[1, 2], do_3D=False)
+    except Exception:
+        # Same GPU-backend fallback rationale as segment_fov's own retry.
+        import cellpose.models
+        cpu_model = cellpose.models.Cellpose(gpu=False, model_type='cyto3')
+        result = cpu_model.eval([rgb], diameter=diameter, channels=[1, 2], do_3D=False)
+
+    labels = np.asarray(result[0][0]).astype(np.int32)
+    return _drop_labels_by_size(labels, min_size, max_size)
+
+
+def _drop_labels_by_size(labels, min_size, max_size):
+    """
+    Size filter that PRESERVES label values -- unlike _filter_and_relabel,
+    which renumbers. Cytoplasm labels have to keep their identity until
+    they've been matched to nuclei.
+    """
+    out = labels.copy()
+    values, counts = np.unique(out, return_counts=True)
+    bad = values[(counts < min_size) | (counts > max_size)]
+    out[np.isin(out, bad[bad != 0])] = 0
+    return out
+
+
+def incorporate_cytoplasm(cyto_labels, nucleus_label_mask, eligible_ids=None):
+    """
+    Merge a raw cytoplasm label image into the cell-id label space.
+
+    cyto_labels: segment_cytoplasm's own output (arbitrary cellpose ids).
+    nucleus_label_mask: EVERY cell's nucleus painted with its real cell id,
+    already projected into cyto_labels' frame -- including cells that opted
+    OUT of the cytoplasm search, because those still have to win overlaps.
+
+    eligible_ids: the cells that were actually SELECTED as seeds. Only
+    these may claim a cytoplasm; None means "all of them". This is a
+    genuinely separate role from the mask above, and conflating the two
+    was a real bug caught on live data: matching against every nucleus let
+    unselected cells claim cytoplasms cellpose happened to grow around
+    them (66 of 67 cells came back with a cytoplasm from a 50-cell
+    selection). Overlap authority is global; claiming authority is not.
+
+    Rules, per explicit spec:
+      * a cytoplasm inherits the id of the nucleus inside it -- so no cell
+        id is created, renamed, or renumbered by this step;
+      * a cytoplasm containing NO nucleus is discarded (cellpose readily
+        invents these);
+      * if several nuclei fall inside one cytoplasm, the largest-overlap
+        nucleus claims it and the others keep only their own nucleus --
+        never a split, which would have to invent an id;
+      * if one nucleus is claimed by several cytoplasms, it keeps the
+        largest-overlap one;
+      * nuclei always win overlaps: every nucleus pixel is painted last,
+        so a cytoplasm can never eat into another cell's nucleus.
+
+    Returns (merged_mask, claimed) -- claimed is {cell_id: n_pixels} for the
+    cells that actually ended up with a real cytoplasm, so the caller can
+    report/skip the rest without re-deriving it.
+    """
+    merged = np.zeros_like(nucleus_label_mask, dtype=np.int32)
+    eligible = None if eligible_ids is None else {int(i) for i in eligible_ids}
+    best_for_nucleus = {}  # cell id -> (overlap, cyto label)
+    for cyto_id in np.unique(cyto_labels):
+        if cyto_id == 0:
+            continue
+        inside = nucleus_label_mask[cyto_labels == cyto_id]
+        inside = inside[inside != 0]
+        if eligible is not None:
+            inside = inside[np.isin(inside, list(eligible))] if inside.size else inside
+        if inside.size == 0:
+            continue  # no ELIGIBLE nucleus inside -- discard outright
+        ids, counts = np.unique(inside, return_counts=True)
+        winner, overlap = int(ids[np.argmax(counts)]), int(counts.max())
+        prior = best_for_nucleus.get(winner)
+        if prior is None or overlap > prior[0]:
+            best_for_nucleus[winner] = (overlap, cyto_id)
+
+    claimed = {}
+    for cell_id, (_, cyto_id) in best_for_nucleus.items():
+        region = cyto_labels == cyto_id
+        merged[region] = cell_id
+        claimed[cell_id] = int(region.sum())
+
+    # Nuclei last: unconditional, so an unselected cell's nucleus also
+    # carves itself back out of any cytoplasm that overlapped it.
+    nucleus_pixels = nucleus_label_mask != 0
+    merged[nucleus_pixels] = nucleus_label_mask[nucleus_pixels]
+    return merged, claimed
