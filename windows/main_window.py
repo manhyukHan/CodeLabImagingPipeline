@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime
 
@@ -42,14 +44,24 @@ from skimage.feature import peak_local_max
 
 class IngestionWorker(QtCore.QThread):
     """
-    Runs convert_dax_to_h5_worker sequentially (not via ProcessPoolExecutor)
-    -- deliberately: macOS's spawn-based multiprocessing needs the entry
-    script properly __main__-guarded to submit work from a ProcessPoolExecutor,
-    which doesn't hold reliably when called from inside a QThread in a GUI
-    app. A QThread already keeps the ingestion off the GUI thread, which is
-    what actually matters for responsiveness here; throughput can be
-    revisited later if ingesting large hybe/FOV counts through the GUI
-    turns out too slow in practice.
+    Converts every (FOV, hybe) task through a spawn-context
+    ProcessPoolExecutor (max_workers from the Ingestion tab's Parallel
+    workers spinbox; 1 = plain sequential). The work is I/O-bound --
+    each task is one huge sequential DAX read plus an uncompressed H5
+    write -- so a few workers overlapping read latency is where the
+    speedup lives, especially off a network share.
+
+    Two invariants:
+    - vlinks.h5 stays SINGLE-WRITER: children only ever write their own
+      independent {hybe}_stack.h5; the MIP copy into the one shared
+      vlinks.h5 happens HERE, in this coordinator thread, as each future
+      completes (HDF5 forbids concurrent writers as a format matter,
+      independent of file size).
+    - spawn context requires a __main__-guarded entry (main.py is; any
+      script that triggers ingestion must be). convert_dax_to_h5_worker
+      is a top-level function in a Qt-free module, so children never
+      import the GUI. If the pool cannot be created at all, the run
+      degrades to the old sequential loop rather than failing.
     """
     progress = QtCore.pyqtSignal(int, int, str)
     # (n_errors, n_total, error_lines) -- per-task errors from
@@ -62,8 +74,10 @@ class IngestionWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(int, int, list)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, fov_list, hybe_records, dax_directory, storage_path, modality, overwrite=True):
+    def __init__(self, fov_list, hybe_records, dax_directory, storage_path, modality, overwrite=True,
+                 max_workers=4):
         super().__init__()
+        self.max_workers = max(1, int(max_workers))
         self.fov_list = fov_list
         self.hybe_records = hybe_records
         self.dax_directory = dax_directory
@@ -80,18 +94,16 @@ class IngestionWorker(QtCore.QThread):
         try:
             tasks = [(fov, record) for fov in self.fov_list for record in self.hybe_records]
             error_lines = []
-            for i, (fov, record) in enumerate(tasks):
-                fov_r, hybe_r, err = preprocess.convert_dax_to_h5_worker(
-                    fov, record, self.dax_directory, self.storage_path, self.modality, overwrite=self.overwrite)
+            done = [0]
+
+            def finish_task(fov_r, hybe_r, err, record):
+                # Coordinator-side tail of every task, pooled or not:
+                # ingestion is one of the two places this app is allowed
+                # to touch the raw per-hybe stack file directly (see
+                # vlinks_store.write_hybe_mip's own docstring) -- the
+                # file's already just been written, so this MIP copy is
+                # cheap, and doing it HERE keeps vlinks.h5 single-writer.
                 if err is None:
-                    # Ingestion is one of the two places this app is allowed
-                    # to touch the raw per-hybe stack file directly (see
-                    # vlinks_store.write_hybe_mip's own docstring) -- the
-                    # file's already just been written, so this MIP copy is
-                    # cheap. Everything downstream (ingestion-status checks,
-                    # displayers, "has this FOV been aligned") should read
-                    # vlinks.h5 from here on, never re-open this stack file
-                    # just to check whether it's usable.
                     try:
                         h5path = os.path.join(self.storage_path, f'FOV{fov_r:02d}', f'{hybe_r}_stack.h5')
                         with h5py.File(h5path, 'r') as f:
@@ -103,7 +115,37 @@ class IngestionWorker(QtCore.QThread):
                 status = 'OK' if err is None else f'ERROR: {err}'
                 if err is not None:
                     error_lines.append(f'FOV{fov_r:02d} {hybe_r}: {err}')
-                self.progress.emit(i + 1, len(tasks), f'FOV{fov_r:02d} {hybe_r}: {status}')
+                done[0] += 1
+                self.progress.emit(done[0], len(tasks), f'FOV{fov_r:02d} {hybe_r}: {status}')
+
+            executor = None
+            if self.max_workers > 1 and len(tasks) > 1:
+                try:
+                    executor = ProcessPoolExecutor(max_workers=min(self.max_workers, len(tasks)),
+                                                   mp_context=multiprocessing.get_context('spawn'))
+                except Exception as e:
+                    self.progress.emit(0, len(tasks), f'process pool unavailable ({e}) -- running sequentially')
+
+            if executor is not None:
+                with executor:
+                    task_by_future = {executor.submit(preprocess.convert_dax_to_h5_worker,
+                                                      fov, record, self.dax_directory, self.storage_path,
+                                                      self.modality, overwrite=self.overwrite): (fov, record)
+                                      for fov, record in tasks}
+                    for future in as_completed(task_by_future):
+                        fov, record = task_by_future[future]
+                        try:
+                            fov_r, hybe_r, err = future.result()
+                        except Exception as e:
+                            # a task must never kill the run -- same
+                            # per-task error contract as the worker's own
+                            fov_r, hybe_r, err = fov, record['folder'], f'worker process failed: {e}'
+                        finish_task(fov_r, hybe_r, err, record)
+            else:
+                for fov, record in tasks:
+                    fov_r, hybe_r, err = preprocess.convert_dax_to_h5_worker(
+                        fov, record, self.dax_directory, self.storage_path, self.modality, overwrite=self.overwrite)
+                    finish_task(fov_r, hybe_r, err, record)
             # dax_vlinks_h5 (a single aggregate vlinks.h5 across every hybe)
             # is deliberately NOT called here -- it's only ever read by the
             # legacy Jupyter-widget classes now in legacy/segment_widgets.py,
@@ -1403,7 +1445,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Ingesting...')
 
         self._ingestion_worker = IngestionWorker(fov_list, selected_records, dax_directory, storage_path, modality,
-                                                  overwrite=(overwrite_mode == 'overwrite'))
+                                                  overwrite=(overwrite_mode == 'overwrite'),
+                                                  max_workers=ip.IngestWorkersSpinBox.value())
         self._ingestion_worker.progress.connect(self._on_ingestion_progress)
         self._ingestion_worker.finished_ok.connect(self._on_ingestion_finished)
         self._ingestion_worker.failed.connect(self._on_ingestion_failed)
@@ -1958,7 +2001,8 @@ class MainWindow(QtWidgets.QMainWindow):
                               f"{job['modality']}, FOV {job['fov_list']}...")
         self._ingestion_worker = IngestionWorker(job['fov_list'], job['selected_records'],
                                                   job['dax_directory'], job['storage_path'], job['modality'],
-                                                  overwrite=self._job_queue_overwrite)
+                                                  overwrite=self._job_queue_overwrite,
+                                                  max_workers=self.ui.IngestionPanel.IngestWorkersSpinBox.value())
         self._ingestion_worker.progress.connect(self._on_ingestion_progress)
         self._ingestion_worker.finished_ok.connect(self._on_queued_job_finished)
         self._ingestion_worker.failed.connect(self._on_queued_job_failed)
