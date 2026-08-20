@@ -147,5 +147,62 @@ with mock.patch.object(QtWidgets.QMessageBox, 'information', rec('information'))
         check(not np.array_equal(got['mask'], expected.T),
               'mask is NOT the transpose (the reported bug would fail this)')
 
+    # -- door 4: celltype with NO alignment anywhere (the invariant:
+    #    absence of alignment is identity, NEVER a skip). Third
+    #    recurrence of this violation was a lying "missing alignment"
+    #    skip summary on a real single-modality dataset (2026-08-20).
+    w.fov_matrices.clear()
+    w.cross_modal_result.clear()
+    for cont in (w.cell_container_permanent, w.cell_container):
+        for cells_ in cont.data.values():
+            for c in cells_.values():
+                c.matrices.clear()
+                c.matrix_anchors.clear()
+    dialogs['information'].clear()
+    # persistence mocked: this door manipulates session state (cleared
+    # matrices) to test the invariant -- writing that state to the clone
+    # destroyed the shared fixture's arming (confirmed: single-source
+    # test lost its residual-matrix cell)
+    with mock.patch.object(w, '_show_celltype_result'), \
+            mock.patch.object(w, '_persist_celltype_results'):
+        w._run_celltype_determination()
+    summary2 = next((t for t in dialogs['information'] if 'classified' in t), '')
+    m2 = _re.search(r'(\d+) cell\(s\), (\d+) spot\(s\) classified \((.*)\)', summary2)
+    check(m2 is not None and int(m2.group(1)) == n_expected_cells and '0 skipped' in m2.group(3),
+          f'NO-ALIGNMENT run classifies everything via identity, 0 skipped (got {summary2!r})')
+    check('missing alignment' not in summary2,
+          'no run can ever blame "missing alignment" (identity-default rule)')
+
+    # -- door 5: a barcode channel with NO MIP must skip with the REAL
+    #    cause named (the slice), never an alignment blame
+    w._barcode_channel_by_celltype['TypeA'] = ('Hyb_130', 999, 'RNA')   # channel that has no MIP
+    for k in ('scale', 'lower_bound', 'upper_bound'):
+        w._barcode_calibration[k][('Hyb_130', 999, 'RNA')] = {FOV: w._barcode_calibration[k][bch_a][FOV]}
+    dialogs['information'].clear()
+    with mock.patch.object(w, '_show_celltype_result'), \
+            mock.patch.object(w, '_persist_celltype_results'):
+        w._run_celltype_determination()
+    summary3 = next((t for t in dialogs['information'] if 'classified' in t), '')
+    check('no MIP for' in summary3 and 'Hyb_130/ch999' in summary3,
+          f'missing-MIP skip names the real slice (got {summary3!r})')
+    check('missing alignment' not in summary3, 'missing-MIP skip does not blame alignment')
+
+    # -- door 6: parse-layout's fresh-store path (the exact reported
+    #    traceback: write_global_params -> modality_of raised on a store
+    #    with nothing ingested). declare_modality is the fix.
+    fresh = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'fresh_single_modality_store')
+    import shutil
+    if os.path.exists(fresh):
+        shutil.rmtree(fresh)
+    os.makedirs(fresh)
+    try:
+        vlinks_store.declare_modality(fresh, 'DNA')
+        vlinks_store.write_global_params(fresh, layout_path='X:/somewhere/layout.xlsx')
+        back = vlinks_store.read_global_params(fresh)
+        check(back.get('layout_path') == 'X:/somewhere/layout.xlsx',
+              'fresh un-ingested store accepts modality-scoped params (no boot gate)')
+    except ValueError as e:
+        check(False, f'fresh-store params still raise: {e}')
+
 print('ALL GOOD' if not failures else f'{len(failures)} FAILURES')
 sys.exit(1 if failures else 0)

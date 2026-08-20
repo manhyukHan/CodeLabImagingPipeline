@@ -107,6 +107,22 @@ class IngestionPanelUI(object):
         self.CheckSelectedHybesPushButton.clicked.connect(lambda: self._set_selected_hybe_check_state(QtCore.Qt.Checked))
         self.UncheckSelectedHybesPushButton.clicked.connect(lambda: self._set_selected_hybe_check_state(QtCore.Qt.Unchecked))
 
+        workersRow = QtWidgets.QWidget()
+        workersLayout = QtWidgets.QHBoxLayout(workersRow)
+        workersLayout.setContentsMargins(0, 0, 0, 0)
+        workersLayout.addWidget(QtWidgets.QLabel('Parallel workers:'))
+        self.IngestWorkersSpinBox = QtWidgets.QSpinBox()
+        self.IngestWorkersSpinBox.setRange(1, 16)
+        self.IngestWorkersSpinBox.setValue(4)
+        self.IngestWorkersSpinBox.setToolTip(
+            'DAX->H5 conversions run in this many separate processes. The work '
+            'is I/O-bound (huge sequential reads, often from a network share), '
+            'so 3-4 overlaps read latency well; more mostly thrashes the disk/'
+            'share. 1 = the old sequential behavior.')
+        workersLayout.addWidget(self.IngestWorkersSpinBox)
+        workersLayout.addStretch(1)
+        layout.addWidget(workersRow)
+
         self.RunIngestionPushButton = QtWidgets.QPushButton('Run Ingestion')
         self.RunIngestionPushButton.setEnabled(False)
         layout.addWidget(self.RunIngestionPushButton)
