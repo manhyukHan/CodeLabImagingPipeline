@@ -92,10 +92,14 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
     unassigned pool could never notice, which is how a dead owner used to
     survive indefinitely.
 
-    matrix_to_shared: optional callable (hybe, modality, cell) -> 3x3 into
-    the shared frame; when given, an assigned spot's `coordinate` is
-    recomputed through it so shared-frame positions reflect the CURRENT
-    matrices rather than whatever they were at localization time.
+    matrix_to_shared: optional callable (hybe, modality, cell) ->
+    (H_yx 3x3, dz planes) into the shared frame -- a bare 3x3 is also
+    accepted (dz = 0.0, kept for older callers/tests). When given, a
+    spot's `coordinate` is recomputed IN FULL 3D: (y, x) through H, and
+    z as raw_z + dz. Per confirmed real bug: the recast used to carry z
+    over untouched, so a cell's own dz and the cross-modal z drift never
+    reached any persisted coordinate no matter how many saves ran --
+    coordinate[2] stayed equal to raw[2] forever.
 
     area_in_frame: forwarded to label_mask_for_frame (see its docstring --
     session callers must pass the resolver-backed projection).
@@ -125,25 +129,33 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
                 spot.cell = -1
                 spot.celltype = ''
                 if matrix_to_shared is not None:
-                    H = matrix_to_shared(hybe, modality, None)
-                    if H is not None:
-                        cy, cx = (np.asarray(H, dtype=float)[:2]
-                                  @ np.array([float(spot.raw_coordinate[0]),
-                                              float(spot.raw_coordinate[1]), 1.0]))
-                        spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
+                    _apply_transform(spot, matrix_to_shared(hybe, modality, None))
                 n_unassigned += 1
                 continue
             spot.cell = int(owner.id)
             spot.celltype = str(getattr(owner, 'celltype', '') or '')
             if matrix_to_shared is not None:
-                H = matrix_to_shared(hybe, modality, owner)
-                if H is not None:
-                    cy, cx = (np.asarray(H, dtype=float)[:2]
-                              @ np.array([float(spot.raw_coordinate[0]),
-                                          float(spot.raw_coordinate[1]), 1.0]))
-                    spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
+                _apply_transform(spot, matrix_to_shared(hybe, modality, owner))
             n_assigned += 1
     return n_assigned, n_unassigned
+
+
+def _split_transform(resolved):
+    """(H, dz) from a callback result -- bare 3x3 means dz = 0.0."""
+    if isinstance(resolved, tuple):
+        H, dz = resolved
+        return (None, 0.0) if H is None else (np.asarray(H, dtype=float), float(dz))
+    return (None, 0.0) if resolved is None else (np.asarray(resolved, dtype=float), 0.0)
+
+
+def _apply_transform(spot, resolved):
+    H, dz = _split_transform(resolved)
+    if H is None:
+        return False
+    cy, cx = H[:2] @ np.array([float(spot.raw_coordinate[0]),
+                               float(spot.raw_coordinate[1]), 1.0])
+    spot.coordinate = (float(cy), float(cx), float(spot.raw_coordinate[2]) + dz)
+    return True
 
 
 def _memoized(matrix_to_shared):
@@ -188,12 +200,6 @@ def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
     resolve = _memoized(matrix_to_shared)
     for spot in spots:
         owner = cells_by_id.get(int(spot.cell)) if int(spot.cell) != -1 else None
-        H = resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)
-        if H is None:
-            continue
-        cy, cx = (np.asarray(H, dtype=float)[:2]
-                  @ np.array([float(spot.raw_coordinate[0]),
-                              float(spot.raw_coordinate[1]), 1.0]))
-        spot.coordinate = (float(cy), float(cx), float(spot.coordinate[2]))
-        n += 1
+        if _apply_transform(spot, resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)):
+            n += 1
     return n

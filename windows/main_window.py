@@ -4545,8 +4545,16 @@ class MainWindow(QtWidgets.QMainWindow):
         cells_by_id = {c.id: c for c in cells}
 
         def to_shared(hybe, modality, owner):
+            # FULL 3D: (H, dz) -- the z leg (cell dz + cross-modal z
+            # drift) was silently dropped before, so coordinate[2] never
+            # left raw[2] (confirmed real: cell dz=-2 with spot z
+            # unchanged through every save).
             fallback = owner.reference_modality if owner is not None else None
-            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+            m = modality or fallback
+            resolver = self._frame_resolver(owner, fov)
+            if resolver.shared is None:
+                return None
+            return resolver.to_shared(hybe, m, owner), resolver.z_to_shared(hybe, m, owner)
 
         if cells:
             assignment.assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
@@ -4589,8 +4597,13 @@ class MainWindow(QtWidgets.QMainWindow):
         def to_shared(hybe, modality, owner):
             # owner=None is a real case (unassigned spots): the resolver's
             # cell leg defaults to identity, FOV/cross-modal still compose.
+            # FULL 3D: (H, dz) -- see _recast_persisted_spots' twin above.
             fallback = owner.reference_modality if owner is not None else None
-            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+            m = modality or fallback
+            resolver = self._frame_resolver(owner, fov)
+            if resolver.shared is None:
+                return None
+            return resolver.to_shared(hybe, m, owner), resolver.z_to_shared(hybe, m, owner)
 
         # ONE uniform flow, cell existence never required (per explicit
         # spec): (1) label mask in each spot's own frame -- ALL-ZEROS when

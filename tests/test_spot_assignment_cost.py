@@ -189,15 +189,33 @@ def test_matrix_resolution_is_memoized_per_cell():
 def test_unassigned_spots_are_recast_too():
     """No owner means the cell layer is identity, not that nothing moves:
     the FOV/cross-modal legs still change with matrices, so unassigned
-    spots' shared coordinates must refresh like everyone else's."""
+    spots' shared coordinates must refresh like everyone else's. A bare
+    3x3 callback (no dz) is still accepted -- dz defaults to 0."""
     cells, mask = setup()
     s = ASpot(); s.modality = MODALITY
     s.set_metadata(uid=1, fov=FOV, hybe=HYBE, channel=635, cell=-1,
-                   raw_coordinate=(10.0, 20.0, 0.0), coordinate=(10.0, 20.0, 0.0))
+                   raw_coordinate=(10.0, 20.0, 4.0), coordinate=(10.0, 20.0, 4.0))
     H = np.eye(3); H[0, 2], H[1, 2] = 5.0, -3.0
     n = assignment.recast_spots_to_shared([s], lambda h, m, o: H, {c.id: c for c in cells})
     assert n == 1, 'the unassigned spot must be recast'
-    assert s.coordinate[:2] == (15.0, 17.0), s.coordinate
+    assert s.coordinate == (15.0, 17.0, 4.0), s.coordinate
+
+
+def test_recast_applies_the_z_leg():
+    """coordinate[2] = raw[2] + dz. Confirmed real bug: the recast
+    carried z over untouched, so a cell's own dz (-2 in the reported
+    case) and the cross-modal z drift never reached any persisted
+    coordinate no matter how many saves ran."""
+    cells, mask = setup()
+    s = ASpot(); s.modality = MODALITY
+    s.set_metadata(uid=1, fov=FOV, hybe=HYBE, channel=635, cell=-1,
+                   raw_coordinate=(10.0, 20.0, 87.76), coordinate=(0.0, 0.0, 87.76))
+    H = np.eye(3); H[0, 2], H[1, 2] = 0.4287, 0.0276
+    n = assignment.recast_spots_to_shared([s], lambda h, m, o: (H, -2.0),
+                                          {c.id: c for c in cells})
+    assert n == 1
+    assert abs(s.coordinate[2] - 85.76) < 1e-9, s.coordinate
+    assert abs(s.coordinate[0] - 10.4287) < 1e-9 and abs(s.coordinate[1] - 20.0276) < 1e-9
 
 
 def _run_all():
