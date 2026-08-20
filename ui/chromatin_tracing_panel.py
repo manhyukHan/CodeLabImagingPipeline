@@ -16,23 +16,22 @@ from PyQt5 import QtWidgets, QtCore
 # stay single, shared fields. peak_bound/max_sigma/max_uncert/min_hb_ratio/
 # min_ah_ratio are independently configurable per channel -- a fiducial
 # bead and a real genomic-locus probe can have genuinely different
-# brightness/PSF characteristics worth tuning separately (min_hb_ratio's
-# own DEFAULT actually differs between the two, per explicit request: a
-# real genomic-locus readout spot is legitimately dimmer against its local
-# background than a fiducial bead, so readout's default peak/background
-# floor is relaxed to 1.05 vs. fiducial's 1.15 -- freely re-tunable either
-# way, just not the same starting point). min_sep/multi_mode (mixture-mode
+# brightness/PSF characteristics worth tuning separately. Both channels
+# now START at ChrTracer3 FitPsf3D's own gate values (minHBratio 1.2,
+# minAHratio 0.25), per explicit request (2026-08-20), superseding the
+# earlier readout relaxation to 1.05; either stays freely re-tunable
+# here if real traces start losing hybes. min_sep/multi_mode (mixture-mode
 # search) are READOUT-ONLY, per explicit request -- a fiducial's whole
 # purpose is ONE per-hybe drift-correction anchor (see localization.
 # _localize_fiducial_hybe), so there's no legitimate multi-component case
 # for it the way a real genomic-locus readout has.
 CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0,
                        'max_fiducial_drift_z': 10.0}
-SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.15}
+SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS,
-                  'fiducial': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.15},
-                  'readout': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.05, **READOUT_ONLY_FIT_DEFAULTS}}
+                  'fiducial': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2},
+                  'readout': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2, **READOUT_ONLY_FIT_DEFAULTS}}
 
 # (attribute prefix, param key, row label, kind) -- single source of truth
 # for both building the two-column grid and reading/resetting it, so the

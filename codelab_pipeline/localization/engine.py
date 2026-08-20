@@ -64,9 +64,9 @@ class GaussianLocalizeEngine(LocalizeEngine):
     name = 'gaussian'
 
     def __init__(self, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                 min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15,
-                 min_ah_ratio=0.15, max_uncert=2.0, min_sep=3.0,
-                 component_threshold=0.3, z_window=15):
+                 min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2,
+                 min_ah_ratio=0.25, max_uncert=2.0, min_sep=3.0,
+                 component_threshold=0.3, z_window=15, symmetric_xy=False):
         self.fit_kwargs = dict(peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
                                init_sigma_z=init_sigma_z, min_sigma=min_sigma,
                                max_sigma=max_sigma, min_hb_ratio=min_hb_ratio,
@@ -74,6 +74,10 @@ class GaussianLocalizeEngine(LocalizeEngine):
         self.min_sep = min_sep
         self.component_threshold = component_threshold
         self.z_window = z_window
+        # single-emitter fits only -- the mixture keeps free XY (its
+        # components exist precisely because the window is not one
+        # clean symmetric emitter)
+        self.symmetric_xy = symmetric_xy
 
     def raw_components(self, stack, seed_yxz, n_max=1):
         """
@@ -97,7 +101,8 @@ class GaussianLocalizeEngine(LocalizeEngine):
         else:
             seeds = []
         if len(seeds) <= 1:
-            results = [L.fit_gaussian_3d(stack, x0, y0, z0, **self.fit_kwargs)]
+            results = [L.fit_gaussian_3d(stack, x0, y0, z0, symmetric_xy=self.symmetric_xy,
+                                         **self.fit_kwargs)]
             seeds = []
         else:
             results = L.fit_gaussian_mixture_3d(stack, seeds, **self.fit_kwargs)

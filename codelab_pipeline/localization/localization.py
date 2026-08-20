@@ -81,7 +81,8 @@ def _residuals_3d(params, x, y, z, values):
     return gaussian_3d((x, y, z), amp, x0, y0, z0, sigma_x, sigma_y, sigma_z, offset) - values
 
 def fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                    min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0):
+                    min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
+                    symmetric_xy=False):
     """
     Bounded least-squares 3D Gaussian fit, matching ChrTracer3's FitPsf3D
     (/Users/hanmanhyuk/Downloads/ChrTracingLib/FitPsf3D.m) bounds and
@@ -134,7 +135,7 @@ def fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=2.0, init_sigma_xy=1.25, init_
     mask = np.isfinite(cubic)
     x, y, z, values = x[mask].astype(float), y[mask].astype(float), z[mask].astype(float), cubic[mask].astype(float)
 
-    n_params = 8
+    n_params = 7 if symmetric_xy else 8
     if len(values) <= n_params:
         return None  # not enough data to constrain the fit at all
 
@@ -146,18 +147,38 @@ def fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=2.0, init_sigma_xy=1.25, init_
 
     amp0 = float(np.nanmax(values))
     offset0 = float(np.nanmin(values))
-    p0 = [amp0, x0, y0, z0, init_sigma_xy, init_sigma_xy, init_sigma_z, offset0]
-    lb = [0, x0 - peak_bound, y0 - peak_bound, z0 - peak_bound, min_sigma, min_sigma, min_sigma, 0]
-    ub = [65535, x0 + peak_bound, y0 + peak_bound, z0 + peak_bound, max_sigma, max_sigma, 2 * max_sigma, 65535]
+    if symmetric_xy:
+        # ChrTracer3 FitPsf3D's own reduced model (its symmetricXY
+        # default): ONE shared XY sigma. Fewer degrees of freedom is
+        # steadier on dim spots, at the cost of astigmatic PSFs. The
+        # first four parameters keep the same layout as the free model,
+        # so the CI position gates below index identically.
+        def _residuals(p):
+            a_, x_, y_, z_, sxy_, sz_, o_ = p
+            return _residuals_3d([a_, x_, y_, z_, sxy_, sxy_, sz_, o_], x, y, z, values)
+        p0 = [amp0, x0, y0, z0, init_sigma_xy, init_sigma_z, offset0]
+        lb = [0, x0 - peak_bound, y0 - peak_bound, z0 - peak_bound, min_sigma, min_sigma, 0]
+        ub = [65535, x0 + peak_bound, y0 + peak_bound, z0 + peak_bound, max_sigma, 2 * max_sigma, 65535]
+        fit_args = ()
+    else:
+        _residuals = _residuals_3d
+        p0 = [amp0, x0, y0, z0, init_sigma_xy, init_sigma_xy, init_sigma_z, offset0]
+        lb = [0, x0 - peak_bound, y0 - peak_bound, z0 - peak_bound, min_sigma, min_sigma, min_sigma, 0]
+        ub = [65535, x0 + peak_bound, y0 + peak_bound, z0 + peak_bound, max_sigma, max_sigma, 2 * max_sigma, 65535]
+        fit_args = (x, y, z, values)
 
     try:
-        result = least_squares(_residuals_3d, p0, bounds=(lb, ub), args=(x, y, z, values))
+        result = least_squares(_residuals, p0, bounds=(lb, ub), args=fit_args)
     except Exception:
         return None
     if not result.success:
         return None
 
-    amp, x0f, y0f, z0f, sigma_x, sigma_y, sigma_z, offset = result.x
+    if symmetric_xy:
+        amp, x0f, y0f, z0f, sigma_xy_f, sigma_z, offset = result.x
+        sigma_x = sigma_y = sigma_xy_f
+    else:
+        amp, x0f, y0f, z0f, sigma_x, sigma_y, sigma_z, offset = result.x
 
     dof = len(values) - n_params
     residual_var = float(np.sum(result.fun ** 2)) / dof
@@ -168,7 +189,7 @@ def fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=2.0, init_sigma_xy=1.25, init_
         return None
     if not np.all(np.isfinite(se)):
         return None
-    ci_half = student_t.ppf(0.975, dof) * se  # order matches p0: amp,x0,y0,z0,sx,sy,sz,offset
+    ci_half = student_t.ppf(0.975, dof) * se  # both layouts start amp,x0,y0,z0 -- gates below index those
 
     if (2 * ci_half[1] >= max_uncert) or (2 * ci_half[2] >= max_uncert) or (2 * ci_half[3] >= 2 * max_uncert):
         return None
@@ -223,7 +244,7 @@ def _residuals_3d_mixture(params, x, y, z, values, n_components):
     return model - values
 
 def fit_gaussian_mixture_3d(cubic, seeds, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15,
+                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25,
                             max_uncert=2.0):
     """
     Sum-of-N-Gaussians counterpart to fit_gaussian_3d, one amplitude/
@@ -455,7 +476,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
 
 def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modality=None,
                   spad=5, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                  min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
+                  min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
                   min_sep=3.0, component_threshold=0.3, max_components=3, claimed_positions=None,
                   use_mixture=True, z_window=15, fov_matrices=None, resolver=None):
     """
@@ -827,7 +848,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
 
 def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov, modality, cell, fov_matrices,
                             spad=8, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0, resolver=None):
+                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0, resolver=None):
     """
     Crops+fits ONE hybe's fiducial channel around an allele's already-known
     shared-frame (x,y). Always single-component (fit_gaussian_3d) -- no
@@ -878,7 +899,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
 
 def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
                            spad=8, use_mixture=True, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                           min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
+                           min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
                            min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15, resolver=None):
     """
     Crops+fits ONE hybe's readout channel around the same allele anchor,
@@ -947,14 +968,15 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
 # doesn't set, so a caller only needs to override what it actually wants
 # to differ between the two. Fiducial has no mixture mode (see
 # _localize_fiducial_hybe) so it only ever uses the common subset; readout
-# additionally accepts min_sep/use_mixture. min_hb_ratio's own DEFAULT
-# differs between the two, per explicit request: a real genomic-locus
-# readout spot is legitimately dimmer against its local background than a
-# fiducial bead, so readout's default peak/background floor is relaxed to
-# 1.05 vs. fiducial's 1.15.
+# additionally accepts min_sep/use_mixture. Both channels default to
+# ChrTracer3 FitPsf3D's own gate values (minHBratio 1.2, minAHratio
+# 0.25), per explicit request (2026-08-20) -- this SUPERSEDES the earlier
+# readout relaxation to 1.05 ("a readout spot is legitimately dimmer
+# than a fiducial bead"); that remains re-tunable per channel in the
+# Chromatin Tracing panel if real traces start losing hybes.
 _DEFAULT_FIDUCIAL_FIT_PARAMS = dict(peak_bound=2.0, max_sigma=2.5, max_uncert=2.0,
-                                    min_hb_ratio=1.15, min_ah_ratio=0.15)
-_DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS, min_hb_ratio=1.05,
+                                    min_hb_ratio=1.2, min_ah_ratio=0.25)
+_DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS,
                                    min_sep=3.0, use_mixture=False)
 
 
