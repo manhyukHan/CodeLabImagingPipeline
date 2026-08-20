@@ -1447,6 +1447,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ingestion_worker = IngestionWorker(fov_list, selected_records, dax_directory, storage_path, modality,
                                                   overwrite=(overwrite_mode == 'overwrite'),
                                                   max_workers=ip.IngestWorkersSpinBox.value())
+        self._wire_ingestion_ui_guard(self._ingestion_worker)
         self._ingestion_worker.progress.connect(self._on_ingestion_progress)
         self._ingestion_worker.finished_ok.connect(self._on_ingestion_finished)
         self._ingestion_worker.failed.connect(self._on_ingestion_failed)
@@ -1642,11 +1643,50 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         return vlinks_store.read_spots(storage_path, fov)
 
+    def _ingestion_is_running(self):
+        """True while an IngestionWorker is live -- single run or queued."""
+        worker = getattr(self, '_ingestion_worker', None)
+        return worker is not None and worker.isRunning()
+
     def _show_cell_spot_status_displayer(self):
+        # Refused outright while an ingestion is live, for two reasons that
+        # both trace back to this refresh running on the GUI thread:
+        # _refresh_cell_spot_status_full holds the vlinks.h5 lock for its
+        # whole duration, so the coordinator's MIP writes would stall behind
+        # it (they queue and catch up -- nothing is lost, but the run stops
+        # advancing), and the window goes unresponsive meanwhile. Before the
+        # lock existed this same overlap did not merely stall, it FAILED:
+        # "ingested but failed to write vlinks.h5 MIP: Unable to open file
+        # (file is already open for read-only)", losing that hybe's MIP.
+        # This guard goes away once the refresh moves off the GUI thread.
+        if self._ingestion_is_running():
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Information)
+            box.setWindowTitle('Cell/Spot status')
+            box.setText('An ingestion is running.')
+            box.setInformativeText(
+                'This view reads the whole store, which would freeze the '
+                'window and stall the ingestion for as long as it took. It '
+                'becomes available again the moment the run finishes.')
+            box.exec_()
+            return
         d = self.cell_spot_status_displayer
         self._refresh_cell_spot_status_full()
         d.show()
         d.raise_()
+
+    def _wire_ingestion_ui_guard(self, worker):
+        """
+        Grey the Cell/Spot status button out for the life of one ingestion.
+
+        Driven off QThread's own started/finished rather than the six places
+        that already toggle the Run buttons: finished fires whether run()
+        returned or raised, so no failure path can leave the button stuck
+        disabled.
+        """
+        button = self.ui.IngestionPanel.ShowCellSpotStatusDisplayerPushButton
+        worker.started.connect(lambda: button.setEnabled(False))
+        worker.finished.connect(lambda: button.setEnabled(True))
 
     def _status_storage_path(self):
         """
@@ -1686,10 +1726,22 @@ class MainWindow(QtWidgets.QMainWindow):
             d.set_spot_data([], 0)
             d.set_allele_data([], 0, 0)
             return
-        self._refresh_cell_spot_status_matrix_panel()
-        self._refresh_cell_spot_status_cell_panel()
-        self._on_cell_spot_status_spot_scope_changed()
-        self._refresh_cell_spot_status_allele_panel()
+        # ONE vlinks.h5 open for the whole refresh instead of one per read.
+        # Between them the four panels below issue several hundred reads
+        # (per-FOV totals in the cell and allele panels, per-(FOV, modality)
+        # matrices), and each one used to open and close the file for
+        # itself. Those opens were the dominant cost of this refresh AND the
+        # window in which ingestion's per-task MIP write collided with it --
+        # see vlinks_store._open_vlinks for the failure that caused.
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            with vlinks_store.vlinks_session(storage_path):
+                self._refresh_cell_spot_status_matrix_panel()
+                self._refresh_cell_spot_status_cell_panel()
+                self._on_cell_spot_status_spot_scope_changed()
+                self._refresh_cell_spot_status_allele_panel()
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
 
     def _refresh_cell_spot_status_matrix_panel(self):
         """
@@ -2003,6 +2055,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                                   job['dax_directory'], job['storage_path'], job['modality'],
                                                   overwrite=self._job_queue_overwrite,
                                                   max_workers=self.ui.IngestionPanel.IngestWorkersSpinBox.value())
+        self._wire_ingestion_ui_guard(self._ingestion_worker)
         self._ingestion_worker.progress.connect(self._on_ingestion_progress)
         self._ingestion_worker.finished_ok.connect(self._on_queued_job_finished)
         self._ingestion_worker.failed.connect(self._on_queued_job_failed)

@@ -1,6 +1,8 @@
+import contextlib
 import glob
 import os
 import pickle
+import threading
 from datetime import datetime
 
 import h5py
@@ -25,6 +27,108 @@ def _vlinks_path(storage_path):
     return os.path.join(os.path.dirname(os.path.abspath(storage_path).rstrip(os.sep)),
                         'vlinks.h5')
 
+
+
+# -- one open handle at a time (see _open_vlinks) --------------------------
+#
+# HDF5 permits exactly ONE open handle per file per process, and every open
+# must agree on flags. This module had 21 independent h5py.File() sites and
+# no coordination between them, so two overlapping opens simply raced. That
+# is not theoretical -- it was confirmed in a real ingestion run as
+#
+#     FOV06 Hyb_073: ERROR: ingested but failed to write vlinks.h5 MIP:
+#     Unable to open file (file is already open for read-only)
+#
+# when the Cell/Spot status viewer (GUI thread, several hundred reads in one
+# refresh) overlapped IngestionWorker's per-task MIP write on the
+# coordinator thread. The conversion itself had already succeeded; only the
+# MIP copy was lost, and Append mode cannot repair it afterwards because
+# convert_dax_to_h5_worker skips on the stack file merely EXISTING. So a
+# collision here costs real, hard-to-notice data.
+#
+# Every vlinks.h5 access now goes through _open_vlinks, which serializes on
+# a re-entrant module lock: a writer that arrives mid-read WAITS instead of
+# failing. The lock is deliberately held for as long as a handle is open --
+# that is what makes the one-handle guarantee hold, and it is what lets
+# vlinks_session below batch many reads into a single open.
+
+_VLINKS_LOCK = threading.RLock()
+
+# {abs path: [file, depth, mode]}. Only ever holds one entry at a time; the
+# lock guarantees any nested lookup is on the thread that opened it.
+_OPEN_VLINKS = {}
+
+
+@contextlib.contextmanager
+def _open_vlinks(vlinks_path, mode='r'):
+    """
+    The single door to vlinks.h5. Same use as h5py.File(path, mode), but
+    serialized process-wide and re-entrant, so a nested open reuses the
+    handle its enclosing caller already holds instead of asking HDF5 for a
+    second one it will refuse to give.
+    """
+    key = os.path.abspath(vlinks_path)
+    with _VLINKS_LOCK:
+        entry = _OPEN_VLINKS.get(key)
+        if entry is not None:
+            # Re-entrant reuse. Only reachable on the thread already inside
+            # the lock, so no other thread can observe a half-open handle.
+            if mode != 'r' and entry[2] == 'r':
+                raise RuntimeError(
+                    f'{key} is already open read-only further up this call '
+                    f'stack (a vlinks_session, most likely) -- a {mode!r} '
+                    f'write cannot be nested inside a read session')
+            entry[1] += 1
+            try:
+                yield entry[0]
+            finally:
+                entry[1] -= 1
+            return
+
+        f = h5py.File(key, mode)
+        _OPEN_VLINKS[key] = [f, 1, mode]
+        try:
+            yield f
+        finally:
+            entry = _OPEN_VLINKS[key]
+            entry[1] -= 1
+            if entry[1] == 0:
+                del _OPEN_VLINKS[key]
+                f.close()
+
+
+@contextlib.contextmanager
+def vlinks_session(storage_path, mode='r'):
+    """
+    Hold ONE vlinks.h5 handle open across a batch of reads.
+
+    Every read_* call made inside the block reuses this handle rather than
+    opening and closing the file for itself. That matters because the reads
+    are not the expensive part -- the opens are. One Cell/Spot status
+    refresh issues several hundred of them (one per FOV per panel), and each
+    one is both a syscall storm and a window in which the ingestion
+    coordinator's MIP write can collide.
+
+    Callers need change nothing else: read_spots/read_cells/... are unaware
+    of the session and pick the open handle up through _open_vlinks.
+
+    The module lock is held for the whole block, so a concurrent writer
+    waits here rather than failing. Keep a session to a BOUNDED batch of
+    reads for that reason -- an unbounded one stalls ingestion's MIP writes
+    for its duration. Nothing is lost when that happens (the writes queue
+    and catch up) but progress stops moving, so this is a knob to use
+    deliberately, not to wrap the whole app in.
+
+    Yields None if the store does not exist yet; every read_* already
+    guards for that itself, so a caller can ignore the yielded value and
+    simply use the session for its batching effect.
+    """
+    path = _vlinks_path(storage_path)
+    if not os.path.exists(path):
+        yield None
+        return
+    with _open_vlinks(path, mode) as f:
+        yield f
 
 
 # -- coordinate-order schema guard (convention.py) -------------------------
@@ -144,7 +248,7 @@ def allocate_spot_uids(storage_path, fov, count):
     """
     vlinks_path = _vlinks_path(storage_path)
     grp_path = _spots_group_path(fov)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(grp_path)
         next_uid = int(grp.attrs.get('next_uid', 1))
@@ -194,7 +298,7 @@ def write_spots(storage_path, fov, modality, hybe, channel, spots):
                 f'{modality}/{hybe}/ch{channel} -- uid must identify one spot')
         seen[d['uid']] = True
     blob = np.void(pickle.dumps(payload))
-    with h5py.File(_vlinks_path(storage_path), 'a') as f:
+    with _open_vlinks(_vlinks_path(storage_path), 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_spot_slice_path(fov, modality, hybe, channel))
         if 'blob' in grp:
@@ -215,7 +319,7 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
     if not os.path.exists(vlinks_path):
         return []
     out = []
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if modality is not None and hybe is not None and channel is not None:
             gp = _spot_slice_path(fov, modality, hybe, channel)
@@ -263,7 +367,7 @@ def write_cells(storage_path, fov, cell_container):
     payload = {'cells': [cell.save() for cell in cells]}
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_cells_group_path(fov))
         if 'blob' in grp:
@@ -292,7 +396,7 @@ def read_cells(storage_path, fov):
     if not os.path.exists(vlinks_path):
         return None, ''
     grp_path = _cells_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'blob' not in f[grp_path]:
             return None, ''
@@ -355,7 +459,7 @@ def write_fov_alleles(storage_path, fov, alleles):
     payload = [allele.save() for allele in alleles]
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_alleles_group_path(fov))
         if 'blob' in grp:
@@ -373,7 +477,7 @@ def read_fov_alleles(storage_path, fov):
     if not os.path.exists(vlinks_path):
         return []
     grp_path = _alleles_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'blob' not in f[grp_path]:
             return []
@@ -450,7 +554,7 @@ def write_global_params(storage_path, **params):
     """
     vlinks_path = _vlinks_path(storage_path)
     modality = None
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         shared = f.require_group(_params_group_path())
         for k, v in params.items():
@@ -474,7 +578,7 @@ def read_global_params(storage_path):
     if not os.path.exists(vlinks_path):
         return {}
     out = {}
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         grp_path = _params_group_path()
         if grp_path in f:
@@ -521,7 +625,7 @@ def write_celltype_config(storage_path, fov_ranges_by_celltype, barcode_channel_
     }
     blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_params_group_path())
         if 'celltype_config_blob' in grp:
@@ -541,7 +645,7 @@ def read_celltype_config(storage_path):
     if not os.path.exists(vlinks_path):
         return {}, {}, empty_calibration, None
     grp_path = _params_group_path()
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'celltype_config_blob' not in f[grp_path]:
             return {}, {}, empty_calibration, None
@@ -608,7 +712,7 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     that raw file just to answer this.
     """
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_mip_group_path(fov, modality_of(storage_path), hybe))
         for ch, mip in channel_mips.items():
@@ -630,7 +734,7 @@ def read_hybe_mip(storage_path, fov, hybe, channel):
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         name = f'ch{channel}'
         if grp_path not in f or name not in f[grp_path]:
@@ -651,7 +755,7 @@ def fiducial_channel_mip(storage_path, fov, hybe):
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -672,7 +776,7 @@ def readout_channel_mip(storage_path, fov, hybe):
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'fiducial_channel' not in f[grp_path].attrs:
             return None
@@ -697,7 +801,7 @@ def mip_channels_present(storage_path, fov, hybe):
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _mip_group_path(fov, modality_of(storage_path), hybe)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f:
             return None
@@ -720,7 +824,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     cross-modal case into vlinks.h5, for the same reason).
     """
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_fov_matrix_group_path(fov, modality_of(storage_path)))
         for hybe, H in matrices.items():
@@ -752,7 +856,7 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
         return {}
     from ..alignment.frames import FrameMatrices
     matrices = FrameMatrices(modality=modality_of(storage_path))
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         modality = modality_of(storage_path)
         matrix_grp_path = _fov_matrix_group_path(fov, modality)
@@ -781,7 +885,7 @@ def write_cross_modal_z(storage_path, fov, dz):
     touches none. Old files simply have no z_across and read back as 0.
     """
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
         grp.attrs['z_across'] = float(dz)
@@ -793,7 +897,7 @@ def read_cross_modal_z(storage_path, fov):
     if not os.path.exists(vlinks_path):
         return 0.0
     grp_path = _fov_params_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f:
             return 0.0
@@ -813,7 +917,7 @@ def write_cross_modal_matrix(storage_path, fov, H):
     reference hybe required to find it.
     """
     vlinks_path = _vlinks_path(storage_path)
-    with h5py.File(vlinks_path, 'a') as f:
+    with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
         if 'matrix_across' in grp:
@@ -828,7 +932,7 @@ def read_cross_modal_matrix(storage_path, fov):
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _fov_params_group_path(fov)
-    with h5py.File(vlinks_path, 'r') as f:
+    with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
         if grp_path not in f or 'matrix_across' not in f[grp_path]:
             return None
