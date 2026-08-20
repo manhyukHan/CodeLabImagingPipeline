@@ -4073,7 +4073,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mixture_centroid_to_raw(self, coord_xyz, cell, hybe, modality, fov_matrices=None):
         """
         Inverse of localization.refine_spot_z's own _to_real closure --
-        maps a shared-frame (x, y, z) (the frame spot.coordinate AND
+        maps a shared-frame (y, x, z) (the frame spot.coordinate AND
         every entry of spot.mixture_centroids beyond the first already
         live in, see ASpot.mixture_centroids' own docstring) back to
         hybe's raw pixel frame, so an ALREADY-persisted mixture sibling
@@ -4082,13 +4082,14 @@ class MainWindow(QtWidgets.QMainWindow):
         cell is None (unassigned spot): mirrors _to_real's own cell=None
         branch -- inverts through fov_matrices (see main_window._
         composed_fov_matrices_for_cell_alignment) when this hybe has a
-        real FOV-level matrix, identity (x, y unchanged) otherwise.
+        real FOV-level matrix, identity otherwise. Returns (y, x, z) --
+        rasterized order, same as every coordinate in this pipeline.
         """
         if cell is None:
             if fov_matrices and (hybe, fov_matrices.modality) in fov_matrices:
-                x, y, z = coord_xyz
-                rx, ry = spot_mapper.reference_to_raw((x, y), hybe, fov_matrices, modality=modality, cell=None)
-                return rx, ry, z
+                y, x, z = coord_xyz
+                ry, rx = spot_mapper.reference_to_raw((y, x), hybe, fov_matrices, modality=modality, cell=None)
+                return ry, rx, z
             return coord_xyz
         y, x, z = coord_xyz
         # Resolver-backed, never ACell.matrix_to_shared directly -- that
@@ -4152,10 +4153,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             centroid = None
             if spot.coordinate[2] != 0.0:
+                # raw_coordinate is (y, x, z); the displayer's centroid
+                # contract is crop-local (x, y, z) -- the old line
+                # subtracted xmin from Y (transposed circles, confirmed
+                # real on the fit-status grid)
                 own_raw = spot.raw_coordinate
-                centroid = [(own_raw[0] - xmin, own_raw[1] - ymin, own_raw[2])]
+                centroid = [(own_raw[1] - xmin, own_raw[0] - ymin, own_raw[2])]
                 for c in spot.mixture_centroids[1:]:
-                    rx, ry, rz = self._mixture_centroid_to_raw(c[:3], cell, hybe, modality, fov_matrices=fov_matrices)
+                    ry, rx, rz = self._mixture_centroid_to_raw(c[:3], cell, hybe, modality, fov_matrices=fov_matrices)
                     centroid.append((rx - xmin, ry - ymin, rz))
             grid_results.append((cubic, centroid, title))
 
