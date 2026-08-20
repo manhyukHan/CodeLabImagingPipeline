@@ -4545,8 +4545,16 @@ class MainWindow(QtWidgets.QMainWindow):
         cells_by_id = {c.id: c for c in cells}
 
         def to_shared(hybe, modality, owner):
+            # FULL 3D: (H, dz) -- the z leg (cell dz + cross-modal z
+            # drift) was silently dropped before, so coordinate[2] never
+            # left raw[2] (confirmed real: cell dz=-2 with spot z
+            # unchanged through every save).
             fallback = owner.reference_modality if owner is not None else None
-            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+            m = modality or fallback
+            resolver = self._frame_resolver(owner, fov)
+            if resolver.shared is None:
+                return None
+            return resolver.to_shared(hybe, m, owner), resolver.z_to_shared(hybe, m, owner)
 
         if cells:
             assignment.assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
@@ -4589,8 +4597,13 @@ class MainWindow(QtWidgets.QMainWindow):
         def to_shared(hybe, modality, owner):
             # owner=None is a real case (unassigned spots): the resolver's
             # cell leg defaults to identity, FOV/cross-modal still compose.
+            # FULL 3D: (H, dz) -- see _recast_persisted_spots' twin above.
             fallback = owner.reference_modality if owner is not None else None
-            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+            m = modality or fallback
+            resolver = self._frame_resolver(owner, fov)
+            if resolver.shared is None:
+                return None
+            return resolver.to_shared(hybe, m, owner), resolver.z_to_shared(hybe, m, owner)
 
         # ONE uniform flow, cell existence never required (per explicit
         # spec): (1) label mask in each spot's own frame -- ALL-ZEROS when
@@ -7720,6 +7733,18 @@ class MainWindow(QtWidgets.QMainWindow):
         real_cell.matrices = staged_cell.matrices
         real_cell.matrix_anchors = staged_cell.matrix_anchors
         real_cell.matrix_provenance = staged_cell.matrix_provenance
+        # real_cell lives in ONE tier; the other tier holds an independent
+        # twin of the same cell. Propagate the alignment-owned fields so
+        # the tiers can never disagree about this cell's matrices -- the
+        # same sync the batch door does (per confirmed real wipe: any
+        # later legitimate cell write from the stale tier would destroy
+        # this accept's result on disk).
+        for other in (self.cell_container_permanent, self.cell_container):
+            twin = other.by_id(fov, real_cell.id) if other is not None else None
+            if twin is not None and twin is not real_cell:
+                twin.matrices = deepcopy(real_cell.matrices)
+                twin.matrix_anchors = deepcopy(real_cell.matrix_anchors)
+                twin.matrix_provenance = deepcopy(real_cell.matrix_provenance)
 
         # Re-derive the overlay from the SAME (reference_hybe, modality,
         # storage_path) the Preview step actually ran with (stashed in
