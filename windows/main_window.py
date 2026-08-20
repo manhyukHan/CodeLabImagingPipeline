@@ -2925,8 +2925,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Cells changed -> spot ownership may have changed everywhere in
             # this FOV. Reassign every spot and persist all slices now, so no
             # spot is left pointing at a removed or reshaped cell.
-            self._reassign_fov_spots(fov)
-            self._persist_fov_spots(fov)
+            self._recast_persisted_spots(fov)
             vlinks_store.mirror_write_cells(storage_paths, fov, self.cell_container_permanent)
             # No segmentation_reference_hybe param write: each cell already
             # carries its own reference_hybe/nucleus_hybe (with modalities),
@@ -4270,13 +4269,9 @@ class MainWindow(QtWidgets.QMainWindow):
         unassigned pool), which had a real, confirmed bug: pick spots
         across many cells in Cell view, switch to FOV view, click Save --
         nothing for any of those cells ever reached disk, because the
-        FOV-view branch only ever looked at the unassigned pool. Uses
-        vlinks_store.write_cells (one full-blob write per storage_path,
-        not N separate per-cell read-modify-write round trips) since this
-        is now always "the whole FOV", not "one cell" -- guarded by the
-        on-disk-count check below so a merely-partial in-memory container
-        can never silently drop cells that exist on disk but aren't
-        currently loaded.
+        FOV-view branch only ever looked at the unassigned pool.
+
+        Writes SPOTS ONLY -- never cells (see the inline note below).
         """
         sp = self.ui.SpotLocalizationPanel
         fov = self._current_spot_fov()
@@ -4285,7 +4280,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Save Current Spots', 'No storage path available.')
             return
 
-        cells_in_memory = self.cell_container.get_cells(fov) if self.cell_container else []
         # No cells loaded in memory is only a wipe HAZARD when real cells
         # already exist on disk for this FOV AND we're about to write_
         # cells below (a bulk write would then silently drop them) -- so
@@ -4316,20 +4310,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # the reassignment below, which recomputes every spot's owner from
         # the current cells (~1.4us/spot measured: cheap enough for EVERY
         # save -- cell, matrix, and spot alike, per explicit decision).
-        skip_cell_write = False
+        # SPOT SAVE WRITES SPOTS -- NEVER CELLS. Per explicit correction
+        # (confirmed real data loss): this door used to bulk-write the
+        # TRANSIENT cell container to disk, while cell alignment mutates
+        # the PERMANENT tier's copies -- so saving spots after a cell
+        # alignment run silently wiped every cell's matrices from
+        # vlinks.h5. Nothing in a spot operation mutates a cell (ASpot.
+        # cell is the only link, and it lives on the spot), so there is
+        # nothing here for cells to persist. Cell persistence belongs
+        # exclusively to the cell doors (segmentation save, cytoplasm
+        # incorporation, cell alignment, celltype persist).
         n_identified, n_identified_cells = self._reassign_fov_spots(fov)
-
         n_spots = len(self.spot_container.all(fov))
-        n_cells_saved = 0
-        # Cell-owned spots only have somewhere to be written when there
-        # are real cells in memory for this FOV, and only when the wipe-
-        # hazard check above didn't skip it -- skip write_cells
-        # gracefully (not a hard return) rather than assume it's always
-        # safe/needed to call.
-        if cells_in_memory and not skip_cell_write:
-            for storage_path in vlinks_store.distinct_stores(storage_paths):
-                vlinks_store.write_cells(storage_path, fov, self.cell_container)
-            n_cells_saved = len(cells_in_memory)
+
         # The FOV-level unassigned pool needs no cells at all -- always
         # attempted regardless of the above. _identify_fov_unassigned_
         # spots already wrote the leftover pool once (with whatever stale
@@ -4372,13 +4365,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f'FOV{fov:02d} {hybe} ch{channel_text}: {n_written} spot(s) persisted, '
             f'{assignment.count_unassigned(self._all_transient_spots(fov))} unassigned in FOV.')
 
-        skip_note = ' (cell write skipped -- see dialog)' if skip_cell_write else ''
-        sp.LogTextEdit.append(f'FOV{fov:02d}: {n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} '
-                              f'total spot(s) saved to vlinks.h5{skip_note} ({n_identified} unassigned spot(s) '
-                              f'newly identified into {n_identified_cells} cell(s) first).')
+        sp.LogTextEdit.append(f'FOV{fov:02d}: {n_spots} total spot(s) saved to vlinks.h5 '
+                              f'({n_identified} unassigned spot(s) newly identified into '
+                              f'{n_identified_cells} cell(s) first). Cells are never written here.')
         QtWidgets.QMessageBox.information(
-            self, 'Save Current Spots',
-            f'{n_cells_saved} cell(s), {n_spots if not skip_cell_write else 0} total spot(s) saved.{skip_note}')
+            self, 'Save Current Spots', f'{n_spots} total spot(s) saved. (Spot saves never touch cells.)')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
@@ -4512,6 +4503,66 @@ class MainWindow(QtWidgets.QMainWindow):
             raise RuntimeError('no storage path configured -- cannot allocate spot uids')
         for sp, uid in zip(missing, vlinks_store.allocate_spot_uids(any_path, fov, len(missing))):
             sp.uid = int(uid)
+
+    def _recast_persisted_spots(self, fov):
+        """
+        THE post-matrix-write spot recast: coordinates are DERIVED data
+        (coordinate = f(raw, current matrices)), so every door that
+        changes matrices for a FOV must recast that FOV's spots -- all of
+        them, on disk, not just whatever happens to be staged in this
+        session. Per confirmed real bug: accepting alignment (including
+        auto-save-all across every FOV) used _reassign+_persist, both of
+        which no-op for a FOV whose spots were never staged, so persisted
+        spots kept their pre-alignment coordinates until a manual spot
+        save happened to touch that FOV.
+
+        Staged FOV: the session containers are authoritative -- the
+        existing in-session reassign+persist runs unchanged. Unstaged
+        FOV: a DISK-SCOPED pass -- cells and spots are hydrated straight
+        from vlinks.h5, ownership+coordinates recomputed through the SAME
+        resolver-backed transform, and spots written back per slice.
+        Deliberately never staged into the session containers (this is a
+        persistence refresh, not a view activation). Writes SPOTS only.
+        """
+        if fov in self._spot_loaded_fovs:
+            self._reassign_fov_spots(fov)
+            self._persist_fov_spots(fov)
+            return
+        any_path = next(iter(self._all_vlinks_storage_paths()), None)
+        if not any_path:
+            return
+        dicts = vlinks_store.read_spots(any_path, fov)
+        if not dicts:
+            return
+        spots = []
+        for d in dicts:
+            spot = ASpot()
+            spot.set_metadata(**d)
+            spots.append(spot)
+        cell_dicts, cells_modality = vlinks_store.read_cells(any_path, fov)
+        cells = (CellContainer.load({fov: cell_dicts}, modality=cells_modality).get_cells(fov)
+                 if cell_dicts else [])
+        cells_by_id = {c.id: c for c in cells}
+
+        def to_shared(hybe, modality, owner):
+            fallback = owner.reference_modality if owner is not None else None
+            return self._matrix_to_shared(hybe, modality or fallback, owner, fov)
+
+        if cells:
+            assignment.assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
+                                    matrix_to_shared=to_shared)
+        else:
+            # no cells on disk: ownership stays as stored (-1 by
+            # definition), coordinates still recast through the FOV/
+            # cross-modal legs
+            assignment.recast_spots_to_shared(spots, to_shared, cells_by_id)
+
+        by_slice = {}
+        for spot in spots:
+            by_slice.setdefault((spot.modality, spot.hybe, int(spot.channel)), []).append(spot)
+        for (modality, hybe, channel), slice_spots in by_slice.items():
+            path = self._storage_path_for_modality(modality) or any_path
+            vlinks_store.write_spots(path, fov, modality, hybe, channel, slice_spots)
 
     def _reassign_fov_spots(self, fov):
         """
@@ -6121,8 +6172,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # that saving cells, matrices, or spots all re-run assignment.
         for _fov in list(self.fov_matrices.keys()):
             try:
-                self._reassign_fov_spots(_fov)
-                self._persist_fov_spots(_fov)
+                self._recast_persisted_spots(_fov)
             except Exception as e:
                 self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
@@ -6461,8 +6511,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # that saving cells, matrices, or spots all re-run assignment.
         for _fov in list(self.fov_matrices.keys()):
             try:
-                self._reassign_fov_spots(_fov)
-                self._persist_fov_spots(_fov)
+                self._recast_persisted_spots(_fov)
             except Exception as e:
                 self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
@@ -7148,6 +7197,22 @@ class MainWindow(QtWidgets.QMainWindow):
         for path in storage_paths:
             vlinks_store.write_global_params(path, cell_alignment_channel_type=channel_type,
                                              cell_alignment_pad=pad, **cell_alignment_kwargs)
+        # Alignment mutated `container`'s cells in place -- the OTHER
+        # tier holds independent copies of the same cells, and any later
+        # legitimate cell write from that tier (celltype persist,
+        # segmentation save) would silently WIPE these matrices from disk
+        # (confirmed real). Propagate the alignment-owned fields to the
+        # twin copies before persisting.
+        other = (self.cell_container if container is self.cell_container_permanent
+                 else self.cell_container_permanent)
+        if other is not None and other.data.get(fov):
+            src_by_id = {c.id: c for c in container.get_cells(fov)}
+            for twin in other.get_cells(fov):
+                src = src_by_id.get(twin.id)
+                if src is not None:
+                    twin.matrices = deepcopy(src.matrices)
+                    twin.matrix_anchors = deepcopy(src.matrix_anchors)
+                    twin.matrix_provenance = deepcopy(src.matrix_provenance)
         if storage_paths:
             vlinks_store.mirror_write_cells(storage_paths, fov, container)
 
@@ -7710,8 +7775,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # that saving cells, matrices, or spots all re-run assignment.
         for _fov in list(self.fov_matrices.keys()):
             try:
-                self._reassign_fov_spots(_fov)
-                self._persist_fov_spots(_fov)
+                self._recast_persisted_spots(_fov)
             except Exception as e:
                 self.statusBar().showMessage(f'spot reassignment after accept failed for FOV{_fov}: {e}')
 
