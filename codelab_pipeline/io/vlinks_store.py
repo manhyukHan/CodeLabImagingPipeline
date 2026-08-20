@@ -75,10 +75,37 @@ def modality_of(storage_path):
                 m = m.decode() if isinstance(m, bytes) else str(m)
                 _MODALITY_CACHE[key] = m
                 return m
+    declared = _DECLARED_MODALITY.get(key)
+    if declared:
+        # UI-declared mapping (declare_modality): lets every modality-
+        # scoped read/write work on a COMPLETELY FRESH storage path,
+        # before anything was ever ingested -- parse-layout, global
+        # params, MIP reads. Deliberately NOT cached: once a real
+        # ingested stack lands, its own attr (data truth) wins above.
+        return declared
     raise ValueError(
-        f'cannot determine modality for {storage_path}: no ingested '
-        f'{{hybe}}_stack.h5 there carries a `modality` attr. Ingest at least '
-        f'one hybe for this modality first.')
+        f'cannot determine modality for {storage_path}: nothing ingested '
+        f'there carries a `modality` attr and no modality was declared '
+        f'for it (MainWindow declares every configured storage path via '
+        f'declare_modality).')
+
+
+_DECLARED_MODALITY = {}
+
+
+def declare_modality(storage_path, name):
+    """
+    Register which configured modality owns storage_path, from the UI's
+    own Ingestion state. This is what lets a FRESH project work: before
+    anything is ingested, no stack file exists to carry the modality
+    attr, and every modality-scoped path (params, MIPs, matrices) used
+    to raise -- a boot gate on the very first Parse Layout of a new
+    dataset (confirmed real, single-modality Windows session
+    2026-08-20). Data truth still wins: modality_of prefers an ingested
+    stack's own attr and uses this only as the pre-ingestion fallback.
+    """
+    if storage_path and name:
+        _DECLARED_MODALITY[os.path.abspath(storage_path)] = str(name)
 
 
 def _cells_group_path(fov):

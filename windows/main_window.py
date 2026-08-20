@@ -981,6 +981,9 @@ class MainWindow(QtWidgets.QMainWindow):
             state = self._blank_modality_state()
             state.update({k: v for k, v in modality_fields.get(name, {}).items() if k in state})
             self.ui.IngestionPanel.modality_data[name] = state
+            # fresh-store bootstrap: the store can't know its modality
+            # before ingestion, but the UI does -- see declare_modality
+            vlinks_store.declare_modality(state.get('storage_path'), name)
         self.ui.IngestionPanel.current_modality = None
         # the Ingestion tab's own combo is the real modality SWITCHER (see
         # _switch_current_modality's own docstring). Cell-Based Alignment
@@ -1140,6 +1143,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         storage_path = ip.StoragePathLineEdit.text().strip()
         if storage_path:
+            # the typed path may be newer than modality_data's stashed
+            # copy -- declare it NOW so a completely fresh store's
+            # modality-scoped params can be written (confirmed real boot
+            # gate: first Parse Layout of a new dataset raised from
+            # modality_of before anything could be ingested)
+            if ip.current_modality:
+                vlinks_store.declare_modality(storage_path, ip.current_modality)
             # a real, confirmed fact about this storage path (which
             # ExperimentLayout it uses) -- lets a completely fresh session
             # reconstruct hybe_records/combo choices from vlinks.h5 alone
@@ -3581,8 +3591,9 @@ class MainWindow(QtWidgets.QMainWindow):
         pad = sp.PadSpinBox.value()
         crop = self._build_cell_display_crop(cell, hybe, channel, storage_path, fov, pad, modality=sp.current_hybe_modality())
         if crop is None:
-            sp.LogTextEdit.append(f'Cell {cell.id} has no alignment/overlap for {hybe} yet -- '
-                                  f'run cell-based alignment for this hybe first.')
+            sp.LogTextEdit.append(f'Cell {cell.id}: no crop for {hybe} -- the hybe has no image data '
+                                  f'for this FOV, or the cell mask projects outside its frame. '
+                                  f'(Alignment is NOT required -- missing layers default to identity.)')
             return
         rxmin, rymin = crop['rxmin'], crop['rymin']
         self._spot_crop_context = {'kind': 'cell', 'cell': cell, 'hybe': hybe, 'channel': channel,
@@ -4828,7 +4839,10 @@ class MainWindow(QtWidgets.QMainWindow):
             crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality,
                                                  fov_matrices=fov_matrices, resolver=self._frame_resolver(cell, fov))
             if crop is None:
-                QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', f'Cell {cell.id} has no alignment/overlap for {hybe} yet.')
+                QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect',
+                                              f'Cell {cell.id}: no crop for {hybe} -- the hybe has no image '
+                                              f'data for this FOV, or the cell mask projects outside its '
+                                              f'frame. (Alignment is NOT required.)')
                 return
             img, rxmin, rymin = crop['img'], crop['rxmin'], crop['rymin']
             threshold_abs = sp.threshold_abs(np.nanmax(img))
@@ -5644,6 +5658,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         image_cache = {}  # {fov(str): {(hybe,channel,modality): ndarray or None}}
         n_cells, n_spots, n_cells_skipped = 0, 0, 0
+        skip_reasons = set()   # REAL causes, named -- never a blanket blame
         last_fov = None
         permanent_fovs_touched = set()
         for fov, cellmap in self._celltype_distinct_cells(containers).items():
@@ -5672,6 +5687,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 # KeyError('Hyb_130', 635), repeated across 3 separate clicks
                 # with zero visible feedback each time). Checked once per FOV,
                 # not per cell -- calibration completeness doesn't vary by cell.
+                # a barcode channel with no MIP in vlinks.h5 is missing
+                # DATA -- the only honest skip. Alignment is NEVER a skip
+                # cause: an uncomputed layer is identity by the pipeline's
+                # own rule, and the resolver always answers.
+                missing_mips = [bch for bch in barcode_channel
+                                if image_cache[fov_key].get(bch) is None]
+                if missing_mips:
+                    labels = ', '.join(f'{h}/ch{c} ({m})' for h, c, m in missing_mips)
+                    ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no MIP in '
+                                           f'vlinks.h5 for barcode channel(s) {labels}. Ingest those '
+                                           f'(hybe, channel) pairs; alignment is NOT required.')
+                    n_cells_skipped += len(cellmap)
+                    skip_reasons.add(f'no MIP for {labels}')
+                    continue
+
                 missing_calibration = [bch for bch in barcode_channel
                                        if int(fov) not in self._barcode_calibration['scale'].get(bch, {})
                                        or int(fov) not in self._barcode_calibration['lower_bound'].get(bch, {})
@@ -5680,6 +5710,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no calibration for '
                                            f'{missing_calibration} at this FOV (Apply Calibration first).')
                     n_cells_skipped += len(cellmap)
+                    skip_reasons.add('no calibration at this FOV (Apply Calibration first)')
                     continue
 
                 for cell_id, copies in cellmap.items():
@@ -5719,6 +5750,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         area_by_channel[bch] = (np.clip(x_h, 0, width - 1), np.clip(y_h, 0, height - 1))
                     if len(area_by_channel) < len(barcode_channel):
                         n_cells_skipped += 1
+                        skip_reasons.add('a barcode frame could not be resolved (unexpected -- report this)')
                         continue
                     ct = celltype.classify_cell_barcode(area_by_channel, cell.fov, image_cache,
                                                         celltype_determination, method=ctp.barcode_method())
@@ -5757,13 +5789,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._persist_celltype_results(permanent_fovs_touched)
         ctp.RunCelltypeDeterminationPushButton.setEnabled(True)
-        ctp.LogTextEdit.append(f'Barcode-mode: {n_cells} cell(s), {n_spots} spot(s) classified '
-                               f'({n_cells_skipped} cell(s) skipped -- missing alignment for a barcode hybe)'
+        skipped_note = (f'{n_cells_skipped} cell(s) skipped: {"; ".join(sorted(skip_reasons))}'
+                        if n_cells_skipped else '0 skipped')
+        ctp.LogTextEdit.append(f'Barcode-mode: {n_cells} cell(s), {n_spots} spot(s) classified ({skipped_note})'
                                f'{f", saved to vlinks.h5 for FOV(s) {sorted(permanent_fovs_touched)}" if permanent_fovs_touched else ""}.')
         self.statusBar().showMessage('Celltype determination complete.', 5000)
         QtWidgets.QMessageBox.information(self, 'Celltype determination complete',
-                                          f'{n_cells} cell(s), {n_spots} spot(s) classified '
-                                          f'({n_cells_skipped} cell(s) skipped -- missing alignment for a barcode hybe).')
+                                          f'{n_cells} cell(s), {n_spots} spot(s) classified ({skipped_note}).')
         if last_fov is not None:
             self._show_celltype_result(last_fov)
 
@@ -6496,6 +6528,17 @@ class MainWindow(QtWidgets.QMainWindow):
         rna_modality = self._modality_for_storage_path(rna_sp) if rna_sp else None
         dna_modality = self._modality_for_storage_path(dna_sp) if dna_sp else None
         shared = rna_modality or (cell.reference_modality if cell is not None else None)
+        if shared is None:
+            # single-modality mode has no cross-modal RNA path to name the
+            # shared frame, but the shared frame plainly IS the one
+            # configured modality -- without this, every cell-less
+            # transform (unassigned-spot recast, FOV-level mapping)
+            # resolved to None and callers skipped work that identity
+            # answers exactly (the alignment-requirement violation again).
+            configured = [n for n in self.ui.IngestionPanel.modality_names
+                          if self._storage_path_for_modality(n)]
+            if len(configured) == 1:
+                shared = configured[0]
 
         within = {}
         for modality in self.ui.IngestionPanel.modality_names:
@@ -7200,17 +7243,23 @@ class MainWindow(QtWidgets.QMainWindow):
             if hybe not in record_by_folder:
                 return None, None, f"{hybe} ({modality}) isn't in this modality's parsed layout."
             return record_by_folder[hybe], storage_path, None
-        other = self._other_modality_cell_alignment_inputs(storage_path, fov)
-        if other is None:
-            return None, None, (f"no cross-modal alignment result found for FOV{fov:02d} yet "
-                                f"(run and accept Cross-Modality Alignment first).")
-        other_storage_path, other_hybe_records, _, _, other_modality = other
-        if modality != other_modality:
-            return None, None, f"{modality} isn't configured as either Cross-Modality Alignment path right now."
-        other_record_by_folder = {r['folder']: r for r in other_hybe_records}
+        # Another modality's hybe: resolve it from the Ingestion tab's own
+        # configuration DIRECTLY -- per the identity-default rule, an
+        # unaccepted cross-modal bridge is identity (provisional), never a
+        # refusal, so this deliberately has NO alignment requirement (the
+        # old version demanded an accepted cross-modal result and refused
+        # otherwise -- the exact violated principle, third recurrence).
+        data = self.ui.IngestionPanel.modality_data.get(modality)
+        if not data or not data.get('storage_path') or not data.get('layout_path'):
+            return None, None, f"{modality} isn't a configured modality (Ingestion tab)."
+        try:
+            other_records = preprocess.parse_experiment_layout(data['layout_path'])
+        except Exception as e:
+            return None, None, f"couldn't parse {modality}'s layout: {e}"
+        other_record_by_folder = {r['folder']: r for r in other_records}
         if hybe not in other_record_by_folder:
             return None, None, f"{hybe} ({modality}) isn't in that modality's parsed layout."
-        return other_record_by_folder[hybe], other_storage_path, None
+        return other_record_by_folder[hybe], data['storage_path'], None
 
     def _show_cell_alignment_preview_for_hybe(self, target_key=None):
         """
