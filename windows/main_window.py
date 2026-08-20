@@ -772,6 +772,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'dax_directory': ip.DaxDirectoryLineEdit.text().strip(),
             'storage_path': ip.StoragePathLineEdit.text().strip(),
         })
+        # every stash is also the freshest storage_path -> modality fact
+        # (see vlinks_store.declare_modality: fresh-store bootstrap)
+        vlinks_store.declare_modality(data['storage_path'], self.ui.IngestionPanel.current_modality)
 
     def _switch_current_modality(self, name):
         """
@@ -1066,6 +1069,15 @@ class MainWindow(QtWidgets.QMainWindow):
         all, just a disk-truth readout, so re-running this is always
         safe and should always reflect disk's current real state).
         """
+        # Flush the LIVE Ingestion line-edits into modality_data FIRST.
+        # They were only ever stashed on modality SWITCH-AWAY -- which
+        # never happens in single-modality mode, so a one-modality session
+        # kept modality_data's storage_path empty forever and every hybe
+        # combobox in the app stayed blank (confirmed real, 2026-08-20).
+        # Config-save already knew to flush before reading; this is the
+        # same rule applied at the other read site.
+        if self.ui.IngestionPanel.current_modality is not None:
+            self._save_current_modality_fields()
         for name in self.ui.IngestionPanel.modality_names:
             self.ui.IngestionPanel.modality_data.setdefault(name, self._blank_modality_state())['active_hybe_list'] = \
                 self._active_hybe_records_for_modality(name)
