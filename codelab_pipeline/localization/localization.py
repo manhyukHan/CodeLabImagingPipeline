@@ -9,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import h5py
 
 from ..io import preprocess
+from .engine import make_engine
 import cv2
 
 from ..alignment import chain as alignment
@@ -614,33 +615,19 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     x0, y0 = raw_x - xmin, raw_y - ymin
     z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
 
-    if use_mixture:
-        # Search for seeds only within +/-z_window of z0, not across
-        # cubic's full native Z depth -- see this function's own
-        # docstring on z_window for why the unrestricted search is a
-        # confirmed, real bug (both a far-away accepted centroid and a
-        # spurious "second component" on crops that are really just one
-        # real blob). threshold_rel is also computed relative to THIS
-        # sub-cube's own max, not the full stack's, so a real local peak
-        # that isn't the single brightest voxel anywhere in 100+ planes
-        # is no longer overlooked either.
-        z0_idx = int(round(z0))
-        zwin_min = max(0, z0_idx - z_window)
-        zwin_max = min(cubic.shape[2], z0_idx + z_window + 1)
-        seeds_local = find_local_peaks_3d(cubic[:, :, zwin_min:zwin_max], min_sep=min_sep,
-                                          threshold_rel=component_threshold, max_peaks=max_components)
-        seeds = [(sx, sy, sz + zwin_min) for (sx, sy, sz) in seeds_local]
-    else:
-        seeds = []
+    # THE localizer seam (engine.py): seeding + fitting live behind
+    # LocalizeEngine so the gaussian engine and a future ML engine are
+    # swappable; the z_window-restricted seed search rationale lives in
+    # this function's own docstring.
+    engine = make_engine('gaussian', peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                                    init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                                    min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert,
+                                    min_sep=min_sep, component_threshold=component_threshold, z_window=z_window)
+    results, seeds = engine.raw_components(cubic, (y0, x0, z0),
+                                           n_max=max_components if use_mixture else 1)
     if len(seeds) <= 1:
-        results = [fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
-                                   init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
-                                   min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)]
         primary = 0
     else:
-        results = fit_gaussian_mixture_3d(cubic, seeds, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
-                                          init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
-                                          min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
         # Brightness ranking (fitted amplitude, results[i][0]) -- per
         # explicit request, the representative component is whichever
         # real blob is actually brightest, not whichever landed nearest
@@ -871,9 +858,10 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     x0, y0 = raw_x - xmin, raw_y - ymin
     z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
 
-    result = fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
-                             init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
-                             min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
+    engine = make_engine('gaussian', peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                                    init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                                    min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
+    result = engine.raw_components(cubic, (y0, x0, z0), n_max=1)[0][0]
     if result is None:
         return None, cubic, None
     amp, xf, yf, zf = result[:4]
@@ -930,24 +918,12 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     x0, y0 = raw_x - xmin, raw_y - ymin
     z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
 
-    if use_mixture:
-        z0_idx = int(round(z0))
-        zwin_min = max(0, z0_idx - z_window)
-        zwin_max = min(cubic.shape[2], z0_idx + z_window + 1)
-        seeds_local = find_local_peaks_3d(cubic[:, :, zwin_min:zwin_max], min_sep=min_sep,
-                                          threshold_rel=component_threshold, max_peaks=max_components)
-        seeds = [(sx, sy, sz + zwin_min) for (sx, sy, sz) in seeds_local]
-    else:
-        seeds = []
-
-    if len(seeds) <= 1:
-        results = [fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
-                                   init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
-                                   min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)]
-    else:
-        results = fit_gaussian_mixture_3d(cubic, seeds, peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
-                                          init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
-                                          min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
+    engine = make_engine('gaussian', peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
+                                    init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
+                                    min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert,
+                                    min_sep=min_sep, component_threshold=component_threshold, z_window=z_window)
+    results, _seeds = engine.raw_components(cubic, (y0, x0, z0),
+                                            n_max=max_components if use_mixture else 1)
 
     dy, dx, dz = delta   # (y, x, z), rasterized order
     m = modality if modality is not None else (cell.reference_modality if cell is not None else None)
