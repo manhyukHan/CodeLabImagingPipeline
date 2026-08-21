@@ -3,17 +3,22 @@ rem CODE Lab Imaging Pipeline launcher -- Windows (double-clickable).
 rem Same resolution order as launch_codelab.command, so both platforms
 rem behave identically:
 rem   1. CODELAB_PYTHON env var (explicit interpreter -- the reliable knob)
-rem   2. conda (on PATH, or common miniforge/miniconda/anaconda install
-rem      locations), running the cellclassifier env -- but ONLY if that env
-rem      actually exists. A machine with conda but no cellclassifier used to
-rem      die here on "EnvironmentLocationNotFound" instead of falling
-rem      through, even when conda's base env had every dependency.
-rem   3. conda's base env, then plain python, and hope the active
+rem   2. the cellclassifier conda env, if conda says it exists
+rem   3. offer to CREATE that env from requirements.txt and then use it
+rem   4. conda's base env, then plain python, and hope the active
 rem      environment has the deps
+rem
+rem Step 3 exists because base is not a safe fallback for this project any
+rem more: requirements.txt pins cellpose below 4 (4.x deleted the
+rem models.Cellpose class segment.py builds), and a base env that has
+rem cellpose 4 imports fine and only fails once someone runs segmentation.
+rem A purpose-built env is the fix; creating it should not be a manual
+rem chore, so the launcher offers to do it.
 setlocal
 cd /d "%~dp0"
 
 set "CODELAB_ENV=cellclassifier"
+set "CODELAB_PY_VERSION=3.11"
 
 if defined CODELAB_PYTHON (
     "%CODELAB_PYTHON%" main.py
@@ -31,16 +36,49 @@ if not defined CONDA call :try_conda "%ProgramData%\miniconda3\Scripts\conda.exe
 if not defined CONDA call :try_conda "%ProgramData%\Anaconda3\Scripts\conda.exe"
 if not defined CONDA goto :plain
 
+rem -- Ask CONDA whether the env exists, never the filesystem: envs_dirs can
+rem    put it anywhere, and this project's own env lives on a different
+rem    drive than the conda install (C: was full). --
+set "ENV_FOUND="
+"%CONDA%" env list 2>nul | findstr /b /c:"%CODELAB_ENV% " >nul
+if not errorlevel 1 set "ENV_FOUND=1"
+if defined ENV_FOUND goto :run_env
+
+echo [launcher] conda env "%CODELAB_ENV%" does not exist yet.
+if /i "%CODELAB_BOOTSTRAP%"=="never" goto :base_fallback
+if /i "%CODELAB_BOOTSTRAP%"=="yes" goto :do_bootstrap
+echo [launcher] It can be created now from requirements.txt. That downloads
+echo [launcher] a few GB (CUDA torch) and takes several minutes, once.
+echo [launcher] Set CODELAB_BOOTSTRAP=yes to skip this prompt, or =never to
+echo [launcher] stop being asked at all.
+set "ANSWER="
+set /p ANSWER=Create it now? [y/N] 
+if /i not "%ANSWER%"=="y" goto :base_fallback
+
+:do_bootstrap
+echo [launcher] creating %CODELAB_ENV% (python %CODELAB_PY_VERSION%)...
+"%CONDA%" create -y -n %CODELAB_ENV% python=%CODELAB_PY_VERSION%
+if errorlevel 1 goto :bootstrap_failed
+echo [launcher] installing requirements.txt...
+"%CONDA%" run -n %CODELAB_ENV% --no-capture-output python -m pip install -r requirements.txt
+if errorlevel 1 goto :bootstrap_failed
+echo [launcher] environment ready.
+goto :run_env
+
+:bootstrap_failed
+echo [launcher] setting up "%CODELAB_ENV%" FAILED -- see the messages above.
+echo [launcher] Falling back for this run; the app may not segment correctly.
+goto :base_fallback
+
+:run_env
+"%CONDA%" run -n %CODELAB_ENV% --no-capture-output python main.py
+goto :end
+
+:base_fallback
 rem conda.exe lives in <root>\Scripts\, so the install root is two levels up.
 for %%I in ("%CONDA%\..\..") do set "CONDA_ROOT=%%~fI"
-
-if exist "%CONDA_ROOT%\envs\%CODELAB_ENV%\python.exe" (
-    "%CONDA%" run -n %CODELAB_ENV% --no-capture-output python main.py
-    goto :end
-)
-
 if exist "%CONDA_ROOT%\python.exe" (
-    echo [launcher] conda env "%CODELAB_ENV%" not found -- using conda base at "%CONDA_ROOT%".
+    echo [launcher] using conda base at "%CONDA_ROOT%".
     "%CONDA%" run -n base --no-capture-output python main.py
     goto :end
 )

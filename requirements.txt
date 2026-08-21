@@ -1,4 +1,37 @@
-numpy
+# Dependencies for the `cellclassifier` conda env. launch_codelab.bat /
+# launch_codelab.command create that env from THIS file automatically the
+# first time they find it missing, so this list is the single source of
+# truth -- add a dependency here, not into an env by hand.
+#
+# torch is pulled from PyTorch's own CUDA 11.8 index rather than PyPI:
+# segmentation/segment.py asks cellpose for gpu=True, and the default PyPI
+# torch wheel on Windows is CPU-only, which silently costs an order of
+# magnitude on every segmentation. Machines with no NVIDIA GPU still work
+# -- the same wheel falls back to CPU at runtime.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# cellpose 4 REPLACED the classical models.Cellpose class with
+# CellposeModel/cpsam and dropped model_type='cyto3' along with it.
+# segmentation/segment.py builds cellpose.models.Cellpose(gpu=True,
+# model_type='cyto3') in four places, so 4.x fails outright with
+#     AttributeError: module 'cellpose.models' has no attribute 'Cellpose'
+# Confirmed against cellpose 4.1.1: models.Cellpose absent, CellposeModel
+# present. Pinned below 4 until those call sites are ported.
+cellpose>=3.1,<4
+
+# cellpose 3.x and the cu118 torch wheels are both built against the
+# numpy 1.x ABI; this matches the interpreter this project is known to run
+# on today (numpy 1.26.4).
+numpy<2
+
+# Pinned WITH the +cu118 local version on purpose. --extra-index-url only
+# ADDS an index; pip still picks the highest version it can see anywhere,
+# and plain "torch" resolved to PyPI 2.13.0 -- which on Windows is
+# CPU-only (verified: torch 2.13.0+cpu, torch.cuda.is_available() False).
+# A "+cu118" version exists on no other index, so naming it forces the
+# CUDA wheel. 2.7.1 is the newest build the cu118 index carries, and it
+# is newer than anything on the cu121/cu124 indexes.
+torch==2.7.1+cu118
 pandas
 openpyxl
 h5py
@@ -8,4 +41,10 @@ scikit-image
 tifffile
 matplotlib
 ipywidgets
-cellpose
+
+# Optional, but preprocess.total_ram_bytes prefers it when deriving the
+# ingestion worker ceiling (it falls back to a Win32/POSIX call without it).
+psutil
+
+# The GUI itself.
+PyQt5
