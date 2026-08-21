@@ -982,6 +982,44 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     return matrices
 
 
+def fov_counts(storage_path, fovs):
+    """
+    {fov: {'cells': n, 'spots': n, 'alleles': n}} for many FOVs in ONE
+    open, from the n_cells/n_spots/n_alleles attrs every writer already
+    maintains -- never by unpacking the data. This is what the status
+    panels' totals must use: counting by full read measured ~50 ms/FOV
+    (~5 s per refresh at 100 FOVs, before NAS latency); attrs are
+    microseconds after the single open. A legacy group written before
+    its count attr existed falls back to one real read, once.
+    """
+    out = {}
+    vlinks_path = _vlinks_path(storage_path)
+    if not os.path.exists(vlinks_path):
+        return {int(f): {'cells': 0, 'spots': 0, 'alleles': 0} for f in fovs}
+    with _open_vlinks(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
+        for fov in fovs:
+            c = {'cells': 0, 'spots': 0, 'alleles': 0}
+            g = f.get(f'FOV{fov:02d}')
+            if g is not None:
+                if 'cells' in g and ('table' in g['cells'] or 'blob' in g['cells']):
+                    n = g['cells'].attrs.get('n_cells')
+                    c['cells'] = int(n) if n is not None else len(read_cells(storage_path, fov)[0] or [])
+                if 'spots' in g:
+                    for mod in g['spots']:
+                        for hy in g['spots'][mod]:
+                            for ch in g['spots'][mod][hy]:
+                                sg = g['spots'][mod][hy][ch]
+                                n = sg.attrs.get('n_spots')
+                                c['spots'] += int(n) if n is not None else                                     len(columnar.unpack_spots(sg) if 'table' in sg
+                                        else pickle.loads(bytes(sg['blob'][()])) if 'blob' in sg else [])
+                if 'alleles' in g and ('table' in g['alleles'] or 'blob' in g['alleles']):
+                    n = g['alleles'].attrs.get('n_alleles')
+                    c['alleles'] = int(n) if n is not None else len(read_fov_alleles(storage_path, fov))
+            out[int(fov)] = c
+    return out
+
+
 def write_cross_modal_z(storage_path, fov, dz):
     """
     FOV-level cross-modal Z drift in PLANES, stored beside the 2D

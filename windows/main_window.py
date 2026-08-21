@@ -1837,7 +1837,7 @@ class MainWindow(QtWidgets.QMainWindow):
             d.set_allele_data([], 0, len(fov_list))
             return
         allele_dicts = vlinks_store.read_fov_alleles(storage_path, fov)
-        n_total = sum(len(vlinks_store.read_fov_alleles(storage_path, f)) for f in fov_list)
+        n_total = sum(c['alleles'] for c in vlinks_store.fov_counts(storage_path, fov_list).values())
         d.set_allele_data(allele_dicts, n_total, len(fov_list))
 
     def _refresh_cell_spot_status_cell_panel(self):
@@ -1866,8 +1866,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pos = spots_by_cell.get(int(cell_dict.get('id', -1)))
                 if pos and len(pos) > 1:
                     cell_dict['distmap'] = _ssd.squareform(_ssd.pdist(np.array(pos)))
-        n_total = sum(len(vlinks_store.read_cells(storage_path, f)[0] or [])
-                      for f in fov_list)
+        n_total = sum(c['cells'] for c in vlinks_store.fov_counts(storage_path, fov_list).values())
         # Spots are no longer nested in the cell dict; count them per cell
         # from the FOV's own spot store for the tree's "(N spots)" label.
         spots_by_cell_id = {}
@@ -1953,7 +1952,7 @@ class MainWindow(QtWidgets.QMainWindow):
             d.set_spot_data([], 0)
             return
         indexed = self._ordered_spot_dicts_for_scope(storage_path, fov, hybe, channel)
-        n_total = sum(len(self._all_spot_dicts_for_fov(storage_path, f)) for f in fov_list)
+        n_total = sum(c['spots'] for c in vlinks_store.fov_counts(storage_path, fov_list).values())
         d.set_spot_data(indexed, n_total)
 
     def _show_mip_viewer(self, silent=False):
