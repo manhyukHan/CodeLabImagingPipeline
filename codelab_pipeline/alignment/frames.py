@@ -145,16 +145,23 @@ class FrameResolver:
       shared        name of the modality whose frame IS the shared frame.
       bridges       {modality: (H_yx, dz)} -- STAR TOPOLOGY: every OTHER
                     configured modality gets its own independent bridge
-                    into `shared` (H_yx: that modality's frame -> shared;
-                    dz: planes, same direction). Any number of entries,
-                    including zero (nothing bridged yet -- identity
-                    everywhere, per the pipeline's absence-is-identity
-                    rule) or one (today's only real case) or many (the
-                    generalization this exists for). A pair with NEITHER
-                    side equal to `shared` is not resolvable -- this
-                    models a star, not a general graph, matching the
-                    single always-shared-frame design the rest of this
-                    module already commits to.
+                    into `shared` (H_yx: that modality's frame ->
+                    shared; dz: planes, same direction). `shared` itself
+                    is never a key here -- its own leg to itself is
+                    IDENTITY/0.0 by definition, the same way a within-
+                    modality reference hybe's own matrix is identity;
+                    storing it would misleadingly claim a real
+                    alignment ran for the trivial case. Any number of
+                    OTHER entries: zero (nothing bridged yet -- identity
+                    everywhere), one (today's only real case), or many.
+                    A pair where NEITHER side is `shared` composes
+                    THROUGH it (inv(to_shared(to)) @ to_shared(from)) --
+                    e.g. two independently-bridged readout modalities
+                    resolve directly against each other with no direct
+                    fit between them ever needed -- as long as BOTH
+                    sides have a known leg; if either doesn't, the pair
+                    is unresolvable (None, same as one missing side
+                    always was).
       bridge_xy, bridge_z, bridge_from
                     LEGACY single-bridge kwargs, kept working exactly as
                     before: folded into `bridges` as one entry when both
@@ -180,6 +187,17 @@ class FrameResolver:
 
     # -- cross-modal leg -------------------------------------------------
 
+    def _to_shared_leg(self, modality):
+        """
+        (H, dz) taking `modality`'s own frame to `shared`, or None when
+        that specific modality's own bridge has never been computed.
+        `shared` itself always answers (IDENTITY, 0.0) -- see the class
+        docstring's note on why that is never actually stored.
+        """
+        if modality == self.shared:
+            return (IDENTITY, 0.0)
+        return self.bridges.get(modality)
+
     def bridge(self, from_modality, to_modality):
         """
         3x3 taking from_modality's own frame into to_modality's.
@@ -187,41 +205,40 @@ class FrameResolver:
         Takes FRAMES, never roles ("is this the cell's own modality?").
         The role-based version of this is what let a cell's two legs land
         in different frames depending on which modality happened to be
-        loaded. Identity within one modality; the stored matrix in the
-        stored direction; its inverse in the other. Star topology: only
-        pairs where one side is `shared` are ever resolvable (see
-        `bridges` in the class docstring).
+        loaded. Composes through `shared` as the hub (see `bridges` in
+        the class docstring) -- identity within one modality; for any
+        other pair, resolvable exactly when BOTH sides have a known leg
+        to `shared`.
         """
         if from_modality == to_modality:
             return IDENTITY
-        if not self.bridges:
-            # No cross-modal alignment accepted yet, for ANY modality.
-            # That is a real, answerable state -- "no correction known",
-            # i.e. no shift -- not a failure. Per the pipeline's
-            # identity-default rule, absence of alignment at ANY layer is
-            # identity, and every downstream step must still run:
-            # returning None here made callers treat the whole FOV
-            # matrix layer as unavailable, so spot assignment silently
-            # assigned nothing at all until a cross-modal link happened
-            # to be accepted.
-            return IDENTITY
-        if to_modality == self.shared and from_modality in self.bridges:
-            return self.bridges[from_modality][0]
-        if from_modality == self.shared and to_modality in self.bridges:
-            return la.inv(self.bridges[to_modality][0])
-        return None
+        leg_from = self._to_shared_leg(from_modality)
+        leg_to = self._to_shared_leg(to_modality)
+        if leg_from is None or leg_to is None:
+            if not self.bridges:
+                # No cross-modal alignment accepted yet, for ANY
+                # modality. That is a real, answerable state -- "no
+                # correction known", i.e. no shift -- not a failure. Per
+                # the pipeline's identity-default rule, absence of
+                # alignment at ANY layer is identity, and every
+                # downstream step must still run: returning None here
+                # made callers treat the whole FOV matrix layer as
+                # unavailable, so spot assignment silently assigned
+                # nothing at all until a cross-modal link happened to be
+                # accepted.
+                return IDENTITY
+            return None
+        return la.inv(leg_to[0]) @ leg_from[0]
 
     def bridge_z_between(self, from_modality, to_modality):
         """Planes to ADD moving z from from_modality's frame to to_modality's."""
         if from_modality == to_modality:
             return 0.0
-        if not self.bridges:
+        leg_from = self._to_shared_leg(from_modality)
+        leg_to = self._to_shared_leg(to_modality)
+        if leg_from is None or leg_to is None:
             return 0.0
-        if to_modality == self.shared and from_modality in self.bridges:
-            return self.bridges[from_modality][1]
-        if from_modality == self.shared and to_modality in self.bridges:
-            return -self.bridges[to_modality][1]
-        return 0.0
+        return leg_from[1] - leg_to[1]
 
     # -- to the shared frame ---------------------------------------------
 

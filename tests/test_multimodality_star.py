@@ -107,8 +107,17 @@ def test_resolver_star_three_modalities():
     assert resolver.bridge_z_between('Chr19', 'RNA') == 12.0
     assert resolver.bridge_z_between('RNA', 'DNA') == 5.0
     assert resolver.bridge_z_between('RNA', 'Chr19') == -12.0
-    # non-shared-to-non-shared pairs are not directly resolvable (star, not a graph)
-    assert resolver.bridge('DNA', 'Chr19') is None
+    # non-shared-to-non-shared pairs compose THROUGH the shared hub, per
+    # explicit design: two independently-bridged modalities resolve
+    # against each other with no direct fit ever computed between them.
+    expected_dna_chr19 = la.inv(H_chr19) @ H_dna
+    assert np.allclose(resolver.bridge('DNA', 'Chr19'), expected_dna_chr19)
+    assert np.allclose(resolver.bridge('Chr19', 'DNA'), la.inv(expected_dna_chr19))
+    assert resolver.bridge_z_between('DNA', 'Chr19') == -5.0 - 12.0
+    assert resolver.bridge_z_between('Chr19', 'DNA') == 12.0 - (-5.0)
+    # but a pair where ONE side has no known bridge at all still fails,
+    # exactly as a single missing leg always has
+    assert resolver.bridge('DNA', 'Nascent') is None
 
     # a modality with NO bridge entry: missing is flagged, transform is identity
     missing = set()
