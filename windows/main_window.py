@@ -523,6 +523,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # saved" that cannot drift from what persist just wrote.
         self.spot_container_permanent = SpotContainer()
         self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
+        self._ingestion_active = False   # see _wire_ingestion_ui_guard
         # Shared celltype identity list (see ui/celltype_determination_
         # panel.py's own docstring) -- default empty, seeded from a loaded
         # config's celltype_names and/or any real classified celltype
@@ -1257,21 +1258,58 @@ class MainWindow(QtWidgets.QMainWindow):
             # (see _refresh_params_from_vlinks), without ever loading a
             # config file.
             vlinks_store.write_global_params(storage_path, layout_path=layout_path)
-        ip.populate_hybe_list(self.hybe_records, dax_directory=ip.DaxDirectoryLineEdit.text().strip())
-        ip.RunIngestionPushButton.setEnabled(True)
         ip.LogTextEdit.append(f'Parsed {len(self.hybe_records)} hybe(s) from {layout_path}')
-        self._check_ingestion_status(silent=True)
+
+        # Parsing is really three separable jobs, per explicit review of
+        # the earlier "just refuse Parse Layout during ingestion" fix:
+        #   1. rebuild the hybe-TO-INGEST checklist (populate_hybe_list)
+        #   2. scan disk for what's already ingested, for the status log
+        #      (_check_ingestion_status) and every other view refresh
+        #      below it
+        #   3. rebuild active_hybe_list/total_active_hybe_list -- the ONE
+        #      canonical "what's actually usable right now" source every
+        #      hybe-choosing combo in the app reads from
+        #
+        # (1) is actively WRONG to run mid-ingestion: it clears and
+        # rebuilds HybeListWidget from the freshly re-parsed layout,
+        # which would silently diverge from whatever checklist state the
+        # RUNNING job was actually launched from (and re-enabling Run
+        # Ingestion here would let a second job start over the first).
+        # (2) is not wrong, just needless disk/vlinks work RIGHT NOW that
+        # only feeds a status log and view refreshes nobody is looking at
+        # mid-run -- and on a v1 store, every one of those reads
+        # contends with the ingestion coordinator's own vlinks writes on
+        # the SAME re-entrant lock, which is the actual mechanism behind
+        # "parsing stalls the app" during ingestion.
+        # (3) stays valuable and CHEAP precisely because it no longer
+        # needs (2)'s scan for a v2 store (paths.mips_present is a plain
+        # directory listing -- see _ingested_hybes_for_fov), so it is
+        # never skipped: a freshly-configured modality's hybes should be
+        # choosable in every combo immediately, ingestion running or not.
+        if not self._ingestion_active:
+            ip.populate_hybe_list(self.hybe_records, dax_directory=ip.DaxDirectoryLineEdit.text().strip())
+            ip.RunIngestionPushButton.setEnabled(True)
+            self._check_ingestion_status(silent=True)
+        else:
+            ip.LogTextEdit.append(
+                'Ingestion is running -- the hybe-to-ingest checklist and full status '
+                'scan are skipped (re-parse once it finishes to refresh them); active '
+                'hybe choices below are still kept current.')
+
         # active_hybe_list/total_active_hybe_list refresh -- covers every
         # hybe-choosing combo (reference hybes, cell-alignment anchor,
-        # spot localization/celltype hybe pickers, RNA/DNA cross-modal
-        # reference hybes) in one place; see _refresh_active_hybe_lists.
+        # spot localization/celltype hybe pickers, cross-modal reference
+        # hybes) in one place; see _refresh_active_hybe_lists. ALWAYS
+        # runs, ingestion or not -- see the comment above.
         self._refresh_active_hybe_lists()
-        self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
-        self._refresh_same_modality_results_list()
-        self._refresh_cross_modal_results_list()
-        self._refresh_fov_spinbox_bounds()
-        self._refresh_celltype_names_from_vlinks()
-        self._refresh_celltype_config_from_vlinks()
+
+        if not self._ingestion_active:
+            self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
+            self._refresh_same_modality_results_list()
+            self._refresh_cross_modal_results_list()
+            self._refresh_fov_spinbox_bounds()
+            self._refresh_celltype_names_from_vlinks()
+            self._refresh_celltype_config_from_vlinks()
 
     def _refresh_celltype_config_from_vlinks(self):
         """
@@ -1561,6 +1599,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # _refresh_active_hybe_lists).
         self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
+        # Closes the gap _parse_layout deliberately opens while
+        # self._ingestion_active is True (see its own comment): any
+        # results-list/celltype refresh it skipped mid-run is caught up
+        # here, once, now that the run is over.
+        self._refresh_same_modality_results_list()
+        self._refresh_cross_modal_results_list()
+        self._refresh_fov_spinbox_bounds()
+        self._refresh_celltype_names_from_vlinks()
+        self._refresh_celltype_config_from_vlinks()
         if n_errors > 0:
             # the worker never raised (each task's error is caught+
             # returned, not thrown), so this branch is reachable even
@@ -1720,16 +1767,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _wire_ingestion_ui_guard(self, worker):
         """
-        Grey the Cell/Spot status button out for the life of one ingestion.
+        Grey the Cell/Spot status button out for the life of one ingestion,
+        and track self._ingestion_active -- the flag _parse_layout reads to
+        skip the parts of parsing that are either meaningless mid-run (the
+        hybe-to-ingest checklist -- rebuilding it while a job is already
+        queued off the OLD checklist state would desync the two) or a real
+        performance/contention risk (repeated vlinks reads racing the
+        ingestion coordinator's own writes on a v1 store). See
+        _parse_layout's own comment on the split.
 
         Driven off QThread's own started/finished rather than the six places
         that already toggle the Run buttons: finished fires whether run()
-        returned or raised, so no failure path can leave the button stuck
-        disabled.
+        returned or raised, so no failure path can leave the button (or the
+        flag) stuck.
         """
         button = self.ui.IngestionPanel.ShowCellSpotStatusDisplayerPushButton
         worker.started.connect(lambda: button.setEnabled(False))
         worker.finished.connect(lambda: button.setEnabled(True))
+        worker.started.connect(lambda: setattr(self, '_ingestion_active', True))
+        worker.finished.connect(lambda: setattr(self, '_ingestion_active', False))
 
     def _status_storage_path(self):
         """
@@ -2092,6 +2148,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ip.LogTextEdit.append(f'Job queue complete ({len(self._job_queue)} job(s)).')
             ip.RunQueuePushButton.setEnabled(True)
             ip.RunIngestionPushButton.setEnabled(True)
+            # same catch-up _on_ingestion_finished does -- once, for the
+            # whole queue, not per job (that would repeat heavy refreshes
+            # for no benefit while several jobs are still queued behind it)
+            self._refresh_same_modality_results_list()
+            self._refresh_cross_modal_results_list()
+            self._refresh_fov_spinbox_bounds()
+            self._refresh_celltype_names_from_vlinks()
+            self._refresh_celltype_config_from_vlinks()
             self.statusBar().showMessage('Job queue complete.', 5000)
             QtWidgets.QMessageBox.information(self, 'Job queue complete',
                                               f'All {len(self._job_queue)} queued job(s) finished successfully.')
@@ -2114,6 +2178,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_queued_job_finished(self, n_errors, n_total, error_lines):
         ip = self.ui.IngestionPanel
         self._check_ingestion_status(silent=True)
+        self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
         if n_errors > 0:
             ip.LogTextEdit.append(f'Job {self._job_queue_index + 1}/{len(self._job_queue)}: '
