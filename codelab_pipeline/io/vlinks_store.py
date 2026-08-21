@@ -7,6 +7,7 @@ from datetime import datetime
 
 import h5py
 
+from . import columnar
 from . import paths
 import numpy as np
 
@@ -139,8 +140,24 @@ def vlinks_session(storage_path, mode='r'):
 # -- coordinate-order schema guard (convention.py) -------------------------
 
 def _stamp_order(f):
-    """Every write stamps the store as rasterized (y, x)."""
+    """Every write stamps the store as rasterized (y, x). A BRAND-NEW
+    store is additionally stamped analysis_schema='columnar' (phase-2
+    typed datasets, io/columnar.py); existing stores keep whatever they
+    are until tools/migrate_analysis_columnar.py converts them."""
     f.attrs['coordinate_order'] = 'yx'
+    if 'analysis_schema' not in f.attrs and len(f.keys()) == 0:
+        f.attrs['analysis_schema'] = 'columnar'
+
+
+def _schema(f):
+    v = f.attrs.get('analysis_schema', 'pickle')
+    return v.decode() if isinstance(v, bytes) else str(v)
+
+
+def _reset_group(f, path):
+    if path in f:
+        del f[path]
+    return f.require_group(path)
 
 
 def _require_yx(f, vlinks_path):
@@ -308,13 +325,16 @@ def write_spots(storage_path, fov, modality, hybe, channel, spots):
                 f'duplicate spot uid {d["uid"]} in FOV{fov:02d} '
                 f'{modality}/{hybe}/ch{channel} -- uid must identify one spot')
         seen[d['uid']] = True
-    blob = np.void(pickle.dumps(payload))
     with _open_vlinks(_vlinks_path(storage_path), 'a') as f:
         _stamp_order(f)
-        grp = f.require_group(_spot_slice_path(fov, modality, hybe, channel))
-        if 'blob' in grp:
-            del grp['blob']
-        grp.create_dataset('blob', data=blob)
+        if _schema(f) == 'columnar':
+            grp = _reset_group(f, _spot_slice_path(fov, modality, hybe, channel))
+            columnar.pack_spots(grp, payload)
+        else:
+            grp = f.require_group(_spot_slice_path(fov, modality, hybe, channel))
+            if 'blob' in grp:
+                del grp['blob']
+            grp.create_dataset('blob', data=np.void(pickle.dumps(payload)))
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_spots'] = len(payload)
 
@@ -334,8 +354,11 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
         _require_yx(f, vlinks_path)
         if modality is not None and hybe is not None and channel is not None:
             gp = _spot_slice_path(fov, modality, hybe, channel)
-            if gp in f and 'blob' in f[gp]:
-                out.extend(pickle.loads(bytes(f[gp]['blob'][()])))
+            if gp in f:
+                if 'table' in f[gp]:
+                    out.extend(columnar.unpack_spots(f[gp]))
+                elif 'blob' in f[gp]:
+                    out.extend(pickle.loads(bytes(f[gp]['blob'][()])))
             return out
         root = _spots_group_path(fov)
         if root not in f:
@@ -346,7 +369,9 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
             for hy in f[f'{root}/{mod}']:
                 for ch in f[f'{root}/{mod}/{hy}']:
                     g = f[f'{root}/{mod}/{hy}/{ch}']
-                    if 'blob' in g:
+                    if 'table' in g:
+                        out.extend(columnar.unpack_spots(g))
+                    elif 'blob' in g:
                         out.extend(pickle.loads(bytes(g['blob'][()])))
     return out
 
@@ -375,15 +400,18 @@ def write_cells(storage_path, fov, cell_container):
     consumer.
     """
     cells = cell_container.get_cells(fov)
-    payload = {'cells': [cell.save() for cell in cells]}
-    blob = np.void(pickle.dumps(payload))
+    dicts = [cell.save() for cell in cells]
     vlinks_path = _vlinks_path(storage_path)
     with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
-        grp = f.require_group(_cells_group_path(fov))
-        if 'blob' in grp:
-            del grp['blob']
-        grp.create_dataset('blob', data=blob)
+        if _schema(f) == 'columnar':
+            grp = _reset_group(f, _cells_group_path(fov))
+            columnar.pack_cells(grp, dicts)
+        else:
+            grp = f.require_group(_cells_group_path(fov))
+            if 'blob' in grp:
+                del grp['blob']
+            grp.create_dataset('blob', data=np.void(pickle.dumps({'cells': dicts})))
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_cells'] = len(cells)
         # No n_spots attr: spots are not in this blob any more, and a
@@ -409,7 +437,11 @@ def read_cells(storage_path, fov):
     grp_path = _cells_group_path(fov)
     with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
-        if grp_path not in f or 'blob' not in f[grp_path]:
+        if grp_path not in f:
+            return None, ''
+        if 'table' in f[grp_path]:
+            return columnar.unpack_cells(f[grp_path]), ''
+        if 'blob' not in f[grp_path]:
             return None, ''
         raw = bytes(f[grp_path]['blob'][()])
     payload = pickle.loads(raw)
@@ -468,14 +500,17 @@ def write_fov_alleles(storage_path, fov, alleles):
     touching /FOV##/cells or /FOV##/unassigned_spots.
     """
     payload = [allele.save() for allele in alleles]
-    blob = np.void(pickle.dumps(payload))
     vlinks_path = _vlinks_path(storage_path)
     with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
-        grp = f.require_group(_alleles_group_path(fov))
-        if 'blob' in grp:
-            del grp['blob']
-        grp.create_dataset('blob', data=blob)
+        if _schema(f) == 'columnar':
+            grp = _reset_group(f, _alleles_group_path(fov))
+            columnar.pack_alleles(grp, payload)
+        else:
+            grp = f.require_group(_alleles_group_path(fov))
+            if 'blob' in grp:
+                del grp['blob']
+            grp.create_dataset('blob', data=np.void(pickle.dumps(payload)))
         grp.attrs['saved_at'] = datetime.now().isoformat()
         grp.attrs['n_alleles'] = len(alleles)
 
@@ -490,7 +525,11 @@ def read_fov_alleles(storage_path, fov):
     grp_path = _alleles_group_path(fov)
     with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
-        if grp_path not in f or 'blob' not in f[grp_path]:
+        if grp_path not in f:
+            return []
+        if 'table' in f[grp_path]:
+            return columnar.unpack_alleles(f[grp_path])
+        if 'blob' not in f[grp_path]:
             return []
         raw = bytes(f[grp_path]['blob'][()])
     return pickle.loads(raw)
