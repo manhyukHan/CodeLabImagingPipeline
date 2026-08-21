@@ -524,6 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spot_container_permanent = SpotContainer()
         self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
         self._ingestion_active = False   # see _wire_ingestion_ui_guard
+        self._active_hybe_records_cache = {}   # see _active_hybe_records_for_modality
         # Shared celltype identity list (see ui/celltype_determination_
         # panel.py's own docstring) -- default empty, seeded from a loaded
         # config's celltype_names and/or any real classified celltype
@@ -1077,12 +1078,32 @@ class MainWindow(QtWidgets.QMainWindow):
         alignment reference/anchor, which then crashed deep inside
         align_same_modality/compute_cell_alignment trying to open a
         stack file that doesn't exist.
+
+        Memoized per (name, storage_path, layout_path, fov_list) for the
+        life of one _refresh_active_hybe_lists cycle -- per confirmed
+        real slowness: this scans EVERY FOV in the Ingestion tab's FOV
+        list (a directory listing per FOV even on the cheap v2 path), yet
+        it is called from over a dozen sites INCLUDING per-cell loops
+        (_save_cell_overlay's own auto-save pass calls it once per cell
+        whose residual shift crosses the threshold -- 27 cells measured
+        on one real 100-cell FOV) and _run_cell_alignment's own
+        preamble, all on the GUI thread before any worker even starts.
+        At real project scale (~100 FOVs) each of those O(FOV-list)
+        rescans is seconds on a NAS-backed store, and they were
+        stacking up BEFORE the very first visible sign of progress --
+        confirmed as the cause of "it takes >10s before starting and
+        the log line appears" for Cell-Based Alignment. Busted by
+        _refresh_active_hybe_lists itself, the one place that is
+        SUPPOSED to see a genuinely fresh answer.
         """
         ip = self.ui.IngestionPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         data = self.ui.IngestionPanel.modality_data.get(name)
         if not data or not data.get('storage_path') or not fov_list:
             return []
+        key = (name, data.get('storage_path'), data.get('layout_path'), tuple(fov_list))
+        if key in self._active_hybe_records_cache:
+            return self._active_hybe_records_cache[key]
         if name == self.ui.IngestionPanel.current_modality and self.hybe_records:
             records = self.hybe_records
         elif data.get('layout_path'):
@@ -1096,7 +1117,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in fov_list:
             ready, _, _ = self._ingested_hybes_for_fov(data['storage_path'], fov, records)
             ingested_folders.update(ready)
-        return [r for r in records if r['folder'] in ingested_folders]
+        result = [r for r in records if r['folder'] in ingested_folders]
+        self._active_hybe_records_cache[key] = result
+        return result
 
     def _refresh_active_hybe_lists(self):
         """
@@ -1128,6 +1151,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # same rule applied at the other read site.
         if self.ui.IngestionPanel.current_modality is not None:
             self._save_current_modality_fields()
+        self._active_hybe_records_cache.clear()
         for name in self.ui.IngestionPanel.modality_names:
             self.ui.IngestionPanel.modality_data.setdefault(name, self._blank_modality_state())['active_hybe_list'] = \
                 self._active_hybe_records_for_modality(name)
