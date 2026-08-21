@@ -1210,12 +1210,37 @@ class MainWindow(QtWidgets.QMainWindow):
             # gate: first Parse Layout of a new dataset raised from
             # modality_of before anything could be ingested)
             if ip.current_modality:
+                # v2 is the layout every NEW store gets. Which modality is
+                # being ingested is already an Ingestion-tab fact
+                # (ip.current_modality), so the user must not also have to
+                # spell it into the storage path -- that used to be the ONLY
+                # way to get v2, and typing a plain experiment folder
+                # silently produced a v1 store instead.
+                #
+                # So a storage path that is not already v2 and holds no v1
+                # data is taken as the project root <dp>, and the modality
+                # directory is appended here. v1 is legacy-READABLE, never
+                # created: a path that already has FOV##/{hybe}_stack.h5 in
+                # it is left exactly as it is, so old datasets keep opening
+                # untouched (tools/migrate_store_v2.py converts one, on
+                # purpose and explicitly, when someone wants that).
+                if not paths.is_v2(storage_path) \
+                        and not paths.looks_like_v1_store(storage_path) \
+                        and os.path.basename(os.path.abspath(storage_path).rstrip(os.sep)) != ip.current_modality:
+                    storage_path = os.path.join(storage_path, ip.current_modality)
+                    os.makedirs(storage_path, exist_ok=True)
+                    ip.StoragePathLineEdit.setText(storage_path)
+                    # re-stash immediately: modality_data (and every
+                    # _storage_path_for_modality caller downstream) must see
+                    # the path the data will ACTUALLY land in, not the
+                    # project root the user typed.
+                    self._save_current_modality_fields()
+                    ip.LogTextEdit.append(f'New v2 project -- storage path is now {storage_path}')
+
                 vlinks_store.declare_modality(storage_path, ip.current_modality)
-                # v2 project bootstrap: a storage path named after its own
-                # modality (<dp>/{modality}) declares the v2 layout -- write/
-                # refresh the manifest so paths.py resolves the tree and
-                # modality_of needs no HDF5 at all. v1 queue dirs
-                # ('RNA_queue', 'data', ...) never match and stay v1.
+                # Write/refresh the manifest, which is what makes paths.py
+                # resolve the v2 tree and lets modality_of answer with no
+                # HDF5 at all.
                 base = os.path.basename(os.path.abspath(storage_path).rstrip(os.sep))
                 if base == ip.current_modality or paths.is_v2(storage_path):
                     dp = paths.project_root(storage_path)

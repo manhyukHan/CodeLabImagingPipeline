@@ -160,6 +160,17 @@ def _open_vlinks(vlinks_path, mode='r'):
                 entry[1] -= 1
             return
 
+        if mode != 'r':
+            # v2 puts the store at <dp>/analysis/vlinks.h5, and a brand-new
+            # project has no analysis/ directory yet. HDF5 will not create a
+            # missing parent, so the FIRST write to a fresh v2 store failed
+            # outright with "unable to create file" -- which meant a new v2
+            # project could not be made through the UI at all. v1's location
+            # (dirname(storage_path)) always existed already, which is why
+            # this never showed up there.
+            parent = os.path.dirname(key)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
         f = h5py.File(key, mode)
         _OPEN_VLINKS[key] = [f, 1, mode]
         try:

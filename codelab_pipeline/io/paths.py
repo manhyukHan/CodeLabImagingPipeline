@@ -99,6 +99,40 @@ def is_v2(storage_path):
     return read_manifest(project_root(storage_path)) is not None
 
 
+def looks_like_v1_store(storage_path):
+    """
+    True when storage_path ALREADY holds v1 data (FOV##/{hybe}_stack.h5).
+
+    Exists to tell an existing v1 store apart from a merely empty path, so
+    that new work can default to v2 without touching old datasets. v1 stays
+    readable for as long as anyone has one; it is simply never created any
+    more. Nothing here converts a store -- that is
+    tools/migrate_store_v2.py's job, deliberately explicit and one-shot.
+
+    Cheap on purpose: one listdir of the store plus one per FOV directory
+    until the first hit, and it stops at the first _stack.h5 it sees. It is
+    called from Parse Layout, not from a loop.
+    """
+    if not os.path.isdir(storage_path):
+        return False
+    try:
+        entries = sorted(os.listdir(storage_path))
+    except OSError:
+        return False
+    for name in entries:
+        if not name.startswith('FOV'):
+            continue
+        fov_dir = os.path.join(storage_path, name)
+        if not os.path.isdir(fov_dir):
+            continue
+        try:
+            if any(f.endswith('_stack.h5') for f in os.listdir(fov_dir)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def modality_from_path(storage_path):
     """v2 only: the modality a storage_path names, validated against the
     manifest; None when not a v2 store or not a declared modality."""
