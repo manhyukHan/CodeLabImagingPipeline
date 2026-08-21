@@ -1140,7 +1140,7 @@ def fov_counts(storage_path, fovs):
     return out
 
 
-def write_cross_modal_z(storage_path, fov, dz):
+def write_cross_modal_z(storage_path, fov, dz, modality=None):
     """
     FOV-level cross-modal Z drift in PLANES, stored beside the 2D
     /matrix_across as its own /params/FOV##/z_across scalar.
@@ -1152,17 +1152,42 @@ def write_cross_modal_z(storage_path, fov, dz):
     the affine (see ACell.matrices' own {'yx','zx'} split). Extending the
     affine would touch every one of those; adding a parallel scalar
     touches none. Old files simply have no z_across and read back as 0.
+
+    modality: the BRIDGING (non-shared) modality's own name, e.g. 'DNA'.
+    None (default) keeps the legacy flat attr -- the single-bridge shape
+    every existing caller still uses. Given, it stores under a
+    modality-scoped sub-attr instead: the flat key has no modality
+    dimension at all, so a second bridging modality (star topology, N
+    modalities into one shared frame) silently overwrote the first's
+    z-drift the moment both were ever computed for the same FOV. Not a
+    hypothetical -- write_cross_modal_matrix has the identical shape and
+    the same collision. Per-modality callers arrive in a later stage;
+    this is the additive, backward-compatible half of that generalization
+    landing first, so every one of today's 25 call sites keeps its exact
+    current behavior untouched.
     """
     vlinks_path = _vlinks_path(storage_path)
     with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
-        grp.attrs['z_across'] = float(dz)
+        if modality is None:
+            grp.attrs['z_across'] = float(dz)
+        else:
+            grp.attrs[f'z_across__{modality}'] = float(dz)
 
 
 @_mtime_cached
-def read_cross_modal_z(storage_path, fov):
-    """Planes, DNA frame -> RNA frame. 0.0 when never written (see write_cross_modal_z)."""
+def read_cross_modal_z(storage_path, fov, modality=None):
+    """
+    Planes, bridging modality's frame -> shared frame. 0.0 when never
+    written (see write_cross_modal_z).
+
+    modality: read that modality's own keyed value first; if absent,
+    fall back to the legacy flat key (a store upgraded from single-bridge
+    still answers correctly for the one bridge it already has, now asked
+    for by its real name instead of implicitly). modality=None (default)
+    reads only the flat key -- unchanged legacy behavior.
+    """
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return 0.0
@@ -1171,40 +1196,64 @@ def read_cross_modal_z(storage_path, fov):
         _require_yx(f, vlinks_path)
         if grp_path not in f:
             return 0.0
-        return float(f[grp_path].attrs.get('z_across', 0.0))
+        attrs = f[grp_path].attrs
+        if modality is not None and f'z_across__{modality}' in attrs:
+            return float(attrs[f'z_across__{modality}'])
+        return float(attrs.get('z_across', 0.0))
 
 
-def write_cross_modal_matrix(storage_path, fov, H):
+def write_cross_modal_matrix(storage_path, fov, H, modality=None):
     """
-    Mirrors an already-computed H_across (see
-    codelab_pipeline.alignment.chain.write_cross_modal_matrix) into
-    vlinks.h5, at /params/FOV##/matrix_across -- same dedicated /params
-    tree as every other piece of metadata here. The per-hybe-stack-file
-    copy that function writes can only be LOCATED if the DNA reference
-    hybe is already known -- a chicken-and-egg problem when
-    reconstructing session state from a fresh app launch with nothing
-    yet loaded. This copy is reachable from vlinks.h5 alone, no
-    reference hybe required to find it.
+    Mirrors an already-computed H_across into vlinks.h5, at
+    /params/FOV##/matrix_across -- same dedicated /params tree as every
+    other piece of metadata here. Reachable from vlinks.h5 alone, no
+    reference hybe required to find it (unlike the per-hybe-stack-file
+    copy chain.py used to keep, which needed the DNA reference hybe
+    already known -- a chicken-and-egg problem on a fresh app launch;
+    that copy no longer exists, this is the only one).
+
+    modality: the BRIDGING (non-shared) modality's own name. None
+    (default) keeps the legacy flat dataset -- see write_cross_modal_z's
+    docstring for why a second bridging modality collides on it
+    (confirmed, identical shape to that function's own collision).
+    Given, writes to a modality-scoped dataset name instead, so multiple
+    modalities can each carry their own accepted bridge into the shared
+    frame at once (star topology) without overwriting each other.
     """
     vlinks_path = _vlinks_path(storage_path)
+    name = 'matrix_across' if modality is None else f'matrix_across__{modality}'
     with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
         grp = f.require_group(_fov_params_group_path(fov))
-        if 'matrix_across' in grp:
-            del grp['matrix_across']
-        grp.create_dataset('matrix_across', data=np.asarray(H, dtype='float64'))
+        if name in grp:
+            del grp[name]
+        grp.create_dataset(name, data=np.asarray(H, dtype='float64'))
 
 
 @_mtime_cached
-def read_cross_modal_matrix(storage_path, fov):
-    """The vlinks.h5-mirrored H_across for this FOV, or None if nothing's
-    been written here yet (see write_cross_modal_matrix)."""
+def read_cross_modal_matrix(storage_path, fov, modality=None):
+    """
+    The vlinks.h5-mirrored H_across for this FOV, or None if nothing's
+    been written here yet (see write_cross_modal_matrix).
+
+    modality: read that modality's own keyed dataset first, falling back
+    to the legacy flat one when absent (a store upgraded from
+    single-bridge still answers for the one bridge it already has, now
+    asked for by its real name). modality=None (default) reads only the
+    flat key -- unchanged legacy behavior for every current caller.
+    """
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
     grp_path = _fov_params_group_path(fov)
     with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
-        if grp_path not in f or 'matrix_across' not in f[grp_path]:
+        if grp_path not in f:
             return None
-        return f[grp_path]['matrix_across'][:]
+        grp = f[grp_path]
+        name = None if modality is None else f'matrix_across__{modality}'
+        if name is not None and name in grp:
+            return grp[name][:]
+        if 'matrix_across' in grp:
+            return grp['matrix_across'][:]
+        return None

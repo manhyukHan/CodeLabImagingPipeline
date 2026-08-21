@@ -143,22 +143,39 @@ class FrameResolver:
                     frame (NOT pre-composed with any cross-modal term --
                     passing pre-bridged matrices here double-counts).
       shared        name of the modality whose frame IS the shared frame.
-      bridge_xy     3x3, `bridge_from` modality's frame -> shared frame.
-      bridge_z      float, planes, same direction as bridge_xy.
-      bridge_from   which modality bridge_xy/bridge_z start in (the DNA
-                    side). None disables cross-modal entirely.
+      bridges       {modality: (H_yx, dz)} -- STAR TOPOLOGY: every OTHER
+                    configured modality gets its own independent bridge
+                    into `shared` (H_yx: that modality's frame -> shared;
+                    dz: planes, same direction). Any number of entries,
+                    including zero (nothing bridged yet -- identity
+                    everywhere, per the pipeline's absence-is-identity
+                    rule) or one (today's only real case) or many (the
+                    generalization this exists for). A pair with NEITHER
+                    side equal to `shared` is not resolvable -- this
+                    models a star, not a general graph, matching the
+                    single always-shared-frame design the rest of this
+                    module already commits to.
+      bridge_xy, bridge_z, bridge_from
+                    LEGACY single-bridge kwargs, kept working exactly as
+                    before: folded into `bridges` as one entry when both
+                    bridge_xy and bridge_from are given. New callers
+                    should pass `bridges` directly; every call site as of
+                    this addition still uses the legacy form, and this
+                    keeps them byte-identical in behavior.
       anchors       {modality: 3x3} each modality's cell-alignment anchor
                     -> shared frame. Pass LIVE values; a stored snapshot
                     goes stale whenever FOV alignment is re-run.
     """
 
     def __init__(self, within, shared, bridge_xy=None, bridge_z=0.0,
-                 bridge_from=None, anchors=None):
+                 bridge_from=None, anchors=None, bridges=None):
         self.within = within or {}
         self.shared = shared
-        self.bridge_xy = np.asarray(bridge_xy, dtype=float) if bridge_xy is not None else None
-        self.bridge_z = float(bridge_z)
-        self.bridge_from = bridge_from
+        self.bridges = {m: (np.asarray(H, dtype=float), float(dz))
+                        for m, (H, dz) in (bridges or {}).items()}
+        if bridge_xy is not None and bridge_from is not None:
+            self.bridges.setdefault(
+                bridge_from, (np.asarray(bridge_xy, dtype=float), float(bridge_z)))
         self.anchors = anchors or {}
 
     # -- cross-modal leg -------------------------------------------------
@@ -171,33 +188,40 @@ class FrameResolver:
         The role-based version of this is what let a cell's two legs land
         in different frames depending on which modality happened to be
         loaded. Identity within one modality; the stored matrix in the
-        stored direction; its inverse in the other.
+        stored direction; its inverse in the other. Star topology: only
+        pairs where one side is `shared` are ever resolvable (see
+        `bridges` in the class docstring).
         """
         if from_modality == to_modality:
             return IDENTITY
-        if self.bridge_xy is None or self.bridge_from is None:
-            # No cross-modal alignment accepted yet. That is a real,
-            # answerable state -- "no correction known", i.e. no shift --
-            # not a failure. Per the pipeline's identity-default rule,
-            # absence of alignment at ANY layer is identity, and every
-            # downstream step must still run: returning None here made
-            # callers treat the whole FOV matrix layer as unavailable, so
-            # spot assignment silently assigned nothing at all until a
-            # cross-modal link happened to be accepted.
+        if not self.bridges:
+            # No cross-modal alignment accepted yet, for ANY modality.
+            # That is a real, answerable state -- "no correction known",
+            # i.e. no shift -- not a failure. Per the pipeline's
+            # identity-default rule, absence of alignment at ANY layer is
+            # identity, and every downstream step must still run:
+            # returning None here made callers treat the whole FOV
+            # matrix layer as unavailable, so spot assignment silently
+            # assigned nothing at all until a cross-modal link happened
+            # to be accepted.
             return IDENTITY
-        if {from_modality, to_modality} != {self.bridge_from, self.shared}:
-            return None
-        return self.bridge_xy if from_modality == self.bridge_from else la.inv(self.bridge_xy)
+        if to_modality == self.shared and from_modality in self.bridges:
+            return self.bridges[from_modality][0]
+        if from_modality == self.shared and to_modality in self.bridges:
+            return la.inv(self.bridges[to_modality][0])
+        return None
 
     def bridge_z_between(self, from_modality, to_modality):
         """Planes to ADD moving z from from_modality's frame to to_modality's."""
         if from_modality == to_modality:
             return 0.0
-        if self.bridge_from is None:
+        if not self.bridges:
             return 0.0
-        if {from_modality, to_modality} != {self.bridge_from, self.shared}:
-            return 0.0
-        return self.bridge_z if from_modality == self.bridge_from else -self.bridge_z
+        if to_modality == self.shared and from_modality in self.bridges:
+            return self.bridges[from_modality][1]
+        if from_modality == self.shared and to_modality in self.bridges:
+            return -self.bridges[to_modality][1]
+        return 0.0
 
     # -- to the shared frame ---------------------------------------------
 
