@@ -6,6 +6,8 @@ import threading
 from datetime import datetime
 
 import h5py
+
+from . import paths
 import numpy as np
 
 
@@ -24,8 +26,11 @@ def _vlinks_path(storage_path):
     pair it wants rather than first switching the whole program into a
     modality. See _modality_of for where that key comes from.
     """
-    return os.path.join(os.path.dirname(os.path.abspath(storage_path).rstrip(os.sep)),
-                        'vlinks.h5')
+    # Layout-versioned (io/paths.py): v2 projects keep analysis state in
+    # <dp>/analysis/vlinks.h5, small and single-writer -- MIPs live in
+    # their own per-hybe files there, so ingestion never contends with
+    # this store at all.
+    return paths.vlinks_path(storage_path)
 
 
 
@@ -168,6 +173,12 @@ def modality_of(storage_path):
     key = os.path.abspath(storage_path)
     if key in _MODALITY_CACHE:
         return _MODALITY_CACHE[key]
+    declared_v2 = paths.modality_from_path(storage_path)
+    if declared_v2:
+        # v2 project: the manifest IS the registry -- no HDF5, no
+        # bootstrapping order, storage_path's basename names the modality.
+        _MODALITY_CACHE[key] = declared_v2
+        return declared_v2
     for fov_dir in sorted(glob.glob(os.path.join(key, 'FOV*'))):
         for stack in sorted(glob.glob(os.path.join(fov_dir, '*_stack.h5'))):
             try:
@@ -711,6 +722,25 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     stack file's own .attrs, now mirrored here so display code never needs
     that raw file just to answer this.
     """
+    if paths.is_v2(storage_path):
+        # v2: one small standalone file per (modality, FOV, hybe), written
+        # ATOMICALLY (.part + replace) so existence == completeness --
+        # this is what lets the ingestion WORKER write it with no shared-
+        # file contention and the checkup become a directory listing.
+        # vlinks.h5 is never touched here (no identity seeding either:
+        # absence of a matrix is identity by the pipeline's own rule).
+        target = paths.mip_path(storage_path, fov, hybe)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = target + '.part'
+        with h5py.File(tmp, 'w') as f:
+            f.attrs['coordinate_order'] = 'yx'
+            if fiducial_channel is not None:
+                f.attrs['fiducial_channel'] = int(fiducial_channel)
+            for ch, mip in channel_mips.items():
+                f.create_dataset(f'ch{ch}', data=np.asarray(mip),
+                                 chunks=True, compression='gzip', compression_opts=1)
+        os.replace(tmp, target)
+        return
     vlinks_path = _vlinks_path(storage_path)
     with _open_vlinks(vlinks_path, 'a') as f:
         _stamp_order(f)
@@ -730,6 +760,13 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
 def read_hybe_mip(storage_path, fov, hybe, channel):
     """The vlinks.h5-stored MIP for one hybe/channel (see write_hybe_mip),
     or None if this hybe hasn't been ingested yet / no vlinks.h5 yet."""
+    if paths.is_v2(storage_path):
+        try:
+            with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
+                name = f'ch{channel}'
+                return f[name][:] if name in f else None
+        except OSError:
+            return None
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
@@ -751,6 +788,15 @@ def fiducial_channel_mip(storage_path, fov, hybe):
     attr -- only present for hybes ingested after write_hybe_mip started
     stashing it) isn't in vlinks.h5 yet.
     """
+    if paths.is_v2(storage_path):
+        try:
+            with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
+                if 'fiducial_channel' not in f.attrs:
+                    return None
+                name = f"ch{int(f.attrs['fiducial_channel'])}"
+                return f[name][:] if name in f else None
+        except OSError:
+            return None
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
@@ -772,6 +818,18 @@ def readout_channel_mip(storage_path, fov, hybe):
     if this hybe/its fiducial_channel attr isn't in vlinks.h5 yet, or if it
     genuinely has no non-fiducial channel.
     """
+    if paths.is_v2(storage_path):
+        try:
+            with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
+                if 'fiducial_channel' not in f.attrs:
+                    return None
+                fid = str(int(f.attrs['fiducial_channel']))
+                chans = [k[2:] for k in f.keys() if k.startswith('ch')]
+                readout = [c for c in chans if c != fid]
+                name = f'ch{readout[0]}' if readout else f'ch{fid}'
+                return f[name][:] if name in f else None
+        except OSError:
+            return None
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
@@ -796,7 +854,16 @@ def mip_channels_present(storage_path, fov, hybe):
     was interrupted partway through its channel loop), the same
     distinction windows/main_window.py's ingestion-status check already
     surfaces to the user (MISSING vs INCOMPLETE/UNREADABLE).
+
+    v2 stores: the per-hybe MIP file is written atomically, so its
+    existence is completeness -- one open only when the file exists.
     """
+    if paths.is_v2(storage_path):
+        try:
+            with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
+                return {k[2:]: True for k in f.keys() if k.startswith('ch')}
+        except OSError:
+            return None
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return None
@@ -860,8 +927,13 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
         _require_yx(f, vlinks_path)
         modality = modality_of(storage_path)
         matrix_grp_path = _fov_matrix_group_path(fov, modality)
+        # ingested-gate is layout-aware: v2 keeps MIPs as standalone
+        # per-hybe files (paths.mips_present -- one directory listing),
+        # not /mip groups inside this store. Gating on the in-store group
+        # returned {} for every v2 hybe (confirmed on the migrated clone).
+        ingested = paths.mips_present(storage_path, fov) if paths.is_v2(storage_path) else None
         for hybe in hybe_list:
-            if _mip_group_path(fov, modality, hybe) not in f:
+            if (hybe not in ingested) if ingested is not None else                     (_mip_group_path(fov, modality, hybe) not in f):
                 continue  # not ingested yet
             key = (hybe, modality)
             if matrix_grp_path in f and hybe in f[matrix_grp_path]:

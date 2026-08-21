@@ -25,6 +25,7 @@ from canvas.mip_viewer import MipViewerDisplayer
 from canvas.cell_spot_status_displayer import CellSpotStatusDisplayer
 from canvas.alignment_preview_window import AlignmentPreviewWindow
 from canvas.chromatin_trace_grid_displayer import ChromatinTraceGridDisplayer
+from codelab_pipeline.io import paths
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import vlinks_store
 from codelab_pipeline.alignment import chain as alignment
@@ -103,9 +104,14 @@ class IngestionWorker(QtCore.QThread):
                 # vlinks_store.write_hybe_mip's own docstring) -- the
                 # file's already just been written, so this MIP copy is
                 # cheap, and doing it HERE keeps vlinks.h5 single-writer.
-                if err is None:
+                if err is None and not paths.is_v2(self.storage_path):
+                    # v1 only: copy the MIP into the shared vlinks.h5 from
+                    # THIS coordinator thread (single-writer). In a v2
+                    # store the worker already wrote the standalone
+                    # per-hybe MIP file itself -- nothing to do here, and
+                    # vlinks.h5 sees zero ingestion traffic.
                     try:
-                        h5path = os.path.join(self.storage_path, f'FOV{fov_r:02d}', f'{hybe_r}_stack.h5')
+                        h5path = paths.stack_path(self.storage_path, fov_r, hybe_r)
                         with h5py.File(h5path, 'r') as f:
                             channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in record['channels']}
                         vlinks_store.write_hybe_mip(self.storage_path, fov_r, hybe_r, channel_mips,
@@ -1204,6 +1210,21 @@ class MainWindow(QtWidgets.QMainWindow):
             # modality_of before anything could be ingested)
             if ip.current_modality:
                 vlinks_store.declare_modality(storage_path, ip.current_modality)
+                # v2 project bootstrap: a storage path named after its own
+                # modality (<dp>/{modality}) declares the v2 layout -- write/
+                # refresh the manifest so paths.py resolves the tree and
+                # modality_of needs no HDF5 at all. v1 queue dirs
+                # ('RNA_queue', 'data', ...) never match and stay v1.
+                base = os.path.basename(os.path.abspath(storage_path).rstrip(os.sep))
+                if base == ip.current_modality or paths.is_v2(storage_path):
+                    dp = paths.project_root(storage_path)
+                    m = paths.read_manifest(dp) or {'modalities': {}}
+                    layouts = {n: v.get('layout_path', '') for n, v in m.get('modalities', {}).items()}
+                    daxes = {n: v.get('dax_directory', '') for n, v in m.get('modalities', {}).items()}
+                    layouts[ip.current_modality] = layout_path
+                    daxes[ip.current_modality] = ip.DaxDirectoryLineEdit.text().strip()
+                    names = sorted(set(list(m.get('modalities', {}).keys()) + list(ip.modality_names)))
+                    paths.write_manifest(dp, names, layouts, daxes)
             # a real, confirmed fact about this storage path (which
             # ExperimentLayout it uses) -- lets a completely fresh session
             # reconstruct hybe_records/combo choices from vlinks.h5 alone
@@ -1554,6 +1575,15 @@ class MainWindow(QtWidgets.QMainWindow):
         missing, invalid) hybe-folder lists.
         """
         ready, missing, invalid = [], [], []
+        if paths.is_v2(storage_path):
+            # v2: MIP files are written atomically, so existence IS
+            # completeness -- the whole check is ONE directory listing
+            # instead of a vlinks open per hybe (which at 100 FOVs x 100
+            # hybes was ~10,000 network opens per refresh).
+            present = paths.mips_present(storage_path, fov)
+            for record in hybe_records:
+                (ready if record['folder'] in present else missing).append(record['folder'])
+            return ready, missing, invalid
         for record in hybe_records:
             hybe = record['folder']
             channels_present = vlinks_store.mip_channels_present(storage_path, fov, hybe)
@@ -6199,7 +6229,7 @@ class MainWindow(QtWidgets.QMainWindow):
         vlinks_store.write_global_params(storage_path, same_modality_reference_hybe=reference_hybe,
                                          same_modality_channel_type=channel_type)
         for fov, matrices in results.items():
-            save_path = os.path.join(storage_path, f'FOV{fov:02d}', 'alignment_overlay.png')
+            save_path = paths.figure_path(storage_path, 'alignment', fov, 'alignment_overlay.png')
             self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, hybe_records, reference_hybe, matrices,
                                                       save_path=save_path, channel_type=channel_type)
         QtWidgets.QMessageBox.information(self, 'FOV alignment complete',
@@ -6220,7 +6250,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                          same_modality_channel_type=channel_type)
         for fov, matrices in self._pending_same_modality_alignment.items():
             alignment.write_same_modality_matrices(ctx['storage_path'], fov, matrices, ctx['reference_hybe'])
-            save_path = os.path.join(ctx['storage_path'], f'FOV{fov:02d}', 'alignment_overlay.png')
+            save_path = paths.figure_path(ctx['storage_path'], 'alignment', fov, 'alignment_overlay.png')
             self.preview_canvas.draw_fov_all_readouts_overlay(ctx['storage_path'], fov, ctx['hybe_records'],
                                                       ctx['reference_hybe'], matrices, save_path=save_path,
                                                       channel_type=channel_type)
@@ -6533,7 +6563,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_cross_modal = None
         self._refresh_cross_modal_results_list()
         for fov, H in results.items():
-            save_path = os.path.join(dna_storage_path, f'FOV{fov:02d}', 'cross_modal_overlay.png')
+            save_path = paths.figure_path(dna_storage_path, 'alignment', fov, 'cross_modal_overlay.png')
             self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, fov,
                                                  rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
                                                  rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
@@ -6555,7 +6585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._pending_cross_modal or ctx is None:
             return
         for fov, H in self._pending_cross_modal.items():
-            save_path = os.path.join(ctx['dna_storage_path'], f'FOV{fov:02d}', 'cross_modal_overlay.png')
+            save_path = paths.figure_path(ctx['dna_storage_path'], 'alignment', fov, 'cross_modal_overlay.png')
             self.preview_canvas.draw_cross_modal_preview(ctx['rna_storage_path'], ctx['dna_storage_path'], fov,
                                                  ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'],
                                                  H, save_path=save_path,
@@ -7347,7 +7377,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reference_record = record_by_folder.get(overlay_reference_hybe)
         if reference_record is None:
             return False
-        save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{cell.id}_alignment_overlay.png')
+        save_path = paths.figure_path(storage_path, 'cells', fov, f'cell{cell.id}_alignment_overlay.png')
         reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
         target_specs = self._cell_overlay_target_specs(cell, storage_path, fov, hybe_records, channel_type)
         mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(cell.reference_modality, cell, fov) or {}).get(
@@ -7827,7 +7857,7 @@ class MainWindow(QtWidgets.QMainWindow):
             hybe_records = self._active_hybe_records_for_modality(overlay_modality) if overlay_modality else []
             reference_record = {r['folder']: r for r in hybe_records}.get(overlay_reference_hybe)
             if reference_record is not None:
-                save_path = os.path.join(storage_path, f'FOV{fov:02d}', f'cell{real_cell.id}_alignment_overlay.png')
+                save_path = paths.figure_path(storage_path, 'cells', fov, f'cell{real_cell.id}_alignment_overlay.png')
                 reference_channel = alignment.pick_channel_by_type(reference_record, channel_type)
                 target_specs = self._cell_overlay_target_specs(real_cell, storage_path, fov, hybe_records, channel_type)
                 mask_anchor_fov_matrix = (self._fov_matrices_for_cell_modality(real_cell.reference_modality, real_cell, fov) or {}).get(

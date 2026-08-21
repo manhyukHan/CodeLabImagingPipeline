@@ -3,6 +3,7 @@ import numpy as np
 import numpy.linalg as la
 import h5py
 
+from ..io import paths
 from ..io import vlinks_store
 
 """
@@ -130,7 +131,7 @@ def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, p
         xmin, xmax = max(0, int(round(x)) - pad), min(width, int(round(x)) + pad + 1)
         return mip[ymin:ymax, xmin:xmax], (ymin, xmin)
 
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         dataset = f[f'/stack/ch{channel}']
         height, width = dataset.shape[0], dataset.shape[1]

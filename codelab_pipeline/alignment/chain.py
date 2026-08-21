@@ -9,6 +9,7 @@ import h5py
 from skimage import filters as skimage_filters
 from skimage.feature import peak_local_max
 
+from ..io import paths
 from ..io import preprocess
 from ..io import vlinks_store
 import cv2
@@ -715,7 +716,7 @@ def hybe_zy_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     contract and same caller obligations (bounds must already be valid and
     in-frame) -- see hybe_zx_projection.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
     projection = stack.max(axis=1)  # (height, depth)
@@ -828,7 +829,7 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     as the YX plane -- the same projection this function's own caller
     below (compute_cell_alignment) uses for its z-depth refinement.
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
     projection = stack.max(axis=0)  # (width, depth)

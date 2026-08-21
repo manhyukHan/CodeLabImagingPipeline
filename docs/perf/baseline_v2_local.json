@@ -1,0 +1,38 @@
+{
+  "storage_path": "/private/tmp/claude-501/-Users-hanmanhyuk-Git-CodeLabImagingPipeline/04e40e67-ac75-4e0b-b95d-259979bbae33/scratchpad/veri_v2/RNA",
+  "fov": 1,
+  "results": {
+    "open_vlinks": {
+      "ms": 0.27954250000006287,
+      "note": ""
+    },
+    "read_cells": {
+      "ms": 28.67650700000013,
+      "note": "101 cells, blob 10 MB store"
+    },
+    "read_spots": {
+      "ms": 4.244029999999954,
+      "note": "133 spots"
+    },
+    "crop3d": {
+      "ms": 7.691388000000021,
+      "note": "stack (1024, 1024, 130) chunks=(32, 32, 64)"
+    },
+    "trace20": {
+      "ms": 125.12288400000004,
+      "note": "20 crops over 5 hybe file(s)"
+    },
+    "checkup": {
+      "ms": 1.1361400000000632,
+      "note": "5 per-hybe MIP-presence checks (1 FOV)"
+    },
+    "layout_parse": {
+      "ms": 9.565297000000195,
+      "note": "data/raw_subset/RNA_Expt/Results/ExperimentLayout.xlsx"
+    },
+    "write_cells": {
+      "ms": 48.78504300000009,
+      "note": "full blob rewrite, 101 cells"
+    }
+  }
+}

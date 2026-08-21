@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
 
+from ..io import paths
 from ..io import preprocess
 from .engine import make_engine
 import cv2
@@ -440,7 +441,7 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
     rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
 
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         mip_crop = f[f'/mip/ch{channel}'][rymin:rymax, rxmin:rxmax]
         stacks_value = f[f'/stack/ch{channel}'][rymin:rymax, rxmin:rxmax, :]

@@ -5,6 +5,8 @@ import pandas as pd
 import logging
 logging.basicConfig(level=logging.INFO)
 import h5py
+
+from . import paths
 import cv2
 from scipy.optimize import minimize
 import xml.etree.ElementTree as ET
@@ -294,8 +296,8 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
     """
     folder = hybe_record['folder']
     channels = hybe_record['channels']
-    os.makedirs(os.path.join(storage_path, f'FOV{fov:02d}'), exist_ok=True)
-    stack_h5name = os.path.join(storage_path, f'FOV{fov:02d}', f'{folder}_stack.h5')
+    os.makedirs(os.path.dirname(paths.stack_path(storage_path, fov, folder)), exist_ok=True)
+    stack_h5name = paths.stack_path(storage_path, fov, folder)
 
     if os.path.exists(stack_h5name):
         if not overwrite:
@@ -344,10 +346,34 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
                     raise ValueError(f'depth mismatch for {folder} ch{ch}: DAX has '
                                      f'{dat.shape[-1]} z-planes, ExperimentLayout '
                                      f'totalFrames predicts {expected_depth}')
-                create_or_replace_dataset(stack_group, f'ch{ch}', dat, 'uint16')
+                # Chunked + lightly compressed, sized for the pipeline's
+                # real access pattern: small-XY x deep-Z crops (3D
+                # localization, chromatin tracing). On the measured NAS
+                # (12.6 ms per scattered read) a contiguous stack made one
+                # 17x17xZ crop ~3.6 s (289 scattered runs); (32, 32,
+                # z-slab) chunks make it a handful of contiguous chunk
+                # reads (~0.1 s), and partial-Z access stays partial --
+                # chunks decompress independently, so only the z-slabs
+                # overlapping a request are touched.
+                zslab = min(dat.shape[-1], 64)
+                stack_group.create_dataset(f'ch{ch}', data=dat, dtype='uint16',
+                                           chunks=(32, 32, zslab),
+                                           compression='gzip', compression_opts=1,
+                                           shuffle=True)
                 create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
             attributes['shape'] = dat.shape
             f.attrs.update(attributes)
+        if paths.is_v2(storage_path):
+            # v2: this worker writes the per-hybe MIP file itself
+            # (atomically -- see vlinks_store.write_hybe_mip's v2 branch),
+            # so the coordinator never touches MIPs and vlinks.h5 sees no
+            # ingestion traffic at all: the UI stays live mid-ingestion
+            # and each hybe becomes browsable the moment ITS file lands.
+            from . import vlinks_store
+            with h5py.File(stack_h5name, 'r') as f:
+                channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
+            vlinks_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
+                                        fiducial_channel=hybe_record['fiducial_channel'])
         logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')
         return fov, folder, None
     except FileNotFoundError:

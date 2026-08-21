@@ -6,6 +6,7 @@ from skimage.feature import peak_local_max
 from scipy import ndimage as scind
 import warnings
 
+from ..io import paths
 from ..io import vlinks_store
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
@@ -182,7 +183,7 @@ def focus_profile(storage_path, fov, hybe, channel, step=1, crop=512):
     projection is by definition not a MIP-only read. Central crop + `step`
     keep it cheap (h5py slices per plane, never materializing the stack).
     """
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         ds = f[f'/stack/ch{channel}']
         height, width, depth = ds.shape
@@ -212,7 +213,7 @@ def read_projection(storage_path, fov, hybe, channel, mode='MIP (stored)', z_pla
     """
     if mode == 'MIP (stored)':
         return vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     with h5py.File(h5path, 'r') as f:
         ds = f[f'/stack/ch{channel}']
         depth = ds.shape[2]
@@ -229,7 +230,7 @@ def read_projection(storage_path, fov, hybe, channel, mode='MIP (stored)', z_pla
 
 def stack_depth(storage_path, fov, hybe, channel):
     """Number of z planes, so the UI can bound its own spinboxes to reality."""
-    h5path = os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    h5path = paths.stack_path(storage_path, fov, hybe)
     if not os.path.exists(h5path):
         return 0
     with h5py.File(h5path, 'r') as f:

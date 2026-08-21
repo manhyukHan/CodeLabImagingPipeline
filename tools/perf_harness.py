@@ -83,11 +83,19 @@ def main():
         spots_holder['d'] = vlinks_store.read_spots(sp, fov)
     rec('read_spots', timed(read_spots), f"{len(spots_holder['d'])} spots")
 
-    # a real (hybe, channel) with a stack file on disk, from the store itself
-    fov_dir = os.path.join(sp, f'FOV{fov:02d}')
-    stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('_stack.h5')) if os.path.isdir(fov_dir) else []
-    if stacks:
+    # a real (hybe, channel) with a stack file on disk, from the store
+    # itself -- layout-aware (io/paths.py): v2 keeps stacks under
+    # sp/stacks/FOV##/{hybe}.h5, v1 under sp/FOV##/{hybe}_stack.h5
+    from codelab_pipeline.io import paths
+    if paths.is_v2(sp):
+        fov_dir = os.path.join(sp, 'stacks', f'FOV{fov:02d}')
+        stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('.h5')) if os.path.isdir(fov_dir) else []
+        hybes = [s[:-3] for s in stacks]
+    else:
+        fov_dir = os.path.join(sp, f'FOV{fov:02d}')
+        stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('_stack.h5')) if os.path.isdir(fov_dir) else []
         hybes = [s[:-len('_stack.h5')] for s in stacks]
+    if stacks:
         with h5py.File(os.path.join(fov_dir, stacks[0]), 'r') as f:
             channels = [int(k[2:]) for k in f['stack'].keys()]
             shape = f['stack'][f'ch{channels[0]}'].shape
