@@ -9,10 +9,79 @@ import h5py
 
 from . import columnar
 from . import paths
+from ..alignment.frames import FrameMatrices
 import numpy as np
 
 
 _MODALITY_CACHE = {}
+
+# -- mtime-keyed read cache (phase 3) ---------------------------------------
+#
+# Refreshes re-read the same unchanged store over and over (status panels,
+# combo switches, matrix lists). Every cached reader stats its backing file
+# (~1 ms even on NAS) and serves the cached result when mtime_ns is
+# unchanged; ANY write -- this process or another machine's -- bumps mtime
+# and invalidates naturally. Bounded LRU so MIP pixel data cannot grow
+# unbounded. Mutation safety: list-of-dict results are shallow-copied per
+# hit; ndarray results are returned read-only so accidental mutation raises
+# instead of poisoning the cache.
+
+import collections
+
+_READ_CACHE = collections.OrderedDict()
+_READ_CACHE_MAX = 256
+
+
+def _invalidate_cache(backing):
+    key = os.path.abspath(backing)
+    for k in [k for k in _READ_CACHE if k[1] == key]:
+        del _READ_CACHE[k]
+
+
+def _cache_copy(v):
+    if isinstance(v, FrameMatrices):
+        return FrameMatrices(v, modality=v.modality)
+    if isinstance(v, np.ndarray):
+        v = v.view()
+        v.flags.writeable = False
+        return v
+    if isinstance(v, list):
+        return [dict(d) if isinstance(d, dict) else d for d in v]
+    if isinstance(v, tuple):
+        return tuple(_cache_copy(x) for x in v)
+    if isinstance(v, dict):
+        return dict(v)
+    return v
+
+
+def _mtime_cached(fn):
+    name = fn.__name__
+
+    def wrapped(storage_path, *args, **kwargs):
+        backing = kwargs.pop('_backing', None) or _vlinks_path(storage_path)
+        try:
+            mtime = os.stat(backing).st_mtime_ns
+        except OSError:
+            return fn(storage_path, *args, **kwargs)
+        hashable = tuple(tuple(a) if isinstance(a, (list, set)) else a for a in args)
+        key = (name, os.path.abspath(backing), hashable,
+               tuple(sorted((k, tuple(v) if isinstance(v, (list, set)) else v)
+                            for k, v in kwargs.items())))
+        hit = _READ_CACHE.get(key)
+        if hit is not None and hit[0] == mtime:
+            _READ_CACHE.move_to_end(key)
+            return _cache_copy(hit[1])
+        result = fn(storage_path, *args, **kwargs)
+        _READ_CACHE[key] = (mtime, result)
+        _READ_CACHE.move_to_end(key)
+        while len(_READ_CACHE) > _READ_CACHE_MAX:
+            _READ_CACHE.popitem(last=False)
+        return _cache_copy(result)
+
+    wrapped.__name__ = name
+    wrapped.__doc__ = fn.__doc__
+    wrapped.__wrapped__ = fn
+    return wrapped
 
 
 def _vlinks_path(storage_path):
@@ -140,11 +209,15 @@ def vlinks_session(storage_path, mode='r'):
 # -- coordinate-order schema guard (convention.py) -------------------------
 
 def _stamp_order(f):
-    """Every write stamps the store as rasterized (y, x). A BRAND-NEW
+    """Every write stamps the store as rasterized (y, x), and drops any
+    cached reads of this file (see _mtime_cached: mtime alone also
+    invalidates, but a same-process read DURING an open write transaction
+    could otherwise see a pre-write cached value). A BRAND-NEW
     store is additionally stamped analysis_schema='columnar' (phase-2
     typed datasets, io/columnar.py); existing stores keep whatever they
     are until tools/migrate_analysis_columnar.py converts them."""
     f.attrs['coordinate_order'] = 'yx'
+    _invalidate_cache(f.filename)
     if 'analysis_schema' not in f.attrs and len(f.keys()) == 0:
         f.attrs['analysis_schema'] = 'columnar'
 
@@ -339,6 +412,7 @@ def write_spots(storage_path, fov, modality, hybe, channel, spots):
         grp.attrs['n_spots'] = len(payload)
 
 
+@_mtime_cached
 def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
     """
     ASpot.save()-shaped dicts. With modality/hybe/channel given, just that
@@ -424,6 +498,7 @@ def write_cells(storage_path, fov, cell_container):
         # own store is the real count.
 
 
+@_mtime_cached
 def read_cells(storage_path, fov):
     """
     Returns (cell_dicts, modality) -- cell_dicts is a list of ACell.save()-
@@ -515,6 +590,7 @@ def write_fov_alleles(storage_path, fov, alleles):
         grp.attrs['n_alleles'] = len(alleles)
 
 
+@_mtime_cached
 def read_fov_alleles(storage_path, fov):
     """Returns a list of AnAllele.save()-shaped dicts (feed to
     AnAllele().set_metadata(**d)), or [] if nothing's been persisted for
@@ -618,6 +694,7 @@ def write_global_params(storage_path, **params):
                 shared.attrs[k] = v
 
 
+@_mtime_cached
 def read_global_params(storage_path):
     """{key: value} of whatever's been written via write_global_params,
     or {} if nothing yet / no vlinks.h5 at this storage path -- the read
@@ -941,6 +1018,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
             ds.attrs['steps'] = np.asarray(H, dtype='float32')[None, ...]
 
 
+@_mtime_cached
 def read_same_modality_matrices(storage_path, fov, hybe_list):
     """
     Reads back whatever's in vlinks.h5's /FOV##/matrix/{hybe} for each hybe
@@ -960,7 +1038,6 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     vlinks_path = _vlinks_path(storage_path)
     if not os.path.exists(vlinks_path):
         return {}
-    from ..alignment.frames import FrameMatrices
     matrices = FrameMatrices(modality=modality_of(storage_path))
     with _open_vlinks(vlinks_path, 'r') as f:
         _require_yx(f, vlinks_path)
@@ -982,6 +1059,38 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     return matrices
 
 
+@_mtime_cached
+def spot_slices(storage_path, fov):
+    """
+    [(modality, hybe, channel), ...] of every spot slice this FOV holds
+    on disk -- GROUP NAMES ONLY, no data unpacked. This is the scanning
+    primitive the status panels' combo choices must use: enumerating
+    slices by reading every spot (read_spots on the whole FOV) parses
+    the full spot payload just to learn which hybes exist -- at the
+    projected full scale (~10^5-10^6 spots per FOV once every hybe is
+    localized) that is seconds of pure waste per refresh.
+    """
+    out = []
+    vlinks_path = _vlinks_path(storage_path)
+    if not os.path.exists(vlinks_path):
+        return out
+    root = _spots_group_path(fov)
+    with _open_vlinks(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
+        if root not in f:
+            return out
+        for mod in f[root]:
+            if not isinstance(f[f'{root}/{mod}'], h5py.Group):
+                continue
+            for hy in f[f'{root}/{mod}']:
+                for ch in f[f'{root}/{mod}/{hy}']:
+                    g = f[f'{root}/{mod}/{hy}/{ch}']
+                    if 'table' in g or 'blob' in g:
+                        out.append((mod, hy, int(ch[2:]) if ch.startswith('ch') else int(ch)))
+    return out
+
+
+@_mtime_cached
 def fov_counts(storage_path, fovs):
     """
     {fov: {'cells': n, 'spots': n, 'alleles': n}} for many FOVs in ONE
@@ -1040,6 +1149,7 @@ def write_cross_modal_z(storage_path, fov, dz):
         grp.attrs['z_across'] = float(dz)
 
 
+@_mtime_cached
 def read_cross_modal_z(storage_path, fov):
     """Planes, DNA frame -> RNA frame. 0.0 when never written (see write_cross_modal_z)."""
     vlinks_path = _vlinks_path(storage_path)
@@ -1074,6 +1184,7 @@ def write_cross_modal_matrix(storage_path, fov, H):
         grp.create_dataset('matrix_across', data=np.asarray(H, dtype='float64'))
 
 
+@_mtime_cached
 def read_cross_modal_matrix(storage_path, fov):
     """The vlinks.h5-mirrored H_across for this FOV, or None if nothing's
     been written here yet (see write_cross_modal_matrix)."""

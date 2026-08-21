@@ -775,6 +775,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
+        sp.SaveAllFovSpotsPushButton.clicked.connect(self._save_all_fov_spots)
         sp.ThresholdPercentLineEdit.editingFinished.connect(self._sync_threshold_from_percent)
         sp.ThresholdAbsoluteLineEdit.editingFinished.connect(self._sync_threshold_from_absolute)
 
@@ -1660,19 +1661,6 @@ class MainWindow(QtWidgets.QMainWindow):
         params = vlinks_store.read_global_params(storage_path)
         return (params or {}).get('same_modality_reference_hybe', '')
 
-    def _all_spot_dicts_for_fov(self, storage_path, fov):
-        """
-        Every persisted spot for one FOV, assigned and unassigned alike,
-        straight off disk -- the same "what is REALLY there" principle as
-        CellSpotStatusDisplayer's own class docstring.
-
-        One read. Spots no longer hide in two places: assigned ones used to
-        be nested inside each cell's own 'spots' list and unassigned ones in
-        a separate group, so this had to stitch them together. They share
-        one store now and differ only in ASpot.cell.
-        """
-        return vlinks_store.read_spots(storage_path, fov)
-
     def _ingestion_is_running(self):
         """True while an IngestionWorker is live -- single run or queued."""
         worker = getattr(self, '_ingestion_worker', None)
@@ -1896,10 +1884,13 @@ class MainWindow(QtWidgets.QMainWindow):
             d.set_spot_hybe_choices([])
             d.set_spot_channel_choices([])
             return
-        spot_dicts = self._all_spot_dicts_for_fov(storage_path, fov)
-        d.set_spot_hybe_choices(sorted({s['hybe'] for s in spot_dicts}))
+        # slice NAMES only -- never the spot payload (see
+        # vlinks_store.spot_slices: full-parse for combo choices is
+        # seconds of waste per refresh at real scale)
+        slices = vlinks_store.spot_slices(storage_path, fov)
+        d.set_spot_hybe_choices(sorted({h for _m, h, _c in slices}))
         hybe = d.current_spot_hybe()
-        channels = sorted({s['channel'] for s in spot_dicts if hybe is None or s['hybe'] == hybe})
+        channels = sorted({c for _m, h, c in slices if hybe is None or h == hybe})
         d.set_spot_channel_choices(channels)
 
     def _ordered_spot_dicts_for_scope(self, storage_path, fov, hybe, channel):
@@ -1922,14 +1913,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # together, differing only in `cell`), not nested inside each cell's
         # own dict -- group by owning cell here rather than reading a
         # 'spots' key that no longer exists on a persisted cell.
+        # ONLY the selected slice is read (lazy detail, per explicit
+        # request): the whole-FOV read this replaces unpacked every
+        # slice's payload just to filter one out.
+        slice_spots = []
+        for mod, h, c in vlinks_store.spot_slices(storage_path, fov):
+            if h == hybe and c == channel:
+                slice_spots.extend(vlinks_store.read_spots(storage_path, fov, mod, hybe, channel))
         by_cell = {}
-        for s in vlinks_store.read_spots(storage_path, fov):
+        for s in slice_spots:
             by_cell.setdefault(int(s.get('cell', -1)), []).append(s)
-        ordered = [s for s in by_cell.get(-1, []) if s['hybe'] == hybe and s['channel'] == channel]
+        ordered = list(by_cell.get(-1, []))
         for c in sorted(cell_dicts, key=lambda c: c['id']):
-            for s in by_cell.get(c['id'], []):
-                if s['hybe'] == hybe and s['channel'] == channel:
-                    ordered.append(s)
+            ordered.extend(by_cell.get(c['id'], []))
         # Spots whose owner was PURGED still exist and must stay visible --
         # hiding them made a stale link invisible instead of inspectable.
         # They keep their stored cell id in the label; the next save's
@@ -4340,6 +4336,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
+
+    def _save_all_fov_spots(self):
+        """
+        Whole-FOV spot save, per explicit request: reassigns every spot
+        in this FOV against the current cells (the same recomputation
+        every save runs) and then persists EVERY (modality, hybe,
+        channel) slice the session holds -- not just the currently
+        viewed one -- clearing stale slices, so nothing is left behind.
+        Deliberately slower than the slice-scoped Save Current Spots
+        (seconds: full reassignment plus every slice write) in exchange
+        for needing to be re-run far less often. Writes SPOTS only,
+        never cells (same rule as every spot door).
+        """
+        sp = self.ui.SpotLocalizationPanel
+        fov = self._current_spot_fov()
+        if fov is None or not self._all_vlinks_storage_paths():
+            QtWidgets.QMessageBox.warning(self, 'Save ALL FOV Spots', 'Set a storage path and FOV first.')
+            return
+        t0 = time.perf_counter()
+        n_identified, n_identified_cells = self._reassign_fov_spots(fov)
+        n_written = self._persist_fov_spots(fov)
+        elapsed = time.perf_counter() - t0
+        sp.LogTextEdit.append(
+            f'FOV{fov:02d}: ALL slices saved -- {n_written} spot(s) across every hybe/channel '
+            f'({n_identified} unassigned spot(s) newly identified into {n_identified_cells} '
+            f'cell(s); {elapsed:.1f}s). Cells are never written here.')
+        QtWidgets.QMessageBox.information(
+            self, 'Save ALL FOV Spots',
+            f'{n_written} spot(s) saved across all slices of FOV{fov:02d} ({elapsed:.1f}s).')
+        self._refresh_spot_cell_list()
 
     def _save_current_spots(self):
         """

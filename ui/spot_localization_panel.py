@@ -238,6 +238,13 @@ class SpotLocalizationPanelUI(object):
         # -- Save current spots --
         self.SaveCurrentSpotsPushButton = QtWidgets.QPushButton('Save Current Spots')
         layout.addWidget(self.SaveCurrentSpotsPushButton)
+        self.SaveAllFovSpotsPushButton = QtWidgets.QPushButton('Save ALL FOV Spots (every hybe/channel)')
+        self.SaveAllFovSpotsPushButton.setToolTip(
+            'Reassigns every spot in this FOV against the current cells and persists '
+            'EVERY (modality, hybe, channel) slice at once -- not just the currently '
+            'viewed one. Takes seconds (full reassignment + every slice write), but '
+            'nothing is left behind, so it needs re-running far less often.')
+        layout.addWidget(self.SaveAllFovSpotsPushButton)
 
         infoLabel = QtWidgets.QLabel(
             'Spots are attached to the current view immediately. Save Current Spots writes EVERY '

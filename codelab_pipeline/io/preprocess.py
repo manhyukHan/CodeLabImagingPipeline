@@ -128,6 +128,9 @@ def create_or_replace_dataset(group, name, data, dtype):
     group.create_dataset(name, data=data, dtype=dtype)
 
 
+_LAYOUT_CACHE = {}
+
+
 def parse_experiment_layout(xlsx_path):
     """
     Parse an ExperimentLayout.xlsx sheet into one record per hybe -- the
@@ -142,6 +145,16 @@ def parse_experiment_layout(xlsx_path):
     total_frames (int), readout_name (str or None -- DNA layouts have no
     rnaNames column, so target rounds are anonymous).
     """
+    # mtime-keyed cache: the SAME layout is re-parsed inside several
+    # doors per click (~46 ms at 16 hybes, ~300 ms at the real 111 --
+    # per call, over NAS). Copies out so a caller mutating its records
+    # cannot poison later parses.
+    try:
+        key = (os.path.abspath(xlsx_path), os.stat(xlsx_path).st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _LAYOUT_CACHE:
+        return [dict(r) for r in _LAYOUT_CACHE[key]]
     df = pd.read_excel(xlsx_path)
     has_names = 'rnaNames' in df.columns
     records = []
@@ -159,6 +172,10 @@ def parse_experiment_layout(xlsx_path):
             'total_frames': int(row['totalFrames']),
             'readout_name': readout_name,
         })
+    if key is not None:
+        _LAYOUT_CACHE.clear()          # one layout per modality in practice; keep it tiny
+        _LAYOUT_CACHE[key] = records
+        return [dict(r) for r in records]
     return records
 
 def make_xml_file(config, save_path):
