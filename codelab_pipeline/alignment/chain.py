@@ -1,4 +1,6 @@
+import multiprocessing
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import reduce
 import numpy as np
 
@@ -590,8 +592,66 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
     return vlinks_store.read_same_modality_matrices(storage_path, fov, hybe_list)
 
 
+# -- parallel same-modality alignment (see align_same_modality) -----------
+#
+# One hybe's fit is completely independent of every other's: it reads its own
+# MIP and compares it against the one shared reference. The loop was serial on
+# a single QThread, so on a 64-core machine it used exactly one of them -- and
+# the fit is pure CPU (measured on real 1024x1024 MIPs: ~3.5 s per hybe, 93%
+# of it inside Powell, which converges in 100-260 objective evaluations of
+# ~20 ms each). A 78-hybe FOV therefore took ~4.5 minutes on one core while
+# 63 sat idle. Nothing about the fit is I/O-bound: a 1024x1024 MIP is ~2 MB.
+#
+# spawn context, matching IngestionWorker's own pool. The children must never
+# import Qt, so the worker function lives here in a Qt-free module and takes
+# only picklable arguments.
+
+_ALIGN_WORKER_REFERENCE = {}
+
+
+def _init_align_worker(storage_path, fov, reference_hybe, ref_channel):
+    """
+    Read the shared reference MIP ONCE per worker process, not once per task.
+
+    Also pins OpenCV to one thread inside the child. Without that, each of N
+    workers spins up its own cv2 pool sized to the whole machine and they
+    fight over the same cores -- the classic oversubscription that can make a
+    pool slower than the serial loop it replaced.
+    """
+    cv2.setNumThreads(1)
+    _ALIGN_WORKER_REFERENCE['mip'] = vlinks_store.read_hybe_mip(
+        storage_path, fov, reference_hybe, ref_channel)
+
+
+def _align_one_hybe(task):
+    """One (hybe -> reference) fit, run in a worker process."""
+    storage_path, fov, hybe, channel, lb, ub, border_trim, max_shift = task
+    reference_mip = _ALIGN_WORKER_REFERENCE.get('mip')
+    if reference_mip is None:
+        return hybe, None, 'reference MIP unavailable in worker'
+    moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    if moving_mip is None:
+        return hybe, None, 'not ingested'
+    H = align_readout_to_reference(moving_mip, reference_mip, lb, ub,
+                                   border_trim=border_trim, max_shift=max_shift)
+    return hybe, H, None
+
+
+def max_alignment_workers(hard_ceiling=32):
+    """
+    How many hybe fits to run at once.
+
+    A core count, not a memory budget: each worker holds two 1024x1024 uint8
+    crops plus a few float32 temporaries, tens of MB at most. That is the
+    opposite of preprocess.max_ingestion_workers, which is bounded by whole
+    DAX files sitting in RAM. Two cores are left for the GUI thread and the
+    coordinator so the app stays responsive while a FOV aligns.
+    """
+    return max(1, min((os.cpu_count() or 4) - 2, hard_ceiling))
+
+
 def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999, write=True,
-                            border_trim=0, max_shift=None, progress=None):
+                            border_trim=0, max_shift=None, progress=None, workers=None):
     """
     Align every hybe's fiducial-channel MIP to reference_hybe's fiducial-
     channel MIP -- always fiducial-to-fiducial, never the readout channel,
@@ -633,24 +693,61 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
     if reference_mip is None:
         raise ValueError(f'FOV{fov:02d} {reference_hybe} not in vlinks.h5 -- ingest it first.')
 
-    matrices = {}
-    for i, record in enumerate(hybe_records):
-        hybe = record['folder']
-        if hybe == reference_hybe:
-            H = np.eye(3)
-        else:
+    matrices = {reference_hybe: np.eye(3)}
+    todo = [r for r in hybe_records if r['folder'] != reference_hybe]
+    n_workers = max_alignment_workers() if workers is None else max(1, int(workers))
+    total = len(hybe_records)
+    done = [0]
+
+    def _report(hybe):
+        # Per-HYBE progress, not per-FOV -- this loop is the app's longest
+        # silent stretch, and a caller must not have to wait for the whole
+        # FOV to learn anything at all.
+        done[0] += 1
+        if progress is not None:
+            progress(done[0], total, fov, hybe)
+
+    _report(reference_hybe)
+
+    executor = None
+    if n_workers > 1 and len(todo) > 1:
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=min(n_workers, len(todo)),
+                mp_context=multiprocessing.get_context('spawn'),
+                initializer=_init_align_worker,
+                initargs=(storage_path, fov, reference_hybe, ref_record['fiducial_channel']))
+        except Exception:
+            executor = None      # degrade to the serial loop below, never fail here
+
+    if executor is not None:
+        with executor:
+            tasks = {executor.submit(_align_one_hybe,
+                                     (storage_path, fov, r['folder'], r['fiducial_channel'],
+                                      lb, ub, border_trim, max_shift)): r['folder']
+                     for r in todo}
+            for future in as_completed(tasks):
+                hybe, H, err = future.result()
+                if err == 'not ingested':
+                    raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+                if err is not None:
+                    raise ValueError(f'FOV{fov:02d} {hybe}: {err}')
+                matrices[hybe] = H
+                _report(hybe)
+    else:
+        for record in todo:
+            hybe = record['folder']
             moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, record['fiducial_channel'])
             if moving_mip is None:
                 raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
-            H = align_readout_to_reference(moving_mip, reference_mip, lb, ub, border_trim=border_trim, max_shift=max_shift)
-        matrices[hybe] = H
-        # Per-HYBE progress, not per-FOV. This loop is the app's longest
-        # silent stretch: each align_readout_to_reference is an ORB fit plus
-        # one to three Powell/MSD optimizations, ~3.5 s per hybe on real
-        # 1024x1024 MIPs, so a 78-hybe FOV runs ~4.5 minutes. The caller
-        # used to learn nothing until the whole FOV returned.
-        if progress is not None:
-            progress(i + 1, len(hybe_records), fov, hybe)
+            matrices[hybe] = align_readout_to_reference(moving_mip, reference_mip, lb, ub,
+                                                        border_trim=border_trim, max_shift=max_shift)
+            _report(hybe)
+
+    # Restore hybe_records order: as_completed yields whatever finishes first,
+    # and no caller should be able to tell from this dict whether it was
+    # computed serially or in a pool.
+    matrices = {r['folder']: matrices[r['folder']] for r in hybe_records if r['folder'] in matrices}
 
     if write:
         write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
