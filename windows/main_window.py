@@ -254,12 +254,23 @@ class AlignmentWorker(QtCore.QThread):
         try:
             results = {}
             z_results = {}
+            # Per-HYBE totals, not per-FOV. align_same_modality is ~3.5 s a
+            # hybe on real data, so a single-FOV run used to emit exactly
+            # one progress signal, ~4.5 minutes in -- indistinguishable
+            # from a hang. Now every hybe reports.
+            n_hybes = max(len(self.hybe_records), 1)
+            total = len(self.fov_list) * n_hybes
             for i, fov in enumerate(self.fov_list):
+                def _on_hybe(done, of, fov_r, hybe, _i=i, _n=n_hybes):
+                    self.progress.emit(_i * _n + done, total,
+                                       f'FOV{fov_r:02d} {hybe}: aligned ({done}/{of})')
                 matrices = alignment.align_same_modality(self.storage_path, fov, self.hybe_records,
                                                               self.reference_hybe, write=self.write,
-                                                              border_trim=self.border_trim, max_shift=self.max_shift)
+                                                              border_trim=self.border_trim, max_shift=self.max_shift,
+                                                              progress=_on_hybe)
                 results[fov] = matrices
-                self.progress.emit(i + 1, len(self.fov_list), f'FOV{fov:02d}: {len(matrices)} hybe(s) aligned')
+                self.progress.emit((i + 1) * n_hybes, total,
+                                   f'FOV{fov:02d}: {len(matrices)} hybe(s) aligned')
             self.finished_ok.emit(results)
         except Exception as e:
             self.failed.emit(str(e))
@@ -1782,6 +1793,24 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         params = vlinks_store.read_global_params(storage_path)
         return (params or {}).get('same_modality_reference_hybe', '')
+
+    def _on_alignment_progress(self, done, total, message):
+        """
+        The Alignment tab's own progress bar + log, mirroring what
+        Ingestion/Cell Segmentation/Spot Localization already do.
+
+        Alignment used to report ONLY through a transient statusBar
+        message, which is both easy to miss and gone a moment later --
+        and same-modality alignment is the longest-running thing in the
+        app (~3.5 s per hybe measured on real 1024x1024 MIPs, so ~4.5
+        minutes for a 78-hybe FOV). Shared by the FOV, cross-modal and
+        cell-alignment workers so all three land in one place.
+        """
+        ap = self.ui.AlignmentPanel
+        ap.ProgressBar.setMaximum(max(total, 1))
+        ap.ProgressBar.setValue(done)
+        ap.LogTextEdit.append(message)
+        self.statusBar().showMessage(message)
 
     def _ingestion_is_running(self):
         """True while an IngestionWorker is live -- single run or queued."""
@@ -6312,7 +6341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Running FOV alignment...')
         self._alignment_worker = AlignmentWorker(storage_path, [fov], hybe_records, reference_hybe, write=False,
                                                   border_trim=border_trim, max_shift=max_shift)
-        self._alignment_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
+        self._alignment_worker.progress.connect(self._on_alignment_progress)
         self._alignment_worker.finished_ok.connect(
             lambda results: self._on_fov_alignment_finished(results, storage_path, hybe_records, reference_hybe))
         self._alignment_worker.failed.connect(self._on_fov_alignment_failed)
@@ -6380,7 +6409,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Running FOV alignment for all FOVs...')
         self._alignment_worker = AlignmentWorker(storage_path, fov_list, hybe_records, reference_hybe, write=True,
                                                   border_trim=border_trim, max_shift=max_shift)
-        self._alignment_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
+        self._alignment_worker.progress.connect(self._on_alignment_progress)
         self._alignment_worker.finished_ok.connect(
             lambda results: self._on_fov_alignment_all_finished(results, storage_path, hybe_records, reference_hybe))
         self._alignment_worker.failed.connect(self._on_fov_alignment_all_failed)
@@ -7440,7 +7469,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Computing cell alignment...')
         worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
         self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad)
-        self._cell_alignment_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
+        self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_finished(results, fov, container, storage_path,
                                                               cell_reference_hybe, cell_modality, channel_type, pad))

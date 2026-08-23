@@ -591,7 +591,7 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
 
 
 def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999, write=True,
-                            border_trim=0, max_shift=None):
+                            border_trim=0, max_shift=None, progress=None):
     """
     Align every hybe's fiducial-channel MIP to reference_hybe's fiducial-
     channel MIP -- always fiducial-to-fiducial, never the readout channel,
@@ -612,6 +612,15 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
     align_readout_to_reference for every non-reference hybe -- see that
     function's docstring. Both default to no-op (0 / None), so existing
     callers see no behavior change unless they opt in.
+
+    progress: optional callable(done, total, fov, hybe), invoked after
+    EVERY hybe. Exists because this loop is slow enough to look hung: on
+    real 1024x1024 MIPs each align_readout_to_reference is an ORB fit
+    plus one to three Powell/MSD optimizations, ~3.5 s per hybe (Powell
+    converges in ~155 objective evaluations at ~20 ms each), so a
+    78-hybe FOV runs ~4.5 minutes. AlignmentWorker used to report only
+    once the whole FOV returned, which read as a hang. Default None
+    leaves every existing call site byte-identical.
     """
     record_by_folder = {r['folder']: r for r in hybe_records}
     ref_record = record_by_folder[reference_hybe]
@@ -625,7 +634,7 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
         raise ValueError(f'FOV{fov:02d} {reference_hybe} not in vlinks.h5 -- ingest it first.')
 
     matrices = {}
-    for record in hybe_records:
+    for i, record in enumerate(hybe_records):
         hybe = record['folder']
         if hybe == reference_hybe:
             H = np.eye(3)
@@ -635,6 +644,13 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
                 raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
             H = align_readout_to_reference(moving_mip, reference_mip, lb, ub, border_trim=border_trim, max_shift=max_shift)
         matrices[hybe] = H
+        # Per-HYBE progress, not per-FOV. This loop is the app's longest
+        # silent stretch: each align_readout_to_reference is an ORB fit plus
+        # one to three Powell/MSD optimizations, ~3.5 s per hybe on real
+        # 1024x1024 MIPs, so a 78-hybe FOV runs ~4.5 minutes. The caller
+        # used to learn nothing until the whole FOV returned.
+        if progress is not None:
+            progress(i + 1, len(hybe_records), fov, hybe)
 
     if write:
         write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)

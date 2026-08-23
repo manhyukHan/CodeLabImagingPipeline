@@ -272,6 +272,25 @@ class AlignmentPanelUI(object):
         cellLayout.addRow(self.SaveAllCellOverlaysPushButton)
         controls_layout.addWidget(cellGroup)
 
+        # -- progress + log, the parity this panel was missing --
+        # Ingestion, Cell Segmentation and Spot Localization all have both;
+        # alignment had neither, and its workers reported only through a
+        # transient statusBar message. Same-modality alignment is the
+        # longest silent operation in the app: measured on real 1024x1024
+        # MIPs it is ~3.5 s PER HYBE (Powell converges in ~155 objective
+        # evaluations at ~20 ms each), so a 78-hybe FOV is ~4.5 minutes
+        # during which AlignmentWorker used to emit exactly ONE signal --
+        # after the whole FOV finished. Nothing was wrong; it just looked
+        # that way.
+        self.ProgressBar = QtWidgets.QProgressBar()
+        controls_layout.addWidget(self.ProgressBar)
+
+        controls_layout.addWidget(QtWidgets.QLabel('Log:'))
+        self.LogTextEdit = QtWidgets.QTextEdit()
+        self.LogTextEdit.setReadOnly(True)
+        self.LogTextEdit.setMinimumHeight(120)
+        controls_layout.addWidget(self.LogTextEdit)
+
         controls_layout.addStretch()
 
     def _accept_reject_row(self):
