@@ -1670,6 +1670,17 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.RunIngestionPushButton.setEnabled(True)
         self.statusBar().clearMessage()
         self._check_ingestion_status(silent=True)
+        # A FAILED run is still a run that ingested things: every task that
+        # completed before the abort has already landed its stack and its
+        # atomic per-hybe MIP on disk, and _check_ingestion_status above
+        # reads exactly that and puts it on screen. _refresh_active_hybe_
+        # lists is what busts _active_hybe_records_cache, and it used to be
+        # reached from only the three SUCCESS doors (_parse_layout and the
+        # two finished handlers) -- so after an abort the status box showed
+        # the new hybes while every hybe-choosing door was still handed the
+        # pre-run list, for the rest of the session. Before the cache
+        # existed each of those doors rescanned disk and self-healed.
+        self._refresh_active_hybe_lists()
         QtWidgets.QMessageBox.critical(self, 'Ingestion error', message)
 
     @staticmethod
@@ -2235,6 +2246,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.RunQueuePushButton.setEnabled(True)
         ip.RunIngestionPushButton.setEnabled(True)
         self.statusBar().clearMessage()
+        # Same reason as _on_ingestion_failed: a failed job aborts the whole
+        # queue, but whatever it managed to ingest first is real on disk and
+        # must not stay invisible behind a stale _active_hybe_records_cache.
+        # This handler refreshed nothing at all before.
+        self._check_ingestion_status(silent=True)
+        self._refresh_active_hybe_lists()
         QtWidgets.QMessageBox.critical(self, 'Queued ingestion error', message)
 
     # -- cell segmentation --
