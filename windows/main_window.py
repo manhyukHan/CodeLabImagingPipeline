@@ -1563,10 +1563,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ingestion_worker.start()
 
     def _existing_h5_targets(self, storage_path, fov_list, selected_records):
+        """
+        The already-converted stack files this run would land on top of.
+
+        MUST resolve through paths.stack_path, exactly like
+        convert_dax_to_h5_worker's own early-return does: this function only
+        means anything if it asks the same question the worker will ask.
+        It used to hardcode v1's storage_path/FOV##/{hybe}_stack.h5, so on a
+        v2 store (stacks/FOV##/{hybe}.h5) it matched NOTHING no matter how
+        much was already ingested -- and since _confirm_overwrite reads an
+        empty list as "nothing to conflict with", every v2 run silently
+        chose Overwrite All, with no dialog and no way to reach Append.
+        Re-converting an already-complete hybe is not a no-op: the worker
+        os.remove()s the existing file first and pulls the whole DAX back
+        over the network to rebuild it.
+        """
         existing = []
         for fov in fov_list:
             for record in selected_records:
-                path = os.path.join(storage_path, f'FOV{fov:02d}', f"{record['folder']}_stack.h5")
+                path = paths.stack_path(storage_path, fov, record['folder'])
                 if os.path.exists(path):
                     existing.append(path)
         return existing
