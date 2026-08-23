@@ -516,7 +516,22 @@ def find_best_alignment(moving_image, reference_image, fixed_scale=1.0,
     # 0 (fixed_angle=True), or the caller's fixed numeric angle -- not the
     # raw (possibly-unused) optimizer parameter.
     angle_to_use = angle if fixed_angle is False else (0.0 if fixed_angle is True else float(fixed_angle))
-    if abs(angle_to_use) > 1/2:
+    # The half-degree gate exists to suppress POWELL'S OWN angle output, which
+    # is meaningless for this kind of image -- the optimizer converges to ~0
+    # regardless of true rotation, even at 8 deg (see
+    # compute_features_affinelike_matrix's docstring). It must NOT second-guess
+    # an angle the caller supplied explicitly: a numeric fixed_angle is a
+    # deliberate instruction, msd_cost_function already fitted dx/dy under
+    # exactly that rotation, and discarding it here would return a translation
+    # measured in a frame the returned matrix no longer describes.
+    #
+    # No behavior change for any existing caller: today the only numeric
+    # fixed_angle comes from align_readout_to_reference's rotation branch,
+    # which is entered only when |angle| >= 0.5, so the old test passed there
+    # anyway. It matters now that callers quantize to 0.5 deg steps -- the
+    # smallest non-zero quantum is exactly 0.5, which `> 1/2` rejected.
+    apply_rotation = abs(angle_to_use) > 1/2 if fixed_angle is False else angle_to_use != 0.0
+    if apply_rotation:
         h, w = moving_image.shape[:2]
         center = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D(center, angle_to_use, fixed_scale)

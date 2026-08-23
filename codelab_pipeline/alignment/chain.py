@@ -28,6 +28,16 @@ import cv2
 MAX_ALIGNMENT_TRANSLATION_PX = 30.0
 MAX_ALIGNMENT_ROTATION_DEG = 10.0
 
+# Rotation is quantized to this step before it is used (see
+# align_readout_to_reference). Fine-scale rotation carries no information for
+# this pipeline: ORB resolves rotation to well under a degree, real inter-hybe
+# rotational drift here is ~0.1 deg (measured across 77 real pairs: |angle| max
+# 0.1007 deg), and a sub-quantum angle changes a 1024x1024 frame's corners by
+# less than the alignment's own translational precision. Quantizing also makes
+# the common "no real rotation" case exactly representable as 0.0, so it can be
+# tested for rather than approximated with a threshold.
+ANGLE_QUANTUM_DEG = 0.5
+
 
 def _center_displacement(H, shape):
     """
@@ -416,8 +426,7 @@ def entry_dz(entry):
     return 0.0 if zx is None else float(np.asarray(zx)[0, 2])
 
 
-def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, border_trim=0, max_shift=None,
-                               angle_threshold=0.5):
+def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, border_trim=0, max_shift=None):
     """
     Compute the affine-like matrix aligning moving_mip onto reference_mip.
     Takes plain MIP arrays -- usable for both within-experiment (fiducial
@@ -425,39 +434,52 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     MIP) alignment; the caller is responsible for always passing
     same-channel-type inputs on both sides, never mixed.
 
-    Two-stage, ORB-first strategy (replaces the earlier "run both, pick
-    whichever has lower residual" approach -- that let ORB win purely on
-    residual even when its correspondence was spurious, since a wrong
-    match can still reconstruct deceptively well):
+    ORB DETECTS, POWELL REFINES -- they are not two competing estimators
+    picked between, and Powell no longer searches rotation at all.
 
-    1. Run ORB+RANSAC (preprocess.compute_features_affinelike_matrix) and
-       read off its rotation angle. ORB is the only one of the two
-       methods that can find real rotation at all -- MSD/Powell's
-       optimizer converges to angle~0 regardless of true rotation, even
-       at 8 degrees (synthetic ground-truth tested) -- so ORB's angle is
-       the only signal available for "is there real rotational drift."
-    2. If |ORB's angle| < angle_threshold degrees (default 0.5 -- no real
-       rotation found): don't trust ORB's translation either. On real
-       data (Hyb_130 barcode round vs. a regular hybe) ORB has been
-       observed to lock onto a confident-but-wrong correspondence while
-       still reporting ~0 rotation -- reporting no rotation doesn't mean
-       the match itself was good. Use a fresh, independent free-angle
-       MSD/Powell fit instead (effectively translation-only, since
-       Powell won't find real rotation either way).
-    3. If ORB DID find real rotation: confirm it three ways, not two.
-       Re-run MSD/Powell with ORB's exact angle held fixed
-       (fixed_angle=<ORB's angle>) to get an independently-optimized
-       translation under the SAME rotation ORB claimed, ALSO run a plain
-       zero-angle Powell fit as a sanity-check baseline, then keep
-       whichever of the three (ORB's own transform, the fixed-angle
-       Powell fit, the zero-angle Powell fit) actually reconstructs
-       reference_mip better. The zero-angle baseline matters even here:
-       without it, a spurious ORB angle (observed on real data: a
-       readout-channel cross-modal pair reporting ~162 degrees, plainly
-       wrong) and its fixed-angle "confirmation" both inherit the same
-       bad rotation and can both fail _reconstruction_residual's overlap
-       guard (return inf) -- inf <= inf still picks ORB, so a genuinely
-       sane zero-rotation candidate has to be in the running to win.
+    1. Run ORB+RANSAC (preprocess.compute_features_affinelike_matrix).
+       ORB is the only one of the two methods that can find real rotation
+       at all -- MSD/Powell's optimizer converges to angle~0 regardless of
+       true rotation, even at 8 degrees (synthetic ground-truth tested) --
+       so ORB's angle is the only signal available for "is there real
+       rotational drift," and Powell has nothing to add to it.
+    2. Admit ORB's result as a SEED, all three parameters or none
+       (_within_hard_alignment_bounds, which fails on dx OR dy OR angle).
+       One-out, because ORB's three outputs come from a single
+       correspondence set: a wrong match corrupts all of them together, so
+       trusting the translation of a fit whose angle is implausible would
+       be trusting the same bad correspondence twice. A rejected seed
+       falls back to the cold (0, 0, 0) start.
+       Measured justification, 77 real hybe pairs in one FOV: ORB's centre
+       displacement sat a median 0.165 px from Powell's own final answer
+       (max 1.089 px; 76/77 within 1 px) at 1/127th of Powell's cost. The
+       previous code computed exactly this and discarded it, then let
+       Powell rediscover it from scratch.
+       Note ORB is a seed and NOT the answer: on those same 77 pairs
+       Powell's refined fit still won on reconstruction residual 76/77
+       times (mean 84.4 vs 87.0). ORB gets close; Powell finishes.
+    3. Quantize the seed angle to ANGLE_QUANTUM_DEG (0.5) -- see that
+       constant -- and seed Powell's angle parameter with it. The angle
+       stays FREE, not fixed. Fixing it was tried and measured and loses on
+       both axes (24 real pairs, vs the cold-start baseline: seed+free
+       1.28x faster and mean residual -0.217; cold+fixed 0.93x SLOWER and
+       +0.569; seed+fixed 1.22x and -0.015). That third parameter is not
+       acting as a rotation estimate -- it cannot, Powell converges to ~0
+       regardless of true rotation -- it is acting as a SEARCH DIRECTION
+       that lets the line searches escape shallow valleys in the
+       translation landscape. Removing it costs evaluations rather than
+       saving them. See the inline comment for the full table.
+    4. If the quantized angle is 0 (the overwhelmingly common case -- real
+       drift here is ~0.1 deg), one seeded Powell fit IS the answer. If it
+       is non-zero, keep the three-candidate bake-off: ORB's own transform,
+       the seeded free-angle Powell fit, and a pinned zero-rotation Powell
+       fit, scored by reconstruction residual. The zero-rotation baseline
+       stays because bounds cannot replace it -- an ORB angle can be
+       spurious yet perfectly in bounds (observed on real data: a
+       readout-channel cross-modal pair reporting ~162 degrees is caught by
+       bounds, but a wrong 3 degrees would not be), and without a
+       no-rotation candidate there is nothing for a wrong-but-plausible
+       angle to lose to.
 
     border_trim (default 0, no behavior change): crop this many pixels off
     every edge of BOTH images before running either method -- vignetting,
@@ -507,15 +529,74 @@ def align_readout_to_reference(moving_mip, reference_mip, lb=0.3, ub=0.9999, bor
     H_orb = preprocess.compute_features_affinelike_matrix(moving_norm, reference_norm)
     angle_orb = _h_rotation_angle_degrees(H_orb)
 
-    if abs(angle_orb) < angle_threshold:
+    # ORB SEEDS POWELL instead of being discarded (see this function's own
+    # docstring for the measurement that motivated it: on 77 real hybe pairs
+    # ORB's centre displacement sat a median 0.165 px from Powell's final
+    # answer, max 1.089 px, at 1/127th of Powell's cost -- and the old code
+    # threw it away on every one of them, leaving Powell to start cold at
+    # (0, 0) and rediscover it).
+    #
+    # ONE-OUT ADMISSION. _within_hard_alignment_bounds is reused rather than
+    # open-coded precisely because it already implements the required rule:
+    # it fails if dx OR dy OR the angle is out of bounds, so a single bad
+    # parameter voids the whole seed. A rejected seed falls back to the
+    # original cold start -- never a partially-trusted one, since ORB's three
+    # outputs come from ONE correspondence set and a wrong correspondence
+    # corrupts all three together.
+    seed_admitted = _within_hard_alignment_bounds(H_orb, moving_norm.shape)
+    if seed_admitted:
+        seed_dy, seed_dx = _center_displacement(H_orb, moving_norm.shape)
+        # dx/dy in msd_cost_function's parameter space ARE the centre
+        # displacement: it rotates about the centre (which maps the centre to
+        # itself) and only then adds dx/dy. So ORB's centre displacement is
+        # directly usable as the seed, and being <= MAX_ALIGNMENT_TRANSLATION_PX
+        # it is inside powell_bounds by construction.
+        angle_seed = round(angle_orb / ANGLE_QUANTUM_DEG) * ANGLE_QUANTUM_DEG
+    else:
+        seed_dy = seed_dx = 0.0
+        angle_seed = 0.0
+    seed = [seed_dx, seed_dy, angle_seed]
+
+    # The angle stays a FREE Powell parameter, seeded from ORB rather than
+    # fixed to it. Holding it fixed was tried and measured, and it loses on
+    # both axes -- 24 real hybe pairs, versus the old cold-start baseline:
+    #
+    #     seed + free angle    1.28x faster    mean residual -0.217  (22/24 better)
+    #     cold + fixed angle   0.93x SLOWER    mean residual +0.569  ( 3/24 better)
+    #     seed + fixed angle   1.22x faster    mean residual -0.015  ( 3/24 better)
+    #
+    # The reason the a-priori argument for dropping it fails: that parameter is
+    # not functioning as a rotation ESTIMATE (it cannot -- Powell converges to
+    # ~0 regardless of true rotation, and the half-degree gate in
+    # find_best_alignment discards whatever it lands on). It functions as a
+    # SEARCH DIRECTION. Powell's line searches use it to leave shallow valleys
+    # in the translation landscape, and the dx/dy reached that way reconstruct
+    # measurably better. Removing it removes an escape route, so the optimizer
+    # needs MORE evaluations to meet the same tolerance, not fewer.
+    #
+    # Seeding it with ORB's quantized angle is what makes this the best of both:
+    # when rotation is real, Powell starts already holding it instead of having
+    # to discover a rotation it provably cannot discover.
+    if angle_seed == 0.0:
         candidates = [preprocess.compute_msd_homography_matrix(moving_norm, reference_norm,
                                                                 fixed_scale=1.0, fixed_angle=False,
-                                                                bounds=powell_bounds)]
+                                                                initial_guess=seed, bounds=powell_bounds)]
     else:
+        # Real, in-bounds rotation: keep the three-way bake-off. The
+        # zero-rotation baseline is the load-bearing one -- an ORB angle can be
+        # spurious yet perfectly in bounds (bounds catch 162 deg, not a wrong
+        # 3 deg), and without a candidate that assumes no rotation there is
+        # nothing for a wrong-but-plausible angle to lose to. It is pinned with
+        # fixed_angle=True rather than merely seeded at zero, so it stays a
+        # genuine no-rotation hypothesis that the free-angle candidate cannot
+        # drift into agreeing with.
         H_confirm = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
-                                                              fixed_angle=angle_orb, bounds=powell_bounds)
+                                                              fixed_angle=False, initial_guess=seed,
+                                                              bounds=powell_bounds)
         H_zero = preprocess.compute_msd_homography_matrix(moving_norm, reference_norm, fixed_scale=1.0,
-                                                           fixed_angle=True, bounds=powell_bounds)
+                                                           fixed_angle=True,
+                                                           initial_guess=[seed_dx, seed_dy, 0.0],
+                                                           bounds=powell_bounds)
         candidates = [H_orb, H_confirm, H_zero]
 
     # ORB is still checked post-hoc here (no native bounds available for
