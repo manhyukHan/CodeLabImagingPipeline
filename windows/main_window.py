@@ -392,6 +392,12 @@ class CellAlignmentWorker(QtCore.QThread):
 class CrossModalAlignmentWorker(QtCore.QThread):
     """fov_list: one entry (manual) or every FOV in the FOV list (automatic)."""
     progress = QtCore.pyqtSignal(int, int, str)
+    # Same contract as AlignmentWorker.fov_done, and for the same reason: the
+    # cross-modal overlay PNG is drawn as ITS FOV lands rather than every one
+    # of them after the last, so the GUI freezes for one FOV at a time with
+    # something to look at instead of for the whole run with nothing.
+    # H is a 3x3 ndarray, hence `object` rather than a typed signal argument.
+    fov_done = QtCore.pyqtSignal(int, object)   # (fov, H)
     finished_ok = QtCore.pyqtSignal(dict)  # {fov: H}
     failed = QtCore.pyqtSignal(str)
 
@@ -439,6 +445,9 @@ class CrossModalAlignmentWorker(QtCore.QThread):
                 z_results[fov] = float(dz)
                 self.progress.emit(i + 1, len(self.fov_list),
                                    f'FOV{fov:02d}: cross-modal computed (dz={dz:+.1f})')
+                # Queued to the GUI thread, which draws this FOV's overlay
+                # while this thread starts the next FOV's fit.
+                self.fov_done.emit(fov, H)
             self.finished_ok.emit({'H': results, 'z': z_results})
         except Exception as e:
             self.failed.emit(str(e))
@@ -6797,11 +6806,48 @@ class MainWindow(QtWidgets.QMainWindow):
                                                               border_trim=border_trim, max_shift=max_shift,
                                                               rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
         self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
+        # Draw+save each FOV's overlay AS IT LANDS, not all of them at the end.
+        self._cross_modal_overlays_saved = 0
+        self._cross_modal_worker.fov_done.connect(
+            lambda fov, H: self._save_cross_modal_overlay(
+                fov, H, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe))
         self._cross_modal_worker.finished_ok.connect(
             lambda results: self._on_cross_modal_all_finished(results, rna_storage_path, dna_storage_path,
                                                                rna_reference_hybe, dna_reference_hybe, channel_type))
         self._cross_modal_worker.failed.connect(self._on_cross_modal_all_failed)
         self._cross_modal_worker.start()
+
+    def _save_cross_modal_overlay(self, fov, H, rna_storage_path, dna_storage_path,
+                                  rna_reference_hybe, dna_reference_hybe):
+        """
+        One FOV's cross-modal overlay PNG, drawn as that FOV completes.
+
+        Cross-modal counterpart of _save_fov_alignment_overlay -- see there for
+        why this runs on the GUI thread and why the cost is unchanged while the
+        experience is not.
+
+        Only the DRAWING moved here. Committing the Z drift and mirroring the
+        parameters into vlinks.h5 stay in _on_cross_modal_all_finished: those
+        are cheap dict/HDF5 writes, not the reason the window froze, and the Z
+        values arrive as one payload with finished_ok rather than per FOV.
+
+        Never raises into the signal: a failure to draw must not take down a
+        run whose matrices are already computed.
+        """
+        ap = self.ui.AlignmentPanel
+        channel_type = ap.ChannelTypeComboBox.currentText()
+        try:
+            save_path = paths.figure_path(dna_storage_path, 'alignment', fov, 'cross_modal_overlay.png')
+            self.preview_canvas.draw_cross_modal_preview(
+                rna_storage_path, dna_storage_path, fov,
+                rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
+                rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
+                dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
+            self._cross_modal_overlays_saved = getattr(self, '_cross_modal_overlays_saved', 0) + 1
+            ap.LogTextEdit.append(f'FOV{fov:02d}: cross-modal overlay image saved.')
+        except Exception as e:
+            ap.LogTextEdit.append(f'FOV{fov:02d}: cross-modal overlay image could not be saved ({e}); '
+                                  f'matrices are unaffected.')
 
     def _on_cross_modal_all_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
         # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z
@@ -6818,17 +6864,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross_modal_result.update({(dna_storage_path, fov): H for fov, H in results.items()})
         self._pending_cross_modal = None
         self._refresh_cross_modal_results_list()
+        # Overlays are NOT drawn here any more -- each was already written by
+        # _save_cross_modal_overlay as its FOV finished. What remains is the
+        # cheap per-FOV bookkeeping, which was never the source of the freeze.
         for fov, H in results.items():
-            save_path = paths.figure_path(dna_storage_path, 'alignment', fov, 'cross_modal_overlay.png')
-            self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, fov,
-                                                 rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
-                                                 rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
-                                                 dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
             self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
             self._mirror_cross_modal_params_to_vlinks(rna_storage_path, dna_storage_path, fov, H,
                                                       rna_reference_hybe, dna_reference_hybe, channel_type)
-        QtWidgets.QMessageBox.information(self, 'Cross-modal alignment complete',
-                                          f'{len(results)} FOV(s) aligned and saved; overlay image(s) written.')
+        n_overlays = getattr(self, '_cross_modal_overlays_saved', 0)
+        QtWidgets.QMessageBox.information(
+            self, 'Cross-modal alignment complete',
+            f'{len(results)} FOV(s) aligned and saved; {n_overlays} overlay image(s) written.')
 
     def _on_cross_modal_all_failed(self, message):
         self.ui.AlignmentPanel.RunAllCrossModalPushButton.setEnabled(True)
