@@ -300,6 +300,70 @@ def read_dax(filename, matlab=False):
             data = np.fromfile(f, dtype=dtype).reshape((height, width, frames), order='F').squeeze()
     return data
 
+def _discard_partial(tmp_h5name):
+    """
+    Remove a half-written .part, best effort.
+
+    Never raises: this runs inside exception handlers whose job is to report
+    the ORIGINAL failure, and a cleanup error (another process still holding
+    the handle, a read-only volume) must not replace it with a less
+    informative one. A leftover .part is inert -- nothing reads that suffix,
+    and tools/verify_store.py reports any that survive.
+    """
+    try:
+        if tmp_h5name and os.path.exists(tmp_h5name):
+            os.remove(tmp_h5name)
+    except OSError:
+        logging.warning(f'could not remove partial file {tmp_h5name}')
+
+
+def stack_is_complete(stack_h5name, channels, expected_depth):
+    """
+    Does this stack file actually contain everything ingestion promised, or
+    does it merely EXIST?
+
+    Append mode used to ask os.path.exists and nothing more, which made a
+    half-written file permanently invisible to re-ingestion: it exists, so
+    append skips it, forever, and only a full overwrite of the whole store
+    could ever replace it. That is not hypothetical -- it is exactly how
+    FOV01's Hyb_016 (channel 555 written, 635 missing) and Hyb_017 (zero
+    channels) survived repeated re-ingestion runs, until they finally
+    surfaced as an unrelated-looking crash in cell alignment, the first
+    stage that reads stacks rather than MIPs.
+
+    Checks structure AND readability. The readability probe matters on its
+    own: HDF5 opens a truncated file perfectly happily and reports the
+    declared shape from its header -- the failure only appears when the
+    missing bytes are actually read. So touch the first and last element of
+    every channel, which is cheap (two chunk reads) and is the only thing
+    that distinguishes "complete" from "header says 120 planes, disk has 30".
+
+    Any exception means not complete: this is a gate in front of a rebuild,
+    so an unreadable file must fail closed and be rebuilt, never propagate.
+    """
+    try:
+        with h5py.File(stack_h5name, 'r') as f:
+            if '/stack' not in f or '/mip' not in f:
+                return False
+            for ch in channels:
+                name = f'ch{ch}'
+                if name not in f['/stack'] or name not in f['/mip']:
+                    return False
+                dset = f['/stack'][name]
+                if dset.ndim != 3 or dset.shape[-1] != expected_depth:
+                    return False
+                dset[0, 0, 0]
+                dset[dset.shape[0] - 1, dset.shape[1] - 1, dset.shape[2] - 1]
+                mip = f['/mip'][name]
+                if mip.ndim != 2:
+                    return False
+                mip[0, 0]
+                mip[mip.shape[0] - 1, mip.shape[1] - 1]
+    except Exception:
+        return False
+    return True
+
+
 def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False):
     """
     Convert one FOV's raw .dax for one hybe into a per-(fov,hybe) H5 file,
@@ -316,18 +380,26 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
     os.makedirs(os.path.dirname(paths.stack_path(storage_path, fov, folder)), exist_ok=True)
     stack_h5name = paths.stack_path(storage_path, fov, folder)
 
-    if os.path.exists(stack_h5name):
-        if not overwrite:
-            return fov, folder, None
-        os.remove(stack_h5name)
-
     # ExperimentLayout's totalFrames is the authoritative source for depth (z-plane
     # count) per hybe -- e.g. barcode hybes here have totalFrames=354 (177 z-planes
     # per channel) vs. 260 (130 z-planes) for regular hybes, so this must be read
     # per-hybe from the layout, never assumed uniform across a dataset.
     expected_depth = hybe_record['total_frames'] // len(channels)
 
+    if os.path.exists(stack_h5name) and not overwrite:
+        # Completeness, not mere existence -- see stack_is_complete. A damaged
+        # file now REBUILDS in append mode instead of being skipped forever,
+        # which makes this failure class self-healing on the next ordinary run
+        # rather than requiring a full-store overwrite to clear.
+        if stack_is_complete(stack_h5name, channels, expected_depth):
+            return fov, folder, None
+        logging.warning(f'FOV {fov} {folder}: existing stack is incomplete or unreadable '
+                        f'-- rebuilding it despite append mode')
+
     dax_path = os.path.join(dax_directory, folder, f'ConvZscan_{fov-1:02d}.dax')
+    # Bound before the try: every handler below cleans it up, including the
+    # read_dax failure that happens before it would otherwise be assigned.
+    tmp_h5name = stack_h5name + '.part'
     try:
         dax = read_dax(dax_path)
         attributes = {
@@ -345,7 +417,21 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
             'path': dax_path,
         }
 
-        with h5py.File(stack_h5name, 'w') as f:
+        # ATOMIC PUBLISH: build into a sibling .part and os.replace it into
+        # position only once it is complete and closed. The old code did
+        # os.remove(stack) and then rebuilt in place, so the file was missing
+        # or half-written for the entire multi-second write -- kill the run in
+        # that window (a user quitting an overwrite pass) and the stack is
+        # destroyed, with its MIP left behind from the previous run to make it
+        # look ingested. os.replace is atomic on Windows and POSIX alike for
+        # same-directory paths, so a reader sees either the old complete file
+        # or the new complete one, never a partial.
+        #
+        # Peak extra disk is bounded by CONCURRENT workers, not by store size:
+        # one .part per worker in flight, so ~278 MB x n_workers (~3.3 GB at
+        # 12 workers on this dataset), released as each is published.
+        tmp_h5name = stack_h5name + '.part'
+        with h5py.File(tmp_h5name, 'w') as f:
             # No /matrix group: alignment matrices are metadata and live in
             # vlinks.h5 alone (see chain.write_same_modality_matrices). A
             # stack file holds raw data plus the MIP derived from it in this
@@ -380,24 +466,43 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
                 create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
             attributes['shape'] = dat.shape
             f.attrs.update(attributes)
+        channel_mips = None
         if paths.is_v2(storage_path):
+            # Read the MIPs back out of the .part BEFORE publishing, so a
+            # failure here still leaves the previous stack untouched.
+            with h5py.File(tmp_h5name, 'r') as f:
+                channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
+
+        os.replace(tmp_h5name, stack_h5name)
+
+        if channel_mips is not None:
             # v2: this worker writes the per-hybe MIP file itself
             # (atomically -- see vlinks_store.write_hybe_mip's v2 branch),
             # so the coordinator never touches MIPs and vlinks.h5 sees no
             # ingestion traffic at all: the UI stays live mid-ingestion
             # and each hybe becomes browsable the moment ITS file lands.
+            # Written AFTER the stack is published, so the only interruption
+            # window left leaves a complete stack with a stale MIP -- fully
+            # recoverable, since the MIP is derived from the stack.
             from . import vlinks_store
-            with h5py.File(stack_h5name, 'r') as f:
-                channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
             vlinks_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
                                         fiducial_channel=hybe_record['fiducial_channel'])
         logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')
         return fov, folder, None
     except FileNotFoundError:
         logging.error(f'DAX file not found: {dax_path}')
+        _discard_partial(tmp_h5name)
         return fov, folder, 'FileNotFoundError'
-    except Exception as e:
+    except BaseException as e:
+        # BaseException, not Exception: KeyboardInterrupt and SystemExit are
+        # precisely the interruptions that created the damage this atomic
+        # write exists to prevent, and a .part left behind by one of them
+        # would be a confusing several-hundred-MB orphan. Re-raised after
+        # cleanup so the interruption still terminates the worker.
         logging.error(f'Error processing FOV {fov}, hybe {folder}: {e}')
+        _discard_partial(tmp_h5name)
+        if not isinstance(e, Exception):
+            raise
         return fov, folder, str(e)
 
 
