@@ -38,6 +38,28 @@ MAX_ALIGNMENT_ROTATION_DEG = 10.0
 # tested for rather than approximated with a threshold.
 ANGLE_QUANTUM_DEG = 0.5
 
+# How far the cell-level Z refinement may move a hybe, in PLANES.
+#
+# Was pad/2 -- i.e. 5 planes at the default pad of 10 -- which derived a DEPTH
+# bound from an XY search radius. The two are not related: pad bounds how far
+# the YX crop could contain matching content, while Z drift between
+# hybridization rounds is a property of the focus/stage, and a 120-plane stack
+# has far more room in Z than a +-10 px crop has in XY.
+#
+# Measured on a real run (110 hybe entries, one FOV): the Z leg APPLIED a shift
+# on 75.5% of entries with |z| median 3.0 and max exactly 5.0 -- pinned at the
+# old cap, which is the signature of a distribution truncated by its limit
+# rather than by physics. Another 16.4% were rejected on magnitude alone, with
+# |z| median 7.5 and max 11.0: real, plausible drift that the bound discarded,
+# leaving those hybes with no Z correction at all.
+#
+# 15 covers the observed maximum with headroom while staying far below the
+# noise-locking artifacts this gate exists to catch (a -35 plane "fit" on a
+# low-signal crop is documented in compute_cell_alignment). It remains a
+# backstop, not the primary defence -- the reconstruction-residual quality gate
+# beside it is what actually rejects bad fits, and caught 8.2% here on its own.
+MAX_CELL_Z_SHIFT_PLANES = 15.0
+
 
 def _center_displacement(H, shape):
     """
@@ -1044,7 +1066,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
                            cell_reference_hybe_matrix=None, modality=None,
                            background_clip=None, fit_method='phase_correlation',
-                           integer_shift=False):
+                           integer_shift=False, z_max_shift=None):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -1456,7 +1478,6 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         H_yx = to_yx(H2)
 
         z_shift = 0.0
-        z_shift = 0.0
         if including_z:
             # z-depth correction uses the same channel_type-resolved
             # channel as the YX fit (ref_channel/target_channel) -- a
@@ -1512,15 +1533,19 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # still applied z=-35.0px -- a shift nowhere near physically
             # plausible for one hybridization round's worth of Z drift.
             #
-            # Magnitude gate: half of H2's own `> pad` bound -- per
-            # explicit request, `pad` itself was still too permissive for
-            # Z (Z drift between hybridization rounds should be smaller
-            # than the XY search radius this refinement crop was built
-            # with). Same underlying reasoning as H2's bound: the
-            # 'full'-mode correlation can return anything up to the whole
-            # profile length as its "best" lag, which is exactly the
-            # noise-locking failure mode, not a real registration.
-            z_magnitude_rejected = abs(z_shift_fitted) > pad / 2
+            # Magnitude gate. Its purpose is unchanged -- a 'full'-mode
+            # correlation can return anything up to the whole profile length
+            # as its "best" lag, which is the noise-locking failure mode, not
+            # a real registration -- but the BOUND is no longer pad/2.
+            #
+            # Deriving a depth limit from the XY search radius conflated two
+            # unrelated quantities, and measured against a real run it was
+            # cutting into genuine drift: applied shifts piled up exactly at
+            # the old 5-plane cap while 16.4% of entries were rejected on
+            # magnitude alone with |z| up to 11. See
+            # MAX_CELL_Z_SHIFT_PLANES for the full measurement.
+            z_bound = MAX_CELL_Z_SHIFT_PLANES if z_max_shift is None else float(z_max_shift)
+            z_magnitude_rejected = abs(z_shift_fitted) > z_bound
             # Quality gate: mirrors H2's own reconstruction-residual check,
             # applied on the SAME (width, depth) ZX crops the shift was
             # fitted from -- reject unless the shift strictly improves the
@@ -1539,7 +1564,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             zx_note = ''
         elif z_rejected:
             if z_magnitude_rejected:
-                z_reject_reason = f'{abs(z_shift_fitted):.1f}px > pad/2={pad / 2}'
+                z_reject_reason = f'{abs(z_shift_fitted):.1f}px > z_max={z_bound:g}'
             else:
                 z_reject_reason = (f'reconstruction residual {z_residual_after:.1f} >= {z_residual_before:.1f} '
                                    f'(no improvement over FOV/cross-modal)')

@@ -319,11 +319,14 @@ class CellAlignmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, channel_type='fiducial', pad=10):
+    def __init__(self, jobs, channel_type='fiducial', pad=10, z_max_shift=None):
         super().__init__()
         self.jobs = jobs
         self.channel_type = channel_type
         self.pad = pad
+        # None defers to chain.MAX_CELL_Z_SHIFT_PLANES rather than hard-coding
+        # a second copy of the default here -- one place to change it.
+        self.z_max_shift = z_max_shift
 
     def run(self):
         try:
@@ -361,7 +364,8 @@ class CellAlignmentWorker(QtCore.QThread):
                             cell, p['storage_path'], fov, hybe_records, fov_matrices,
                             reference_hybe=p['reference_hybe'], channel_type=self.channel_type,
                             pad=self.pad, modality=p['modality'],
-                            cell_reference_hybe_matrix=cellref_matrix)
+                            cell_reference_hybe_matrix=cellref_matrix,
+                            z_max_shift=self.z_max_shift)
                         done += 1
                         self.progress.emit(done, total,
                                            f"FOV{fov:02d} cell {cell.id} ({p['modality']}): aligned")
@@ -7464,11 +7468,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
 
         ap.RunCellAlignmentPushButton.setEnabled(False)
         self.statusBar().showMessage('Computing cell alignment...')
         worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
-        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad)
+        self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad,
+                                                          z_max_shift=z_max_shift)
         self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_finished(results, fov, container, storage_path,
@@ -7612,6 +7618,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
         n_saved = 0
         for fov, cell in self._cell_alignment_display_cells:
             if self._save_cell_overlay(cell, fov, storage_path, channel_type, pad,
@@ -7725,6 +7732,7 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_path, hybe_records = pctx['storage_path'], pctx['hybe_records']
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
 
         target_record, target_storage_path, err = self._resolve_preview_hybe_context(
             target_hybe, target_modality, storage_path, hybe_records, fov)
@@ -7839,6 +7847,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
 
         reference_key = ap.CellPreviewReferenceHybeComboBox.currentData()
         reference_hybe, reference_modality = (reference_key if reference_key
@@ -7937,12 +7946,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
 
         staged_cell = deepcopy(real_cell)
 
         worker = CellAlignmentWorker(
             [(fov, [staged_cell], self._cell_alignment_passes(cell_modality, storage_path, fov))],
-            channel_type=channel_type, pad=pad)
+            channel_type=channel_type, pad=pad, z_max_shift=z_max_shift)
         result_holder = {}
         worker.finished_ok.connect(lambda results: result_holder.__setitem__('results', results))
         worker.failed.connect(lambda message: result_holder.__setitem__('error', message))
@@ -8012,6 +8022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         run_params = self._pending_per_cell_alignment_params or {}
         channel_type = run_params.get('channel_type') or ap.CellChannelTypeComboBox.currentText()
         pad = run_params.get('pad', ap.CellPadSpinBox.value())
+        z_max_shift = run_params.get('z_max_shift', ap.CellZMaxShiftSpinBox.value())
         fp_cells = self._begin_cell_edit(fov)
         real_cell.matrices = staged_cell.matrices
         real_cell.matrix_anchors = staged_cell.matrix_anchors

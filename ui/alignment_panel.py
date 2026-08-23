@@ -1,5 +1,7 @@
 from PyQt5 import QtWidgets
 
+from codelab_pipeline.alignment import chain as alignment
+
 
 class AlignmentPanelUI(object):
     """
@@ -199,6 +201,19 @@ class AlignmentPanelUI(object):
         # real change in signal look alike to the fit.
         self.CellChannelTypeComboBox.addItems(['fiducial', 'readout'])
         cellLayout.addRow('Channel type:', self.CellChannelTypeComboBox)
+        self.CellZMaxShiftSpinBox = QtWidgets.QSpinBox()
+        self.CellZMaxShiftSpinBox.setRange(0, 500)
+        self.CellZMaxShiftSpinBox.setValue(int(alignment.MAX_CELL_Z_SHIFT_PLANES))
+        self.CellZMaxShiftSpinBox.setSuffix(' planes')
+        # How far the cell-level Z refinement may move a hybe. Was derived from
+        # pad (pad/2 = 5 planes), which bounded a DEPTH correction by an XY
+        # search radius -- unrelated quantities. Measured on a real run, that
+        # cap was truncating genuine drift: applied shifts piled up exactly at
+        # 5 while 16.4% of hybes were rejected on magnitude alone with |z| up
+        # to 11. Raise it if hybes are still being rejected with plausible
+        # shifts; the reconstruction-residual gate beside it, not this bound,
+        # is what actually rejects bad fits.
+        cellLayout.addRow('Max Z shift:', self.CellZMaxShiftSpinBox)
         self.CellPadSpinBox = QtWidgets.QSpinBox()
         self.CellPadSpinBox.setRange(0, 500)
         self.CellPadSpinBox.setValue(10)
