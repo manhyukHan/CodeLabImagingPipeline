@@ -402,12 +402,28 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
 
 
 def normalize_to_uint8(img: np.ndarray, lb=.1, ub=.9999):
+    # np.nanquantile/nanmin/nanmax are far more expensive than their plain
+    # counterparts -- they mask and compact the whole array before reducing,
+    # and a quantile is a sort. On input containing no NaN they return exactly
+    # the same values, so establish once whether this array actually has any
+    # and take the cheap path when it does not.
+    #
+    # An integer array cannot hold NaN at all, so its check is free (a dtype
+    # test, no scan). That is the case that matters: every MIP and stack read
+    # from HDF5 here is uint16. Only the cell-crop compositor genuinely passes
+    # float arrays with real NaN holes (see canvas._composite_multi), and it
+    # still gets the correct NaN-aware behavior.
+    has_nan = img.dtype.kind == 'f' and bool(np.isnan(img).any())
+    quantile = np.nanquantile if has_nan else np.quantile
+    amin, amax = (np.nanmin, np.nanmax) if has_nan else (np.min, np.max)
+
     img = img.astype(np.float32)
-    lbq = np.nanquantile(img,lb) if lb < 1 else lb
-    ubq = np.nanquantile(img, ub) if ub < 1 else ub    
+    lbq = quantile(img, lb) if lb < 1 else lb
+    ubq = quantile(img, ub) if ub < 1 else ub
     img = np.clip(img, lbq, ubq)
-    img = (img - np.nanmin(img)) / (np.nanmax(img) - np.nanmin(img)) * 255
-    return img.astype(np.uint8)
+    lo = amin(img)
+    span = amax(img) - lo
+    return ((img - lo) / span * 255).astype(np.uint8)
 
 def pad_to_same_size(img1, img2, pad_value=0):
     h1, w1 = img1.shape[:2]

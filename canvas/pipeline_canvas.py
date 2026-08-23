@@ -39,22 +39,63 @@ def _composite_multi(images, lb=0.3, ub=0.9999):
     """
     labels = list(images.keys())
     shape = next(iter(images.values())).shape
-    composite = np.zeros((*shape, 3), dtype=float)
-    valid_any = np.zeros(shape, dtype=bool)
     n = len(labels)
+
+    # Channel-major (3, H, W) rather than (H, W, 3), and float32 rather than
+    # float64, purely so the per-image accumulation below can run in place:
+    # composite[c] is then a CONTIGUOUS plane, so np.maximum(..., out=) writes
+    # straight into it instead of striding. Transposed back to (H, W, 3) for
+    # imshow at the end -- one copy, instead of one 25 MB float64 temporary per
+    # image per channel. Measured on a real 78-hybe FOV, this function was
+    # 82% of the whole overlay-PNG cost (17.4 s of 21.3 s), and roughly half of
+    # that was allocating and discarding those temporaries.
+    composite = np.zeros((3, *shape), dtype=np.float32)
+    scratch = np.empty(shape, dtype=np.float32)
+
+    # The gray fill below marks pixels NO image covered -- the INTERSECTION of
+    # every image's holes. Tracked as: once any single image covers the whole
+    # frame that intersection is permanently empty, so one flag short-circuits
+    # it. That is the normal case here (whole-FOV MIPs always cover the frame),
+    # which is why it is worth not allocating a mask for it at all.
+    every_pixel_covered = False
+    holes_all = None
+
     for i, label in enumerate(labels):
         color = _sequential_color(i, n)
         img = images[label]
-        valid = np.isfinite(img)
-        norm = np.zeros(shape, dtype=float)
-        if valid.any():
-            norm[valid] = preprocess.normalize_to_uint8(img[valid], lb, ub).astype(float)
-        norm /= 255
-        layer = np.stack([norm * c for c in color], axis=-1)
-        composite = np.maximum(composite, layer)
-        valid_any |= valid
-    composite[~valid_any] = 90 / 255
-    return composite
+        # Only genuinely float input can have holes; an integer MIP never does,
+        # so this costs a dtype test rather than a full-array scan. The
+        # hole-aware path below stays exact for the cell-crop compositor, which
+        # really does pass float arrays with holes (see _true_bounds).
+        # np.isfinite, not np.isnan: +-inf counts as "no real data" too, which
+        # is what this has always meant.
+        valid = None
+        if img.dtype.kind == 'f':
+            finite = np.isfinite(img)
+            if not finite.all():
+                valid = finite
+
+        if valid is None:
+            norm = preprocess.normalize_to_uint8(img, lb, ub).astype(np.float32)
+            every_pixel_covered = True
+        else:
+            norm = np.zeros(shape, dtype=np.float32)
+            if valid.any():
+                norm[valid] = preprocess.normalize_to_uint8(img[valid], lb, ub)
+            if not every_pixel_covered:
+                holes = ~valid
+                holes_all = holes if holes_all is None else (holes_all & holes)
+        norm /= 255.0
+
+        for c, channel_weight in enumerate(color):
+            np.multiply(norm, channel_weight, out=scratch)
+            np.maximum(composite[c], scratch, out=composite[c])
+
+    # A pixel no image covered renders neutral gray, so "nothing here" stays
+    # visually distinct from "real signal, just dark".
+    if not every_pixel_covered and holes_all is not None and holes_all.any():
+        composite[:, holes_all] = 90 / 255
+    return np.ascontiguousarray(np.moveaxis(composite, 0, -1))
 
 
 def _true_bounds(H_eff, x, y, pad):
