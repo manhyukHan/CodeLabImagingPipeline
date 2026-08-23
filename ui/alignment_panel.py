@@ -64,7 +64,16 @@ class AlignmentPanelUI(object):
         self.SameModalityOverlayFovSpinBox.setValue(1)
         sameModalityLayout.addRow('Overlay FOV:', self.SameModalityOverlayFovSpinBox)
         self.SameModalityChannelTypeComboBox = QtWidgets.QComboBox()
-        self.SameModalityChannelTypeComboBox.addItems(['readout', 'fiducial'])
+        # fiducial FIRST, so it is the default. The matrices on this tab are
+        # always fitted fiducial-to-fiducial regardless of this setting (see
+        # canvas.draw_fov_all_readouts_overlay) -- the fiducial images the same
+        # physical object in every hybe, which is exactly what makes a
+        # before/after overlay readable as "did alignment work". A readout
+        # overlay shows genuinely different biological content per hybe, so
+        # residual misregistration is hard to distinguish from real signal
+        # change. Showing readout by default meant the default view was the one
+        # that answers the question least directly.
+        self.SameModalityChannelTypeComboBox.addItems(['fiducial', 'readout'])
         sameModalityLayout.addRow('Overlay channel:', self.SameModalityChannelTypeComboBox)
         self.SameModalityShowOverlayPushButton = QtWidgets.QPushButton('Show All-Readouts Overlay')
         sameModalityLayout.addRow(self.SameModalityShowOverlayPushButton)
@@ -180,7 +189,15 @@ class AlignmentPanelUI(object):
         self.CellReferenceHybeComboBoxes = {}
         cellLayout.addRow(self.CellReferenceHybeFormLayout)
         self.CellChannelTypeComboBox = QtWidgets.QComboBox()
-        self.CellChannelTypeComboBox.addItems(['readout', 'fiducial'])
+        # fiducial FIRST, so it is the default -- and here it is not only a
+        # display choice: this value selects the channel compute_cell_alignment
+        # actually FITS on, both the YX phase correlation and the Z leg. The
+        # cell-level step is a small residual refinement measured between two
+        # crops of the same physical location, which needs a channel showing
+        # the same physical content on both sides. Fiducial does; a readout
+        # round images different targets per hybe, so a real residual and a
+        # real change in signal look alike to the fit.
+        self.CellChannelTypeComboBox.addItems(['fiducial', 'readout'])
         cellLayout.addRow('Channel type:', self.CellChannelTypeComboBox)
         self.CellPadSpinBox = QtWidgets.QSpinBox()
         self.CellPadSpinBox.setRange(0, 500)
@@ -218,7 +235,14 @@ class AlignmentPanelUI(object):
         # -- tier 2: whole-FOV commit --
         self.CellOverlayAutoSaveThresholdSpinBox = QtWidgets.QSpinBox()
         self.CellOverlayAutoSaveThresholdSpinBox.setRange(0, 500)
-        self.CellOverlayAutoSaveThresholdSpinBox.setValue(5)
+        # 10 px, raised from 5. At 5 a routine FOV auto-saved far more overlays
+        # than anyone looks at, and each one costs ~9x the cell's own alignment
+        # fit -- the same "PNG work dominates the run" problem the FOV-level
+        # overlay had. 10 px still flags a genuinely unusual cell-level
+        # residual: the fit is bounded by pad (10 px default) in the first
+        # place, so this now means "at the edge of what this refinement is even
+        # allowed to move," which is the thing actually worth a human look.
+        self.CellOverlayAutoSaveThresholdSpinBox.setValue(10)
         self.CellOverlayAutoSaveThresholdSpinBox.setSuffix(' px')
         # Automatic-mode overlay PNGs are no longer generated for every
         # cell (too slow -- drawing+saving one is ~9x the cost of the

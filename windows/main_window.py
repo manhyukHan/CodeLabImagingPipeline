@@ -319,7 +319,7 @@ class CellAlignmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, channel_type='readout', pad=10):
+    def __init__(self, jobs, channel_type='fiducial', pad=10):
         super().__init__()
         self.jobs = jobs
         self.channel_type = channel_type
