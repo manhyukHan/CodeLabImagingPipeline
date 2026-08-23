@@ -237,6 +237,15 @@ class AlignmentWorker(QtCore.QThread):
     mode -- "automatic" now means batch, not single-FOV-as-a-demo.
     """
     progress = QtCore.pyqtSignal(int, int, str)
+    # Emitted as EACH FOV finishes, before the run as a whole does, so the
+    # overlay PNG for that FOV can be drawn and saved while the worker is
+    # already aligning the next one. Previously every PNG was drawn in
+    # finished_ok, i.e. all of them after the LAST FOV: ~10 s of GUI-thread
+    # matplotlib work per FOV, batched, so a 20-FOV run ended with a single
+    # frozen window for minutes with nothing to look at. Same total cost,
+    # completely different experience -- the freeze is now one FOV long, and
+    # between FOVs the previous result is on screen and the app responds.
+    fov_done = QtCore.pyqtSignal(int, dict)   # (fov, {hybe: H})
     finished_ok = QtCore.pyqtSignal(dict)  # {fov: {hybe: H}}
     failed = QtCore.pyqtSignal(str)
 
@@ -271,6 +280,11 @@ class AlignmentWorker(QtCore.QThread):
                 results[fov] = matrices
                 self.progress.emit((i + 1) * n_hybes, total,
                                    f'FOV{fov:02d}: {len(matrices)} hybe(s) aligned')
+                # Queued across the thread boundary, so the receiving slot runs
+                # on the GUI thread (matplotlib + preview_canvas are not usable
+                # from here) while THIS thread carries straight on to the next
+                # FOV's fit. The two overlap instead of queueing up at the end.
+                self.fov_done.emit(fov, matrices)
             self.finished_ok.emit(results)
         except Exception as e:
             self.failed.emit(str(e))
@@ -6414,10 +6428,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self._alignment_worker = AlignmentWorker(storage_path, fov_list, hybe_records, reference_hybe, write=True,
                                                   border_trim=border_trim, max_shift=max_shift)
         self._alignment_worker.progress.connect(self._on_alignment_progress)
+        # Draw+save each FOV's overlay AS IT LANDS, not all of them at the end.
+        # Resolve channel_type per FOV inside the slot rather than capturing it
+        # here, so changing the combo mid-run affects the FOVs still to come.
+        self._fov_overlays_saved = 0
+        self._alignment_worker.fov_done.connect(
+            lambda fov, matrices: self._save_fov_alignment_overlay(
+                fov, matrices, storage_path, hybe_records, reference_hybe))
         self._alignment_worker.finished_ok.connect(
             lambda results: self._on_fov_alignment_all_finished(results, storage_path, hybe_records, reference_hybe))
         self._alignment_worker.failed.connect(self._on_fov_alignment_all_failed)
         self._alignment_worker.start()
+
+    def _save_fov_alignment_overlay(self, fov, matrices, storage_path, hybe_records, reference_hybe):
+        """
+        One FOV's all-readouts overlay PNG, drawn as that FOV completes.
+
+        Runs on the GUI thread (AlignmentWorker.fov_done crosses the thread
+        boundary as a queued connection) because it touches preview_canvas and
+        matplotlib, neither of which is safe off it. That does block the UI for
+        the duration -- ~10 s on a real 78-hybe FOV -- but only for ONE FOV at
+        a time, with the worker already fitting the next one meanwhile, and
+        with that FOV's result left on screen to look at. The previous
+        behaviour paid exactly the same total cost as one uninterrupted freeze
+        after the final FOV, showing nothing until it ended.
+
+        Never raises into the signal: a failure to DRAW must not take down a
+        run whose matrices are already computed and written.
+        """
+        ap = self.ui.AlignmentPanel
+        channel_type = ap.SameModalityChannelTypeComboBox.currentText()
+        try:
+            save_path = paths.figure_path(storage_path, 'alignment', fov, 'alignment_overlay.png')
+            self.preview_canvas.draw_fov_all_readouts_overlay(
+                storage_path, fov, hybe_records, reference_hybe, matrices,
+                save_path=save_path, channel_type=channel_type)
+            self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
+            ap.LogTextEdit.append(f'FOV{fov:02d}: overlay image saved.')
+        except Exception as e:
+            ap.LogTextEdit.append(f'FOV{fov:02d}: overlay image could not be saved ({e}); '
+                                  f'matrices are unaffected.')
 
     def _on_fov_alignment_all_finished(self, results, storage_path, hybe_records, reference_hybe):
         ap = self.ui.AlignmentPanel
@@ -6432,12 +6482,14 @@ class MainWindow(QtWidgets.QMainWindow):
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
         vlinks_store.write_global_params(storage_path, same_modality_reference_hybe=reference_hybe,
                                          same_modality_channel_type=channel_type)
-        for fov, matrices in results.items():
-            save_path = paths.figure_path(storage_path, 'alignment', fov, 'alignment_overlay.png')
-            self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, hybe_records, reference_hybe, matrices,
-                                                      save_path=save_path, channel_type=channel_type)
-        QtWidgets.QMessageBox.information(self, 'FOV alignment complete',
-                                          f'{len(results)} FOV(s) aligned and saved; overlay image(s) written.')
+        # Overlays are NOT drawn here any more -- each one was already written
+        # by _save_fov_alignment_overlay as its FOV finished. Drawing them in
+        # this slot meant every FOV's matplotlib work happened after the last
+        # fit, as one unbroken GUI-thread freeze.
+        n_overlays = getattr(self, '_fov_overlays_saved', 0)
+        QtWidgets.QMessageBox.information(
+            self, 'FOV alignment complete',
+            f'{len(results)} FOV(s) aligned and saved; {n_overlays} overlay image(s) written.')
 
     def _on_fov_alignment_all_failed(self, message):
         self.ui.AlignmentPanel.RunAllFovAlignmentPushButton.setEnabled(True)
