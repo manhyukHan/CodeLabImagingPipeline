@@ -324,12 +324,6 @@ class AlignmentPanelUI(object):
         self.ProgressBar = QtWidgets.QProgressBar()
         controls_layout.addWidget(self.ProgressBar)
 
-        controls_layout.addWidget(QtWidgets.QLabel('Log:'))
-        self.LogTextEdit = QtWidgets.QTextEdit()
-        self.LogTextEdit.setReadOnly(True)
-        self.LogTextEdit.setMinimumHeight(120)
-        controls_layout.addWidget(self.LogTextEdit)
-
         controls_layout.addStretch()
 
     def _accept_reject_row(self):

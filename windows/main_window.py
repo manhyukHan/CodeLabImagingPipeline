@@ -17,6 +17,7 @@ from ui.main_window_ui import MainWindowUI
 from canvas.pipeline_canvas import PipelineCanvas, _sequential_color
 from canvas.cell_displayer import CellDisplayer
 from ui.cytoplasm_panel import CytoplasmSegmentationWindow
+from ui.log_window import LogWindow
 from canvas.spot_crop_displayer import SpotCropDisplayer
 from canvas.localize_3d_displayer import Localize3DDisplayer, Localize3DGridDisplayer
 from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
@@ -775,6 +776,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # the single composited view can sit side by side on screen.
         self.chromatin_fiducial_total_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Total Overlay')
 
+        # The one combined, timestamped log window (see ui/log_window.py's
+        # docstring) -- every panel's messages land here via self.log().
+        # Created before _connect_signals/_load_config so anything logged
+        # from here on already has its sink; main.py shows it alongside the
+        # main window itself.
+        self.log_window = LogWindow()
+        self.log('CODE Lab Imaging Pipeline started.')
         self._quitting = False   # closeEvent re-entry guard (closeAllWindows below re-fires it)
 
         self._connect_signals()
@@ -782,6 +790,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if config_file is not None:
             self._load_config(config_file)
+
+    def log(self, message):
+        """The single log sink: every message that used to land in some
+        panel's own log box goes to the combined pop-up log window, which
+        timestamps it. The panels carry no log boxes at all any more."""
+        self.log_window.append(message)
+
+    def show_log_window(self):
+        self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
 
     def closeEvent(self, event):
         """Closing the MAIN window quits the whole app -- after asking.
@@ -853,6 +872,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cp = self.ui.CellSegmentPanel
         sp = self.ui.SpotLocalizationPanel
         ctp = self.ui.CelltypeDeterminationPanel
+
+        self.ui.ShowLogPushButton.clicked.connect(self.show_log_window)
 
         ip.SetNumModalitiesPushButton.clicked.connect(self._on_set_num_modalities)
         ip.ActivateModalitiesPushButton.clicked.connect(self._on_activate_modalities)
@@ -1407,7 +1428,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         ip.lock_modality_setup()
         self._activate_modalities(names)
-        ip.LogTextEdit.append(f"Activated modalities: {', '.join(names)}")
+        self.log(f"Activated modalities: {', '.join(names)}")
 
     # -- ingestion --
 
@@ -1455,7 +1476,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     # the path the data will ACTUALLY land in, not the
                     # project root the user typed.
                     self._save_current_modality_fields()
-                    ip.LogTextEdit.append(f'New v2 project -- storage path is now {storage_path}')
+                    self.log(f'New v2 project -- storage path is now {storage_path}')
 
                 vlinks_store.declare_modality(storage_path, ip.current_modality)
                 # Write/refresh the manifest, which is what makes paths.py
@@ -1477,7 +1498,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # (see _refresh_params_from_vlinks), without ever loading a
             # config file.
             vlinks_store.write_global_params(storage_path, layout_path=layout_path)
-        ip.LogTextEdit.append(f'Parsed {len(self.hybe_records)} hybe(s) from {layout_path}')
+        self.log(f'Parsed {len(self.hybe_records)} hybe(s) from {layout_path}')
 
         # Parsing is really three separable jobs, per explicit review of
         # the earlier "just refuse Parse Layout during ingestion" fix:
@@ -1510,10 +1531,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ip.RunIngestionPushButton.setEnabled(True)
             self._check_ingestion_status(silent=True)
         else:
-            ip.LogTextEdit.append(
-                'Ingestion is running -- the hybe-to-ingest checklist and full status '
-                'scan are skipped (re-parse once it finishes to refresh them); active '
-                'hybe choices below are still kept current.')
+            self.log(
+                     'Ingestion is running -- the hybe-to-ingest checklist and full status '
+                     'scan are skipped (re-parse once it finishes to refresh them); active '
+                     'hybe choices below are still kept current.')
 
         # active_hybe_list/total_active_hybe_list refresh -- covers every
         # hybe-choosing combo (reference hybes, cell-alignment anchor,
@@ -1581,9 +1602,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ctp.BarcodeMethodComboBox.setCurrentText(
                     'Median' if barcode_method == 'median' else 'Vote (200-sample)')
         if n_dropped_legacy:
-            ctp.LogTextEdit.append(f'{n_dropped_legacy} barcode-channel/calibration entr(ies) from an older '
-                                   f'saved config had no modality tag -- dropped rather than guessed. '
-                                   f'Re-assign/re-calibrate the affected celltype(s) if needed.')
+            self.log(f'{n_dropped_legacy} barcode-channel/calibration entr(ies) from an older '
+                     f'saved config had no modality tag -- dropped rather than guessed. '
+                     f'Re-assign/re-calibrate the affected celltype(s) if needed.')
         # any celltype named only via a barcode assignment/FOV range
         # (not yet reflected in any real classified cell) should still
         # show up in the shared identity list.
@@ -1745,7 +1766,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.RunIngestionPushButton.setEnabled(False)
         ip.ProgressBar.setValue(0)
         ip.ProgressBar.setMaximum(len(selected_records) * len(fov_list))
-        ip.LogTextEdit.append(f'Starting ingestion ({overwrite_mode}): {len(fov_list)} FOV(s) x {len(selected_records)} hybe(s)...')
+        self.log(f'Starting ingestion ({overwrite_mode}): {len(fov_list)} FOV(s) x {len(selected_records)} hybe(s)...')
         self.statusBar().showMessage('Ingesting...')
 
         self._ingestion_worker = IngestionWorker(fov_list, selected_records, dax_directory, storage_path, modality,
@@ -1820,7 +1841,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_ingestion_progress(self, done, total, message):
         ip = self.ui.IngestionPanel
         ip.ProgressBar.setValue(done)
-        ip.LogTextEdit.append(message)
+        self.log(message)
 
     def _on_ingestion_finished(self, n_errors, n_total, error_lines):
         ip = self.ui.IngestionPanel
@@ -1847,21 +1868,21 @@ class MainWindow(QtWidgets.QMainWindow):
             # returned, not thrown), so this branch is reachable even
             # though finished_ok fired -- don't call it "successful" just
             # because nothing raised.
-            ip.LogTextEdit.append(f'Ingestion finished with {n_errors}/{n_total} task(s) FAILED:')
+            self.log(f'Ingestion finished with {n_errors}/{n_total} task(s) FAILED:')
             for line in error_lines:
-                ip.LogTextEdit.append(f'  {line}')
+                self.log(f'  {line}')
             self.statusBar().showMessage(f'Ingestion finished with {n_errors}/{n_total} failure(s).', 5000)
             QtWidgets.QMessageBox.warning(self, 'Ingestion finished with errors',
                                           f'{n_errors} of {n_total} FOV/hybe task(s) failed -- see the log for details.\n'
                                           f'First error: {error_lines[0]}')
         else:
-            ip.LogTextEdit.append('Ingestion complete.')
+            self.log('Ingestion complete.')
             self.statusBar().showMessage('Ingestion complete.', 5000)
             QtWidgets.QMessageBox.information(self, 'Ingestion complete', f'Ingestion finished successfully ({n_total} task(s)).')
 
     def _on_ingestion_failed(self, message):
         ip = self.ui.IngestionPanel
-        ip.LogTextEdit.append(f'Ingestion FAILED: {message}')
+        self.log(f'Ingestion FAILED: {message}')
         ip.RunIngestionPushButton.setEnabled(True)
         self.statusBar().clearMessage()
         self._check_ingestion_status(silent=True)
@@ -1993,7 +2014,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap = self.ui.AlignmentPanel
         ap.ProgressBar.setMaximum(max(total, 1))
         ap.ProgressBar.setValue(done)
-        ap.LogTextEdit.append(message)
+        self.log(message)
         self.statusBar().showMessage(message)
 
     def _ingestion_is_running(self):
@@ -2408,7 +2429,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run_next_queued_job(self):
         ip = self.ui.IngestionPanel
         if self._job_queue_index >= len(self._job_queue):
-            ip.LogTextEdit.append(f'Job queue complete ({len(self._job_queue)} job(s)).')
+            self.log(f'Job queue complete ({len(self._job_queue)} job(s)).')
             ip.RunQueuePushButton.setEnabled(True)
             ip.RunIngestionPushButton.setEnabled(True)
             # same catch-up _on_ingestion_finished does -- once, for the
@@ -2426,8 +2447,8 @@ class MainWindow(QtWidgets.QMainWindow):
         job = self._job_queue[self._job_queue_index]
         ip.ProgressBar.setValue(0)
         ip.ProgressBar.setMaximum(len(job['selected_records']) * len(job['fov_list']))
-        ip.LogTextEdit.append(f"Starting queued job {self._job_queue_index + 1}/{len(self._job_queue)}: "
-                              f"{job['modality']}, FOV {job['fov_list']}...")
+        self.log(f"Starting queued job {self._job_queue_index + 1}/{len(self._job_queue)}: "
+                 f"{job['modality']}, FOV {job['fov_list']}...")
         self._ingestion_worker = IngestionWorker(job['fov_list'], job['selected_records'],
                                                   job['dax_directory'], job['storage_path'], job['modality'],
                                                   overwrite=self._job_queue_overwrite,
@@ -2444,18 +2465,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
         if n_errors > 0:
-            ip.LogTextEdit.append(f'Job {self._job_queue_index + 1}/{len(self._job_queue)}: '
-                                  f'{n_errors}/{n_total} task(s) FAILED:')
+            self.log(f'Job {self._job_queue_index + 1}/{len(self._job_queue)}: '
+                     f'{n_errors}/{n_total} task(s) FAILED:')
             for line in error_lines:
-                ip.LogTextEdit.append(f'  {line}')
+                self.log(f'  {line}')
         else:
-            ip.LogTextEdit.append(f'Job {self._job_queue_index + 1}/{len(self._job_queue)} complete.')
+            self.log(f'Job {self._job_queue_index + 1}/{len(self._job_queue)} complete.')
         self._job_queue_index += 1
         self._run_next_queued_job()
 
     def _on_queued_job_failed(self, message):
         ip = self.ui.IngestionPanel
-        ip.LogTextEdit.append(f'Job {self._job_queue_index + 1}/{len(self._job_queue)} FAILED: {message}')
+        self.log(f'Job {self._job_queue_index + 1}/{len(self._job_queue)} FAILED: {message}')
         ip.RunQueuePushButton.setEnabled(True)
         ip.RunIngestionPushButton.setEnabled(True)
         self.statusBar().clearMessage()
@@ -2498,7 +2519,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._on_cell_segment_failed(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 return
             mask = np.zeros(reference_image.shape, dtype=np.uint8)
-            cp.LogTextEdit.append(f'Manual mode: opened empty mask for FOV{fov:02d} ({reference_hybe}, ch{channel}).')
+            self.log(f'Manual mode: opened empty mask for FOV{fov:02d} ({reference_hybe}, ch{channel}).')
             self._on_cell_segment_finished(mask, reference_image, fov, reference_hybe, modality, append=append)
             self.cell_displayer.ManualAddModeCheckBox.setChecked(True)
             return
@@ -2507,8 +2528,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._confirm_projection_choice(cp, 'Run Segmentation'):
             return
         proj_desc = segment.describe_projection(*cp.current_projection())
-        cp.LogTextEdit.append(
-            f'Segmenting FOV{fov:02d} ({reference_hybe}, ch{channel}, method={method}, {proj_desc})...')
+        self.log(
+                 f'Segmenting FOV{fov:02d} ({reference_hybe}, ch{channel}, method={method}, {proj_desc})...')
         self.statusBar().showMessage('Segmenting...')
 
         if method == 'cellpose':
@@ -2599,10 +2620,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 mask = self._filter_small_labels(mask, min_size)
                 n_removed = n_before_filter - int(np.count_nonzero(np.unique(mask)))
                 if n_removed > 0:
-                    cp.LogTextEdit.append(f'Append mode: removed {n_removed} remnant fragment(s) below {min_size}px after merging.')
-            cp.LogTextEdit.append(f'Append mode: merged with the existing {n_before} cell(s) already in this FOV.')
+                    self.log(f'Append mode: removed {n_removed} remnant fragment(s) below {min_size}px after merging.')
+            self.log(f'Append mode: merged with the existing {n_before} cell(s) already in this FOV.')
         elif append:
-            cp.LogTextEdit.append('Append mode: no existing mask for this FOV to append to -- starting fresh.')
+            self.log('Append mode: no existing mask for this FOV to append to -- starting fresh.')
 
         # min/max size already filtered inside segment_fov/segment_fov_classical -- don't re-filter here
         # preserve_existing=merged: a surviving cell id's own reference_hybe/
@@ -2618,7 +2639,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._commit_cell_edit(fov, fp)
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         n_cells = len(self.cell_container.get_cells(fov))
-        cp.LogTextEdit.append(f'Segmentation complete: {n_cells} cell(s) found.')
+        self.log(f'Segmentation complete: {n_cells} cell(s) found.')
         cp.RunSegmentationPushButton.setEnabled(True)
         self.statusBar().showMessage('Segmentation complete.', 5000)
         self.cell_displayer.set_data(reference_image, mask)
@@ -2626,7 +2647,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_cell_segment_failed(self, message):
         cp = self.ui.CellSegmentPanel
-        cp.LogTextEdit.append(f'Segmentation FAILED: {message}')
+        self.log(f'Segmentation FAILED: {message}')
         cp.RunSegmentationPushButton.setEnabled(True)
         self.statusBar().clearMessage()
         QtWidgets.QMessageBox.critical(self, 'Segmentation error', message)
@@ -2719,7 +2740,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                           'Pick a reference hybe and channel first.')
             return
         self._apply_focus_detection(cp, storage_path, cp.FovSpinBox.value(), hybe, channel,
-                                    cp.LogTextEdit.append)
+                                    self.log)
 
     def _apply_focus_detection(self, panel, storage_path, fov, hybe, channel, log):
         """Shared by both panels' Detect Focal Plane buttons -- one metric, one
@@ -2845,7 +2866,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Cytoplasmic Segmentation',
                                           'Pick a cytoplasm hybe and channel first.')
             return
-        self._apply_focus_detection(cw, storage_path, cw.FovSpinBox.value(), hybe, channel, cw.log)
+        self._apply_focus_detection(cw, storage_path, cw.FovSpinBox.value(), hybe, channel, self.log)
 
     def _refresh_cytoplasm_cell_list(self):
         cw = self.cytoplasm_window
@@ -2860,7 +2881,7 @@ class MainWindow(QtWidgets.QMainWindow):
                          f'{cell.nucleus_hybe} ({cell.nucleus_modality}){suffix}'))
         cw.set_cell_choices(rows)
         if not rows:
-            cw.log(f'FOV{fov:02d}: no cells loaded -- segment nuclei first.')
+            self.log(f'FOV{fov:02d}: no cells loaded -- segment nuclei first.')
 
     def _cell_nucleus_in_readout(self, cell, hybe, modality, fov):
         """
@@ -2958,10 +2979,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cell_displayer.set_data(image, label_mask.astype(float))
         self.cell_displayer.show()
         self.cell_displayer.raise_()
-        cw.log(f'Preview: {n_drawn}/{len(selected)} selected nucleus/nuclei project into '
-               f'{hybe} ({modality}).')
+        self.log(f'Preview: {n_drawn}/{len(selected)} selected nucleus/nuclei project into '
+                 f'{hybe} ({modality}).')
         if n_drawn < len(selected):
-            cw.log('  (some nuclei fall outside this hybe\'s frame entirely -- check alignment)')
+            self.log('  (some nuclei fall outside this hybe\'s frame entirely -- check alignment)')
 
     def _run_cytoplasm_segmentation(self):
         ctx = self._cytoplasm_context()
@@ -2992,9 +3013,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         diameter = cw.DiameterSpinBox.value() or None
         proj_desc = segment.describe_projection(*cw.current_projection())
-        cw.log(f'Running cellpose on {hybe} ch{channel} ({modality}) [{proj_desc}], '
-               f'{len(selected)} nucleus seed(s), seed style={cw.current_seed_mode()}, '
-               f'diameter={diameter or "auto"}...')
+        self.log(f'Running cellpose on {hybe} ch{channel} ({modality}) [{proj_desc}], '
+                 f'{len(selected)} nucleus seed(s), seed style={cw.current_seed_mode()}, '
+                 f'diameter={diameter or "auto"}...')
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             cyto_labels = segment.segment_cytoplasm(
@@ -3003,7 +3024,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QApplication.restoreOverrideCursor()
             QtWidgets.QMessageBox.critical(self, 'Cytoplasmic Segmentation', str(exc))
-            cw.log(f'FAILED: {exc}')
+            self.log(f'FAILED: {exc}')
             return
         QtWidgets.QApplication.restoreOverrideCursor()
 
@@ -3015,8 +3036,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                   'selected_ids': sorted(chosen)}
         cw.IncorporatePushButton.setEnabled(True)
         n = len(np.unique(cyto_labels)) - 1
-        cw.log(f'Cellpose returned {n} cytoplasm label(s). Review/remove in the displayer, '
-               f'then Incorporate.')
+        self.log(f'Cellpose returned {n} cytoplasm label(s). Review/remove in the displayer, '
+                 f'then Incorporate.')
         self._cell_displayer_mode = 'cytoplasm'
         self.cell_displayer.setWindowTitle(
             f'Cytoplasm Displayer -- FOV{fov:02d} {hybe} ch{channel} ({modality}) -- raw cytoplasm')
@@ -3065,13 +3086,13 @@ class MainWindow(QtWidgets.QMainWindow):
             n_updated += 1
 
         skipped = [c.id for c in cells if c.id not in claimed]
-        cw.log(f'Incorporated {n_updated} cytoplasm(s) at {hybe} ({modality}); '
-               f'{len(skipped)} cell(s) left nucleus-only.')
+        self.log(f'Incorporated {n_updated} cytoplasm(s) at {hybe} ({modality}); '
+                 f'{len(skipped)} cell(s) left nucleus-only.')
         if skipped:
-            cw.log(f'  nucleus-only: {", ".join(str(i) for i in sorted(skipped)[:20])}'
+            self.log(f'  nucleus-only: {", ".join(str(i) for i in sorted(skipped)[:20])}'
                    + (' ...' if len(skipped) > 20 else ''))
-        cw.log('Cell ids and count are unchanged. Alignment matrices were NOT recomputed -- '
-               're-run Cell-Based Alignment if you want the residual refit against the cytoplasm.')
+        self.log('Cell ids and count are unchanged. Alignment matrices were NOT recomputed -- '
+                 're-run Cell-Based Alignment if you want the residual refit against the cytoplasm.')
         # Review is OVER: the merge just landed in the transient container,
         # which is the one authority from here on (per explicit principle:
         # the raw cytoplasm labels are super-temporal, never stored;
@@ -3130,10 +3151,10 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_image = segment.read_projection(storage_path, fov, reference_hybe, channel,
                                                       mode=proj_mode, z_plane=proj_plane, z_range=proj_range)
         except (OSError, KeyError) as exc:
-            cp.LogTextEdit.append(f"Can't read {reference_hybe} ch{channel} for FOV{fov:02d}: {exc}")
+            self.log(f"Can't read {reference_hybe} ch{channel} for FOV{fov:02d}: {exc}")
             return
         if reference_image is None:
-            cp.LogTextEdit.append(f'{reference_hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
+            self.log(f'{reference_hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
 
         # activate whatever's persisted for this FOV (disk or already in
@@ -3175,7 +3196,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         display_cells = self.cell_container.get_cells(fov)
         self._render_cell_displayer(fov, display_cells, reference_hybe, modality, reference_image)
-        cp.LogTextEdit.append(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(display_cells)} cell(s).')
+        self.log(f'Displayer showing FOV{fov:02d} ({reference_hybe}, ch{channel}) -- {len(display_cells)} cell(s).')
 
     def _render_cell_displayer(self, fov, cells, reference_hybe, modality, reference_image):
         """
@@ -3208,8 +3229,8 @@ class MainWindow(QtWidgets.QMainWindow):
             valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
             mask[yi[valid], xi[valid]] = cell.id
         if cells and approximate:
-            cp.LogTextEdit.append(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
-                                  f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
+            self.log(f'Note: no alignment matrix for {reference_hybe} yet -- cell positions shown here '
+                     f'are raw/untransformed (approximate) until cell-based alignment is run for this hybe.')
         self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe, 'modality': modality}
         self.cell_displayer.set_data(reference_image, mask)
 
@@ -3245,9 +3266,9 @@ class MainWindow(QtWidgets.QMainWindow):
         removed = self.cell_container.remove(fov, ids)
         self._commit_cell_edit(fov, fp)
         self._refresh_cell_displayer_from_container(fov)
-        self.ui.CellSegmentPanel.LogTextEdit.append(
-            f'Removed {len(removed)} cell(s) ({", ".join(str(c.id) for c in removed) or "none found"}) -- '
-            f'{len(self.cell_container.get_cells(fov))} remain. Undo restores.')
+        self.log(
+                 f'Removed {len(removed)} cell(s) ({", ".join(str(c.id) for c in removed) or "none found"}) -- '
+                 f'{len(self.cell_container.get_cells(fov))} remain. Undo restores.')
 
     def _on_displayer_mask_edited(self, mask):
         """
@@ -3280,7 +3301,7 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_modality=self._last_segment_context.get('modality'))
         self._commit_cell_edit(fov, fp)
         n_cells = len(self.cell_container.get_cells(fov))
-        self.ui.CellSegmentPanel.LogTextEdit.append(f'Mask edited in displayer: {n_cells} cell(s) remain.')
+        self.log(f'Mask edited in displayer: {n_cells} cell(s) remain.')
 
     def _all_vlinks_storage_paths(self):
         """
@@ -3369,11 +3390,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # cells in one FOV can legitimately disagree, and nothing ever
             # read the FOV-level copy back.
             where = ', '.join(storage_paths)
-            cp.LogTextEdit.append(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
-                                  f'container and vlinks.h5 ({where}).')
+            self.log(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
+                     f'container and vlinks.h5 ({where}).')
         else:
-            cp.LogTextEdit.append(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
-                                  f'container (no storage path set -- not written to vlinks.h5).')
+            self.log(f'Saved {len(self.cell_container.get_cells(fov))} cell(s) for FOV{fov:02d} to permanent '
+                     f'container (no storage path set -- not written to vlinks.h5).')
 
     def _discard_cells(self):
         cp = self.ui.CellSegmentPanel
@@ -3384,7 +3405,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_displayer.reference_image is not None:
             empty_mask = np.zeros(self.cell_displayer.reference_image.shape, dtype=np.uint8)
             self.cell_displayer.set_data(self.cell_displayer.reference_image, empty_mask)
-        cp.LogTextEdit.append(f'Discarded transient cells for FOV{fov:02d}.')
+        self.log(f'Discarded transient cells for FOV{fov:02d}.')
 
     def _send_permanent_cells_to_transient(self):
         cp = self.ui.CellSegmentPanel
@@ -3398,7 +3419,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None:
             self.cell_container = CellContainer([fov])
         self.cell_container.sync_from(self.cell_container_permanent, fov)
-        cp.LogTextEdit.append(f'Pulled {len(self.cell_container.get_cells(fov))} cell(s) from permanent for FOV{fov:02d}.')
+        self.log(f'Pulled {len(self.cell_container.get_cells(fov))} cell(s) from permanent for FOV{fov:02d}.')
 
     def _activate_fov(self, fov):
         """
@@ -3537,7 +3558,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.cell_container_permanent.data[fov] = loaded.data[fov]
                     if fov not in self.cell_container_permanent.fov_list:
                         self.cell_container_permanent.fov_list.append(fov)
-                cp.LogTextEdit.append(f'Activated {len(cell_dicts)} cell(s) for FOV{fov:02d} from vlinks.h5 ({storage_path}).')
+                self.log(f'Activated {len(cell_dicts)} cell(s) for FOV{fov:02d} from vlinks.h5 ({storage_path}).')
 
         if self.cell_container_permanent is None or fov not in self.cell_container_permanent.data \
                 or not self.cell_container_permanent.data[fov]:
@@ -3563,7 +3584,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              .get('storage_path') or storage_path)
         reference_image = vlinks_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
-            cp.LogTextEdit.append(f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d} -- cannot show existing cells.')
+            self.log(f'{reference_hybe} not in vlinks.h5 for FOV{fov:02d} -- cannot show existing cells.')
             return False
 
         # same uint8 label convention segment_fov/segment_fov_classical
@@ -3587,7 +3608,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.CellOverlayFovSpinBox.setValue(fov)
         ap.CellOverlayFovSpinBox.blockSignals(False)
         self._refresh_cell_fov_panels(fov)
-        cp.LogTextEdit.append(f'Showing {len(cells)} already-saved cell(s) for FOV{fov:02d} (from permanent container).')
+        self.log(f'Showing {len(cells)} already-saved cell(s) for FOV{fov:02d} (from permanent container).')
         return True
 
     @staticmethod
@@ -3818,7 +3839,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if int(spot.cell) != -1:
                     n_by_cell[int(spot.cell)] = n_by_cell.get(int(spot.cell), 0) + 1
             sp.populate_cell_choices(cells, n_by_cell)
-            sp.LogTextEdit.append(f'Cell list refreshed: {len(cells)} cell(s) for FOV{fov:02d}.')
+            self.log(f'Cell list refreshed: {len(cells)} cell(s) for FOV{fov:02d}.')
         self._refresh_spot_fov_summary()
         self._refresh_spot_breakdown()
 
@@ -4083,9 +4104,9 @@ class MainWindow(QtWidgets.QMainWindow):
         pad = sp.PadSpinBox.value()
         crop = self._build_cell_display_crop(cell, hybe, channel, storage_path, fov, pad, modality=sp.current_hybe_modality())
         if crop is None:
-            sp.LogTextEdit.append(f'Cell {cell.id}: no crop for {hybe} -- the hybe has no image data '
-                                  f'for this FOV, or the cell mask projects outside its frame. '
-                                  f'(Alignment is NOT required -- missing layers default to identity.)')
+            self.log(f'Cell {cell.id}: no crop for {hybe} -- the hybe has no image data '
+                     f'for this FOV, or the cell mask projects outside its frame. '
+                     f'(Alignment is NOT required -- missing layers default to identity.)')
             return
         rxmin, rymin = crop['rxmin'], crop['rymin']
         self._spot_crop_context = {'kind': 'cell', 'cell': cell, 'hybe': hybe, 'channel': channel,
@@ -4152,7 +4173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         channel = int(channel_text)
         mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
         if mip is None:
-            sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
+            self.log(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
             return
         unassigned_spots = [s for s in self.spot_container.unassigned(fov)
                            if s.hybe == hybe and s.channel == channel]
@@ -4682,16 +4703,16 @@ class MainWindow(QtWidgets.QMainWindow):
             fp = self._begin_spot_edit(fov)
             self._replace_cell_spots(cell, hybe, channel, permanent)
             self._commit_spot_edit(fov, fp)
-            sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
-                                  f'permanent spot(s) (transient discarded).')
+            self.log(f'Cell {cell.id}, {hybe} ch{channel}: reverted to {len(permanent)} '
+                     f'permanent spot(s) (transient discarded).')
         else:
             permanent = [deepcopy(sp) for sp in self.spot_container_permanent.unassigned(fov)
                          if sp.hybe == hybe and int(sp.channel) == channel]
             fp = self._begin_spot_edit(fov)
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, permanent)
             self._commit_spot_edit(fov, fp)
-            sp.LogTextEdit.append(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
-                                  f'permanent unassigned spot(s) (transient discarded).')
+            self.log(f'FOV{fov:02d}, {hybe} ch{channel}: reverted to {len(permanent)} '
+                     f'permanent unassigned spot(s) (transient discarded).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
@@ -4717,9 +4738,9 @@ class MainWindow(QtWidgets.QMainWindow):
         n_identified, n_identified_cells = self._reassign_fov_spots(fov)
         n_written = self._persist_fov_spots(fov)
         elapsed = time.perf_counter() - t0
-        sp.LogTextEdit.append(
-            f'FOV{fov:02d}: ALL slices saved -- {n_written} spot(s) across every hybe/channel '
-            f'({n_identified} unassigned spot(s) newly identified into {n_identified_cells} '
+        self.log(
+                 f'FOV{fov:02d}: ALL slices saved -- {n_written} spot(s) across every hybe/channel '
+                 f'({n_identified} unassigned spot(s) newly identified into {n_identified_cells} '
             f'cell(s); {elapsed:.1f}s). Cells are never written here.')
         QtWidgets.QMessageBox.information(
             self, 'Save ALL FOV Spots',
@@ -4828,12 +4849,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if hybe and modality and channel_text:
             current_slice = (modality, hybe, int(channel_text))
         n_written = self._persist_fov_spots(fov, only_slice=current_slice)
-        sp.LogTextEdit.append(
-            f'FOV{fov:02d} {hybe} ch{channel_text}: {n_written} spot(s) persisted, '
-            f'{assignment.count_unassigned(self._all_transient_spots(fov))} unassigned in FOV.')
+        self.log(
+                 f'FOV{fov:02d} {hybe} ch{channel_text}: {n_written} spot(s) persisted, '
+                 f'{assignment.count_unassigned(self._all_transient_spots(fov))} unassigned in FOV.')
 
-        sp.LogTextEdit.append(f'FOV{fov:02d}: {n_spots} total spot(s) saved to vlinks.h5 '
-                              f'({n_identified} unassigned spot(s) newly identified into '
+        self.log(f'FOV{fov:02d}: {n_spots} total spot(s) saved to vlinks.h5 '
+                 f'({n_identified} unassigned spot(s) newly identified into '
                               f'{n_identified_cells} cell(s) first). Cells are never written here.')
         QtWidgets.QMessageBox.information(
             self, 'Save Current Spots', f'{n_spots} total spot(s) saved. (Spot saves never touch cells.)')
@@ -4870,8 +4891,8 @@ class MainWindow(QtWidgets.QMainWindow):
                   and (s.modality or modality) == modality]
         n = len(self.spot_container.remove(fov, doomed))
         self._commit_spot_edit(fov, fp)
-        sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {n} spot(s) cleared '
-                              f'(in memory -- Save persists the empty slice).')
+        self.log(f'FOV{fov:02d} {hybe} ch{channel}: {n} spot(s) cleared '
+                 f'(in memory -- Save persists the empty slice).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
@@ -5157,7 +5178,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fov = self.cell_undo.undo()
         if fov is not None:
             self._refresh_cell_displayer_from_container(fov)
-            self.ui.CellSegmentPanel.LogTextEdit.append('Undo: cell state restored.')
+            self.log('Undo: cell state restored.')
         self._update_cell_undo_buttons()
 
     def _redo_cell_action(self):
@@ -5165,7 +5186,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fov = self.cell_undo.redo()
         if fov is not None:
             self._refresh_cell_displayer_from_container(fov)
-            self.ui.CellSegmentPanel.LogTextEdit.append('Redo: cell state restored.')
+            self.log('Redo: cell state restored.')
         self._update_cell_undo_buttons()
 
     def _find_cell_by_id(self, fov, cell_id):
@@ -5196,12 +5217,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_undo_redo_buttons()
         self._refresh_spot_cell_list()
         if missing:
-            sp.LogTextEdit.append(f'{label}: cell(s) {missing} no longer exist -- their spot state could not be restored.')
+            self.log(f'{label}: cell(s) {missing} no longer exist -- their spot state could not be restored.')
         if sp.current_view() == 'cell':
             self._load_spot_crop_for_display()
         else:
             self._load_fov_spot_display()
-        sp.LogTextEdit.append(f'{label}: spot state restored.')
+        self.log(f'{label}: spot state restored.')
 
     def _update_undo_redo_buttons(self):
         sp = self.ui.SpotLocalizationPanel
@@ -5326,13 +5347,13 @@ class MainWindow(QtWidgets.QMainWindow):
             fp = self._begin_spot_edit(cell.fov)
             self._replace_cell_spots(cell, hybe, channel, new_spots)
             self._commit_spot_edit(cell.fov, fp)
-            sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) after manual edit.')
+            self.log(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) after manual edit.')
         else:
             fp = self._begin_spot_edit(ctx['fov'])
             self._replace_fov_unassigned_spots(ctx['storage_path'], ctx['fov'], hybe, channel, new_spots)
             self._commit_spot_edit(ctx['fov'], fp)
-            sp.LogTextEdit.append(f'FOV{ctx["fov"]:02d}, {hybe} ch{channel}: {len(new_spots)} unassigned '
-                                  f'spot(s) after manual edit.')
+            self.log(f'FOV{ctx["fov"]:02d}, {hybe} ch{channel}: {len(new_spots)} unassigned '
+                     f'spot(s) after manual edit.')
         self._refresh_spot_cell_list()
         # re-derives global display indices and the 3D-localization
         # popup's spot list from the just-mutated state -- without this,
@@ -5386,8 +5407,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # cell too regardless of which view is open (see its own
         # docstring), no need to switch back to Cell {cell.id}'s own view
         # first the way the old view-scoped Save View required.
-        sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: removed 1 spot from FOV view '
-                              f'(not yet saved -- click Save Current Spots to persist).')
+        self.log(f'Cell {cell.id}, {hybe} ch{channel}: removed 1 spot from FOV view '
+                 f'(not yet saved -- click Save Current Spots to persist).')
         self._refresh_spot_cell_list()
         self._load_fov_spot_display(keep_view=True)  # re-derives global indices + 3D-localization popup list
 
@@ -5464,8 +5485,8 @@ class MainWindow(QtWidgets.QMainWindow):
             fp = self._begin_spot_edit(cell.fov)
             self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
             self._commit_spot_edit(cell.fov, fp)
-            sp.LogTextEdit.append(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) detected '
-                                  f'(Cell view{", appended" if append else ""}).')
+            self.log(f'Cell {cell.id}, {hybe} ch{channel}: {len(new_spots)} spot(s) detected '
+                     f'(Cell view{", appended" if append else ""}).')
             self._load_spot_crop_for_display()
             self._refresh_spot_cell_list()
         else:
@@ -5480,7 +5501,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # detect time.
             mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
             if mip is None:
-                sp.LogTextEdit.append(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
+                self.log(f'{hybe} ch{channel} not in vlinks.h5 for FOV{fov:02d} -- ingest it first.')
                 return
             threshold_abs = sp.threshold_abs(mip.max())
             coords = peak_local_max(mip, min_distance=min_distance, exclude_border=1, threshold_abs=threshold_abs)
@@ -5505,8 +5526,8 @@ class MainWindow(QtWidgets.QMainWindow):
             fp = self._begin_spot_edit(fov)
             self._replace_fov_unassigned_spots(storage_path, fov, hybe, channel, new_spots, append=append)
             self._commit_spot_edit(fov, fp)
-            sp.LogTextEdit.append(f'FOV{fov:02d} {hybe} ch{channel}: {len(new_spots)} peak(s) detected '
-                                  f'(unassigned{", appended" if append else ""} -- run Save Current Spots to identify cell ownership).')
+            self.log(f'FOV{fov:02d} {hybe} ch{channel}: {len(new_spots)} peak(s) detected '
+                     f'(unassigned{", appended" if append else ""} -- run Save Current Spots to identify cell ownership).')
             self._refresh_spot_cell_list()
             self._load_fov_spot_display()
             self.spot_crop_displayer.show()
@@ -6043,7 +6064,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Set FOV Ranges', 'Select a celltype first.')
             return
         self._fov_ranges_by_celltype[celltype_name] = ctp.FovRangesLineEdit.text().strip()
-        ctp.LogTextEdit.append(f"{celltype_name} FOV ranges set to '{self._fov_ranges_by_celltype[celltype_name]}'")
+        self.log(f"{celltype_name} FOV ranges set to '{self._fov_ranges_by_celltype[celltype_name]}'")
         self._refresh_celltype_summaries()
         self._persist_celltype_config()
 
@@ -6070,7 +6091,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Assign Barcode Channel', 'Pick a barcode hybe/channel first.')
             return
         self._barcode_channel_by_celltype[celltype_name] = (hybe, channel, modality)
-        ctp.LogTextEdit.append(f'{celltype_name} <- {hybe} ch{channel} ({modality})')
+        self.log(f'{celltype_name} <- {hybe} ch{channel} ({modality})')
         self._refresh_celltype_summaries()
         self._apply_barcode_calibration()
 
@@ -6101,7 +6122,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in fovs:
             img = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
             if img is None:
-                ctp.LogTextEdit.append(f'FOV{fov:02d}: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
+                self.log(f'FOV{fov:02d}: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
             lower = np.quantile(img, inputs['lower_value']) if inputs['lower_is_quantile'] else inputs['lower_value']
             upper = np.quantile(img, inputs['upper_value']) if inputs['upper_is_quantile'] else inputs['upper_value']
@@ -6112,8 +6133,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._barcode_calibration['scale'][bch][fov] = inputs['scale']
             self._barcode_calibration['lower_bound'][bch][fov] = float(lower)
             self._barcode_calibration['upper_bound'][bch][fov] = float(upper)
-        ctp.LogTextEdit.append(f'Calibrated {celltype_name} ({hybe} ch{channel}) for FOV(s) {fovs}: '
-                               f"scale={inputs['scale']}, lower={lower:.2f}, upper={upper:.2f} (last FOV shown)")
+        self.log(f'Calibrated {celltype_name} ({hybe} ch{channel}) for FOV(s) {fovs}: '
+                 f"scale={inputs['scale']}, lower={lower:.2f}, upper={upper:.2f} (last FOV shown)")
         self._refresh_celltype_summaries()
         self._persist_celltype_config()
 
@@ -6167,7 +6188,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             img = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
             if img is None:
-                ctp.LogTextEdit.append(f'Overview: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
+                self.log(f'Overview: {hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
                 continue
             # warp each channel into the pipeline's ONE shared frame for
             # visualization ONLY (never for stored/analyzed data) -- same
@@ -6282,8 +6303,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         permanent_fovs_touched.add(fov)
             self._persist_celltype_results(permanent_fovs_touched)
             ctp.RunCelltypeDeterminationPushButton.setEnabled(True)
-            ctp.LogTextEdit.append(f'FOV-mode: {n_cells} cell(s) classified'
-                                   f'{f", saved to vlinks.h5 for FOV(s) {sorted(permanent_fovs_touched)}" if permanent_fovs_touched else ""}.')
+            self.log(f'FOV-mode: {n_cells} cell(s) classified'
+                     f'{f", saved to vlinks.h5 for FOV(s) {sorted(permanent_fovs_touched)}" if permanent_fovs_touched else ""}.')
             self.statusBar().showMessage('Celltype determination complete.', 5000)
             QtWidgets.QMessageBox.information(self, 'Celltype determination complete', f'{n_cells} cell(s) classified.')
             if last_fov is not None:
@@ -6345,9 +6366,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 if image_cache[fov_key].get(bch) is None]
                 if missing_mips:
                     labels = ', '.join(f'{h}/ch{c} ({m})' for h, c, m in missing_mips)
-                    ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no MIP in '
-                                           f'vlinks.h5 for barcode channel(s) {labels}. Ingest those '
-                                           f'(hybe, channel) pairs; alignment is NOT required.')
+                    self.log(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no MIP in '
+                             f'vlinks.h5 for barcode channel(s) {labels}. Ingest those '
+                             f'(hybe, channel) pairs; alignment is NOT required.')
                     n_cells_skipped += len(cellmap)
                     skip_reasons.add(f'no MIP for {labels}')
                     continue
@@ -6357,8 +6378,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                        or int(fov) not in self._barcode_calibration['lower_bound'].get(bch, {})
                                        or int(fov) not in self._barcode_calibration['upper_bound'].get(bch, {})]
                 if missing_calibration:
-                    ctp.LogTextEdit.append(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no calibration for '
-                                           f'{missing_calibration} at this FOV (Apply Calibration first).')
+                    self.log(f'FOV{fov:02d}: skipped ({len(cellmap)} cell(s)) -- no calibration for '
+                             f'{missing_calibration} at this FOV (Apply Calibration first).')
                     n_cells_skipped += len(cellmap)
                     skip_reasons.add('no calibration at this FOV (Apply Calibration first)')
                     continue
@@ -6441,8 +6462,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ctp.RunCelltypeDeterminationPushButton.setEnabled(True)
         skipped_note = (f'{n_cells_skipped} cell(s) skipped: {"; ".join(sorted(skip_reasons))}'
                         if n_cells_skipped else '0 skipped')
-        ctp.LogTextEdit.append(f'Barcode-mode: {n_cells} cell(s), {n_spots} spot(s) classified ({skipped_note})'
-                               f'{f", saved to vlinks.h5 for FOV(s) {sorted(permanent_fovs_touched)}" if permanent_fovs_touched else ""}.')
+        self.log(f'Barcode-mode: {n_cells} cell(s), {n_spots} spot(s) classified ({skipped_note})'
+                 f'{f", saved to vlinks.h5 for FOV(s) {sorted(permanent_fovs_touched)}" if permanent_fovs_touched else ""}.')
         self.statusBar().showMessage('Celltype determination complete.', 5000)
         QtWidgets.QMessageBox.information(self, 'Celltype determination complete',
                                           f'{n_cells} cell(s), {n_spots} spot(s) classified ({skipped_note}).')
@@ -6688,10 +6709,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 storage_path, fov, hybe_records, reference_hybe, matrices,
                 save_path=save_path, channel_type=channel_type)
             self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
-            ap.LogTextEdit.append(f'FOV{fov:02d}: overlay image saved.')
+            self.log(f'FOV{fov:02d}: overlay image saved.')
         except Exception as e:
-            ap.LogTextEdit.append(f'FOV{fov:02d}: overlay image could not be saved ({e}); '
-                                  f'matrices are unaffected.')
+            self.log(f'FOV{fov:02d}: overlay image could not be saved ({e}); '
+                     f'matrices are unaffected.')
 
     def _on_fov_alignment_all_finished(self, results, storage_path, hybe_records, reference_hybe):
         ap = self.ui.AlignmentPanel
@@ -7059,10 +7080,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
                 dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
             self._cross_modal_overlays_saved = getattr(self, '_cross_modal_overlays_saved', 0) + 1
-            ap.LogTextEdit.append(f'FOV{fov:02d}: cross-modal overlay image saved.')
+            self.log(f'FOV{fov:02d}: cross-modal overlay image saved.')
         except Exception as e:
-            ap.LogTextEdit.append(f'FOV{fov:02d}: cross-modal overlay image could not be saved ({e}); '
-                                  f'matrices are unaffected.')
+            self.log(f'FOV{fov:02d}: cross-modal overlay image could not be saved ({e}); '
+                     f'matrices are unaffected.')
 
     def _on_cross_modal_all_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
         # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z

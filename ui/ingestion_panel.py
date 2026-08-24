@@ -187,10 +187,10 @@ class IngestionPanelUI(object):
         self.ProgressBar = QtWidgets.QProgressBar()
         layout.addWidget(self.ProgressBar)
 
-        layout.addWidget(QtWidgets.QLabel('Log:'))
-        self.LogTextEdit = QtWidgets.QTextEdit()
-        self.LogTextEdit.setReadOnly(True)
-        layout.addWidget(self.LogTextEdit)
+        # The panel log boxes moved into the one combined log window (see
+        # ui/log_window.py) -- the stretch keeps the controls top-anchored
+        # where the log box used to soak up the leftover height.
+        layout.addStretch(1)
 
     def _path_row(self, dialog_title, is_file, name_filter='All files (*)'):
         row = QtWidgets.QWidget()

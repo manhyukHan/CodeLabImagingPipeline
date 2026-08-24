@@ -76,5 +76,8 @@ if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
     app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     window = MainWindow(config_file if config_file != '' else None)
+    # the combined log comes up with the app; shown first so the main
+    # window lands on top of it
+    window.show_log_window()
     window.show()
     sys.exit(app.exec_())

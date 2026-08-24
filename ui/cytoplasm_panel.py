@@ -175,10 +175,9 @@ class CytoplasmSegmentationWindow(QtWidgets.QMainWindow):
         actionLayout.addWidget(self.IncorporatePushButton)
         outer.addWidget(actionGroup)
 
-        self.LogTextEdit = QtWidgets.QPlainTextEdit()
-        self.LogTextEdit.setReadOnly(True)
-        self.LogTextEdit.setMaximumHeight(110)
-        outer.addWidget(self.LogTextEdit)
+        # Log messages go to the app-wide combined log window (see
+        # ui/log_window.py) -- this window carries no log box of its own.
+        outer.addStretch(1)
 
         self.SelectAllPushButton.clicked.connect(lambda: self.set_all_checked(True))
         self.SelectNonePushButton.clicked.connect(lambda: self.set_all_checked(False))
@@ -312,5 +311,3 @@ class CytoplasmSegmentationWindow(QtWidgets.QMainWindow):
         chosen = len(self.selected_cell_ids())
         self.CellCountLabel.setText(f'{chosen} of {total} cell(s) selected as nuclei')
 
-    def log(self, message):
-        self.LogTextEdit.appendPlainText(message)

@@ -60,6 +60,12 @@ class MainWindowUI(object):
         self.ChromatinTracingPanel.setupUi(self.ChromatinTracingPanelWidget)
         self.tabWidget.addTab(self._scrollable(self.ChromatinTracingPanelWidget), 'Chromatin Tracing')
 
+        # The combined log window replaced every panel's own log box -- this
+        # corner button (visible from every tab) re-opens it after the user
+        # closes it. MainWindow wires the click.
+        self.ShowLogPushButton = QtWidgets.QPushButton('Show Log')
+        self.tabWidget.setCornerWidget(self.ShowLogPushButton)
+
         MainWindow.setCentralWidget(self.centralwidget)
 
         self.menubar = QtWidgets.QMenuBar(MainWindow)
