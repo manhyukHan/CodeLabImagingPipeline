@@ -42,6 +42,9 @@ class LogWindow(QtWidgets.QMainWindow):
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
+        self.SavePushButton = QtWidgets.QPushButton('Save...')
+        self.SavePushButton.clicked.connect(self._save_log)
+        row.addWidget(self.SavePushButton)
         self.ClearPushButton = QtWidgets.QPushButton('Clear')
         self.ClearPushButton.clicked.connect(self.LogTextEdit.clear)
         row.addWidget(self.ClearPushButton)
@@ -54,3 +57,20 @@ class LogWindow(QtWidgets.QMainWindow):
         # stamping uniformly keeps the left edge parseable.
         for line in (str(message).splitlines() or ['']):
             self.LogTextEdit.appendPlainText(f'{stamp}-{line}')
+
+    def _save_log(self):
+        # The suggested name reuses the line-stamp date format but with
+        # dashes for the time -- colons are illegal in Windows filenames.
+        suggested = time.strftime('codelab_log_%Y-%m-%d-%H-%M-%S.txt')
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Save Log', suggested, 'Text files (*.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(self.LogTextEdit.toPlainText() + '\n')
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(self, 'Save Log', f"Can't write {path}: {e}")
+            return
+        # confirmation lands in the log itself, stamped like everything else
+        self.append(f'Log saved to {path}')
