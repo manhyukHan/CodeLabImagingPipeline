@@ -743,7 +743,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cross_modal_z = {}       # {(dna_storage_path, fov): planes}, DNA frame -> RNA frame
         self._same_modality_context = None
         self._pending_same_modality_alignment = None  # {fov: {hybe: H}} awaiting Accept/Reject
-        self._cross_modal_context = None
+        self._cross_modal_context = {}
+        self._cross_modal_view_modality = None
+        # cross-modal run-queue state -- always present so an out-of-context
+        # call (nothing running) is a no-op, never an AttributeError
+        self._cross_modal_queue = []
+        self._cross_modal_run_fovs = []
+        self._cross_modal_run_staged = False
+        self._cross_modal_run_button = None
+        self._cross_modal_pairs_done = 0
+        self._cross_modal_fovs_done = 0
+        self._cross_modal_last_pair = None
+        self._cross_modal_last_results = {}
         self._pending_cross_modal = None    # {fov: H} awaiting Accept/Reject
         self._pending_cross_modal_z = {}    # {fov: planes} staged alongside
         # Align All Cells in FOV always computes AND saves immediately (no
@@ -1167,71 +1178,67 @@ class MainWindow(QtWidgets.QMainWindow):
         if cell_pad is not None:
             ap.CellPadSpinBox.setValue(int(cell_pad))
 
-        rna_modality = params.get('cross_modal_rna_modality')
-        dna_modality = params.get('cross_modal_dna_modality')
-        if rna_modality and dna_modality:
-            rna_path = self.ui.IngestionPanel.modality_data.get(rna_modality, {}).get('storage_path', '')
-            dna_path = self.ui.IngestionPanel.modality_data.get(dna_modality, {}).get('storage_path', '')
-            if rna_path and dna_path:
-                ap.RnaStoragePathLineEdit.setText(rna_path)
-                ap.DnaStoragePathLineEdit.setText(dna_path)
-            rna_ref = params.get('cross_modal_rna_reference_hybe')
-            dna_ref = params.get('cross_modal_dna_reference_hybe')
-            cross_channel_type = params.get('cross_modal_channel_type')
-            if rna_ref:
-                ap.RnaReferenceHybeComboBox.setCurrentText(rna_ref)
-            if dna_ref:
-                ap.DnaReferenceHybeComboBox.setCurrentText(dna_ref)
-            if cross_channel_type:
-                ap.ChannelTypeComboBox.setCurrentText(cross_channel_type)
+        # Cross-modal restore, generalized: the hub and every bridge hybe
+        # come back from the per-modality-suffixed params the mirror writes
+        # (cross_modal_reference_hybe_{name} + cross_modal_shared_*), one
+        # bridge per moving modality -- no fixed RNA/DNA pair, no storage-
+        # path line edits (the manifest owns the paths).
+        shared_modality = self._shared_frame_modality()
+        cross_channel_type = params.get('cross_modal_channel_type')
+        if cross_channel_type:
+            ap.ChannelTypeComboBox.setCurrentText(cross_channel_type)
+        shared_ref = params.get('cross_modal_shared_reference_hybe')
+        if shared_modality and shared_ref:
+            ap.select_cross_modal_reference_hybe(shared_modality, shared_ref)
+        for moving in self._cross_modal_moving_modalities():
+            moving_ref = params.get(f'cross_modal_reference_hybe_{moving}')
+            if moving_ref:
+                ap.select_cross_modal_reference_hybe(moving, moving_ref)
 
-            # Backfill self.fov_matrices for the PAIRED (non-current)
-            # modality too -- normally only populated by _activate_fov for
-            # whichever modality is "current" (never the paired one, since
-            # that requires an actual modality switch) -- read it directly
-            # here, same read_same_modality_matrices call _activate_fov
-            # itself uses, for the CellSegmentPanel's current FOV plus
-            # anything in the Ingestion tab's own FOV list. This tail used
-            # to also DISCOVER the paired modality from the retired
-            # cross_modal_role/cross_modal_paired_storage_path params --
-            # obsolete (and, left half-deleted, a NameError that blocked
-            # config load) now that _activate_modalities seeds every
-            # configured modality's own state before this ever runs.
-            for paired_modality in {rna_modality, dna_modality} - {self._modality_for_storage_path(storage_path)}:
-                paired_data = self.ui.IngestionPanel.modality_data.get(paired_modality, {})
-                paired_path = paired_data.get('storage_path', '')
-                paired_layout = paired_data.get('layout_path', '') or (
-                    vlinks_store.read_global_params(paired_path).get('layout_path', '') if paired_path else '')
-                if not paired_path or not paired_layout:
-                    continue
-                try:
-                    paired_hybe_records = preprocess.parse_experiment_layout(paired_layout)
-                except Exception:
-                    continue
-                fovs_to_populate = set(self._parse_fov_list(ip.FovListLineEdit.text()))
-                fovs_to_populate.add(self.ui.CellSegmentPanel.FovSpinBox.value())
-                for fov_to_populate in fovs_to_populate:
-                    if not self._fov_matrices_for(paired_path, fov_to_populate):
-                        try:
-                            self._merge_fov_matrices(
-                                fov_to_populate,
-                                alignment.read_same_modality_matrices(
-                                    paired_path, fov_to_populate,
-                                    paired_hybe_records))
-                        except Exception:
-                            pass
+        # Backfill self.fov_matrices for every NON-current modality --
+        # normally only populated by _activate_fov for whichever modality
+        # is "current" (never the others, since that requires an actual
+        # modality switch) -- same read_same_modality_matrices call
+        # _activate_fov itself uses, for the CellSegmentPanel's current
+        # FOV plus anything in the Ingestion tab's own FOV list.
+        current_modality = self._modality_for_storage_path(storage_path)
+        for paired_modality in self.ui.IngestionPanel.modality_names:
+            if paired_modality == current_modality:
+                continue
+            paired_data = self.ui.IngestionPanel.modality_data.get(paired_modality, {})
+            paired_path = paired_data.get('storage_path', '')
+            paired_layout = paired_data.get('layout_path', '') or (
+                vlinks_store.read_global_params(paired_path).get('layout_path', '') if paired_path else '')
+            if not paired_path or not paired_layout:
+                continue
+            try:
+                paired_hybe_records = preprocess.parse_experiment_layout(paired_layout)
+            except Exception:
+                continue
+            fovs_to_populate = set(self._parse_fov_list(ip.FovListLineEdit.text()))
+            fovs_to_populate.add(self.ui.CellSegmentPanel.FovSpinBox.value())
+            for fov_to_populate in fovs_to_populate:
+                if not self._fov_matrices_for(paired_path, fov_to_populate):
+                    try:
+                        self._merge_fov_matrices(
+                            fov_to_populate,
+                            alignment.read_same_modality_matrices(
+                                paired_path, fov_to_populate,
+                                paired_hybe_records))
+                    except Exception:
+                        pass
 
-        # backfill self.cross_modal_result from vlinks so
-        # _other_modality_cell_alignment_inputs finds a real H_across
+        # backfill self.cross_modal_result from vlinks -- one bridge per
+        # moving modality -- so cell alignment finds a real H_across
         # without a fresh Run Cross-Modal Alignment this session.
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        if dna_storage_path:
+        for moving in self._cross_modal_moving_modalities():
+            msp = self._storage_path_for_modality(moving)
             for fov in self._parse_fov_list(ip.FovListLineEdit.text()):
-                if (dna_storage_path, fov) in self.cross_modal_result:
+                if (msp, fov) in self.cross_modal_result:
                     continue
-                H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
+                H = vlinks_store.read_cross_modal_matrix(msp, fov)
                 if H is not None:
-                    self.cross_modal_result[(dna_storage_path, fov)] = H
+                    self.cross_modal_result[(msp, fov)] = H
 
     def _activate_modalities(self, names, modality_fields=None):
         """
@@ -1268,6 +1275,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.ModalityComboBox.blockSignals(False)
         ap = self.ui.AlignmentPanel
         ap.build_cell_reference_hybe_fields(names)
+        ap.build_cross_modal_reference_hybe_fields(names)
+        ap.CrossModalSharedFrameLabel.setText(names[0] if names else '-')
         # Each combo is a brand-new QComboBox object every rebuild (unlike
         # CellFovSpinBox/CellIdSpinBox, which persist and are wired once
         # in __init__) -- reconnect here every time.
@@ -1395,9 +1404,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.CelltypeDeterminationPanel.populate_hybe_choices(self.total_active_hybe_list)
         ip.populate_viewer_hybe_choices(self.total_active_hybe_list)
         ap.populate_cell_reference_hybe_choices(self.total_active_hybe_list)
-        for name, populate in (('RNA', ap.populate_rna_reference_hybe_choices),
-                               ('DNA', ap.populate_dna_reference_hybe_choices)):
-            populate(self.ui.IngestionPanel.modality_data.get(name, {}).get('active_hybe_list', []))
+        ap.populate_cross_modal_reference_hybe_choices(self.total_active_hybe_list)
 
         chp = self.ui.ChromatinTracingPanel
         chp.populate_hybe_list(self.total_active_hybe_list, default_checked=self._default_chromatin_tracing_hybes)
@@ -3317,43 +3324,32 @@ class MainWindow(QtWidgets.QMainWindow):
         files, not just whichever one happens to be the "current" tab.
         """
         ip = self.ui.IngestionPanel
-        ap = self.ui.AlignmentPanel
-        paths = []
-        for p in (ip.StoragePathLineEdit.text().strip(),
-                  ap.RnaStoragePathLineEdit.text().strip(),
-                  ap.DnaStoragePathLineEdit.text().strip()):
-            if p and p not in paths:
-                paths.append(p)
-        return paths
+        sps = []
+        for p in [ip.StoragePathLineEdit.text().strip()] + [
+                self._storage_path_for_modality(name) for name in ip.modality_names]:
+            if p and p not in sps:
+                sps.append(p)
+        return sps
 
-    def _mirror_cross_modal_params_to_vlinks(self, rna_storage_path, dna_storage_path, fov, H,
-                                             rna_reference_hybe, dna_reference_hybe, channel_type):
+    def _mirror_cross_modal_params_to_vlinks(self, pair, fov, H, channel_type):
         """
-        Mirrors an accepted cross-modal alignment result into BOTH
-        modalities' own vlinks.h5 -- global params (both reference hybes,
-        channel type, and each side's OWN paired storage path + role) plus
-        the per-FOV H_across matrix -- so either modality's own FOV
-        activation can reconstruct the full cross-modal picture without
-        ever needing the OTHER side's config loaded first (see
-        _other_modality_cell_alignment_inputs, which today can only find
-        any of this via manually-populated UI fields).
+        Mirrors one moving modality's accepted bridge into vlinks.h5:
+        the per-FOV H_across under the MOVING modality's own key (the
+        star's rule -- a bridge belongs to the modality it carries into
+        the hub; the hub itself has no bridge, its H_across is identity
+        by design), plus global params naming the hub, the hub's bridge
+        hybe, the channel type, and this modality's own bridge hybe under
+        a per-modality-suffixed key -- so any number of moving modalities
+        can each record their own without clobbering each other.
         """
-        # One write, not one per side. These describe the RELATIONSHIP
-        # between the two modalities, so a single copy is the correct
-        # representation -- and with a unified vlinks both storage paths
-        # resolve to the same /params group, so writing twice with opposite
-        # cross_modal_role values would leave only whichever went last.
-        # The sides are named by modality rather than by a per-file role,
-        # and the paired storage path is gone: there is one file now.
+        moving = pair['moving_modality']
         vlinks_store.write_global_params(
-            rna_storage_path,
-            cross_modal_rna_modality=self._modality_for_storage_path(rna_storage_path),
-            cross_modal_dna_modality=self._modality_for_storage_path(dna_storage_path),
-            cross_modal_rna_reference_hybe=rna_reference_hybe,
-            cross_modal_dna_reference_hybe=dna_reference_hybe,
-            cross_modal_channel_type=channel_type)
-        vlinks_store.write_cross_modal_matrix(rna_storage_path, fov, H)
-        vlinks_store.write_cross_modal_matrix(dna_storage_path, fov, H)
+            pair['moving_storage_path'],
+            cross_modal_shared_modality=pair['shared_modality'],
+            cross_modal_shared_reference_hybe=pair['shared_reference_hybe'],
+            cross_modal_channel_type=channel_type,
+            **{f'cross_modal_reference_hybe_{moving}': pair['moving_reference_hybe']})
+        vlinks_store.write_cross_modal_matrix(pair['moving_storage_path'], fov, H)
 
     def _save_cells(self):
         cp = self.ui.CellSegmentPanel
@@ -6843,302 +6839,275 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_cross_modal_results_list(self):
         """
-        Populates the FULL Results list -- every FOV in the FOV list with
-        EITHER a disk-persisted cross-modal result, an in-memory
-        cross_modal_result entry (already accepted/auto-saved this
-        session), OR a not-yet-accepted staged current-FOV result --
-        never just whichever FOV happened to be aligned most recently
-        (mirrors _refresh_same_modality_results_list's own pattern). Rows
-        for a staged (unsaved) result are marked "[pending]".
+        Populates the FULL Results list: for EVERY moving modality, every
+        FOV in the FOV list with a disk-persisted bridge, an in-memory
+        cross_modal_result entry, or a not-yet-accepted staged result
+        ("[pending]"). Rows carry (moving_storage_path, fov) so a click
+        can name which modality's bridge it means -- one list serves any
+        number of moving modalities, mirroring the generalized combos.
+
+        vlinks_store's mirror is the ONLY accepted disk source -- keyed by
+        (storage_path, fov), never by a reference hybe's name, so it can't
+        be read from the wrong hybe's stack file (confirmed real bug; see
+        git history of this function for the full forensic note). An empty
+        mirror means "never accepted", and the correct answer to that is
+        no bridge at all -- identity, FrameResolver's documented default.
         """
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
+        shared = self._shared_frame_modality()
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         ap.CrossModalResultsListWidget.clear()
-        if not rna_storage_path or not dna_storage_path or not dna_reference_hybe or not fov_list:
+        if not shared or not fov_list:
             return
-        disk_results = {}
-        for fov in fov_list:
-            # vlinks_store's own mirror first -- keyed only by (storage_path,
-            # fov), never by dna_reference_hybe's own name, so it can't be
-            # read from the wrong hybe's stack file the way chain.py's own
-            # read can when the reference-hybe combo hasn't been reconciled
-            # against vlinks yet (confirmed real bug: during config load,
-            # ap.DnaReferenceHybeComboBox briefly holds the config file's
-            # own text before _refresh_params_from_vlinks corrects it,
-            # so a read here with the wrong reference hybe silently pulled
-            # /matrix_across out of an unrelated hybe's own file and
-            # permanently contaminated self.cross_modal_result for the rest
-            # of the session -- vlinks_store's copy is immune to this since
-            # it never depends on which hybe is currently selected anywhere).
-            # There is deliberately NO fallback to chain.py's reference-hybe-
-            # keyed read. An empty mirror means "no cross-modal alignment has
-            # ever been accepted", and the correct answer to that is no bridge
-            # at all -- identity, which the FrameResolver already supplies as
-            # its documented default for an uncomputed layer. Reading
-            # {dna_reference_hybe}_stack.h5's own /matrix_across instead
-            # cannot distinguish an accepted matrix from whatever stale bytes
-            # happen to sit in an unrelated hybe's file, and a fallback that
-            # only holds when the mirror is ALREADY populated guards nothing:
-            # on a freshly-rebuilt vlinks it fires every time and permanently
-            # caches garbage here (confirmed -- this is what rotated every
-            # projected cell mask ~100 degrees in the RNA hybes while the DNA
-            # hybes, needing no bridge, stayed correct).
-            H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
-            if H is not None:
-                disk_results[fov] = H
-        if disk_results:
-            self.cross_modal_result.update({(dna_storage_path, fov): H for fov, H in disk_results.items()})
-
-        display_results = dict(disk_results)
-        for (sp, fov), H in self.cross_modal_result.items():
-            if sp == dna_storage_path:
-                display_results[fov] = H
-        pending_fovs = set()
-        if self._pending_cross_modal:
-            for fov, H in self._pending_cross_modal.items():
-                display_results[fov] = H
-                pending_fovs.add(fov)
-        for fov in sorted(display_results.keys()):
-            H = display_results[fov]
-            suffix = ' [pending]' if fov in pending_fovs else ''
-            dz = self._pending_cross_modal_z.get(fov)
-            if dz is None:
-                dz = self.cross_modal_z.get((dna_storage_path, fov))
-            if dz is None:
-                dz = vlinks_store.read_cross_modal_z(dna_storage_path, fov)
-            item = QtWidgets.QListWidgetItem(
-                f'FOV{fov:02d} {_matrix_summary("DNA->RNA", H)}, dz={float(dz or 0.0):+.1f}{suffix}')
-            item.setData(QtCore.Qt.UserRole, fov)
-            ap.CrossModalResultsListWidget.addItem(item)
+        for moving in self._cross_modal_moving_modalities():
+            msp = self._storage_path_for_modality(moving)
+            display = {}
+            for fov in fov_list:
+                H = vlinks_store.read_cross_modal_matrix(msp, fov)
+                if H is not None:
+                    display[fov] = H
+                    self.cross_modal_result[(msp, fov)] = H
+            for (sp, fov), H in self.cross_modal_result.items():
+                if sp == msp:
+                    display[fov] = H
+            pending_fovs = set()
+            if self._pending_cross_modal:
+                for (sp, fov), H in self._pending_cross_modal.items():
+                    if sp == msp:
+                        display[fov] = H
+                        pending_fovs.add(fov)
+            for fov in sorted(display):
+                H = display[fov]
+                suffix = ' [pending]' if fov in pending_fovs else ''
+                dz = (self._pending_cross_modal_z or {}).get((msp, fov))
+                if dz is None:
+                    dz = self.cross_modal_z.get((msp, fov))
+                if dz is None:
+                    dz = vlinks_store.read_cross_modal_z(msp, fov)
+                item = QtWidgets.QListWidgetItem(
+                    f'FOV{fov:02d} {_matrix_summary(f"{moving}->{shared}", H)}, '
+                    f'dz={float(dz or 0.0):+.1f}{suffix}')
+                item.setData(QtCore.Qt.UserRole, (msp, fov))
+                ap.CrossModalResultsListWidget.addItem(item)
 
     def _show_cross_modal_result_preview(self, item):
-        """Clicking a Results row shows that FOV's overlay -- sets the
-        Overlay FOV spinbox to match (so Show Overlay stays consistent
-        with whatever was just clicked) and reuses _show_cross_modal_
-        overlay's own matrix-source priority (staged/cache/disk)."""
+        """Clicking a Results row shows that FOV's overlay for that ROW's
+        own moving modality -- sets the Overlay FOV spinbox and the view
+        modality to match, then reuses _show_cross_modal_overlay's own
+        matrix-source priority (staged/cache/disk)."""
         ap = self.ui.AlignmentPanel
-        fov = item.data(QtCore.Qt.UserRole)
+        msp, fov = item.data(QtCore.Qt.UserRole)
+        self._cross_modal_view_modality = self._modality_for_storage_path(msp)
         ap.CrossModalOverlayFovSpinBox.blockSignals(True)
         ap.CrossModalOverlayFovSpinBox.setValue(fov)
         ap.CrossModalOverlayFovSpinBox.blockSignals(False)
         self._show_cross_modal_overlay()
 
     def _run_cross_modal_alignment(self):
-        """Current-FOV alignment (ap.CrossModalFovSpinBox) -- computes into a
-        staged result with its own Accept/Reject. Run Cross-Modal Alignment
-        for All FOVs below (_run_cross_modal_alignment_all) is the always-
-        auto-save, no-staging counterpart for every FOV at once."""
+        """Current-FOV alignment (ap.CrossModalFovSpinBox), EVERY moving
+        modality in sequence -- computes into staged results with one
+        shared Accept/Reject. Run for All FOVs below is the always-auto-
+        save counterpart."""
         ap = self.ui.AlignmentPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        rna_reference_hybe = ap.RnaReferenceHybeComboBox.currentText().strip()
-        dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-        channel_type = ap.ChannelTypeComboBox.currentText()
-        fov = ap.CrossModalFovSpinBox.value()
-        if not all([rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe]):
-            QtWidgets.QMessageBox.warning(self, 'Run Cross-Modal Alignment',
-                                          'Fill in both storage paths and reference hybes first.')
+        pairs = self._cross_modal_pairs('Run Cross-Modal Alignment')
+        if not pairs:
             return
+        self._pending_cross_modal = {}
+        self._pending_cross_modal_z = {}
+        self._cross_modal_context = {}
+        self._start_cross_modal_queue(pairs, [ap.CrossModalFovSpinBox.value()],
+                                      staged=True, button=ap.RunCrossModalPushButton)
 
-        border_trim = ap.CrossModalBorderTrimSpinBox.value()
-        max_shift = ap.CrossModalMaxShiftSpinBox.value() or None
+    def _run_cross_modal_alignment_all(self):
+        """Every FOV in the Ingestion tab's FOV list x every moving
+        modality, computed AND saved immediately -- no staging."""
+        ap, ip = self.ui.AlignmentPanel, self.ui.IngestionPanel
+        pairs = self._cross_modal_pairs('Run Cross-Modal Alignment')
+        if not pairs:
+            return
+        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        if not fov_list:
+            QtWidgets.QMessageBox.warning(self, 'Run Cross-Modal Alignment',
+                                          "Set a FOV list in the Ingestion tab first.")
+            return
+        self._cross_modal_overlays_saved = 0
+        self._start_cross_modal_queue(pairs, fov_list, staged=False,
+                                      button=ap.RunAllCrossModalPushButton)
 
+    def _start_cross_modal_queue(self, pairs, fovs, staged, button):
+        """
+        One CrossModalAlignmentWorker per (shared -> moving) pair, run in
+        sequence: each pair's finish starts the next, so any number of
+        moving modalities flows through the ONE engine and the two-
+        modality case degrades to exactly one run. Sequential rather than
+        parallel deliberately -- the per-pair worker already parallelizes
+        internally where it matters, and pairs share the preview canvas
+        and status machinery.
+        """
+        self._cross_modal_queue = list(pairs)
+        self._cross_modal_run_fovs = list(fovs)
+        self._cross_modal_run_staged = staged
+        self._cross_modal_run_button = button
+        self._cross_modal_pairs_done = 0
+        self._cross_modal_fovs_done = 0
+        button.setEnabled(False)
+        self._start_next_cross_modal_pair()
+
+    def _start_next_cross_modal_pair(self):
+        pair = self._cross_modal_queue.pop(0)
+        ap = self.ui.AlignmentPanel
+        channel_type = ap.ChannelTypeComboBox.currentText()
         # Fiducial channels for the Z leg -- z drift is measured on the
         # same reference pair as dx/dy, in the same run.
-        rna_fid = dna_fid = None
+        shared_fid = moving_fid = None
         try:
-            rna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
-                self._modality_for_storage_path(rna_storage_path))}[rna_reference_hybe]
-            dna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
-                self._modality_for_storage_path(dna_storage_path))}[dna_reference_hybe]
-            rna_fid = alignment.pick_channel_by_type(rna_rec, 'fiducial')
-            dna_fid = alignment.pick_channel_by_type(dna_rec, 'fiducial')
+            srec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                pair['shared_modality'])}[pair['shared_reference_hybe']]
+            mrec = {r['folder']: r for r in self._active_hybe_records_for_modality(
+                pair['moving_modality'])}[pair['moving_reference_hybe']]
+            shared_fid = alignment.pick_channel_by_type(srec, 'fiducial')
+            moving_fid = alignment.pick_channel_by_type(mrec, 'fiducial')
         except (KeyError, TypeError):
             pass
-        ap.RunCrossModalPushButton.setEnabled(False)
-        self.statusBar().showMessage('Running cross-modal alignment...')
-        self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, [fov], self.fov_matrices,
-                                                              rna_reference_hybe, dna_reference_hybe, channel_type,
-                                                              border_trim=border_trim, max_shift=max_shift,
-                                                              rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
-        self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
+        self.statusBar().showMessage(
+            f"Cross-modal alignment: {pair['moving_modality']} -> {pair['shared_modality']}...")
+        # Worker argument names keep the historical rna_/dna_ prefixes; the
+        # semantics have always been shared-side/moving-side and are what
+        # the pair dict carries.
+        self._cross_modal_worker = CrossModalAlignmentWorker(
+            pair['shared_storage_path'], pair['moving_storage_path'],
+            list(self._cross_modal_run_fovs), self.fov_matrices,
+            pair['shared_reference_hybe'], pair['moving_reference_hybe'], channel_type,
+            border_trim=ap.CrossModalBorderTrimSpinBox.value(),
+            max_shift=ap.CrossModalMaxShiftSpinBox.value() or None,
+            rna_fiducial_channel=shared_fid, dna_fiducial_channel=moving_fid)
+        self._cross_modal_worker.progress.connect(
+            lambda done, total, msg: self.statusBar().showMessage(msg))
+        if not self._cross_modal_run_staged:
+            # Draw+save each FOV's overlay AS IT LANDS, not all at the end.
+            self._cross_modal_worker.fov_done.connect(
+                lambda fov, H, _pair=pair: self._save_cross_modal_overlay(fov, H, _pair))
         self._cross_modal_worker.finished_ok.connect(
-            lambda results: self._on_cross_modal_finished(results, rna_storage_path, dna_storage_path,
-                                                           rna_reference_hybe, dna_reference_hybe, channel_type))
+            lambda results, _pair=pair: self._on_cross_modal_pair_finished(results, _pair))
         self._cross_modal_worker.failed.connect(self._on_cross_modal_failed)
         self._cross_modal_worker.start()
 
-    def _on_cross_modal_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
-        # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z
-        # drift is part of the cross-modal RESULT, staged and accepted with it.
+    def _on_cross_modal_pair_finished(self, results, pair):
+        # worker returns {'H': {fov: H}, 'z': {fov: planes}} -- the z drift
+        # is part of the cross-modal RESULT, staged and accepted with it.
+        z = {}
         if isinstance(results, dict) and 'H' in results and 'z' in results:
-            self._pending_cross_modal_z = dict(results['z'])
+            z = dict(results['z'])
             results = results['H']
-        ap = self.ui.AlignmentPanel
-        ap.RunCrossModalPushButton.setEnabled(True)
-        self.statusBar().showMessage('Cross-modal alignment computed.', 5000)
-        self._cross_modal_context = {'rna_storage_path': rna_storage_path, 'dna_storage_path': dna_storage_path,
-                                      'rna_reference_hybe': rna_reference_hybe, 'dna_reference_hybe': dna_reference_hybe,
-                                      'channel_type': channel_type}
-        self._pending_cross_modal = results
-        self._refresh_cross_modal_results_list()
-        last_fov = list(results.keys())[-1]
-        # this is the only place the current-FOV preview auto-shows (the
-        # Results list below still lets any OTHER already-computed FOV be
-        # previewed on demand via a click) -- pop it up here rather than
-        # waiting for a separate interactive trigger
-        self.alignment_preview_window.show()
-        self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, last_fov,
-                                             rna_reference_hybe, dna_reference_hybe, channel_type, results[last_fov],
-                                             rna_fov_matrices=self._fov_matrices_for(rna_storage_path, last_fov),
-                                             dna_fov_matrices=self._fov_matrices_for(dna_storage_path, last_fov))
-
-        ap.CrossModalAcceptPushButton.setEnabled(True)
-        ap.CrossModalRejectPushButton.setEnabled(True)
-
-    def _on_cross_modal_failed(self, message):
-        self.ui.AlignmentPanel.RunCrossModalPushButton.setEnabled(True)
-        self.statusBar().clearMessage()
-        QtWidgets.QMessageBox.critical(self, 'Cross-modal alignment error', message)
-
-    def _run_cross_modal_alignment_all(self):
-        """Every FOV in the Ingestion tab's FOV list, computed AND saved
-        immediately -- no staging, no Accept step."""
-        ap = self.ui.AlignmentPanel
-        ip = self.ui.IngestionPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        rna_reference_hybe = ap.RnaReferenceHybeComboBox.currentText().strip()
-        dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-        channel_type = ap.ChannelTypeComboBox.currentText()
-        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
-        if not all([rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe]) or not fov_list:
-            QtWidgets.QMessageBox.warning(self, 'Run Cross-Modal Alignment',
-                                          'Fill in both storage paths and reference hybes, and set a FOV list in the Ingestion tab.')
+        msp = pair['moving_storage_path']
+        channel_type = self.ui.AlignmentPanel.ChannelTypeComboBox.currentText()
+        if self._cross_modal_run_staged:
+            for fov, H in results.items():
+                self._pending_cross_modal[(msp, fov)] = H
+            for fov, dz in z.items():
+                self._pending_cross_modal_z[(msp, fov)] = dz
+            self._cross_modal_context[msp] = dict(pair, channel_type=channel_type)
+        else:
+            self.cross_modal_result.update({(msp, fov): H for fov, H in results.items()})
+            for fov, H in results.items():
+                self._commit_cross_modal_z(msp, fov, z.get(fov))
+                self._mirror_cross_modal_params_to_vlinks(pair, fov, H, channel_type)
+        self._cross_modal_pairs_done += 1
+        self._cross_modal_fovs_done += len(results)
+        self._cross_modal_last_pair = pair
+        self._cross_modal_last_results = results
+        if self._cross_modal_queue:
+            self._start_next_cross_modal_pair()
             return
+        self._finish_cross_modal_run()
 
-        border_trim = ap.CrossModalBorderTrimSpinBox.value()
-        max_shift = ap.CrossModalMaxShiftSpinBox.value() or None
-
-        # Fiducial channels for the Z leg -- z drift is measured on the
-        # same reference pair as dx/dy, in the same run.
-        rna_fid = dna_fid = None
-        try:
-            rna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
-                self._modality_for_storage_path(rna_storage_path))}[rna_reference_hybe]
-            dna_rec = {r['folder']: r for r in self._active_hybe_records_for_modality(
-                self._modality_for_storage_path(dna_storage_path))}[dna_reference_hybe]
-            rna_fid = alignment.pick_channel_by_type(rna_rec, 'fiducial')
-            dna_fid = alignment.pick_channel_by_type(dna_rec, 'fiducial')
-        except (KeyError, TypeError):
-            pass
-        ap.RunAllCrossModalPushButton.setEnabled(False)
-        self.statusBar().showMessage('Running cross-modal alignment for all FOVs...')
-        self._cross_modal_worker = CrossModalAlignmentWorker(rna_storage_path, dna_storage_path, fov_list, self.fov_matrices,
-                                                              rna_reference_hybe, dna_reference_hybe, channel_type,
-                                                              border_trim=border_trim, max_shift=max_shift,
-                                                              rna_fiducial_channel=rna_fid, dna_fiducial_channel=dna_fid)
-        self._cross_modal_worker.progress.connect(lambda done, total, msg: self.statusBar().showMessage(msg))
-        # Draw+save each FOV's overlay AS IT LANDS, not all of them at the end.
-        self._cross_modal_overlays_saved = 0
-        self._cross_modal_worker.fov_done.connect(
-            lambda fov, H: self._save_cross_modal_overlay(
-                fov, H, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe))
-        self._cross_modal_worker.finished_ok.connect(
-            lambda results: self._on_cross_modal_all_finished(results, rna_storage_path, dna_storage_path,
-                                                               rna_reference_hybe, dna_reference_hybe, channel_type))
-        self._cross_modal_worker.failed.connect(self._on_cross_modal_all_failed)
-        self._cross_modal_worker.start()
-
-    def _save_cross_modal_overlay(self, fov, H, rna_storage_path, dna_storage_path,
-                                  rna_reference_hybe, dna_reference_hybe):
-        """
-        One FOV's cross-modal overlay PNG, drawn as that FOV completes.
-
-        Cross-modal counterpart of _save_fov_alignment_overlay -- see there for
-        why this runs on the GUI thread and why the cost is unchanged while the
-        experience is not.
-
-        Only the DRAWING moved here. Committing the Z drift and mirroring the
-        parameters into vlinks.h5 stay in _on_cross_modal_all_finished: those
-        are cheap dict/HDF5 writes, not the reason the window froze, and the Z
-        values arrive as one payload with finished_ok rather than per FOV.
-
-        Never raises into the signal: a failure to draw must not take down a
-        run whose matrices are already computed.
-        """
+    def _finish_cross_modal_run(self):
         ap = self.ui.AlignmentPanel
-        channel_type = ap.ChannelTypeComboBox.currentText()
+        if self._cross_modal_run_button is not None:
+            self._cross_modal_run_button.setEnabled(True)
+        self.statusBar().showMessage('Cross-modal alignment computed.', 5000)
+        self._refresh_cross_modal_results_list()
+        pair, results = self._cross_modal_last_pair, self._cross_modal_last_results
+        if self._cross_modal_run_staged:
+            if results:
+                last_fov = list(results.keys())[-1]
+                self._cross_modal_view_modality = pair['moving_modality']
+                # the one place the current-FOV preview auto-shows -- the
+                # Results list still previews any other FOV/modality on click
+                self.alignment_preview_window.show()
+                self.alignment_preview_window.raise_()
+                self.preview_canvas.draw_cross_modal_preview(
+                    pair['shared_storage_path'], pair['moving_storage_path'], last_fov,
+                    pair['shared_reference_hybe'], pair['moving_reference_hybe'],
+                    ap.ChannelTypeComboBox.currentText(), results[last_fov],
+                    rna_fov_matrices=self._fov_matrices_for(pair['shared_storage_path'], last_fov),
+                    dna_fov_matrices=self._fov_matrices_for(pair['moving_storage_path'], last_fov))
+            ap.CrossModalAcceptPushButton.setEnabled(True)
+            ap.CrossModalRejectPushButton.setEnabled(True)
+        else:
+            n_overlays = getattr(self, '_cross_modal_overlays_saved', 0)
+            QtWidgets.QMessageBox.information(
+                self, 'Cross-modal alignment complete',
+                f'{self._cross_modal_pairs_done} modality pair(s), '
+                f'{self._cross_modal_fovs_done} FOV result(s) aligned and saved; '
+                f'{n_overlays} overlay image(s) written.')
+
+    def _save_cross_modal_overlay(self, fov, H, pair):
+        """
+        One FOV's cross-modal overlay PNG for one moving modality, drawn
+        as that FOV completes (see _save_fov_alignment_overlay for why
+        this runs on the GUI thread). Never raises into the signal: a
+        failure to draw must not take down a run whose matrices are
+        already computed.
+        """
+        channel_type = self.ui.AlignmentPanel.ChannelTypeComboBox.currentText()
         try:
-            save_path = paths.figure_path(dna_storage_path, 'alignment', fov, 'cross_modal_overlay.png')
+            save_path = paths.figure_path(pair['moving_storage_path'], 'alignment', fov,
+                                          'cross_modal_overlay.png')
             self.preview_canvas.draw_cross_modal_preview(
-                rna_storage_path, dna_storage_path, fov,
-                rna_reference_hybe, dna_reference_hybe, channel_type, H, save_path=save_path,
-                rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
-                dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
+                pair['shared_storage_path'], pair['moving_storage_path'], fov,
+                pair['shared_reference_hybe'], pair['moving_reference_hybe'], channel_type, H,
+                save_path=save_path,
+                rna_fov_matrices=self._fov_matrices_for(pair['shared_storage_path'], fov),
+                dna_fov_matrices=self._fov_matrices_for(pair['moving_storage_path'], fov))
             self._cross_modal_overlays_saved = getattr(self, '_cross_modal_overlays_saved', 0) + 1
-            self.log(f'FOV{fov:02d}: cross-modal overlay image saved.')
+            self.log(f"FOV{fov:02d}: cross-modal overlay image saved ({pair['moving_modality']}).")
         except Exception as e:
             self.log(f'FOV{fov:02d}: cross-modal overlay image could not be saved ({e}); '
                      f'matrices are unaffected.')
 
-    def _on_cross_modal_all_finished(self, results, rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe, channel_type):
-        # worker now returns {'H': {fov: H}, 'z': {fov: planes}} -- the z
-        # drift is part of the cross-modal RESULT, staged and accepted with it.
-        if isinstance(results, dict) and 'H' in results and 'z' in results:
-            self._pending_cross_modal_z = dict(results['z'])
-            results = results['H']
-        ap = self.ui.AlignmentPanel
-        ap.RunAllCrossModalPushButton.setEnabled(True)
-        self.statusBar().showMessage('Cross-modal alignment computed.', 5000)
-        self._cross_modal_context = {'rna_storage_path': rna_storage_path, 'dna_storage_path': dna_storage_path,
-                                      'rna_reference_hybe': rna_reference_hybe, 'dna_reference_hybe': dna_reference_hybe,
-                                      'channel_type': channel_type}
-        self.cross_modal_result.update({(dna_storage_path, fov): H for fov, H in results.items()})
-        self._pending_cross_modal = None
-        self._refresh_cross_modal_results_list()
-        # Overlays are NOT drawn here any more -- each was already written by
-        # _save_cross_modal_overlay as its FOV finished. What remains is the
-        # cheap per-FOV bookkeeping, which was never the source of the freeze.
-        for fov, H in results.items():
-            self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
-            self._mirror_cross_modal_params_to_vlinks(rna_storage_path, dna_storage_path, fov, H,
-                                                      rna_reference_hybe, dna_reference_hybe, channel_type)
-        n_overlays = getattr(self, '_cross_modal_overlays_saved', 0)
-        QtWidgets.QMessageBox.information(
-            self, 'Cross-modal alignment complete',
-            f'{len(results)} FOV(s) aligned and saved; {n_overlays} overlay image(s) written.')
-
-    def _on_cross_modal_all_failed(self, message):
-        self.ui.AlignmentPanel.RunAllCrossModalPushButton.setEnabled(True)
+    def _on_cross_modal_failed(self, message):
+        self._cross_modal_queue = []
+        button = getattr(self, '_cross_modal_run_button', None)
+        if button is not None:
+            button.setEnabled(True)
         self.statusBar().clearMessage()
         QtWidgets.QMessageBox.critical(self, 'Cross-modal alignment error', message)
 
     def _accept_cross_modal(self):
         ap = self.ui.AlignmentPanel
-        ctx = self._cross_modal_context
-        if not self._pending_cross_modal or ctx is None:
+        if not self._pending_cross_modal or not self._cross_modal_context:
             return
-        for fov, H in self._pending_cross_modal.items():
-            save_path = paths.figure_path(ctx['dna_storage_path'], 'alignment', fov, 'cross_modal_overlay.png')
-            self.preview_canvas.draw_cross_modal_preview(ctx['rna_storage_path'], ctx['dna_storage_path'], fov,
-                                                 ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'],
-                                                 H, save_path=save_path,
-                                                 rna_fov_matrices=self._fov_matrices_for(ctx['rna_storage_path'], fov),
-                                                 dna_fov_matrices=self._fov_matrices_for(ctx['dna_storage_path'], fov))
-            self._commit_cross_modal_z(fov, self._pending_cross_modal_z.get(fov))
-            self._mirror_cross_modal_params_to_vlinks(ctx['rna_storage_path'], ctx['dna_storage_path'], fov, H,
-                                                      ctx['rna_reference_hybe'], ctx['dna_reference_hybe'], ctx['channel_type'])
-        self.cross_modal_result.update({(ctx['dna_storage_path'], fov): H for fov, H in self._pending_cross_modal.items()})
+        for (msp, fov), H in self._pending_cross_modal.items():
+            ctx = self._cross_modal_context.get(msp)
+            if ctx is None:
+                continue
+            save_path = paths.figure_path(msp, 'alignment', fov, 'cross_modal_overlay.png')
+            self.preview_canvas.draw_cross_modal_preview(
+                ctx['shared_storage_path'], msp, fov,
+                ctx['shared_reference_hybe'], ctx['moving_reference_hybe'],
+                ctx['channel_type'], H, save_path=save_path,
+                rna_fov_matrices=self._fov_matrices_for(ctx['shared_storage_path'], fov),
+                dna_fov_matrices=self._fov_matrices_for(msp, fov))
+            self._commit_cross_modal_z(msp, fov, self._pending_cross_modal_z.get((msp, fov)))
+            self._mirror_cross_modal_params_to_vlinks(ctx, fov, H, ctx['channel_type'])
+        self.cross_modal_result.update(self._pending_cross_modal)
         self._pending_cross_modal = None
         self._refresh_cross_modal_results_list()
         ap.CrossModalAcceptPushButton.setEnabled(False)
         ap.CrossModalRejectPushButton.setEnabled(False)
-        QtWidgets.QMessageBox.information(self, 'Cross-modal alignment accepted', 'Result written to H5; overlay image(s) saved.')
+        QtWidgets.QMessageBox.information(self, 'Cross-modal alignment accepted',
+                                          'Result written to H5; overlay image(s) saved.')
 
         # Matrices changed -> every spot's shared-frame coordinate (and
         # possibly its owner) is stale. Assignment is cheap; recompute for
@@ -7159,59 +7128,55 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_cross_modal_overlay(self):
         """
-        Cross-modal alignment used to have no dedicated overlay viewer at
-        all -- the only preview was the one auto-shown right after Run
-        Cross-Modal Alignment, using whatever storage paths/reference
-        hybes/channel_type were selected AT THAT TIME. This reads all of
-        those LIVE from the panel every click instead, so re-viewing an
-        already-computed result with a freshly-changed channel_type (or
-        just checking a different FOV) doesn't require re-running the
-        alignment. Matrix source, in priority order: a staged (not-yet-
-        accepted) result, the in-memory cross_modal_result cache, then
-        vlinks_store.read_cross_modal_matrix as a last resort -- same
-        "never require re-computation just to look" pattern used by the
-        within-experiment/cell overlay viewers. vlinks is the only disk
-        source; nothing here reads a raw stack file.
+        Re-view an already-computed bridge for ONE moving modality without
+        re-running anything: the modality is whichever Results row was
+        clicked last (falling back to the first moving modality), the FOV
+        is the Overlay FOV spinbox, and everything else is read LIVE from
+        the generalized per-modality combos. Matrix source, in priority
+        order: staged result, in-memory cache, then vlinks_store.read_
+        cross_modal_matrix -- vlinks is the only disk source; nothing here
+        reads a raw stack file.
         """
         ap = self.ui.AlignmentPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        rna_reference_hybe = ap.RnaReferenceHybeComboBox.currentText().strip()
-        dna_reference_hybe = ap.DnaReferenceHybeComboBox.currentText().strip()
-        channel_type = ap.ChannelTypeComboBox.currentText()
-        if not all([rna_storage_path, dna_storage_path, rna_reference_hybe, dna_reference_hybe]):
+        shared = self._shared_frame_modality()
+        movings = self._cross_modal_moving_modalities()
+        if not shared or not movings:
             QtWidgets.QMessageBox.warning(self, 'Show Cross-Modal Overlay',
-                                          'Fill in both storage paths and reference hybes first.')
+                                          'Cross-modal alignment needs at least two activated modalities.')
+            return
+        moving = (self._cross_modal_view_modality
+                  if self._cross_modal_view_modality in movings else movings[0])
+        msp = self._storage_path_for_modality(moving)
+        ssp = self._storage_path_for_modality(shared)
+        shared_ref = ap.current_cross_modal_reference_hybe(shared)
+        moving_ref = ap.current_cross_modal_reference_hybe(moving)
+        channel_type = ap.ChannelTypeComboBox.currentText()
+        if not shared_ref or not moving_ref:
+            QtWidgets.QMessageBox.warning(self, 'Show Cross-Modal Overlay',
+                                          f'Pick bridge reference hybes for {shared} and {moving} first.')
             return
 
         fov = ap.CrossModalOverlayFovSpinBox.value()
-
         H = None
         if self._pending_cross_modal is not None:
-            H = self._pending_cross_modal.get(fov)
+            H = self._pending_cross_modal.get((msp, fov))
         if H is None:
-            H = self.cross_modal_result.get((dna_storage_path, fov))
+            H = self.cross_modal_result.get((msp, fov))
         if H is None:
-            # vlinks_store's own mirror is the ONLY accepted disk source --
-            # reference-hybe-independent, immune to a not-yet-reconciled combo
-            # (see _refresh_cross_modal_results_list's own comment for the full
-            # reasoning). Nothing here is a real answer -- "not accepted yet",
-            # reported below -- not a reason to scavenge
-            # {dna_reference_hybe}_stack.h5's own /matrix_across.
-            H = vlinks_store.read_cross_modal_matrix(dna_storage_path, fov)
+            H = vlinks_store.read_cross_modal_matrix(msp, fov)
         if H is None:
             QtWidgets.QMessageBox.warning(self, 'Show Cross-Modal Overlay',
-                                          f'No cross-modal result for FOV{fov:02d} yet -- run alignment first.')
+                                          f'No cross-modal result for FOV{fov:02d} ({moving}) yet -- run alignment first.')
             return
 
         self.alignment_preview_window.show()
         self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_cross_modal_preview(rna_storage_path, dna_storage_path, fov,
-                                             rna_reference_hybe, dna_reference_hybe, channel_type, H,
-                                             rna_fov_matrices=self._fov_matrices_for(rna_storage_path, fov),
-                                             dna_fov_matrices=self._fov_matrices_for(dna_storage_path, fov))
+        self.preview_canvas.draw_cross_modal_preview(ssp, msp, fov,
+                                             shared_ref, moving_ref, channel_type, H,
+                                             rna_fov_matrices=self._fov_matrices_for(ssp, fov),
+                                             dna_fov_matrices=self._fov_matrices_for(msp, fov))
 
-    # -- cell-based alignment --
+    # -- cell-based alignment --    # -- cell-based alignment --
 
     def _storage_path_for_modality(self, modality):
         """
@@ -7246,14 +7211,57 @@ class MainWindow(QtWidgets.QMainWindow):
     def _shared_frame_modality(self):
         """
         Which modality's own within-experiment frame IS the pipeline's ONE
-        shared frame -- always the RNA side of the cross-modal pair (the
-        side whose own H_across is identity by design; see ACell.
-        matrix_to_shared: "there is no separate DNA's own shared frame").
-        None when no cross-modal pair is configured at all, in which case
-        each caller falls back to its own modality (nothing to bridge).
+        shared frame: the FIRST activated modality with a configured
+        storage path. Activation order is the config's modality order
+        ("first = active"), so the hub is a declared fact of the project,
+        not something typed into a line edit -- the fixed RNA-side path
+        field this used to read is gone with the RNA/DNA-pair assumption.
+        The hub's own H_across is identity by design (see ACell.
+        matrix_to_shared); every other modality bridges into it. None only
+        when nothing is configured at all.
         """
-        rna_storage_path = self.ui.AlignmentPanel.RnaStoragePathLineEdit.text().strip()
-        return self._modality_for_storage_path(rna_storage_path) if rna_storage_path else None
+        for name in self.ui.IngestionPanel.modality_names:
+            if self._storage_path_for_modality(name):
+                return name
+        return None
+
+    def _cross_modal_moving_modalities(self):
+        """Every configured modality that is NOT the shared hub -- the
+        ones that each need their own accepted bridge into it."""
+        shared = self._shared_frame_modality()
+        return [name for name in self.ui.IngestionPanel.modality_names
+                if name != shared and self._storage_path_for_modality(name)]
+
+    def _cross_modal_pairs(self, warn_title=None):
+        """
+        One (shared -> moving) alignment job description per moving
+        modality, each carrying both sides' storage paths and bridge
+        reference hybes from the per-modality combos. Empty list (after a
+        warning, when warn_title is given) if fewer than two modalities
+        are activated or any needed bridge hybe has no pick.
+        """
+        ap = self.ui.AlignmentPanel
+        shared = self._shared_frame_modality()
+        movings = self._cross_modal_moving_modalities()
+        if not shared or not movings:
+            if warn_title:
+                QtWidgets.QMessageBox.warning(self, warn_title,
+                                              'Cross-modal alignment needs at least two activated modalities.')
+            return []
+        missing = [] if ap.current_cross_modal_reference_hybe(shared) else [shared]
+        missing += [m for m in movings if not ap.current_cross_modal_reference_hybe(m)]
+        if missing:
+            if warn_title:
+                QtWidgets.QMessageBox.warning(self, warn_title,
+                                              f'No bridge reference hybe selected for: {", ".join(missing)}.')
+            return []
+        return [{'shared_modality': shared,
+                 'moving_modality': moving,
+                 'shared_storage_path': self._storage_path_for_modality(shared),
+                 'moving_storage_path': self._storage_path_for_modality(moving),
+                 'shared_reference_hybe': ap.current_cross_modal_reference_hybe(shared),
+                 'moving_reference_hybe': ap.current_cross_modal_reference_hybe(moving)}
+                for moving in movings]
 
     def _frame_resolver(self, cell, fov):
         """
@@ -7268,22 +7276,11 @@ class MainWindow(QtWidgets.QMainWindow):
         pre-bridged matrices would count that leg twice.
         """
         ap = self.ui.AlignmentPanel
-        rna_sp = ap.RnaStoragePathLineEdit.text().strip()
-        dna_sp = ap.DnaStoragePathLineEdit.text().strip()
-        rna_modality = self._modality_for_storage_path(rna_sp) if rna_sp else None
-        dna_modality = self._modality_for_storage_path(dna_sp) if dna_sp else None
-        shared = rna_modality or (cell.reference_modality if cell is not None else None)
-        if shared is None:
-            # single-modality mode has no cross-modal RNA path to name the
-            # shared frame, but the shared frame plainly IS the one
-            # configured modality -- without this, every cell-less
-            # transform (unassigned-spot recast, FOV-level mapping)
-            # resolved to None and callers skipped work that identity
-            # answers exactly (the alignment-requirement violation again).
-            configured = [n for n in self.ui.IngestionPanel.modality_names
-                          if self._storage_path_for_modality(n)]
-            if len(configured) == 1:
-                shared = configured[0]
+        # First activated modality IS the hub (single-modality mode
+        # included: the one configured modality is trivially its own
+        # shared frame -- the old special case falls out of the rule).
+        shared = self._shared_frame_modality() or (
+            cell.reference_modality if cell is not None else None)
 
         within = {}
         for modality in self.ui.IngestionPanel.modality_names:
@@ -7296,15 +7293,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 # resolve to identity.
                 within[modality] = {h: H for (h, _m), H in self._fov_matrices_for(sp, fov).items()}
 
-        bridge_xy = None
-        bridge_z = 0.0
-        if rna_modality and dna_modality and rna_modality != dna_modality:
-            bridge_xy = self.cross_modal_result.get((dna_sp, fov))
-            if bridge_xy is None:
-                bridge_xy = vlinks_store.read_cross_modal_matrix(dna_sp, fov)
-            bridge_z = self.cross_modal_z.get((dna_sp, fov))
-            if bridge_z is None:
-                bridge_z = vlinks_store.read_cross_modal_z(dna_sp, fov)
+        # STAR topology, for real now: one bridge per moving modality,
+        # each read from that modality's own accepted result (session
+        # cache first, then the vlinks mirror) -- the resolver composes
+        # any pair through the hub (frames.FrameResolver.bridge). The old
+        # single bridge_xy/bridge_from construction could only carry ONE
+        # moving modality and was the last structural leftover of the
+        # fixed RNA/DNA pair.
+        bridges = {}
+        for moving in self._cross_modal_moving_modalities():
+            msp = self._storage_path_for_modality(moving)
+            H = self.cross_modal_result.get((msp, fov))
+            if H is None:
+                H = vlinks_store.read_cross_modal_matrix(msp, fov)
+            if H is None:
+                continue
+            z = self.cross_modal_z.get((msp, fov))
+            if z is None:
+                z = vlinks_store.read_cross_modal_z(msp, fov)
+            bridges[moving] = (H, float(z or 0.0))
 
         # Anchors are MODALITY-level facts (each modality's own cell-
         # alignment reference hybe's live FOV matrix, in the shared
@@ -7318,9 +7325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # whose bridge step builds another resolver (confirmed real
         # RecursionError). The cell's stored snapshot remains the
         # fallback when the live combo has no pick.
-        resolver = frames.FrameResolver(within, shared, bridge_xy=bridge_xy,
-                                        bridge_z=float(bridge_z or 0.0),
-                                        bridge_from=dna_modality if bridge_xy is not None else None)
+        resolver = frames.FrameResolver(within, shared, bridges=bridges or None)
         anchors = {}
         for modality in self.ui.IngestionPanel.modality_names:
             anchor_hybe = ap.current_cell_reference_hybe(modality)
@@ -7340,17 +7345,18 @@ class MainWindow(QtWidgets.QMainWindow):
         one place, shared with the Z leg.
         """
         return self._frame_resolver(None, fov).bridge(from_modality, to_modality)
-    def _commit_cross_modal_z(self, fov, dz=None):
+    def _commit_cross_modal_z(self, moving_storage_path, fov, dz=None):
         """
-        Persist this FOV's measured z drift alongside its H_across. `dz`
-        comes from the SAME alignment run that produced H -- it is a
-        measured component of the result, never a user-set parameter.
+        Persist this FOV's measured z drift alongside its H_across, keyed
+        by the MOVING modality's own storage path (there is one bridge per
+        moving modality now, not one global pair). `dz` comes from the
+        SAME alignment run that produced H -- a measured component of the
+        result, never a user-set parameter.
         """
-        dna_sp = self.ui.AlignmentPanel.DnaStoragePathLineEdit.text().strip()
-        if not dna_sp or dz is None:
+        if not moving_storage_path or dz is None:
             return
-        self.cross_modal_z[(dna_sp, fov)] = float(dz)
-        vlinks_store.write_cross_modal_z(dna_sp, fov, float(dz))
+        self.cross_modal_z[(moving_storage_path, fov)] = float(dz)
+        vlinks_store.write_cross_modal_z(moving_storage_path, fov, float(dz))
 
     def _cross_modal_z(self, from_modality, to_modality, fov):
         """
@@ -7495,44 +7501,36 @@ class MainWindow(QtWidgets.QMainWindow):
         compute_cell_alignment's own modality= parameter so every write
         it makes is correctly tagged.
         """
-        ap = self.ui.AlignmentPanel
-        rna_storage_path = ap.RnaStoragePathLineEdit.text().strip()
-        dna_storage_path = ap.DnaStoragePathLineEdit.text().strip()
-        if not rna_storage_path or not dna_storage_path or rna_storage_path == dna_storage_path:
-            return None
-        if storage_path == rna_storage_path:
-            other_storage_path = dna_storage_path
-        elif storage_path == dna_storage_path:
-            other_storage_path = rna_storage_path
-        else:
-            return None
-
-        other_modality = self._modality_for_storage_path(other_storage_path)
-        other_data = self.ui.IngestionPanel.modality_data.get(other_modality) if other_modality else None
-        if not other_data or not other_data['layout_path']:
-            return None
-        # the real, persisted same-modality reference hybe for this
-        # storage_path -- read from vlinks.h5 global params (see
-        # _reference_hybe_for_storage_path), not modality_data, since
-        # that no longer tracks a per-modality reference hybe at all
-        # (Same-Modality Alignment's own reference-hybe combo isn't
-        # modality-switch-scoped any more).
-        other_reference_hybe = self._reference_hybe_for_storage_path(other_storage_path)
-        if not other_reference_hybe:
-            return None
-        try:
-            other_hybe_records = preprocess.parse_experiment_layout(other_data['layout_path'])
-        except Exception:
-            return None
-
-        # ONE shared frame for both legs, never storage_path's own -- see
-        # this function's own other_fov_matrices docstring and
-        # _cross_modal_bridge for the measured bug that motivated it.
-        frame_modality = self._shared_frame_modality() or other_modality
-        other_fov_matrices = self._fov_matrices_in_frame(other_modality, frame_modality, fov)
-        if not other_fov_matrices:
-            return None
-        return other_storage_path, other_hybe_records, other_fov_matrices, other_reference_hybe, other_modality
+        own_modality = self._modality_for_storage_path(storage_path)
+        out = []
+        for other_modality in self.ui.IngestionPanel.modality_names:
+            if other_modality == own_modality:
+                continue
+            other_storage_path = self._storage_path_for_modality(other_modality)
+            other_data = self.ui.IngestionPanel.modality_data.get(other_modality)
+            if not other_storage_path or not other_data or not other_data['layout_path']:
+                continue
+            # the real, persisted same-modality reference hybe for that
+            # storage_path -- read from vlinks.h5 global params (see
+            # _reference_hybe_for_storage_path), not modality_data, since
+            # that no longer tracks a per-modality reference hybe at all.
+            other_reference_hybe = self._reference_hybe_for_storage_path(other_storage_path)
+            if not other_reference_hybe:
+                continue
+            try:
+                other_hybe_records = preprocess.parse_experiment_layout(other_data['layout_path'])
+            except Exception:
+                continue
+            # ONE shared frame for both legs, never storage_path's own -- see
+            # this function's own other_fov_matrices docstring and
+            # _cross_modal_bridge for the measured bug that motivated it.
+            frame_modality = self._shared_frame_modality() or other_modality
+            other_fov_matrices = self._fov_matrices_in_frame(other_modality, frame_modality, fov)
+            if not other_fov_matrices:
+                continue
+            out.append((other_storage_path, other_hybe_records, other_fov_matrices,
+                        other_reference_hybe, other_modality))
+        return out
 
     def _cell_alignment_passes(self, cell_modality, storage_path, fov):
         """
@@ -7577,8 +7575,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'reference_hybe': ap.current_cell_reference_hybe(cell_modality) or None,
             'cellref_fov_matrices': frames_by_modality,
         }]
-        other = self._other_modality_cell_alignment_inputs(storage_path, fov)
-        if other is not None:
+        for other in self._other_modality_cell_alignment_inputs(storage_path, fov):
             other_storage_path, _, other_fov_matrices, _, other_modality = other
             frames_by_modality[other_modality] = other_fov_matrices
             other_reference_hybe = ap.current_cell_reference_hybe(other_modality)
@@ -8486,8 +8483,6 @@ class MainWindow(QtWidgets.QMainWindow):
         },
         'cross_modal_alignment': {
             'channel_type': ('AlignmentPanel', 'ChannelTypeComboBox'),
-            'reference_hybe_RNA': ('AlignmentPanel', 'RnaReferenceHybeComboBox'),
-            'reference_hybe_DNA': ('AlignmentPanel', 'DnaReferenceHybeComboBox'),
             'border_trim': ('AlignmentPanel', 'CrossModalBorderTrimSpinBox'),
             'max_shift': ('AlignmentPanel', 'CrossModalMaxShiftSpinBox'),
         },
@@ -8586,6 +8581,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             for param, (panel, widget) in entries.items()}
         for name, hybe in self.ui.AlignmentPanel.cell_align_references().items():
             out['cell_alignment'][f'reference_hybe_{name}'] = hybe
+        for name, hybe in self.ui.AlignmentPanel.cross_modal_references().items():
+            out['cross_modal_alignment'][f'reference_hybe_{name}'] = hybe
         out['chromatin_tracing']['hybes'] = ','.join(
             f'{folder}|{modality}' for folder, modality in self.ui.ChromatinTracingPanel.checked_hybes())
         return out
@@ -8608,6 +8605,10 @@ class MainWindow(QtWidgets.QMainWindow):
             for param, value in fields.items():
                 if section == 'cell_alignment' and param.startswith('reference_hybe_'):
                     self.ui.AlignmentPanel.select_cell_reference_hybe(
+                        param[len('reference_hybe_'):], value)
+                    continue
+                if section == 'cross_modal_alignment' and param.startswith('reference_hybe_'):
+                    self.ui.AlignmentPanel.select_cross_modal_reference_hybe(
                         param[len('reference_hybe_'):], value)
                     continue
                 if section == 'chromatin_tracing' and param == 'hybes':
@@ -8643,11 +8644,12 @@ class MainWindow(QtWidgets.QMainWindow):
         run actually did (truth lives in vlinks.h5), not something an
         external config should dictate.
 
-        The cross-modal section (Rna/DnaStoragePathLineEdit +
-        Rna/DnaReferenceHybeComboBox) gets populated directly from
-        modalities['RNA']/['DNA'] -- no separate rna_storage_path/
-        dna_storage_path keys needed, the modality entries ARE that
-        information. The Ingestion tab + within-experiment section are
+        The cross-modal section has no per-modality fields of its own to
+        populate any more: the shared hub is the first activated modality,
+        storage paths live in modality_data (from the manifest), and the
+        per-modality bridge combos are restored through the
+        cross_modal_alignment params section like every other analysis
+        parameter. The Ingestion tab + within-experiment section are
         single-context (one active modality at a time in this app's
         current UI), so they're populated from whichever modality appears
         FIRST in the file.
@@ -8718,8 +8720,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if name and name not in self.current_celltype_list:
                     self.current_celltype_list.append(name)
             self.ui.CelltypeDeterminationPanel.ensure_celltype_names(self.current_celltype_list)
-        ap.RnaStoragePathLineEdit.setText(modalities.get('RNA', {}).get('storage_path', ''))
-        ap.DnaStoragePathLineEdit.setText(modalities.get('DNA', {}).get('storage_path', ''))
 
         # Modality Setup: rebuild the name-entry fields to match the file's
         # modality count/names, lock them (mirrors what clicking Activate

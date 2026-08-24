@@ -85,19 +85,18 @@ class AlignmentPanelUI(object):
         crossGroup = QtWidgets.QGroupBox('2. Cross-Modality Alignment')
         crossLayout = QtWidgets.QFormLayout(crossGroup)
 
-        self.RnaStoragePathLineEdit, rnaRow = self._path_row('Select RNA storage directory')
-        crossLayout.addRow('RNA storage path:', rnaRow)
-        self.RnaReferenceHybeComboBox = QtWidgets.QComboBox()
-        self.RnaReferenceHybeComboBox.setEditable(True)
-        self.RnaReferenceHybeComboBox.lineEdit().setPlaceholderText('e.g. Hyb_500')
-        crossLayout.addRow('RNA reference hybe:', self.RnaReferenceHybeComboBox)
-
-        self.DnaStoragePathLineEdit, dnaRow = self._path_row('Select DNA storage directory')
-        crossLayout.addRow('DNA storage path:', dnaRow)
-        self.DnaReferenceHybeComboBox = QtWidgets.QComboBox()
-        self.DnaReferenceHybeComboBox.setEditable(True)
-        self.DnaReferenceHybeComboBox.lineEdit().setPlaceholderText('e.g. Hyb_400')
-        crossLayout.addRow('DNA reference hybe:', self.DnaReferenceHybeComboBox)
+        # No storage-path rows and no fixed RNA/DNA combos, per explicit
+        # direction: storage paths come from the project manifest (there is
+        # nothing to type), and the bridge reference-hybe selectors are
+        # rebuilt per ACTIVATED modality -- the same generalized-name
+        # principle as the cell-level residual section's own per-modality
+        # combos below. The first activated modality is the shared (hub)
+        # frame; every other modality bridges into it with its own hybe.
+        self.CrossModalSharedFrameLabel = QtWidgets.QLabel('-')
+        crossLayout.addRow('Shared frame (hub):', self.CrossModalSharedFrameLabel)
+        self.CrossModalReferenceHybeComboBoxes = {}
+        self.CrossModalReferenceHybeFormLayout = QtWidgets.QFormLayout()
+        crossLayout.addRow(self.CrossModalReferenceHybeFormLayout)
 
         self.ChannelTypeComboBox = QtWidgets.QComboBox()
         self.ChannelTypeComboBox.addItems(['readout', 'fiducial'])
@@ -478,20 +477,60 @@ class AlignmentPanelUI(object):
         return {m: self.current_cell_reference_hybe(m) for m in self.CellReferenceHybeComboBoxes
                if self.current_cell_reference_hybe(m)}
 
-    def populate_rna_reference_hybe_choices(self, hybe_records):
-        self._repopulate_editable_combo(self.RnaReferenceHybeComboBox, [r['folder'] for r in hybe_records])
+    def build_cross_modal_reference_hybe_fields(self, modality_names):
+        """
+        Cross-modal counterpart of build_cell_reference_hybe_fields: one
+        bridge-hybe combo per ACTIVATED modality, rebuilt whenever the
+        configured modality set changes -- replacing the fixed RNA/DNA
+        pair per the generalized-name principle.
+        """
+        while self.CrossModalReferenceHybeFormLayout.rowCount():
+            self.CrossModalReferenceHybeFormLayout.removeRow(0)
+        self.CrossModalReferenceHybeComboBoxes = {}
+        for name in modality_names:
+            combo = QtWidgets.QComboBox()
+            self.CrossModalReferenceHybeComboBoxes[name] = combo
+            self.CrossModalReferenceHybeFormLayout.addRow(f'Bridge hybe ({name}):', combo)
 
-    def populate_dna_reference_hybe_choices(self, hybe_records):
-        self._repopulate_editable_combo(self.DnaReferenceHybeComboBox, [r['folder'] for r in hybe_records])
+    def populate_cross_modal_reference_hybe_choices(self, total_active_hybe_list):
+        """Route each hybe into its own modality's bridge combo -- same
+        per-modality scoping as populate_cell_reference_hybe_choices."""
+        by_modality = {}
+        for record, modality in total_active_hybe_list:
+            by_modality.setdefault(modality, []).append(record)
+        for modality, combo in self.CrossModalReferenceHybeComboBoxes.items():
+            current = combo.currentData()['folder'] if combo.currentData() is not None else None
+            combo.blockSignals(True)
+            combo.clear()
+            for record in by_modality.get(modality, []):
+                combo.addItem(record['folder'], record)
+            if combo.count():
+                restore_index = next((i for i in range(combo.count())
+                                      if combo.itemData(i)['folder'] == current), 0)
+                combo.setCurrentIndex(restore_index)
+            combo.blockSignals(False)
 
-    @staticmethod
-    def _repopulate_editable_combo(combo, items):
-        """clear()+addItems() on an editable combo wipes its typed/selected
-        text too -- restore whatever was there before, so repopulating
-        choices (e.g. after re-parsing a layout) never silently discards
-        a value the user already set or loaded from config."""
-        current = combo.currentText()
-        combo.clear()
-        combo.addItems(items)
-        if current:
-            combo.setCurrentText(current)
+    def current_cross_modal_reference_hybe(self, modality):
+        """Real hybe folder currently selected as `modality`'s bridge hybe, or ''."""
+        combo = self.CrossModalReferenceHybeComboBoxes.get(modality)
+        if combo is None:
+            return ''
+        data = combo.currentData()
+        return data['folder'] if data is not None else ''
+
+    def select_cross_modal_reference_hybe(self, modality, folder):
+        """Finds and selects `folder` in `modality`'s bridge combo. No-op if either doesn't exist."""
+        combo = self.CrossModalReferenceHybeComboBoxes.get(modality)
+        if combo is None:
+            return
+        for i in range(combo.count()):
+            if combo.itemData(i)['folder'] == folder:
+                combo.setCurrentIndex(i)
+                return
+
+    def cross_modal_references(self):
+        """{modality: bridge hybe} for every modality with a real pick."""
+        return {m: self.current_cross_modal_reference_hybe(m)
+                for m in self.CrossModalReferenceHybeComboBoxes
+                if self.current_cross_modal_reference_hybe(m)}
+

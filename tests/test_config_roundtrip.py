@@ -79,9 +79,10 @@ def main():
         chp.set_checked_hybes(keys[:2])
         ap = a.ui.AlignmentPanel
         for name in a.ui.IngestionPanel.modality_names:
-            combo = ap.CellReferenceHybeComboBoxes.get(name)
-            if combo is not None and combo.count() > 1:
-                combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
+            for combos in (ap.CellReferenceHybeComboBoxes, ap.CrossModalReferenceHybeComboBoxes):
+                combo = combos.get(name)
+                if combo is not None and combo.count() > 1:
+                    combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
 
         with mock.patch.object(QtWidgets.QFileDialog, 'getSaveFileName',
                                return_value=(OUT, '')):
