@@ -143,6 +143,51 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self._resize_canvas(width_px, height_px)
         self._force_repaint()
 
+    def show_total_overlay(self, total, allele_label='', params=None):
+        """
+        The ONE-vs-ALL companion to show_overlay_grid: instead of one tile
+        per hybe, a single 2x2 figure compositing EVERY fitted hybe into one
+        image -- before | after as columns, YX above ZX as rows, the same
+        per-tile layout convention the per-hybe grid uses, so the two
+        pop-ups read as zoom levels of the same comparison. The per-hybe
+        grid answers "which hybe is misbehaving"; this answers "did the
+        whole trace converge onto the reference" in one glance, without
+        scanning N tiles.
+
+        total: (yx_before, yx_after, zx_before, zx_after, n_hybes) -- each
+        image an (h, w, 3) float RGB already composited by the caller
+        (reference red, hybes graded to cyan, pixelwise max -- the same
+        sequential red-cyan language as the FOV-level all-readouts overlay
+        and the per-hybe tiles), or None to clear.
+        """
+        self._current_allele_label = allele_label
+        self._current_params = dict(params) if params else {}
+        fig = self.canvas.figure
+        fig.clear()
+        if not total:
+            self._resize_canvas(self.canvas.minimumWidth(), self.canvas.minimumHeight())
+            self._force_repaint()
+            return
+        yx_b, yx_a, zx_b, zx_a, n_hybes = total
+        outer = fig.add_gridspec(2, 2, hspace=0.12, wspace=0.08,
+                                 left=0.06, right=0.98, top=0.88, bottom=0.04)
+        axes = [[fig.add_subplot(outer[r, c]) for c in range(2)] for r in range(2)]
+        for ax, img in ((axes[0][0], yx_b), (axes[0][1], yx_a),
+                        (axes[1][0], zx_b), (axes[1][1], zx_a)):
+            ax.imshow(img, aspect='auto')
+            ax.set_xticks([])
+            ax.set_yticks([])
+        axes[0][0].set_title('before', fontsize=10)
+        axes[0][1].set_title('after alignment', fontsize=10)
+        axes[0][0].set_ylabel('YX', fontsize=9)
+        axes[1][0].set_ylabel('ZX', fontsize=9)
+        fig.suptitle(f'{allele_label}: reference (red) vs ALL {n_hybes} fitted hybe(s) (to cyan)',
+                     fontsize=10)
+        # One fixed-size tile -- the minimum canvas is already the right
+        # scale for a single 2x2, no per-entry growth to compute.
+        self._resize_canvas(self.canvas.minimumWidth(), self.canvas.minimumHeight())
+        self._force_repaint()
+
     def save_figure(self):
         """
         Default filename embeds the allele + the live fit-parameter values

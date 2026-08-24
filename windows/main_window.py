@@ -14,7 +14,7 @@ from PyQt5 import QtWidgets, QtCore
 
 from config import path as repo_path, config_name
 from ui.main_window_ui import MainWindowUI
-from canvas.pipeline_canvas import PipelineCanvas
+from canvas.pipeline_canvas import PipelineCanvas, _sequential_color
 from canvas.cell_displayer import CellDisplayer
 from ui.cytoplasm_panel import CytoplasmSegmentationWindow
 from canvas.spot_crop_displayer import SpotCropDisplayer
@@ -743,6 +743,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chromatin_fiducial_grid_displayer = ChromatinTraceGridDisplayer('Fiducial')
         self.chromatin_readout_grid_displayer = ChromatinTraceGridDisplayer('Readout')
         self.chromatin_fiducial_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Overlay')
+        # The one-vs-all companion to the per-hybe overlay grid above -- its
+        # own separate pop-up per explicit request, so the per-hybe grid and
+        # the single composited view can sit side by side on screen.
+        self.chromatin_fiducial_total_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Total Overlay')
 
         self._connect_signals()
         self._switch_current_modality(self.ui.IngestionPanel.ModalityComboBox.currentText())
@@ -5695,15 +5699,19 @@ class MainWindow(QtWidgets.QMainWindow):
         allele_label = f'FOV{fov:02d}_allele{allele.id}'
         self.chromatin_fiducial_grid_displayer.show_fit_status_grid(fid_results, allele_label=allele_label, params=full_params)
         self.chromatin_readout_grid_displayer.show_fit_status_grid(readout_results, allele_label=allele_label, params=full_params)
-        overlay_entries = self._build_fiducial_overlay_entries(allele, reference_hybe, debug)
+        overlay_entries, total_overlay = self._build_fiducial_overlay_entries(allele, reference_hybe, debug)
         self.chromatin_fiducial_overlay_displayer.show_overlay_grid(
             overlay_entries, allele_label=allele_label, params=full_params)
+        self.chromatin_fiducial_total_overlay_displayer.show_total_overlay(
+            total_overlay, allele_label=allele_label, params=full_params)
         self.chromatin_fiducial_grid_displayer.show()
         self.chromatin_fiducial_grid_displayer.raise_()
         self.chromatin_readout_grid_displayer.show()
         self.chromatin_readout_grid_displayer.raise_()
         self.chromatin_fiducial_overlay_displayer.show()
         self.chromatin_fiducial_overlay_displayer.raise_()
+        self.chromatin_fiducial_total_overlay_displayer.show()
+        self.chromatin_fiducial_total_overlay_displayer.raise_()
         self._refresh_chromatin_allele_lists(storage_path, fov)
         chp.StatusLabel.setText(f'Allele {allele.id}: {len(allele.polymer)}/{len(hybes)} hybe(s) traced '
                                 f'({len(allele.rejected_hybes)} rejected).')
@@ -5741,12 +5749,31 @@ class MainWindow(QtWidgets.QMainWindow):
             M = np.array([[1.0, 0.0, -dx_h], [0.0, 1.0, -dy_v]], dtype=np.float64)
             return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
 
+        def composite(planes):
+            """
+            One-vs-all: pixelwise-max of every plane in its own sequential
+            red-to-cyan color, reference first (index 0 = pure red) -- the
+            same _sequential_color language the FOV-level all-readouts
+            overlay uses, so 'red = reference, toward cyan = later hybes'
+            means the same thing at every zoom level of this app. Planes
+            can differ by a pixel or two in size (edge-of-frame crops), so
+            everything is cut to the common minimum first.
+            """
+            h = min(p.shape[0] for p in planes)
+            w = min(p.shape[1] for p in planes)
+            out = np.zeros((h, w, 3))
+            n = len(planes)
+            for i, p in enumerate(planes):
+                color = np.asarray(_sequential_color(i, n))
+                np.maximum(out, p[:h, :w, None] * color[None, None, :], out)
+            return out
+
         Z_PAD = 15   # same z display window the fit-status grids use
         fid = allele.fiducial_trace or {}
         ref_fit = fid.get(reference_hybe)
         ref_cubic = (debug.get(reference_hybe) or {}).get('fiducial_cubic')
         if ref_fit is None or ref_cubic is None:
-            return []
+            return [], None
         ref_cubic = np.asarray(ref_cubic, dtype=float)
         # ONE absolute z-window (the reference fit's) applied to BOTH
         # sides of every pair: windowing each hybe around its OWN fit
@@ -5757,6 +5784,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ref_yx = norm2d(np.nanmax(ref_cubic, axis=2))
         ref_zx = norm2d(np.nanmax(ref_cubic[:, :, z0:z1], axis=0).T)
         entries = []
+        # The total overlay reuses the per-tile normalized planes verbatim
+        # -- same normalization, same z-window, same shift -- so the two
+        # pop-ups can never disagree about what "after" looks like.
+        yx_before, yx_after = [ref_yx], [ref_yx]
+        zx_before, zx_after = [ref_zx], [ref_zx]
         for hybe in sorted(fid):
             if hybe == reference_hybe:
                 continue
@@ -5769,10 +5801,20 @@ class MainWindow(QtWidgets.QMainWindow):
             mov_yx = norm2d(np.nanmax(cubic, axis=2))
             mov_zx = norm2d(np.nanmax(cubic[:, :, z0:mz1], axis=0).T)
             dy, dx, dz = fit[0] - ref_fit[0], fit[1] - ref_fit[1], fit[2] - ref_fit[2]
-            entries.append((rgb(ref_yx, mov_yx), rgb(ref_yx, shifted(mov_yx, dx, dy)),
-                            rgb(ref_zx, mov_zx), rgb(ref_zx, shifted(mov_zx, dx, dz)),
+            yx_after_img = shifted(mov_yx, dx, dy)
+            zx_after_img = shifted(mov_zx, dx, dz)
+            entries.append((rgb(ref_yx, mov_yx), rgb(ref_yx, yx_after_img),
+                            rgb(ref_zx, mov_zx), rgb(ref_zx, zx_after_img),
                             f'{hybe}  d=({dx:+.2f},{dy:+.2f},{dz:+.2f})'))
-        return entries
+            yx_before.append(mov_yx)
+            yx_after.append(yx_after_img)
+            zx_before.append(mov_zx)
+            zx_after.append(zx_after_img)
+        if not entries:
+            return [], None
+        total = (composite(yx_before), composite(yx_after),
+                 composite(zx_before), composite(zx_after), len(entries))
+        return entries, total
 
     def _refresh_allele_anchor(self, allele, fov):
         """
