@@ -874,6 +874,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ctp = self.ui.CelltypeDeterminationPanel
 
         self.ui.ShowLogPushButton.clicked.connect(self.show_log_window)
+        self.ui.SaveConfigPushButton.clicked.connect(self._save_config_dialog)
 
         ip.SetNumModalitiesPushButton.clicked.connect(self._on_set_num_modalities)
         ip.ActivateModalitiesPushButton.clicked.connect(self._on_activate_modalities)
@@ -8443,6 +8444,185 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- config --
 
+
+    # -- full-parameter config (Save Config) ------------------------------
+    # {section: {param: (ui panel attr, widget attr)}}. One declarative
+    # table drives BOTH sides of the config -- _capture_config_params reads
+    # it to save, _apply_config_params reads it to load -- so the two can
+    # never disagree about what a parameter is called or where it lives,
+    # and the saved file reads as an experiment description
+    # (<chromatin_tracing z_boundary_trim="10" .../>) a human can audit
+    # and edit, never a widget dump. Deliberately BIOLOGICAL/analysis
+    # parameters only: navigation and view state (FOV spinboxes, viewer
+    # combos, selected rows, window geometry) is not configuration.
+    # Two special parameters have no scalar widget and are handled
+    # explicitly in the capture/apply pair below: cell_alignment's
+    # per-modality reference_hybe_{name} (a dict of dynamic combos) and
+    # chromatin_tracing's checked-hybe list.
+    _CONFIG_PARAM_MAP = {
+        'cell_segmentation': {
+            'reference_hybe': ('CellSegmentPanel', 'ReferenceHybeComboBox'),
+            'channel': ('CellSegmentPanel', 'ChannelComboBox'),
+            'method': ('CellSegmentPanel', 'MethodComboBox'),
+            'diameter': ('CellSegmentPanel', 'DiameterSpinBox'),
+            'min_size': ('CellSegmentPanel', 'MinSizeSpinBox'),
+            'max_size': ('CellSegmentPanel', 'MaxSizeSpinBox'),
+            'classical_algorithm': ('CellSegmentPanel', 'ClassicalAlgorithmComboBox'),
+            'classical_absolute_cutoff': ('CellSegmentPanel', 'ClassicalAbsoluteCutoffSpinBox'),
+            'classical_min_distance': ('CellSegmentPanel', 'ClassicalMinDistanceSpinBox'),
+            'classical_min_size': ('CellSegmentPanel', 'ClassicalMinSizeSpinBox'),
+            'classical_max_size': ('CellSegmentPanel', 'ClassicalMaxSizeSpinBox'),
+            'append_mode': ('CellSegmentPanel', 'AppendModeCheckBox'),
+            'projection': ('CellSegmentPanel', 'ProjectionModeComboBox'),
+            'z_plane': ('CellSegmentPanel', 'ZPlaneSpinBox'),
+            'z_start': ('CellSegmentPanel', 'ZStartSpinBox'),
+            'z_end': ('CellSegmentPanel', 'ZEndSpinBox'),
+        },
+        'fov_alignment': {
+            'reference_hybe': ('AlignmentPanel', 'ReferenceHybeComboBox'),
+            'channel_type': ('AlignmentPanel', 'SameModalityChannelTypeComboBox'),
+            'border_trim': ('AlignmentPanel', 'SameModalityBorderTrimSpinBox'),
+            'max_shift': ('AlignmentPanel', 'SameModalityMaxShiftSpinBox'),
+        },
+        'cross_modal_alignment': {
+            'channel_type': ('AlignmentPanel', 'ChannelTypeComboBox'),
+            'reference_hybe_RNA': ('AlignmentPanel', 'RnaReferenceHybeComboBox'),
+            'reference_hybe_DNA': ('AlignmentPanel', 'DnaReferenceHybeComboBox'),
+            'border_trim': ('AlignmentPanel', 'CrossModalBorderTrimSpinBox'),
+            'max_shift': ('AlignmentPanel', 'CrossModalMaxShiftSpinBox'),
+        },
+        'cell_alignment': {
+            'channel_type': ('AlignmentPanel', 'CellChannelTypeComboBox'),
+            'pad': ('AlignmentPanel', 'CellPadSpinBox'),
+            'max_z_shift': ('AlignmentPanel', 'CellZMaxShiftSpinBox'),
+            'overlay_autosave_threshold_px': ('AlignmentPanel', 'CellOverlayAutoSaveThresholdSpinBox'),
+        },
+        'spot_localization': {
+            'hybe': ('SpotLocalizationPanel', 'HybeComboBox'),
+            'channel': ('SpotLocalizationPanel', 'ChannelComboBox'),
+            'threshold_percent': ('SpotLocalizationPanel', 'ThresholdPercentLineEdit'),
+            'threshold_absolute': ('SpotLocalizationPanel', 'ThresholdAbsoluteLineEdit'),
+            'min_distance': ('SpotLocalizationPanel', 'MinDistanceSpinBox'),
+            'pad': ('SpotLocalizationPanel', 'PadSpinBox'),
+            'append_mode': ('SpotLocalizationPanel', 'AppendModeCheckBox'),
+        },
+        'celltype': {
+            'barcode_hybe': ('CelltypeDeterminationPanel', 'BarcodeHybeComboBox'),
+            'barcode_channel': ('CelltypeDeterminationPanel', 'BarcodeChannelComboBox'),
+            'method': ('CelltypeDeterminationPanel', 'BarcodeMethodComboBox'),
+            'fov_ranges': ('CelltypeDeterminationPanel', 'FovRangesLineEdit'),
+            'calibration_fov': ('CelltypeDeterminationPanel', 'CalibrationFovLineEdit'),
+            'scale': ('CelltypeDeterminationPanel', 'ScaleDoubleSpinBox'),
+            'lower_bound_mode': ('CelltypeDeterminationPanel', 'LowerBoundModeComboBox'),
+            'lower_bound_value': ('CelltypeDeterminationPanel', 'LowerBoundValueDoubleSpinBox'),
+            'upper_bound_mode': ('CelltypeDeterminationPanel', 'UpperBoundModeComboBox'),
+            'upper_bound_value': ('CelltypeDeterminationPanel', 'UpperBoundValueDoubleSpinBox'),
+            'include_transient': ('CelltypeDeterminationPanel', 'IncludeTransientCheckBox'),
+        },
+        'chromatin_tracing': {
+            'reference_hybe': ('ChromatinTracingPanel', 'ReferenceHybeComboBox'),
+            'spad': ('ChromatinTracingPanel', 'SpadSpinBox'),
+            'z_window': ('ChromatinTracingPanel', 'ZWindowSpinBox'),
+            'z_boundary_trim': ('ChromatinTracingPanel', 'ZBoundaryTrimSpinBox'),
+            'max_fiducial_drift': ('ChromatinTracingPanel', 'MaxFiducialDriftSpinBox'),
+            'max_fiducial_drift_z': ('ChromatinTracingPanel', 'MaxFiducialDriftZSpinBox'),
+            'fiducial_peak_bound': ('ChromatinTracingPanel', 'FiducialPeakBoundSpinBox'),
+            'readout_peak_bound': ('ChromatinTracingPanel', 'ReadoutPeakBoundSpinBox'),
+            'fiducial_max_sigma': ('ChromatinTracingPanel', 'FiducialMaxSigmaSpinBox'),
+            'readout_max_sigma': ('ChromatinTracingPanel', 'ReadoutMaxSigmaSpinBox'),
+            'fiducial_max_uncert': ('ChromatinTracingPanel', 'FiducialMaxUncertSpinBox'),
+            'readout_max_uncert': ('ChromatinTracingPanel', 'ReadoutMaxUncertSpinBox'),
+            'fiducial_min_hb_ratio': ('ChromatinTracingPanel', 'FiducialMinHBRatioSpinBox'),
+            'readout_min_hb_ratio': ('ChromatinTracingPanel', 'ReadoutMinHBRatioSpinBox'),
+            'fiducial_min_ah_ratio': ('ChromatinTracingPanel', 'FiducialMinAHRatioSpinBox'),
+            'readout_min_ah_ratio': ('ChromatinTracingPanel', 'ReadoutMinAHRatioSpinBox'),
+            'readout_min_sep': ('ChromatinTracingPanel', 'ReadoutMinSepSpinBox'),
+            'multi_component_fit': ('ChromatinTracingPanel', 'ReadoutMultiModeCheckBox'),
+        },
+    }
+
+    @staticmethod
+    def _widget_value(w):
+        if isinstance(w, QtWidgets.QComboBox):
+            return w.currentText()
+        if isinstance(w, QtWidgets.QLineEdit):
+            return w.text()
+        if isinstance(w, QtWidgets.QCheckBox):
+            return '1' if w.isChecked() else '0'
+        return str(w.value())   # QSpinBox / QDoubleSpinBox
+
+    @staticmethod
+    def _apply_widget_value(w, value):
+        """True if the value landed. A combo that doesn't (yet) hold the
+        item reports False so _apply_config_params can retry it after the
+        combos it depends on have fired their repopulation signals."""
+        if isinstance(w, QtWidgets.QComboBox):
+            w.setCurrentText(value)
+            return w.currentText() == value
+        if isinstance(w, QtWidgets.QLineEdit):
+            w.setText(value)
+            return True
+        if isinstance(w, QtWidgets.QCheckBox):
+            w.setChecked(value == '1')
+            return True
+        if isinstance(w, QtWidgets.QDoubleSpinBox):
+            w.setValue(float(value))
+            return True
+        w.setValue(int(float(value)))
+        return True
+
+    def _capture_config_params(self):
+        """
+        Every analysis parameter the app is currently running with, as
+        {section: {param: str}} -- the write side of _CONFIG_PARAM_MAP,
+        plus the two dynamic ones (per-modality cell-alignment reference
+        hybes; chromatin tracing's checked-hybe set). Also the equality
+        probe for config verification: load a saved config into a fresh
+        app and the two captures must compare equal.
+        """
+        out = {}
+        for section, entries in self._CONFIG_PARAM_MAP.items():
+            out[section] = {param: self._widget_value(getattr(getattr(self.ui, panel), widget))
+                            for param, (panel, widget) in entries.items()}
+        for name, hybe in self.ui.AlignmentPanel.cell_align_references().items():
+            out['cell_alignment'][f'reference_hybe_{name}'] = hybe
+        out['chromatin_tracing']['hybes'] = ','.join(
+            f'{folder}|{modality}' for folder, modality in self.ui.ChromatinTracingPanel.checked_hybes())
+        return out
+
+    def _apply_config_params(self, params):
+        """
+        The read side of _CONFIG_PARAM_MAP. Runs LAST in _load_config --
+        after modality activation and layout parsing have populated every
+        hybe/channel combo -- and in two passes: setting one combo often
+        repopulates a dependent one (choosing a hybe rebuilds its channel
+        list), so anything that failed to land in pass 1 gets exactly one
+        retry after every other value has fired its signals. Unknown
+        sections/params are skipped: a config written by a newer build
+        must degrade to "that one setting stays at its default", never an
+        error.
+        """
+        pending = []
+        for section, fields in params.items():
+            entries = self._CONFIG_PARAM_MAP.get(section, {})
+            for param, value in fields.items():
+                if section == 'cell_alignment' and param.startswith('reference_hybe_'):
+                    self.ui.AlignmentPanel.select_cell_reference_hybe(
+                        param[len('reference_hybe_'):], value)
+                    continue
+                if section == 'chromatin_tracing' and param == 'hybes':
+                    keys = [tuple(pair.split('|', 1)) for pair in value.split(',') if '|' in pair]
+                    self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
+                    continue
+                target = entries.get(param)
+                if target is None:
+                    continue
+                w = getattr(getattr(self.ui, target[0]), target[1])
+                if not self._apply_widget_value(w, value):
+                    pending.append((w, value))
+        for w, value in pending:
+            self._apply_widget_value(w, value)
+
     def _load_config_dialog(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Load configuration file', self.save_path, 'configuration file (*.xml)')
         if path:
@@ -8472,16 +8652,18 @@ class MainWindow(QtWidgets.QMainWindow):
         current UI), so they're populated from whichever modality appears
         FIRST in the file.
 
-        v2-form configs name a project_root instead of per-modality
-        paths: the project's own manifest.json is the modality registry
-        (names, layout_path, dax_directory -- see paths.write_manifest),
-        and each modality's storage_path IS <project_root>/<name> by the
-        v2 layout contract, so the config carries only genuinely-config
-        state on top of it (fov_list, reference hybes, channel types).
-        <modality> entries are optional overrides and fix the modality
-        ORDER (first = active), exactly like the legacy form; legacy
-        configs (explicit per-modality storage_path, no project_root)
-        load unchanged.
+        Configs name a project_root -- REQUIRED, the v2 project directory
+        holding manifest.json (legacy per-modality-path configs are
+        retired; construction phase, per explicit decision). The manifest
+        is the modality registry (names, layout_path, dax_directory --
+        see paths.write_manifest) and each modality's storage_path IS
+        <project_root>/<name> by the v2 layout contract, so the config
+        carries only genuinely-config state on top of it. <modality>
+        entries fix the modality ORDER (first = active). Analysis
+        parameters arrive as per-stage <section> elements (see
+        _CONFIG_PARAM_MAP) and are applied LAST, after activation/parse
+        has populated the combos they set -- so a freshly loaded config
+        reproduces the exact app state Save Config captured.
         """
         try:
             cfg = preprocess.load_xml_file(path)
@@ -8492,27 +8674,33 @@ class MainWindow(QtWidgets.QMainWindow):
         glob = cfg.get('global', {})
         modalities = cfg.get('modalities', {})
         project_root = glob.get('project_root', '').strip()
-        if project_root:
-            # v2-form config (see docstring): the manifest is the modality
-            # registry, and storage_path IS <project_root>/<name> -- derive
-            # all three per-modality paths from it rather than trusting a
-            # copy in the config that could drift from the store.
-            manifest = paths.read_manifest(project_root)
-            if manifest is None:
-                QtWidgets.QMessageBox.critical(
-                    self, 'Load Config',
-                    f'project_root has no readable {paths.MANIFEST_NAME}: {project_root}')
-                return
-            merged = {}
-            ordered = list(modalities) + [n for n in manifest.get('modalities', {})
-                                          if n not in modalities]
-            for name in ordered:
-                m = manifest.get('modalities', {}).get(name, {})
-                merged[name] = {'layout_path': m.get('layout_path', ''),
-                                'dax_directory': m.get('dax_directory', ''),
-                                'storage_path': os.path.join(project_root, name),
-                                **modalities.get(name, {})}
-            modalities = merged
+        if not project_root:
+            QtWidgets.QMessageBox.critical(
+                self, 'Load Config',
+                'This config names no project_root. A config points at the v2 '
+                'project directory (the one holding manifest.json); '
+                'per-modality path configs are retired.')
+            return
+        # The manifest is the modality registry, and storage_path IS
+        # <project_root>/<name> -- derive all three per-modality paths from
+        # it rather than trusting a copy in the config that could drift
+        # from the store.
+        manifest = paths.read_manifest(project_root)
+        if manifest is None:
+            QtWidgets.QMessageBox.critical(
+                self, 'Load Config',
+                f'project_root has no readable {paths.MANIFEST_NAME}: {project_root}')
+            return
+        merged = {}
+        ordered = list(modalities) + [n for n in manifest.get('modalities', {})
+                                      if n not in modalities]
+        for name in ordered:
+            m = manifest.get('modalities', {}).get(name, {})
+            merged[name] = {'layout_path': m.get('layout_path', ''),
+                            'dax_directory': m.get('dax_directory', ''),
+                            'storage_path': os.path.join(project_root, name),
+                            **modalities.get(name, {})}
+        modalities = merged
         self._config_modalities = modalities  # kept around for reference even beyond what's live-populated below
 
         ip.FovListLineEdit.setText(','.join(str(f) for f in glob.get('fov_list', [])))
@@ -8530,19 +8718,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 if name and name not in self.current_celltype_list:
                     self.current_celltype_list.append(name)
             self.ui.CelltypeDeterminationPanel.ensure_celltype_names(self.current_celltype_list)
-        if glob.get('cross_modality_channel_type'):
-            ap.ChannelTypeComboBox.setCurrentText(glob['cross_modality_channel_type'])
-        if glob.get('cell_align_channel_type'):
-            ap.CellChannelTypeComboBox.setCurrentText(glob['cell_align_channel_type'])
-        if glob.get('cell_seg_fov'):
-            cp.FovSpinBox.setValue(int(glob['cell_seg_fov']))
-
-        rna_fields = modalities.get('RNA', {})
-        ap.RnaStoragePathLineEdit.setText(rna_fields.get('storage_path', ''))
-        ap.RnaReferenceHybeComboBox.setCurrentText(rna_fields.get('cross_modality_reference_hybe', ''))
-        dna_fields = modalities.get('DNA', {})
-        ap.DnaStoragePathLineEdit.setText(dna_fields.get('storage_path', ''))
-        ap.DnaReferenceHybeComboBox.setCurrentText(dna_fields.get('cross_modality_reference_hybe', ''))
+        ap.RnaStoragePathLineEdit.setText(modalities.get('RNA', {}).get('storage_path', ''))
+        ap.DnaStoragePathLineEdit.setText(modalities.get('DNA', {}).get('storage_path', ''))
 
         # Modality Setup: rebuild the name-entry fields to match the file's
         # modality count/names, lock them (mirrors what clicking Activate
@@ -8553,8 +8730,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # modality's own reference_hybe/same_modality_channel_type, in the right
         # order (selection after repopulation, not before).
         names = list(modalities.keys())
-        if not names:
-            names = [f'Modality {i + 1}' for i in range(int(glob.get('num_modalities', 2)))]
         ip.build_modality_name_fields(len(names))
         for combo, name in zip(ip.ModalityNameComboBoxes, names):
             combo.setCurrentText(name)
@@ -8562,102 +8737,62 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.lock_modality_setup()
         self._activate_modalities(names, modality_fields=modalities)
 
-        # cell_align_reference_hybe is now per-modality-suffixed (see
-        # _save_config_dialog's own write side) -- one independent XML
-        # key per configured modality, matching cell_align_references'
-        # own {modality: hybe} shape. Only a fallback for when vlinks
-        # (already applied by _activate_modalities -> _refresh_params_
-        # from_vlinks, which runs before this line) had nothing real to
-        # say -- vlinks-actual values must always win over this stale
-        # config default, never get overwritten by it after the fact.
-        for name in self.ui.IngestionPanel.modality_names:
-            config_value = glob.get(f'cell_align_reference_hybe_{name}')
-            if config_value and not ap.current_cell_reference_hybe(name):
-                ap.select_cell_reference_hybe(name, config_value)
+        # Analysis parameters last: activation/parse above has populated
+        # the combos these set, and an explicitly loaded config expresses
+        # the user's intent -- it wins over whatever per-store defaults
+        # _refresh_params_from_vlinks restored during activation.
+        self._apply_config_params(cfg.get('params', {}))
 
     def _save_config_dialog(self):
         """
-        Builds the modality-nested config from whatever this session's UI
-        currently has -- the Ingestion tab's active modality becomes one
-        <modality> entry (with its full layout_path/dax_directory/
-        storage_path), and the cross-modal section's OTHER storage path
-        (if filled in) becomes a second <modality> entry (storage_path +
-        cross_modality_reference_hybe only -- this app's current UI has
-        no live layout_path/dax_directory for a modality that isn't the
-        Ingestion tab's active one). reference_hybe/same_modality_
-        channel_type are no longer per-modality state at all (Same-
-        Modality Alignment's own reference-hybe combo isn't modality-
-        switch-scoped any more), so they're never written here -- a
-        config saved by an OLDER version of this app may still have them
-        under an old <modality> entry, which _activate_modalities' own
-        state.update filter silently drops on load. A future N-modality
-        UI would just add more entries to the same 'modalities' dict; the
-        file format itself already supports it.
-
-        Saves in the v2 form (project_root + slim modality entries)
-        whenever every configured modality's storage path is a modality
-        dir of ONE v2 project, validated against that project's own
-        manifest -- the manifest owns layout_path/dax_directory/
-        storage_path, so writing them here again would only create a
-        second copy able to drift. Anything else (legacy v1 queue dirs,
-        mixed roots, paths the manifest doesn't recognize) keeps the
-        full legacy form.
+        The full-state snapshot: project_root (the ONE path -- the
+        manifest owns everything derivable from it), the modality ORDER,
+        fov_list + celltype names, and every analysis parameter the app
+        is currently running with via _capture_config_params -- so
+        loading the file into a fresh app reproduces the running app's
+        configuration exactly, which is also how a saved config is
+        verified. Requires every configured modality's storage path to
+        be a modality dir of ONE v2 project (validated against its
+        manifest); anything else is an error, not a fallback -- legacy
+        per-modality-path configs are retired.
         """
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save configuration file', self.save_path, 'configuration file (*.xml)')
         if not path:
             return
-        ip, ap, cp = self.ui.IngestionPanel, self.ui.AlignmentPanel, self.ui.CellSegmentPanel
-        if self.ui.IngestionPanel.current_modality is not None:
+        ip = self.ui.IngestionPanel
+        if ip.current_modality is not None:
             self._save_current_modality_fields()  # flush whatever's live in the fields right now
 
-        cross_hybe_fields = {'RNA': ap.RnaReferenceHybeComboBox, 'DNA': ap.DnaReferenceHybeComboBox}
         modalities = {}
+        roots = set()
         for name in self.ui.IngestionPanel.modality_names:
             state = self.ui.IngestionPanel.modality_data.get(name, self._blank_modality_state())
-            if not state['layout_path'] and not state['storage_path']:
+            sp = state.get('storage_path', '')
+            if not sp:
                 continue  # never configured -- omit rather than writing an empty placeholder
-            entry = dict(state)
-            if name in cross_hybe_fields:
-                entry['cross_modality_reference_hybe'] = cross_hybe_fields[name].currentText().strip()
-            modalities[name] = entry
-
-        for entry in modalities.values():
-            # derived state, recomputed from disk on every parse -- never
-            # config (str()'ing a list into an XML attr, besides)
-            entry.pop('active_hybe_list', None)
-
-        project_root = None
-        roots = set()
-        for name, entry in modalities.items():
-            sp = entry.get('storage_path', '')
-            if not sp or paths.modality_from_path(sp) != name:
-                roots = None
-                break
+            if paths.modality_from_path(sp) != name:
+                QtWidgets.QMessageBox.critical(
+                    self, 'Save Config',
+                    f"{name}'s storage path is not a modality directory of a v2 project "
+                    f"(expected <project>/{name} beside a manifest.json): {sp}")
+                return
             roots.add(paths.project_root(sp))
-        if roots and len(roots) == 1:
-            project_root = roots.pop()
-            for entry in modalities.values():
-                for key in ('layout_path', 'dax_directory', 'storage_path'):
-                    entry.pop(key, None)
+            modalities[name] = {}   # order only -- the manifest owns the paths
+        if len(roots) != 1:
+            QtWidgets.QMessageBox.critical(
+                self, 'Save Config',
+                'Configured modalities do not share one v2 project root -- '
+                f'found {sorted(roots) if roots else "none"}. One project per config.')
+            return
 
         cfg = {
             'global': {
-                'num_modalities': len(self.ui.IngestionPanel.modality_names),
-                **({'project_root': project_root} if project_root else {}),
+                'project_root': roots.pop(),
                 'fov_list': self._parse_fov_list(ip.FovListLineEdit.text()),
-                'cross_modality_channel_type': ap.ChannelTypeComboBox.currentText(),
-                # per-modality-suffixed -- see cell_align_references' own
-                # {modality: hybe} shape (CellAlignmentWorker no longer
-                # attempts a cross-modal residual fit, so each modality
-                # needs its own independent, explicit reference hybe --
-                # see that class's own docstring).
-                **{f'cell_align_reference_hybe_{name}': hybe
-                  for name, hybe in ap.cell_align_references().items()},
-                'cell_align_channel_type': ap.CellChannelTypeComboBox.currentText(),
-                'cell_seg_fov': cp.FovSpinBox.value(),
                 'celltype_names': self.ui.CelltypeDeterminationPanel.celltype_names(),
             },
             'modalities': modalities,
+            'params': self._capture_config_params(),
         }
         preprocess.make_xml_file(cfg, path)
 

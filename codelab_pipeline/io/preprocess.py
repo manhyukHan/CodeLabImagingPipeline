@@ -207,6 +207,15 @@ def make_xml_file(config, save_path):
         elem.set('name', str(name))
         for key, value in fields.items():
             elem.set(key, str(value))
+    # Per-stage parameter sections (see MainWindow._CONFIG_PARAM_MAP):
+    # one element per pipeline stage, biologically-named attributes --
+    # <cell_segmentation diameter="60" .../>, <chromatin_tracing
+    # z_boundary_trim="10" .../> -- so the file reads as an experiment
+    # description a human can audit and edit, never a widget dump.
+    for section, fields in config.get('params', {}).items():
+        elem = ET.SubElement(root, section)
+        for key, value in fields.items():
+            elem.set(key, str(value))
     with open(save_path, 'w') as f:
         f.write('\n'.join(_render_element(root)) + '\n')
 
@@ -256,6 +265,10 @@ def load_xml_file(file_path):
         fields = dict(elem.attrib)
         fields.pop('name', None)
         cfg['modalities'][name] = fields
+    cfg['params'] = {}
+    for elem in root:
+        if elem.tag != 'modality':
+            cfg['params'][elem.tag] = dict(elem.attrib)
     return cfg
 
 def read_dax(filename, matlab=False):

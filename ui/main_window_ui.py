@@ -63,8 +63,14 @@ class MainWindowUI(object):
         # The combined log window replaced every panel's own log box -- this
         # corner button (visible from every tab) re-opens it after the user
         # closes it. MainWindow wires the click.
+        corner = QtWidgets.QWidget()
+        corner_layout = QtWidgets.QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        self.SaveConfigPushButton = QtWidgets.QPushButton('Save Config')
+        corner_layout.addWidget(self.SaveConfigPushButton)
         self.ShowLogPushButton = QtWidgets.QPushButton('Show Log')
-        self.tabWidget.setCornerWidget(self.ShowLogPushButton)
+        corner_layout.addWidget(self.ShowLogPushButton)
+        self.tabWidget.setCornerWidget(corner)
 
         MainWindow.setCentralWidget(self.centralwidget)
 

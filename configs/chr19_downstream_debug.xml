@@ -1,16 +1,15 @@
 <settings
-  num_modalities="2"
   project_root="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/Codelab_imaging_pipeline_test"
-  fov_list="1,2"
-  cross_modality_channel_type="readout"
-  cell_align_reference_hybe_RNA="Hyb_101"
-  cell_align_reference_hybe_DNA="Hyb_002"
-  cell_align_channel_type="fiducial"
-  cell_seg_fov="1">
-  <modality
-    name="RNA"
-    cross_modality_reference_hybe="Hyb_130" />
-  <modality
-    name="DNA"
-    cross_modality_reference_hybe="Hyb_130" />
+  fov_list="1,2">
+  <modality name="RNA" />
+  <modality name="DNA" />
+  <fov_alignment channel_type="fiducial" />
+  <cross_modal_alignment
+    channel_type="readout"
+    reference_hybe_RNA="Hyb_130"
+    reference_hybe_DNA="Hyb_130" />
+  <cell_alignment
+    channel_type="fiducial"
+    reference_hybe_RNA="Hyb_101"
+    reference_hybe_DNA="Hyb_002" />
 </settings>

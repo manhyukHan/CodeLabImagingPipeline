@@ -312,6 +312,17 @@ class ChromatinTracingPanelUI(object):
                 checked.append(item.data(QtCore.Qt.UserRole))
         return checked
 
+    def set_checked_hybes(self, keys):
+        """Restore HybeListWidget check states by (folder, modality) key --
+        the inverse of checked_hybes, for config save/load. Keys not in the
+        current list are ignored (the list is rebuilt from the live active-
+        hybe set; a stale config must not error)."""
+        want = {tuple(k) for k in keys}
+        for i in range(self.HybeListWidget.count()):
+            item = self.HybeListWidget.item(i)
+            item.setCheckState(QtCore.Qt.Checked if tuple(item.data(QtCore.Qt.UserRole)) in want
+                               else QtCore.Qt.Unchecked)
+
     def populate_reference_hybe_choices(self, total_active_hybe_list):
         current = self.current_reference_hybe_key()
         self.ReferenceHybeComboBox.blockSignals(True)
