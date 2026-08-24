@@ -8471,6 +8471,17 @@ class MainWindow(QtWidgets.QMainWindow):
         single-context (one active modality at a time in this app's
         current UI), so they're populated from whichever modality appears
         FIRST in the file.
+
+        v2-form configs name a project_root instead of per-modality
+        paths: the project's own manifest.json is the modality registry
+        (names, layout_path, dax_directory -- see paths.write_manifest),
+        and each modality's storage_path IS <project_root>/<name> by the
+        v2 layout contract, so the config carries only genuinely-config
+        state on top of it (fov_list, reference hybes, channel types).
+        <modality> entries are optional overrides and fix the modality
+        ORDER (first = active), exactly like the legacy form; legacy
+        configs (explicit per-modality storage_path, no project_root)
+        load unchanged.
         """
         try:
             cfg = preprocess.load_xml_file(path)
@@ -8480,6 +8491,28 @@ class MainWindow(QtWidgets.QMainWindow):
         ip, ap, cp = self.ui.IngestionPanel, self.ui.AlignmentPanel, self.ui.CellSegmentPanel
         glob = cfg.get('global', {})
         modalities = cfg.get('modalities', {})
+        project_root = glob.get('project_root', '').strip()
+        if project_root:
+            # v2-form config (see docstring): the manifest is the modality
+            # registry, and storage_path IS <project_root>/<name> -- derive
+            # all three per-modality paths from it rather than trusting a
+            # copy in the config that could drift from the store.
+            manifest = paths.read_manifest(project_root)
+            if manifest is None:
+                QtWidgets.QMessageBox.critical(
+                    self, 'Load Config',
+                    f'project_root has no readable {paths.MANIFEST_NAME}: {project_root}')
+                return
+            merged = {}
+            ordered = list(modalities) + [n for n in manifest.get('modalities', {})
+                                          if n not in modalities]
+            for name in ordered:
+                m = manifest.get('modalities', {}).get(name, {})
+                merged[name] = {'layout_path': m.get('layout_path', ''),
+                                'dax_directory': m.get('dax_directory', ''),
+                                'storage_path': os.path.join(project_root, name),
+                                **modalities.get(name, {})}
+            modalities = merged
         self._config_modalities = modalities  # kept around for reference even beyond what's live-populated below
 
         ip.FovListLineEdit.setText(','.join(str(f) for f in glob.get('fov_list', [])))
@@ -8560,6 +8593,15 @@ class MainWindow(QtWidgets.QMainWindow):
         state.update filter silently drops on load. A future N-modality
         UI would just add more entries to the same 'modalities' dict; the
         file format itself already supports it.
+
+        Saves in the v2 form (project_root + slim modality entries)
+        whenever every configured modality's storage path is a modality
+        dir of ONE v2 project, validated against that project's own
+        manifest -- the manifest owns layout_path/dax_directory/
+        storage_path, so writing them here again would only create a
+        second copy able to drift. Anything else (legacy v1 queue dirs,
+        mixed roots, paths the manifest doesn't recognize) keeps the
+        full legacy form.
         """
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save configuration file', self.save_path, 'configuration file (*.xml)')
         if not path:
@@ -8579,9 +8621,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 entry['cross_modality_reference_hybe'] = cross_hybe_fields[name].currentText().strip()
             modalities[name] = entry
 
+        for entry in modalities.values():
+            # derived state, recomputed from disk on every parse -- never
+            # config (str()'ing a list into an XML attr, besides)
+            entry.pop('active_hybe_list', None)
+
+        project_root = None
+        roots = set()
+        for name, entry in modalities.items():
+            sp = entry.get('storage_path', '')
+            if not sp or paths.modality_from_path(sp) != name:
+                roots = None
+                break
+            roots.add(paths.project_root(sp))
+        if roots and len(roots) == 1:
+            project_root = roots.pop()
+            for entry in modalities.values():
+                for key in ('layout_path', 'dax_directory', 'storage_path'):
+                    entry.pop(key, None)
+
         cfg = {
             'global': {
                 'num_modalities': len(self.ui.IngestionPanel.modality_names),
+                **({'project_root': project_root} if project_root else {}),
                 'fov_list': self._parse_fov_list(ip.FovListLineEdit.text()),
                 'cross_modality_channel_type': ap.ChannelTypeComboBox.currentText(),
                 # per-modality-suffixed -- see cell_align_references' own

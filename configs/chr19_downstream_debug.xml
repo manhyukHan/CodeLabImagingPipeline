@@ -1,24 +1,16 @@
 <settings
   num_modalities="2"
+  project_root="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/Codelab_imaging_pipeline_test"
   fov_list="1,2"
   cross_modality_channel_type="readout"
-  cell_align_reference_hybe="Hyb_130"
+  cell_align_reference_hybe_RNA="Hyb_101"
+  cell_align_reference_hybe_DNA="Hyb_002"
   cell_align_channel_type="fiducial"
   cell_seg_fov="1">
   <modality
     name="RNA"
-    layout_path="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/raw_subset/RNA_Expt/Results/ExperimentLayout.xlsx"
-    dax_directory="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/raw_subset/RNA_Expt/Results"
-    storage_path="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/chr19_downstream_new/RNA_queue"
-    reference_hybe="Hyb_101"
-    same_modality_channel_type="fiducial"
     cross_modality_reference_hybe="Hyb_130" />
   <modality
     name="DNA"
-    layout_path="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/raw_subset/DNA_Expt/Results/ExperimentLayout.xlsx"
-    dax_directory="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/raw_subset/DNA_Expt/Results"
-    storage_path="/Users/hanmanhyuk/Git/CodeLabImagingPipeline/data/chr19_downstream_new/DNA_queue"
-    reference_hybe="Hyb_002"
-    same_modality_channel_type="fiducial"
     cross_modality_reference_hybe="Hyb_130" />
 </settings>
