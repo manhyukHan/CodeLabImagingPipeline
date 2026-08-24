@@ -25,8 +25,14 @@ from PyQt5 import QtWidgets, QtCore
 # purpose is ONE per-hybe drift-correction anchor (see localization.
 # _localize_fiducial_hybe), so there's no legitimate multi-component case
 # for it the way a real genomic-locus readout has.
+# z_boundary_trim: planes shaved off EACH end of a crop's depth before the
+# Gaussian fit runs -- boundary trimming, deliberately NOT a center window
+# (+-N around a seed), per explicit decision: an allele near the top or
+# bottom of its cell can have its real peak outside a seed-centered window,
+# while a stack's outermost planes are out-of-focus junk regardless of where
+# the allele sits. Display crops stay full-depth; only the fit domain shrinks.
 CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0,
-                       'max_fiducial_drift_z': 10.0}
+                       'max_fiducial_drift_z': 10.0, 'z_boundary_trim': 10}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS,
@@ -185,6 +191,12 @@ class ChromatinTracingPanelUI(object):
         self.ZWindowSpinBox.setRange(1, 200)
         self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
         crossForm.addRow('Z search window (+/-px, mixture mode only):', self.ZWindowSpinBox)
+
+        self.ZBoundaryTrimSpinBox = QtWidgets.QSpinBox()
+        self.ZBoundaryTrimSpinBox.setRange(0, 100)
+        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
+        self.ZBoundaryTrimSpinBox.setSuffix(' planes')
+        crossForm.addRow('Z boundary trim (each end):', self.ZBoundaryTrimSpinBox)
 
         self.MaxFiducialDriftSpinBox = double_spin(CROSS_MODE_DEFAULTS['max_fiducial_drift'], 0.5, 100.0)
         # The rejection gate, per explicit request: a hybe whose own
@@ -454,12 +466,14 @@ class ChromatinTracingPanelUI(object):
                 'z_window': self.ZWindowSpinBox.value(),
                 'max_fiducial_drift': self.MaxFiducialDriftSpinBox.value(),
                 'max_fiducial_drift_z': self.MaxFiducialDriftZSpinBox.value(),
+                'z_boundary_trim': self.ZBoundaryTrimSpinBox.value(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
 
     def reset_defaults(self):
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])
         self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
+        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
         self.MaxFiducialDriftSpinBox.setValue(CROSS_MODE_DEFAULTS['max_fiducial_drift'])
         for column_name, boxes in (('fiducial', self.FiducialSpinBoxes), ('readout', self.ReadoutSpinBoxes)):
             for key, widget in boxes.items():

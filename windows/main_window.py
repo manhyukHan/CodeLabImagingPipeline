@@ -539,9 +539,13 @@ class ChromatinTracingWorker(QtCore.QThread):
     def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
-                max_fiducial_drift_z=10.0):
+                max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None):
         super().__init__()
         self.resolver_by_fov = resolver_by_fov or {}
+        self.z_boundary_trim = z_boundary_trim
+        # None defers to localization.max_tracing_workers(); 1 forces the
+        # serial per-hybe path (the A/B equivalence harness uses it).
+        self.workers = workers
         self.jobs = jobs
         self.hybes = hybes
         self.reference_hybe = reference_hybe
@@ -562,22 +566,45 @@ class ChromatinTracingWorker(QtCore.QThread):
             results = {}
             total = sum(len(alleles) for _, _, alleles in self.jobs)
             done = 0
-            for storage_path, fov, alleles in self.jobs:
-                fov_matrices = self.fov_matrices_by_fov.get(fov, {})
-                for allele in alleles:
-                    cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
-                    localization.build_chromatin_trace_allele(
-                        allele, self.hybes, self.reference_hybe, self.hybe_fiducial_channels,
-                        self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
-                        max_fiducial_drift=self.max_fiducial_drift,
-                        max_fiducial_drift_z=self.max_fiducial_drift_z,
-                        spad=self.spad, z_window=self.z_window,
-                        fiducial_params=self.fiducial_params, readout_params=self.readout_params,
-                        resolver=self.resolver_by_fov.get(fov))
-                    done += 1
-                    self.progress.emit(done, total, f'FOV{fov:02d} allele {allele.id}: '
-                                       f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
-                results[(storage_path, fov)] = alleles
+            # ONE pool for the whole run, passed into every allele's build:
+            # alleles stay a serial outer loop, each fanning its ~111 per-hybe
+            # Gaussian fits (96% of the measured cost, pure CPU) across the
+            # pool. Same executor contract View Crop uses for a single
+            # allele, so the interactive and batch paths share the code
+            # entirely -- and build mutates the real allele HERE in the
+            # parent, so there is no allele-level merge-back to get wrong.
+            n_workers = (localization.max_tracing_workers()
+                         if self.workers is None else max(1, int(self.workers)))
+            executor = None
+            if n_workers > 1 and total > 0:
+                try:
+                    executor = ProcessPoolExecutor(
+                        max_workers=n_workers,
+                        mp_context=multiprocessing.get_context('spawn'),
+                        initializer=localization._init_tracing_worker)
+                except Exception:
+                    executor = None   # degrade to the serial per-hybe loop
+            try:
+                for storage_path, fov, alleles in self.jobs:
+                    fov_matrices = self.fov_matrices_by_fov.get(fov, {})
+                    for allele in alleles:
+                        cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
+                        localization.build_chromatin_trace_allele(
+                            allele, self.hybes, self.reference_hybe, self.hybe_fiducial_channels,
+                            self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
+                            max_fiducial_drift=self.max_fiducial_drift,
+                            max_fiducial_drift_z=self.max_fiducial_drift_z,
+                            spad=self.spad, z_window=self.z_window,
+                            fiducial_params=self.fiducial_params, readout_params=self.readout_params,
+                            resolver=self.resolver_by_fov.get(fov),
+                            z_boundary_trim=self.z_boundary_trim, executor=executor)
+                        done += 1
+                        self.progress.emit(done, total, f'FOV{fov:02d} allele {allele.id}: '
+                                           f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
+                    results[(storage_path, fov)] = alleles
+            finally:
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
             self.finished_ok.emit(results)
         except Exception as e:
             self.failed.emit(str(e))
@@ -5679,13 +5706,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
-        _, debug = localization.build_chromatin_trace_allele(
-            allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
-            storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
-            max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
-            spad=full_params['spad'], z_window=full_params['z_window'],
-            fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
-            resolver=self._frame_resolver(None, fov))
+        # A pool for THIS click: ~222 independent Gaussian fits at ~370 ms
+        # each was ~85 s on one core -- the single worst interactive wait in
+        # the app. Same executor contract the Fit-All worker uses (the code
+        # inside build is shared); created per click because a pool held
+        # open between clicks would pin child processes while the user is
+        # not tracing at all. Construction failure just means serial.
+        pool = None
+        try:
+            pool = ProcessPoolExecutor(
+                max_workers=localization.max_tracing_workers(),
+                mp_context=multiprocessing.get_context('spawn'),
+                initializer=localization._init_tracing_worker)
+        except Exception:
+            pool = None
+        try:
+            _, debug = localization.build_chromatin_trace_allele(
+                allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
+                storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
+                max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
+                spad=full_params['spad'], z_window=full_params['z_window'],
+                fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
+                resolver=self._frame_resolver(None, fov),
+                z_boundary_trim=full_params['z_boundary_trim'], executor=pool)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
 
         fid_results, readout_results = [], []
         for hybe in hybes:
@@ -5890,7 +5936,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          full_params['max_fiducial_drift'], full_params['spad'],
                                                          full_params['z_window'], fiducial_params, readout_params,
                                                          resolver_by_fov=resolver_by_fov,
-                                                         max_fiducial_drift_z=full_params['max_fiducial_drift_z'])
+                                                         max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
+                                                         z_boundary_trim=full_params['z_boundary_trim'])
         self._chromatin_worker.progress.connect(self._on_chromatin_fit_progress)
         self._chromatin_worker.finished_ok.connect(self._on_chromatin_fit_finished)
         self._chromatin_worker.failed.connect(self._on_chromatin_fit_failed)

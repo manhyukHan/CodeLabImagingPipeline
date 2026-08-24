@@ -847,9 +847,23 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
 # alignment; it just uses whichever matrix chain already applies to this
 # allele's own anchor spot.
 
+def _z_boundary_offset(depth, z_boundary_trim, min_fit_depth=9):
+    """
+    How many planes to actually shave off EACH end of a depth-`depth` crop
+    for a requested boundary trim -- clamped so the fit always keeps at
+    least min_fit_depth planes. On real stacks (120/177 planes) the clamp
+    never engages; it exists so a pathological short stack degrades to a
+    smaller trim instead of an empty fit domain.
+    """
+    if z_boundary_trim <= 0:
+        return 0
+    return max(0, min(int(z_boundary_trim), (depth - min_fit_depth) // 2))
+
+
 def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov, modality, cell, fov_matrices,
                             spad=8, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0, resolver=None):
+                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
+                            z_boundary_trim=0, resolver=None):
     """
     Crops+fits ONE hybe's fiducial channel around an allele's already-known
     shared-frame (x,y). Always single-component (fit_gaussian_3d) -- no
@@ -878,15 +892,28 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
     if cubic.size == 0:
         return None, None, None
     x0, y0 = raw_x - xmin, raw_y - ymin
-    z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+
+    # BOUNDARY trim, not a center window: the fit runs on the stack minus its
+    # outermost z_boundary_trim planes each side. Per explicit decision, a
+    # center window (+-N around a seed) is dangerous for an allele sitting
+    # near the top or bottom of its cell -- the real peak can fall outside a
+    # window placed around a noisy seed -- while the stack's outermost planes
+    # are out-of-focus junk regardless of where the allele sits. The FIT is
+    # restricted; the DISPLAY cubic stays full-depth, and every returned z is
+    # mapped back to absolute plane units (zf + z_off), so traces, drift
+    # gates and the overlay/grid builders are untouched.
+    z_off = _z_boundary_offset(cubic.shape[2], z_boundary_trim)
+    fit_cubic = cubic[:, :, z_off:cubic.shape[2] - z_off] if z_off else cubic
+    z0 = float(np.unravel_index(np.nanargmax(fit_cubic), fit_cubic.shape)[2])
 
     engine = make_engine('gaussian', peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
                                     init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
                                     min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
-    result = engine.raw_components(cubic, (y0, x0, z0), n_max=1)[0][0]
+    result = engine.raw_components(fit_cubic, (y0, x0, z0), n_max=1)[0][0]
     if result is None:
         return None, cubic, None
     amp, xf, yf, zf = result[:4]
+    zf = zf + z_off   # back to the full stack's own absolute plane index
     raw_fx, raw_fy = xf + xmin, yf + ymin
     sy, sx = spot_mapper.raw_to_reference((raw_fy, raw_fx), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
     sz = zf
@@ -901,7 +928,8 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
 def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
                            spad=8, use_mixture=True, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
-                           min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15, resolver=None):
+                           min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15,
+                           z_boundary_trim=0, resolver=None):
     """
     Crops+fits ONE hybe's readout channel around the same allele anchor,
     mixture-capable (find_local_peaks_3d + fit_gaussian_mixture_3d, same
@@ -938,13 +966,18 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     if cubic.size == 0:
         return [], None, []
     x0, y0 = raw_x - xmin, raw_y - ymin
-    z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+    # Same boundary trim as _localize_fiducial_hybe (see the comment there):
+    # fit on the stack minus its outermost planes, display the full crop,
+    # report absolute plane indices.
+    z_off = _z_boundary_offset(cubic.shape[2], z_boundary_trim)
+    fit_cubic = cubic[:, :, z_off:cubic.shape[2] - z_off] if z_off else cubic
+    z0 = float(np.unravel_index(np.nanargmax(fit_cubic), fit_cubic.shape)[2])
 
     engine = make_engine('gaussian', peak_bound=peak_bound, init_sigma_xy=init_sigma_xy,
                                     init_sigma_z=init_sigma_z, min_sigma=min_sigma, max_sigma=max_sigma,
                                     min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert,
                                     min_sep=min_sep, component_threshold=component_threshold, z_window=z_window)
-    results, _seeds = engine.raw_components(cubic, (y0, x0, z0),
+    results, _seeds = engine.raw_components(fit_cubic, (y0, x0, z0),
                                             n_max=max_components if use_mixture else 1)
 
     dy, dx, dz = delta   # (y, x, z), rasterized order
@@ -955,6 +988,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
         if r is None:
             continue
         amp, xf, yf, zf = r[:4]
+        zf = zf + z_off   # back to the full stack's own absolute plane index
         raw_rx, raw_ry = xf + xmin, yf + ymin
         sy, sx = spot_mapper.raw_to_reference((raw_ry, raw_rx), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
@@ -981,11 +1015,64 @@ _DEFAULT_READOUT_FIT_PARAMS = dict(_DEFAULT_FIDUCIAL_FIT_PARAMS,
                                    min_sep=3.0, use_mixture=False)
 
 
+# -- parallel per-hybe tracing (see build_chromatin_trace_allele) ----------
+#
+# One hybe's fit is independent of every other's within a phase: phase 1
+# (fiducial) needs nothing but the anchor, and phase 2 (readout) needs only
+# the per-hybe delta computed between the phases. Measured on real alleles the
+# work is 96% Gaussian fitting (369 ms/call) and under 4% I/O, so unlike the
+# disk-bound cell-alignment pool this one is pure CPU and scales with cores.
+#
+# The SAME executor serves both callers: View Crop passes one for a single
+# allele (the interactive click was ~85 s of fitting on one core), and the
+# Fit-All worker creates one pool for its whole run and passes it into every
+# allele's build -- alleles stay a serial outer loop, each fanning its ~111
+# hybes across the pool, so the two paths share this code entirely and there
+# is no allele-level mutate-and-merge to get wrong: build mutates the real
+# allele in the PARENT; only the per-hybe fits travel.
+#
+# Task functions are module-level (pickling requires it) and Qt-free; every
+# payload field is plain data (FrameResolver is constructed from plain data
+# by design -- see its own docstring -- and pickles).
+
+def _init_tracing_worker():
+    """One cv2 thread per child -- the standard oversubscription guard; the
+    fits are scipy, but crop reads go through cv2-adjacent code paths."""
+    cv2.setNumThreads(1)
+
+
+def _fiducial_task(payload):
+    (shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
+     kwargs, resolver, want_debug) = payload
+    result, cubic, centroid = _localize_fiducial_hybe(
+        shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
+        resolver=resolver, **kwargs)
+    # cubic is display-only (~100+ KB per hybe); never ship it back for a
+    # batch run that would discard it.
+    return hybe, result, (cubic if want_debug else None), centroid
+
+
+def _readout_task(payload):
+    (shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
+     delta, kwargs, resolver, want_debug) = payload
+    candidates, cubic, crop_local = _localize_readout_hybe(
+        shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
+        delta, resolver=resolver, **kwargs)
+    return hybe, candidates, (cubic if want_debug else None), crop_local
+
+
+def max_tracing_workers(hard_ceiling=32):
+    """CPU-bound (96% Gaussian fitting), so the FOV-alignment pool's own
+    ceiling applies rather than the disk-bound cell pool's lower one. Two
+    cores stay reserved for the GUI thread and the coordinator."""
+    return max(1, min((os.cpu_count() or 4) - 2, hard_ceiling))
+
+
 def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
                                  max_fiducial_drift_z=10.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
-                                 collect_debug=False, resolver=None):
+                                 collect_debug=False, resolver=None, z_boundary_trim=0, executor=None):
     """
     Fills in allele.fiducial_trace/polymer/rejected_hybes for every hybe in
     `hybes` (folder names) -- full replace, same "re-run overwrites"
@@ -1063,9 +1150,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
     shared_xy = (allele.coordinate[0], allele.coordinate[1])
     debug = {} if collect_debug else None
 
-    fiducial_kwargs = dict(spad=spad, **{**_DEFAULT_FIDUCIAL_FIT_PARAMS, **(fiducial_params or {})})
-    readout_kwargs = dict(spad=spad, z_window=z_window, **{**_DEFAULT_READOUT_FIT_PARAMS, **(readout_params or {})})
+    fiducial_kwargs = dict(spad=spad, z_boundary_trim=z_boundary_trim,
+                           **{**_DEFAULT_FIDUCIAL_FIT_PARAMS, **(fiducial_params or {})})
+    readout_kwargs = dict(spad=spad, z_window=z_window, z_boundary_trim=z_boundary_trim,
+                          **{**_DEFAULT_READOUT_FIT_PARAMS, **(readout_params or {})})
 
+    # -- phase 1: fiducial fits. Independent per hybe, so pooled whenever an
+    # executor is supplied -- byte-identical either way (deterministic scipy
+    # least-squares, no RNG anywhere in this path); as_completed only changes
+    # the order dict keys are INSERTED, and every consumer looks up by hybe.
+    fid_todo = []
     for hybe in hybes:
         if debug is not None:
             debug[hybe] = {'fiducial_cubic': None, 'fiducial_centroid': None,
@@ -1075,15 +1169,33 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.fiducial_trace[hybe] = None
             allele.rejected_hybes[hybe] = 'no fiducial channel configured'
             continue
-        fid_result, fid_cubic, fid_centroid = _localize_fiducial_hybe(
-            shared_xy, hybe, fid_channel, storage_path, fov, modality, cell, fov_matrices,
-            resolver=resolver, **fiducial_kwargs)
+        fid_todo.append((hybe, fid_channel))
+
+    def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid):
         allele.fiducial_trace[hybe] = fid_result
         if debug is not None:
             debug[hybe]['fiducial_cubic'] = fid_cubic
             debug[hybe]['fiducial_centroid'] = fid_centroid
 
+    if executor is not None and len(fid_todo) > 1:
+        futures = [executor.submit(_fiducial_task,
+                                   (shared_xy, hybe, ch, storage_path, fov, modality, cell,
+                                    fov_matrices, fiducial_kwargs, resolver, debug is not None))
+                   for hybe, ch in fid_todo]
+        for future in as_completed(futures):
+            _store_fiducial(*future.result())
+    else:
+        for hybe, ch in fid_todo:
+            fid_result, fid_cubic, fid_centroid = _localize_fiducial_hybe(
+                shared_xy, hybe, ch, storage_path, fov, modality, cell, fov_matrices,
+                resolver=resolver, **fiducial_kwargs)
+            _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid)
+
     baseline = allele.fiducial_trace.get(reference_hybe)
+    # -- phase 2a: the drift gate. Cheap arithmetic, stays serial; produces
+    # per hybe (reject_reason, delta, readout_channel) so the fits below can
+    # run detached from the gating.
+    gate = {}
     for hybe in hybes:
         # reject_reason may already be set from phase 1 ('no fiducial
         # channel configured'); otherwise derive it from this hybe's own
@@ -1115,28 +1227,48 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
         readout_channel = hybe_readout_channels.get(hybe)
         if readout_channel is None and reject_reason is None:
             reject_reason = 'no readout channel configured'
+        gate[hybe] = (reject_reason, delta, readout_channel)
 
-        # Batch mode (collect_debug=False, nothing ever displays this crop):
-        # skip a hybe already known to be rejected -- no reason to pay for
-        # the readout crop+fit. Preview mode (collect_debug=True) always
-        # crops+fits every hybe regardless of accept/reject -- per explicit
-        # request, a crop should always be visible (map the allele's
-        # coordinate into this hybe's own frame and crop nearby); only the
-        # FIT/marker depends on whether the gate passed. delta stays
-        # (0, 0, 0) (uncorrected) whenever it couldn't be computed. A
-        # missing readout channel, though, means there's nothing to crop
-        # at all -- always skipped, even in preview mode.
-        if readout_channel is None or (reject_reason is not None and debug is None):
-            allele.rejected_hybes[hybe] = reject_reason
+    # -- phase 2b: the readout fits the gate decided to pay for. Batch mode
+    # (collect_debug=False, nothing ever displays this crop) skips a hybe
+    # already known to be rejected -- no reason to pay for the readout
+    # crop+fit. Preview mode (collect_debug=True) always crops+fits every
+    # hybe regardless of accept/reject -- per explicit request, a crop
+    # should always be visible; only the FIT/marker depends on whether the
+    # gate passed. delta stays (0, 0, 0) (uncorrected) whenever it couldn't
+    # be computed. A missing readout channel means there is nothing to crop
+    # at all -- always skipped, even in preview mode.
+    ro_todo = [hybe for hybe in hybes
+               if gate[hybe][2] is not None
+               and not (gate[hybe][0] is not None and debug is None)]
+    ro_results = {}
+    if executor is not None and len(ro_todo) > 1:
+        futures = [executor.submit(_readout_task,
+                                   (shared_xy, hybe, gate[hybe][2], storage_path, fov, modality,
+                                    cell, fov_matrices, gate[hybe][1], readout_kwargs, resolver,
+                                    debug is not None))
+                   for hybe in ro_todo]
+        for future in as_completed(futures):
+            hybe, candidates, cubic, crop_local = future.result()
+            ro_results[hybe] = (candidates, cubic, crop_local)
+    else:
+        for hybe in ro_todo:
+            candidates, cubic, crop_local = _localize_readout_hybe(
+                shared_xy, hybe, gate[hybe][2], storage_path, fov, modality, cell, fov_matrices,
+                gate[hybe][1], resolver=resolver, **readout_kwargs)
+            ro_results[hybe] = (candidates, cubic, crop_local)
+
+    # -- phase 2c: bookkeeping, in the caller's own hybe order --
+    for hybe in hybes:
+        reject_reason, _delta, readout_channel = gate[hybe]
+        if hybe not in ro_results:
+            if readout_channel is None or (reject_reason is not None and debug is None):
+                allele.rejected_hybes[hybe] = reject_reason
             continue
-
-        candidates, readout_cubic, readout_centroids = _localize_readout_hybe(
-            shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices,
-            delta, resolver=resolver, **readout_kwargs)
+        candidates, readout_cubic, readout_centroids = ro_results[hybe]
         if debug is not None:
             debug[hybe]['readout_cubic'] = readout_cubic
             debug[hybe]['readout_centroids'] = readout_centroids or None
-
         if reject_reason is not None:
             allele.rejected_hybes[hybe] = reject_reason
             continue
