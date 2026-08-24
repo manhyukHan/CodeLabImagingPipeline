@@ -333,7 +333,7 @@ class CellAlignmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, channel_type='fiducial', pad=10, z_max_shift=None):
+    def __init__(self, jobs, channel_type='fiducial', pad=10, z_max_shift=None, workers=None):
         super().__init__()
         self.jobs = jobs
         self.channel_type = channel_type
@@ -341,48 +341,108 @@ class CellAlignmentWorker(QtCore.QThread):
         # None defers to chain.MAX_CELL_Z_SHIFT_PLANES rather than hard-coding
         # a second copy of the default here -- one place to change it.
         self.z_max_shift = z_max_shift
+        # None defers to chain.max_cell_alignment_workers(); 1 forces the
+        # serial loop (used by the A/B equivalence harness, and the natural
+        # path for manual single-cell mode anyway).
+        self.workers = workers
+
+    def _resolve_passes(self, cell, passes):
+        """
+        The per-(cell, pass) resolution the serial loop always did, factored
+        out so the pool path ships ALREADY-RESOLVED passes to the child --
+        the resolution logic stays here, in the code that has always owned
+        it, and _align_one_cell is just the loop body.
+        """
+        resolved = []
+        for p in passes:
+            fov_matrices = p['fov_matrices']
+            # only the hybes actually present in this FOV's own
+            # fov_matrices are valid -- hybe_records can hold more (e.g.
+            # every hybe in the parsed layout) than what FOV alignment was
+            # actually run/accepted for.
+            hybe_records = [r for r in p['hybe_records']
+                            if (r['folder'], fov_matrices.modality) in fov_matrices]
+            # Resolved PER CELL, not once per pass: cell.reference_hybe
+            # genuinely varies cell-to-cell under append-mode segmentation.
+            # Resolved from the CELL's own reference_modality, not the
+            # pass's -- after cytoplasmic segmentation a cell's
+            # reference_hybe can belong to the other modality, and looking
+            # it up in the wrong modality's dict would miss and silently
+            # fall back to identity.
+            frame_modality = cell.reference_modality
+            cellref_matrix = p['cellref_fov_matrices'].get(
+                frame_modality, {}).get((cell.reference_hybe, frame_modality), np.eye(3))
+            resolved.append({'storage_path': p['storage_path'], 'hybe_records': hybe_records,
+                             'fov_matrices': fov_matrices, 'reference_hybe': p['reference_hybe'],
+                             'modality': p['modality'], 'cellref_matrix': cellref_matrix})
+        return resolved
 
     def run(self):
         try:
             results = []
             total = sum(len(cells) * max(len(passes), 1) for _, cells, passes in self.jobs)
             done = 0
+
+            # One task per (fov, cell) -- a cell's passes stay together so its
+            # matrices dicts are only ever mutated by one child.
+            tasks = []
+            cell_by_key = {}
             for fov, cells, passes in self.jobs:
                 for cell in cells:
+                    tasks.append((cell, fov, self._resolve_passes(cell, passes),
+                                  self.channel_type, self.pad, self.z_max_shift))
+                    cell_by_key[(fov, cell.id)] = cell
+
+            n_workers = (alignment.max_cell_alignment_workers()
+                         if self.workers is None else max(1, int(self.workers)))
+            executor = None
+            if n_workers > 1 and len(tasks) > 1:
+                try:
+                    executor = ProcessPoolExecutor(
+                        max_workers=min(n_workers, len(tasks)),
+                        mp_context=multiprocessing.get_context('spawn'),
+                        initializer=alignment._init_cell_align_worker)
+                except Exception:
+                    executor = None   # degrade to the serial loop, never fail here
+
+            if executor is not None:
+                try:
+                    futures = {executor.submit(alignment._align_one_cell, t): t for t in tasks}
+                    for future in as_completed(futures):
+                        fov, cell_id, matrices, anchors, provenance = future.result()
+                        # The commit. The child mutated a pickled copy that
+                        # started from this exact cell's state, so its end
+                        # state IS the serial end state -- replace the three
+                        # dicts compute_cell_alignment mutates (and nothing
+                        # else; area/nucleus/celltype were never touched).
+                        real = cell_by_key[(fov, cell_id)]
+                        real.matrices = matrices
+                        real.matrix_anchors = anchors
+                        real.matrix_provenance = provenance
+                        n_passes = len(futures[future][2])
+                        done += max(n_passes, 1)
+                        self.progress.emit(done, total,
+                                           f'FOV{fov:02d} cell {cell_id}: aligned ({n_passes} pass(es))')
+                finally:
+                    # cancel_futures so one cell's real failure (e.g. "cell
+                    # doesn't overlap reference hybe") aborts the run promptly
+                    # -- the serial loop's behavior -- instead of finishing
+                    # every other cell first and reporting minutes later.
+                    executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                for cell, fov, passes, channel_type, pad, z_max_shift in tasks:
                     for p in passes:
-                        fov_matrices = p['fov_matrices']
-                        # only the hybes actually present in this FOV's own
-                        # fov_matrices are valid -- hybe_records can hold
-                        # more (e.g. every hybe in the parsed layout) than
-                        # what FOV alignment was actually run/accepted for.
-                        hybe_records = [r for r in p['hybe_records']
-                                if (r['folder'], fov_matrices.modality) in fov_matrices]
-                        # Resolved PER CELL, not once per pass:
-                        # cell.reference_hybe genuinely varies cell-to-cell
-                        # under append-mode segmentation. For the cell's own
-                        # modality this reproduces compute_cell_alignment's
-                        # own default lookup exactly (same dict); for any
-                        # other modality it supplies the value that
-                        # function's docstring explicitly requires the
-                        # caller to pass, since cell.reference_hybe is never
-                        # a key in another modality's own fov_matrices.
-                        # Resolved from the CELL's own reference_modality, not
-                        # the pass's -- after cytoplasmic segmentation a cell's
-                        # reference_hybe can belong to the other modality, and
-                        # looking it up in the wrong modality's dict would miss
-                        # and silently fall back to identity.
-                        frame_modality = cell.reference_modality
-                        cellref_matrix = p['cellref_fov_matrices'].get(
-                            frame_modality, {}).get((cell.reference_hybe, frame_modality), np.eye(3))
                         alignment.compute_cell_alignment(
-                            cell, p['storage_path'], fov, hybe_records, fov_matrices,
-                            reference_hybe=p['reference_hybe'], channel_type=self.channel_type,
-                            pad=self.pad, modality=p['modality'],
-                            cell_reference_hybe_matrix=cellref_matrix,
-                            z_max_shift=self.z_max_shift)
+                            cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
+                            reference_hybe=p['reference_hybe'], channel_type=channel_type,
+                            pad=pad, modality=p['modality'],
+                            cell_reference_hybe_matrix=p['cellref_matrix'],
+                            z_max_shift=z_max_shift)
                         done += 1
                         self.progress.emit(done, total,
                                            f"FOV{fov:02d} cell {cell.id} ({p['modality']}): aligned")
+
+            for fov, cells, _passes in self.jobs:
                 results.append((fov, cells))
             self.finished_ok.emit(results)
         except Exception as e:

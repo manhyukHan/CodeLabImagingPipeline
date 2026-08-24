@@ -753,6 +753,70 @@ def max_alignment_workers(hard_ceiling=32):
     return max(1, min((os.cpu_count() or 4) - 2, hard_ceiling))
 
 
+# -- parallel cell-level residual alignment (see CellAlignmentWorker) ------
+#
+# One cell's residual fit is independent of every other cell's: it reads its
+# own crops out of shared read-only files and writes only its own matrices.
+# The loop was serial on a single QThread. Unlike the per-hybe FOV pool above
+# (pure CPU, near-linear), this workload is ~74% disk reads after the ref_zx
+# hoist and windowed-MIP fixes, so the pool's ceiling is the DRIVE, not the
+# core count: measured on the real E: store, concurrent windowed stack reads
+# scale 2.87x at 8 workers / 3.74x at 16 / 4.98x at 24 -- sublinear the whole
+# way. Expect roughly 4x, not core-count.
+#
+# The genuinely risky part is not memory (a worker holds a few ~82x75 crops
+# and ZX projections -- tens of MB) but the MUTATION CONTRACT:
+# compute_cell_alignment commits by mutating the cell in place, and in
+# automatic mode those are the real ACell objects. A child process mutates a
+# PICKLED COPY, so the parent must replace the real cell's three mutated
+# attributes with the child's end state. The child started from the same
+# pickled state the serial code would have mutated, so its end state IS the
+# serial end state -- wholesale replacement of exactly those three dicts
+# (matrices, matrix_anchors, matrix_provenance -- see compute_cell_alignment's
+# docstring for why it is these three and nothing else) is faithful, not
+# approximate.
+
+def _init_cell_align_worker():
+    """One cv2 thread per child -- same oversubscription guard as the pools
+    above; the fit maths here is small, the reads are the real cost."""
+    cv2.setNumThreads(1)
+
+
+def _align_one_cell(task):
+    """
+    All passes for ONE cell, in a worker process.
+
+    `passes` arrive with hybe_records already filtered against fov_matrices
+    membership and cellref_matrix already resolved per cell -- that logic
+    stays in the parent (CellAlignmentWorker), which is the code that has
+    always owned it; this function is deliberately just the loop body.
+
+    Returns the cell's three mutated dicts rather than the whole cell:
+    the parent already holds the real object, and shipping ~44 KB of mask
+    arrays back per cell would be pure overhead.
+    """
+    cell, fov, passes, channel_type, pad, z_max_shift = task
+    for p in passes:
+        compute_cell_alignment(
+            cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
+            reference_hybe=p['reference_hybe'], channel_type=channel_type,
+            pad=pad, modality=p['modality'],
+            cell_reference_hybe_matrix=p['cellref_matrix'],
+            z_max_shift=z_max_shift)
+    return fov, cell.id, cell.matrices, cell.matrix_anchors, cell.matrix_provenance
+
+
+def max_cell_alignment_workers(hard_ceiling=16):
+    """
+    How many cells to fit at once. Capped well below max_alignment_workers'
+    32 because this pool is disk-bound (see the block comment above): the
+    measured read-throughput curve has visibly flattened by 16 workers, and
+    workers beyond the knee add spawn cost and seek pressure for little
+    return. Two cores stay reserved for the GUI thread and the coordinator.
+    """
+    return max(1, min((os.cpu_count() or 4) - 2, hard_ceiling))
+
+
 def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3, ub=0.9999, write=True,
                             border_trim=0, max_shift=None, progress=None, workers=None):
     """
