@@ -775,11 +775,77 @@ class MainWindow(QtWidgets.QMainWindow):
         # the single composited view can sit side by side on screen.
         self.chromatin_fiducial_total_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Total Overlay')
 
+        self._quitting = False   # closeEvent re-entry guard (closeAllWindows below re-fires it)
+
         self._connect_signals()
         self._switch_current_modality(self.ui.IngestionPanel.ModalityComboBox.currentText())
 
         if config_file is not None:
             self._load_config(config_file)
+
+    def closeEvent(self, event):
+        """Closing the MAIN window quits the whole app -- after asking.
+
+        Without this, close only hid this window while every pop-up
+        displayer stayed open and any running worker kept the process alive
+        headless. Quitting while work is running is allowed deliberately:
+        the store is interruption-safe by design (.part + os.replace stack
+        writes, completeness-checked appends -- see CLAUDE.md), so a kill
+        loses at most the in-flight task, never already-written data.
+        """
+        if self._quitting:   # re-entered via closeAllWindows() below
+            event.accept()
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, 'Quit',
+            'Really quit the CODE Lab Imaging Pipeline?\n\n'
+            'Every window will close, and any running task (ingestion, '
+            'alignment, tracing, ...) will be killed.',
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if reply != QtWidgets.QMessageBox.Yes:
+            event.ignore()
+            return
+        self._quitting = True
+        event.accept()
+        killed = self._kill_running_work()
+        QtWidgets.QApplication.closeAllWindows()
+        QtWidgets.QApplication.quit()
+        if killed:
+            # A terminated QThread can die holding arbitrary locks, and a
+            # ProcessPoolExecutor whose children were just killed still has
+            # an atexit join that can hang interpreter shutdown -- after a
+            # kill, a normal teardown is not guaranteed to return. End the
+            # process outright instead of leaving a headless, wedged
+            # python.exe behind.
+            os._exit(0)
+
+    def _kill_running_work(self):
+        """Hard-stop every live worker thread and pooled child process;
+        returns whether anything was actually running. terminate() rather
+        than a cooperative flag: none of the workers poll for interruption,
+        and quitting is exactly the case where "finish the current FOV
+        first" is not wanted."""
+        killed = False
+        for name in ('_ingestion_worker', '_segment_worker', '_alignment_worker',
+                     '_cross_modal_worker', '_cell_alignment_worker', '_chromatin_worker'):
+            worker = getattr(self, name, None)
+            if worker is not None and worker.isRunning():
+                killed = True
+                worker.terminate()
+                worker.wait(2000)
+        # Pool children (ingestion conversion, cell alignment, tracing) are
+        # plain multiprocessing children of THIS process, so
+        # active_children() sees them all. A terminated coordinator thread
+        # never reaps its own pool, and an orphaned spawn child would keep
+        # churning the NAS long after the windows are gone.
+        for child in multiprocessing.active_children():
+            killed = True
+            try:
+                child.terminate()
+            except Exception:
+                pass
+        return killed
 
     def _connect_signals(self):
         ip = self.ui.IngestionPanel
