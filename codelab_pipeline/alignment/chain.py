@@ -989,22 +989,9 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
 MAX_CROSS_MODAL_Z_PLANES = 80.0
 
 
-def hybe_zy_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
-    """
-    The ZY counterpart of hybe_zx_projection: max-projects along WIDTH (X)
-    instead of height, giving a (height, depth) "Y-by-Z" image. Same
-    contract and same caller obligations (bounds must already be valid and
-    in-frame) -- see hybe_zx_projection.
-    """
-    h5path = paths.stack_path(storage_path, fov, hybe)
-    with h5py.File(h5path, 'r') as f:
-        stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
-    projection = stack.max(axis=1)  # (height, depth)
-    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
-
-
 def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dna_hybe,
-                           rna_channel, dna_channel, y0=192, y1=832, x0=192, x1=832):
+                           rna_channel, dna_channel, y0=192, y1=832, x0=192, x1=832,
+                           with_focus_diagnostics=False):
     """
     FOV-level cross-modal Z drift, in PLANES, from DNA's frame into RNA's --
     the same direction the 2D H_across is stored in, so both legs of the
@@ -1029,14 +1016,30 @@ def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dn
     since on equal-depth stacks this returns ~0 where the truth was
     +12/+4 -- a graceful failure (degrades toward no correction) but a
     real one.
-    """
-    from ..segmentation import segment as _segment
 
+    with_focus_diagnostics (default False): also probe each stack's
+    focal plane (segment.focus_profile, a per-plane scan of the whole
+    stack) and report it in `diagnostics`. Off by default per direct
+    measurement: the two probes cost ~43 s of a 57 s call on a LOCAL
+    SSD -- 75% of cross-modal alignment's entire per-FOV runtime -- and
+    the one production caller (CrossModalAlignmentWorker) discarded the
+    diagnostics unread. Focal planes are a cross-check for a human
+    investigating a suspect dz, not part of the measurement (the method
+    docstring above already rules them out as an estimator), so they are
+    computed only when someone asks to see them.
+    """
     def depth_profiles(storage_path, hybe, channel):
-        zx = hybe_zx_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
-                                0.3, 0.9999, normalize=False)
-        zy = hybe_zy_projection(storage_path, fov, hybe, channel, y0, y1, x0, x1,
-                                0.3, 0.9999, normalize=False)
+        # ONE windowed read per hybe -- the ZX and ZY projections are two
+        # reductions of the SAME crop, so reading it twice through
+        # hybe_zx_projection/hybe_zy_projection (each opens the file and
+        # decompresses every covering chunk independently) paid the whole
+        # I/O cost twice for identical bytes. Measured: 1.9 s of the old
+        # 3.7 s of crop reads per FOV, gone.
+        h5path = paths.stack_path(storage_path, fov, hybe)
+        with h5py.File(h5path, 'r') as f:
+            crop = f[f'/stack/ch{channel}'][y0:y1, x0:x1, :]
+        zx = crop.max(axis=0).astype(np.float32)   # (width, depth)
+        zy = crop.max(axis=1).astype(np.float32)   # (height, depth)
         return zx.mean(axis=0).astype(np.float64), zy.mean(axis=0).astype(np.float64)
 
     rna_zx, rna_zy = depth_profiles(rna_storage_path, rna_hybe, rna_channel)
@@ -1065,12 +1068,14 @@ def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dn
     dz = -float(lags[best_i])
     quality = float(combined[best_i] / 2.0)
 
-    zs_r, v_r = _segment.focus_profile(rna_storage_path, fov, rna_hybe, rna_channel)
-    zs_d, v_d = _segment.focus_profile(dna_storage_path, fov, dna_hybe, dna_channel)
-    focal_rna, focal_dna = int(zs_r[int(np.argmax(v_r))]), int(zs_d[int(np.argmax(v_d))])
-    diagnostics = {'focal_rna': focal_rna, 'focal_dna': focal_dna,
-                   'focal_dz': -float(focal_dna - focal_rna),
-                   'zx_dz': per_axis['zx'], 'zy_dz': per_axis['zy']}
+    diagnostics = {'zx_dz': per_axis['zx'], 'zy_dz': per_axis['zy']}
+    if with_focus_diagnostics:
+        from ..segmentation import segment as _segment
+        zs_r, v_r = _segment.focus_profile(rna_storage_path, fov, rna_hybe, rna_channel)
+        zs_d, v_d = _segment.focus_profile(dna_storage_path, fov, dna_hybe, dna_channel)
+        focal_rna, focal_dna = int(zs_r[int(np.argmax(v_r))]), int(zs_d[int(np.argmax(v_d))])
+        diagnostics.update({'focal_rna': focal_rna, 'focal_dna': focal_dna,
+                            'focal_dz': -float(focal_dna - focal_rna)})
     return dz, quality, diagnostics
 
 
