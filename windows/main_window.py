@@ -1681,7 +1681,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data = self.ui.IngestionPanel.modality_data.get(name)
         if not data or not data.get('storage_path') or not fov_list:
             return []
-        if self._ingestion_is_running():
+        if self._disk_scan_blocked(data['storage_path']):
+            # v1 only (see _disk_scan_blocked): answer from memory.
             active = data.get('active_hybe_list', [])
             if not active:
                 # Self-heal, zero disk: an emptied list (e.g. state
@@ -1699,8 +1700,12 @@ class MainWindow(QtWidgets.QMainWindow):
                               if r['folder'] in ready]
                     data['active_hybe_list'] = active
             return list(active)
+        # The memo is keyed on inputs only, so mid-ingestion it would
+        # pin a stale answer for the whole run. Skip it while ingesting:
+        # the scan behind it is 7 ms on v2, and a hybe that lands during
+        # the run must become usable without waiting for the run to end.
         key = (name, data.get('storage_path'), data.get('layout_path'), tuple(fov_list))
-        if key in self._active_hybe_records_cache:
+        if key in self._active_hybe_records_cache and not self._ingestion_is_running():
             return self._active_hybe_records_cache[key]
         # Fast path for EVERY modality now, not just a "current" one:
         # _parse_layouts fills hybe_records_by_modality for all of them in
@@ -1728,6 +1733,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._active_hybe_records_cache[key] = result
         return result
 
+    def _disk_scan_blocked(self, storage_path):
+        """
+        Should a readiness scan be skipped because an ingestion holds the
+        NAS link?
+
+        Only for v1 stores. There, "is this hybe ready" costs one
+        vlinks.h5 open PER HYBE (~10,000 network opens for a 100x100
+        store), which genuinely competed with the coordinator's own
+        traffic and was the confirmed cause of the parse-mid-ingestion
+        freeze.
+
+        v2 answers the same question with ONE directory listing per
+        (modality, FOV) -- measured 7 ms for a full 2-modality x 40-FOV
+        sweep of the real store, warm or cold. Blocking that costs
+        nothing and breaks the thing this whole architecture exists for:
+        with the gate closed, a FOV that finished ingesting BEFORE this
+        session is invisible to every analysis list (confirmed real --
+        FOV alignment offered only the reference hybe while ingestion
+        ran, even though the FOV was fully ingested on disk). Analysis
+        during ingestion is the point; a 7 ms listdir sweep is not what
+        threatens it.
+        """
+        return self._ingestion_is_running() and not paths.is_v2(storage_path)
+
     def _ready_hybes(self, modality, fov):
         """
         The set of hybe folders REALLY ingested for this exact
@@ -1739,11 +1768,11 @@ class MainWindow(QtWidgets.QMainWindow):
         a real disk scan, which also re-seeds the registry.
         """
         key = (modality, fov)
-        if self._ingestion_is_running():
-            return set(self.fov_ready_hybes.get(key, set()))
         records = self.hybe_records_by_modality.get(modality) or []
         storage_path = self._storage_path_for_modality(modality)
         if not records or not storage_path:
+            return set(self.fov_ready_hybes.get(key, set()))
+        if self._disk_scan_blocked(storage_path):
             return set(self.fov_ready_hybes.get(key, set()))
         ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, records)
         self.fov_ready_hybes[key] = set(ready)
@@ -2091,19 +2120,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # cost and the other rides its cache. The active sweep is the one
         # that must always run, so it goes first.
         self._refresh_active_hybe_lists()
-        if self._ingestion_is_running():
-            self.log('An ingestion is running -- the disk-based status scan is skipped '
-                     '(re-parse, or click Check Ingestion Status, once it finishes to '
-                     'refresh it); the hybe checklist and active hybe choices below are '
-                     'kept live from the running job itself.')
+        v1_busy = any(self._disk_scan_blocked(ip.modality_data[n]['storage_path'])
+                      for n in ip.modality_names
+                      if ip.modality_data.get(n, {}).get('storage_path'))
+        if v1_busy:
+            self.log('An ingestion is running on a v1 store -- the disk-based status scan '
+                     'is skipped (re-parse, or click Check Ingestion Status, once it '
+                     'finishes); the hybe checklist and active hybe choices below are kept '
+                     'live from the running job itself.')
         else:
             self._check_ingestion_status(silent=True)
 
-        # Heavy vlinks-backed view refreshes stay skipped while ANY
-        # ingestion runs (v1: lock contention with the coordinator; v2:
-        # merely needless multi-second GUI-thread reads mid-run) -- they
-        # are all caught up once, in the finished handlers.
-        if not self._ingestion_is_running():
+        # These read the per-FOV analysis capsules, which have no shared
+        # lock and cost milliseconds -- so on v2 they run DURING ingestion
+        # too. Skipping them mid-run is what left an already-ingested FOV
+        # looking un-analysed (confirmed real). v1's vlinks.h5 still
+        # contends with the coordinator, so it keeps the gate.
+        if not v1_busy:
             self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
             self._refresh_same_modality_results_list()
             self._refresh_cross_modal_results_list()
@@ -2288,7 +2321,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # anything accepted/run this session is there already); the full
         # disk-backed pass runs on the next idle refresh (run end handlers
         # already trigger one).
-        if not self._ingestion_is_running():
+        if not self._disk_scan_blocked(storage_path):
             for fov in fov_list:
                 ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, hybe_records)
                 if not ready:
@@ -2534,7 +2567,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # full status scan is exactly the GUI-thread sweep the
         # mid-ingestion gate exists for. It catches up when the LAST run
         # ends (this same handler, gate open).
-        if not self._ingestion_is_running():
+        # v1-only gate: on v2 the status scan is one listdir per
+        # (modality, FOV) -- 7 ms for the whole real store -- so a
+        # concurrent run is no reason to leave the status stale.
+        if not self._v1_ingestion_is_running():
             self._check_ingestion_status(silent=True)
         # a freshly-ingested hybe must become choosable immediately, not
         # only after the user happens to switch modality -- ingestion
@@ -2575,7 +2611,10 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.RunIngestionPushButton.setEnabled(True)
         self.statusBar().clearMessage()
         # same concurrent-run gate as _on_ingestion_finished
-        if not self._ingestion_is_running():
+        # v1-only gate: on v2 the status scan is one listdir per
+        # (modality, FOV) -- 7 ms for the whole real store -- so a
+        # concurrent run is no reason to leave the status stale.
+        if not self._v1_ingestion_is_running():
             self._check_ingestion_status(silent=True)
         # A FAILED run is still a run that ingested things: every task that
         # completed before the abort has already landed its stack and its
@@ -3270,7 +3309,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # something still holds. The active-hybe refresh below is
         # mid-run-safe (its chokepoint is gated); the status TEXT catches
         # up at queue completion / true idle.
-        if not self._ingestion_is_running():
+        # v1-only gate: on v2 the status scan is one listdir per
+        # (modality, FOV) -- 7 ms for the whole real store -- so a
+        # concurrent run is no reason to leave the status stale.
+        if not self._v1_ingestion_is_running():
             self._check_ingestion_status(silent=True)
         self._refresh_active_hybe_lists()
         self._activate_fov(self.ui.CellSegmentPanel.FovSpinBox.value())
@@ -3299,7 +3341,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # This handler refreshed nothing at all before. Status scan gated
         # like every finish handler -- a concurrent run may still hold
         # the link.
-        if not self._ingestion_is_running():
+        # v1-only gate: on v2 the status scan is one listdir per
+        # (modality, FOV) -- 7 ms for the whole real store -- so a
+        # concurrent run is no reason to leave the status stale.
+        if not self._v1_ingestion_is_running():
             self._check_ingestion_status(silent=True)
         self._refresh_active_hybe_lists()
         QtWidgets.QMessageBox.critical(self, 'Queued ingestion error', message)
