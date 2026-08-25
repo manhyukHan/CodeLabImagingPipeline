@@ -33,7 +33,7 @@ FOV = 1
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 from windows.main_window import MainWindow
 from codelab_pipeline.alignment import chain as alignment
-from codelab_pipeline.io import vlinks_store
+from codelab_pipeline.io import analysis_store as vlinks_store
 
 failures = []
 

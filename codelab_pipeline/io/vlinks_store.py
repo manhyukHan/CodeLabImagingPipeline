@@ -205,12 +205,17 @@ def vlinks_session(storage_path, mode='r'):
     and catch up) but progress stops moving, so this is a knob to use
     deliberately, not to wrap the whole app in.
 
-    Yields None if the store does not exist yet; every read_* already
-    guards for that itself, so a caller can ignore the yielded value and
-    simply use the session for its batching effect.
+    Yields None if the store does not exist yet AND the session is
+    read-only; every read_* already guards for that itself, so a caller
+    can ignore the yielded value and simply use the session for its
+    batching effect. A WRITE session ('a') must not short-circuit on a
+    missing file -- _open_vlinks creates it (and its parent dir) for
+    write modes, and bailing out here silently disabled write batching
+    on a fresh store: every slice write then re-opened the file for
+    itself, exactly the per-open NAS cost the session exists to remove.
     """
     path = _vlinks_path(storage_path)
-    if not os.path.exists(path):
+    if mode == 'r' and not os.path.exists(path):
         yield None
         return
     with _open_vlinks(path, mode) as f:
@@ -371,6 +376,17 @@ def allocate_spot_uids(storage_path, fov, count):
         return list(range(start, start + int(count)))
 
 
+def _norm_spot_dicts(dicts):
+    """v1 pickled spot dicts persisted the old 'coordinate' key; the
+    attribute is now ASpot.adj_coordinate, and every consumer reads the
+    new key -- normalize at this read boundary so data on disk outlives
+    the rename."""
+    for d in dicts:
+        if 'adj_coordinate' not in d and 'coordinate' in d:
+            d['adj_coordinate'] = d.pop('coordinate')
+    return dicts
+
+
 def _spot_slice_path(fov, modality, hybe, channel):
     """
     One blob per (modality, hybe, channel) inside the FOV's spot group.
@@ -443,7 +459,7 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
                 if 'table' in f[gp]:
                     out.extend(columnar.unpack_spots(f[gp]))
                 elif 'blob' in f[gp]:
-                    out.extend(pickle.loads(bytes(f[gp]['blob'][()])))
+                    out.extend(_norm_spot_dicts(pickle.loads(bytes(f[gp]['blob'][()]))))
             return out
         root = _spots_group_path(fov)
         if root not in f:
@@ -457,7 +473,7 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
                     if 'table' in g:
                         out.extend(columnar.unpack_spots(g))
                     elif 'blob' in g:
-                        out.extend(pickle.loads(bytes(g['blob'][()])))
+                        out.extend(_norm_spot_dicts(pickle.loads(bytes(g['blob'][()]))))
     return out
 
 
@@ -1095,6 +1111,32 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
 
 
 @_mtime_cached
+def aligned_hybes(storage_path, fov):
+    """
+    The set of hybe folder names with a REAL persisted same-modality
+    matrix dataset for this (storage_path's modality, FOV) -- group keys
+    only, no matrix data read. This is the append-mode primitive
+    (MainWindow's Run-All Append options): read_same_modality_matrices
+    cannot serve it, because that reader deliberately defaults an
+    ingested-but-never-aligned hybe to identity -- indistinguishable from
+    a genuinely-aligned-to-identity one -- whereas append must know
+    "was a matrix ever actually computed and written for this hybe".
+    """
+    vlinks_path = _vlinks_path(storage_path)
+    if not os.path.exists(vlinks_path):
+        return frozenset()
+    grp_path = _fov_matrix_group_path(fov, modality_of(storage_path))
+    with _open_vlinks(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
+        if grp_path not in f:
+            return frozenset()
+        # frozenset: _mtime_cached returns cached objects by reference for
+        # types _cache_copy doesn't copy -- immutable, so no caller can
+        # poison the cache by mutating its result.
+        return frozenset(f[grp_path].keys())
+
+
+@_mtime_cached
 def spot_slices(storage_path, fov):
     """
     [(modality, hybe, channel), ...] of every spot slice this FOV holds
@@ -1281,3 +1323,72 @@ def read_cross_modal_matrix(storage_path, fov, modality=None):
         if 'matrix_across' in grp:
             return grp['matrix_across'][:]
         return None
+
+
+CROSS_MODAL_QUALITY_KEYS = ('residual_before', 'residual_after', 'z_quality')
+"""
+The measured fit-quality components of one cross-modal result, stored as
+scalars beside its matrix_across/z_across: residual_before/residual_after
+are the signal-gated reconstruction MSD of the bridge pair under identity
+vs. under the accepted H_across (chain.link_cross_modal with_residuals --
+lower is better, after >= before means the fit didn't help), z_quality is
+estimate_cross_modal_z's peak normalized correlation (1.0 = perfect;
+that function's own docstring says to gate on it, and until now the one
+production caller discarded it unread).
+"""
+
+
+def write_cross_modal_quality(storage_path, fov, quality, modality=None):
+    """
+    Persist the measured quality of one FOV's cross-modal result --
+    whichever CROSS_MODAL_QUALITY_KEYS `quality` actually carries (a run
+    without raw stacks legitimately has no z_quality) -- as attrs on the
+    same /params/FOV## group as matrix_across/z_across. Written at the
+    same moments the matrix itself is (auto-save and Accept), never on a
+    reject: these are components of the RESULT, not session state, so the
+    status viewer can report the bridge's fit quality from vlinks.h5
+    alone.
+
+    modality: same key scheme as write_cross_modal_matrix/z -- None keeps
+    the legacy flat attr names, a bridging modality's name suffixes them
+    (`residual_after_across__DNA`) so a second bridge cannot overwrite
+    the first's quality any more than its matrix.
+    """
+    if not quality:
+        return
+    suffix = '' if modality is None else f'__{modality}'
+    vlinks_path = _vlinks_path(storage_path)
+    with _open_vlinks(vlinks_path, 'a') as f:
+        _stamp_order(f)
+        grp = f.require_group(_fov_params_group_path(fov))
+        for key in CROSS_MODAL_QUALITY_KEYS:
+            value = quality.get(key)
+            if value is not None:
+                grp.attrs[f'{key}_across{suffix}'] = float(value)
+
+
+@_mtime_cached
+def read_cross_modal_quality(storage_path, fov, modality=None):
+    """
+    {key: float} of whatever quality components were persisted for this
+    FOV's cross-modal result (see write_cross_modal_quality), or {} when
+    none were (a result accepted before quality existed reads back empty,
+    never fabricated). modality-scoped keys first, flat legacy fallback --
+    same rule as read_cross_modal_matrix/z.
+    """
+    vlinks_path = _vlinks_path(storage_path)
+    if not os.path.exists(vlinks_path):
+        return {}
+    grp_path = _fov_params_group_path(fov)
+    out = {}
+    with _open_vlinks(vlinks_path, 'r') as f:
+        _require_yx(f, vlinks_path)
+        if grp_path not in f:
+            return {}
+        attrs = f[grp_path].attrs
+        for key in CROSS_MODAL_QUALITY_KEYS:
+            if modality is not None and f'{key}_across__{modality}' in attrs:
+                out[key] = float(attrs[f'{key}_across__{modality}'])
+            elif f'{key}_across' in attrs:
+                out[key] = float(attrs[f'{key}_across'])
+    return out

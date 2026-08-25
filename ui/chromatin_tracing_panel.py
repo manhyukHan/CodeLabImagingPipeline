@@ -421,7 +421,7 @@ class ChromatinTracingPanelUI(object):
         self.SpotListWidget.clear()
         for global_index, d in indexed:
             cell_tag = 'unassigned' if d['cell'] == -1 else f"cell {d['cell']}"
-            x, y, z = d['coordinate']
+            x, y, z = d['adj_coordinate']
             item = QtWidgets.QListWidgetItem(f'Spot {global_index} | {cell_tag} | ({x:.1f}, {y:.1f}, {z:.1f})')
             item.setData(QtCore.Qt.UserRole, d)
             self.SpotListWidget.addItem(item)

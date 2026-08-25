@@ -128,7 +128,7 @@ def enumerate_files(storage_path):
     out = {}
     stacks_root = os.path.join(storage_path, 'stacks') if v2 else storage_path
     if os.path.isdir(stacks_root):
-        for fov_dir in sorted(d for d in os.listdir(stacks_root) if d.startswith('FOV')):
+        for fov_dir in sorted(d for d in os.listdir(stacks_root) if d[:3].lower() == 'fov'):
             full = os.path.join(stacks_root, fov_dir)
             if not os.path.isdir(full):
                 continue
@@ -145,7 +145,7 @@ def enumerate_files(storage_path):
     if v2:
         mips_root = os.path.join(storage_path, 'mips')
         if os.path.isdir(mips_root):
-            for fov_dir in sorted(d for d in os.listdir(mips_root) if d.startswith('FOV')):
+            for fov_dir in sorted(d for d in os.listdir(mips_root) if d[:3].lower() == 'fov'):
                 full = os.path.join(mips_root, fov_dir)
                 if not os.path.isdir(full):
                     continue

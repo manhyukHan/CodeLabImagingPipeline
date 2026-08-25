@@ -47,7 +47,7 @@ rng = np.random.default_rng(7)
 
 app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 from windows.main_window import MainWindow
-from codelab_pipeline.io import vlinks_store
+from codelab_pipeline.io import analysis_store as vlinks_store
 from codelab_pipeline.models.cell import ACell
 from codelab_pipeline.models.spot import ASpot
 from codelab_pipeline.models.allele import AnAllele
@@ -67,7 +67,7 @@ def build_alleles(w, fov, dna_hybes):
     alleles = []
     for aid, s in enumerate(anchors, start=1):
         a = AnAllele()
-        ax, ay, az = s.coordinate
+        ax, ay, az = s.adj_coordinate
         fiducial, polymer, rejected = {}, {}, {}
         for j, h in enumerate(dna_hybes):
             if j == len(dna_hybes) - 1 and aid == 1:
@@ -83,7 +83,7 @@ def build_alleles(w, fov, dna_hybes):
             polymer[h] = cands
         a.set_metadata(id=aid, fov=fov, cell=int(s.cell), anchor_hybe=s.hybe,
                        anchor_channel=int(s.channel),
-                       coordinate=tuple(map(float, s.coordinate)),
+                       adj_coordinate=tuple(map(float, s.adj_coordinate)),
                        raw_coordinate=tuple(map(float, s.raw_coordinate)))
         a.fiducial_trace, a.polymer, a.rejected_hybes = fiducial, polymer, rejected
         a.final_polymer = np.array([max(v, key=lambda t: t[3])[:3] for v in polymer.values()])
@@ -172,8 +172,8 @@ def main():
                         z = float(rng.uniform(6, 22))
                         s = ASpot()
                         s.set_metadata(fov=fov, modality=modality, hybe=hybe, channel=channel,
-                                       raw_coordinate=(float(y[k]), float(x[k]), z),
-                                       coordinate=(float(y[k]), float(x[k]), z),
+                                       raw_adj_coordinate=(float(y[k]), float(x[k]), z),
+                                       adj_coordinate=(float(y[k]), float(x[k]), z),
                                        size=float(rng.uniform(1.1, 2.4)),
                                        brightness=float(rng.uniform(300, 4000)))
                         new_spots.append(s)

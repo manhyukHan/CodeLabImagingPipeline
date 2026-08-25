@@ -30,6 +30,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self.resize(760, 600)
         self._current_allele_label = ''
         self._current_params = {}
+        self._default_save_dir = ''
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -51,7 +52,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self.SaveFigurePushButton.clicked.connect(self.save_figure)
         layout.addWidget(self.SaveFigurePushButton)
 
-    def show_fit_status_grid(self, results, allele_label='', params=None):
+    def show_fit_status_grid(self, results, allele_label='', params=None, default_dir=''):
         """
         results: list of (cubic, centroid, title) -- one entry per active
         hybe, same shape/semantics Localize3DGridDisplayer.
@@ -64,6 +65,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         """
         self._current_allele_label = allele_label
         self._current_params = dict(params) if params else {}
+        self._default_save_dir = default_dir
 
         fig = self.canvas.figure
         fig.clear()
@@ -91,7 +93,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self._resize_canvas(width_px, height_px)
         self._force_repaint()
 
-    def show_overlay_grid(self, entries, allele_label='', params=None):
+    def show_overlay_grid(self, entries, allele_label='', params=None, default_dir=''):
         """
         Red-cyan fiducial overlay tiles, one per hybe: TOP = before
         fiducial alignment (each crop cut at its modality/cell-residual-
@@ -111,6 +113,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         """
         self._current_allele_label = allele_label
         self._current_params = dict(params) if params else {}
+        self._default_save_dir = default_dir
         fig = self.canvas.figure
         fig.clear()
         if not entries:
@@ -143,7 +146,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         self._resize_canvas(width_px, height_px)
         self._force_repaint()
 
-    def show_total_overlay(self, total, allele_label='', params=None):
+    def show_total_overlay(self, total, allele_label='', params=None, default_dir=''):
         """
         The ONE-vs-ALL companion to show_overlay_grid: instead of one tile
         per hybe, a single 2x2 figure compositing EVERY fitted hybe into one
@@ -162,6 +165,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         """
         self._current_allele_label = allele_label
         self._current_params = dict(params) if params else {}
+        self._default_save_dir = default_dir
         fig = self.canvas.figure
         fig.clear()
         if not total:
@@ -206,7 +210,16 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         param_bits = '_'.join(f'{k}{v}' for k, v in flat.items()) if flat else 'params'
         safe_allele = (self._current_allele_label or 'allele').replace(' ', '_').replace('/', '-')
         default_name = f'{safe_allele}_{self.kind.lower()}_{param_bits}.png'
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f'Save {self.kind} Grid Figure', default_name,
+        # Default into the project's figures tree (figures/{modality}/
+        # alleles/fov###/, handed in by MainWindow) so allele overlays
+        # land beside the FOV- and cell-level ones instead of wherever
+        # the dialog last was; the user can still browse anywhere.
+        default = default_name
+        if self._default_save_dir:
+            import os
+            os.makedirs(self._default_save_dir, exist_ok=True)
+            default = os.path.join(self._default_save_dir, default_name)
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, f'Save {self.kind} Grid Figure', default,
                                                          'PNG image (*.png)')
         if not path:
             return

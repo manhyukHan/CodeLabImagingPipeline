@@ -4,7 +4,7 @@ independently into ONE shared frame, never colliding with each other.
 
 Two layers, both real code, no mocks:
 
-1. codelab_pipeline.io.vlinks_store's modality-keyed cross-modal
+1. codelab_pipeline.io.analysis_store's modality-keyed cross-modal
    matrix/z (write_cross_modal_matrix/read_cross_modal_matrix,
    write_cross_modal_z/read_cross_modal_z): confirms a SECOND bridging
    modality's write does not clobber the first's -- the collision this
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import numpy.linalg as la
 
-from codelab_pipeline.io import vlinks_store as V
+from codelab_pipeline.io import analysis_store as V
 from codelab_pipeline.alignment.frames import FrameResolver, IDENTITY
 
 SCRATCH = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'multimodality_star')
@@ -43,9 +43,13 @@ FOV = 1
 def setup_store():
     if os.path.exists(SCRATCH):
         shutil.rmtree(SCRATCH)
-    sp = os.path.join(SCRATCH, 'RNA_queue')
+    # v2 project: the store under test is the per-FOV capsule layout
+    # the app actually runs on now (v1 stays covered by the frozen
+    # legacy module analysis_store delegates to).
+    from codelab_pipeline.io import paths
+    paths.write_manifest(SCRATCH, ['RNA', 'DNA', 'ATAC'])
+    sp = os.path.join(SCRATCH, 'RNA')
     os.makedirs(sp, exist_ok=True)
-    V.declare_modality(sp, 'RNA')
     return sp
 
 

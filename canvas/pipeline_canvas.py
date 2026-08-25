@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 
 from codelab_pipeline.io import preprocess
-from codelab_pipeline.io import vlinks_store
+from codelab_pipeline.io import analysis_store
 from codelab_pipeline.alignment import chain as alignment
 from codelab_pipeline.alignment.convention import as_cv2  # y-major -> cv2 at warp boundaries
 
@@ -794,13 +794,13 @@ class PipelineCanvas():
             before_images[hybe] = mip
             after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
 
-        title = f'FOV{fov:02d}: all readouts vs {reference_hybe} (before/after)'
+        title = f'FOV{fov:03d}: all readouts vs {reference_hybe} (before/after)'
         self.draw_all_readouts_overlay(before_images, after_images, title, save_path)
 
     def draw_cell_all_readouts_overlay(self, cell, fov, reference_hybe, reference_storage_path, reference_channel,
                                        target_specs, pad=10, lb=0.3, ub=0.9999,
                                        save_path=None, reference_matrix=None, reference_final_matrix=None,
-                                       mask_anchor_fov_matrix=None):
+                                       mask_anchor_fov_matrix=None, figure=None):
         """
         Multi-hybe "did this cell's alignment succeed overall" composite,
         rebuilt to match everything the single-hybe preview
@@ -974,10 +974,11 @@ class PipelineCanvas():
         # reference panel is included in every modality's own block (the
         # one shared anchor the whole run compares against) -- only the
         # TARGET hybes are split by modality. Dict order follows
-        # target_specs' own order (MainWindow._cell_overlay_target_specs
-        # emits this cell's own modality first, then every other
-        # configured modality), so this cell's own modality's block
-        # renders first without needing an explicit sort.
+        # target_specs' own order, which MainWindow._cell_overlay_target_
+        # specs emits in the SYSTEM modality order (the Ingestion tab's
+        # configured list) -- per explicit request, block order must not
+        # depend on which cell was clicked: ['DNA', 'RNA'] always renders
+        # as DNA(yx)/DNA(zx) then RNA(yx)/RNA(zx).
         specs_by_modality = {}
         for spec in target_specs:
             specs_by_modality.setdefault(spec.get('modality'), []).append(spec)
@@ -1029,7 +1030,12 @@ class PipelineCanvas():
         col_titles = ['raw', 'FOV/cross-modal', 'final']
         num_blocks = max(len(blocks), 1)
 
-        fig = self.preview_canvas.figure
+        # figure=None -> the GUI canvas (interactive path). A caller that
+        # passes its own Agg Figure gets the identical drawing off the GUI
+        # thread -- that is what lets overlay PNGs be generated in a
+        # background worker (the reads above are plain file I/O and the
+        # Figure is not shared with Qt, so nothing here touches the GUI).
+        fig = figure if figure is not None else self.preview_canvas.figure
         fig.clear()
         ax = fig.subplots(2 * num_blocks, 3, squeeze=False, sharex='col')
         # aspect='auto' -- see _draw_three_way's own comment on why 'equal'
@@ -1077,7 +1083,8 @@ class PipelineCanvas():
                     f'reference panel={reference_hybe} '
                     f'(sequential color, red=frame, yellow=cell boundary)', fontsize=10, wrap=True)
         fig.tight_layout(rect=[0, 0, 1, 0.93])
-        self.preview_canvas.draw()
+        if figure is None:
+            self.preview_canvas.draw()
         if save_path:
             fig.savefig(save_path, dpi=150)
 
@@ -1095,7 +1102,8 @@ class PipelineCanvas():
 
     def draw_cross_modal_preview(self, rna_storage_path, dna_storage_path, fov,
                                  rna_reference_hybe, dna_reference_hybe, channel_type, H_across,
-                                 rna_fov_matrices=None, dna_fov_matrices=None, save_path=None):
+                                 rna_fov_matrices=None, dna_fov_matrices=None, save_path=None,
+                                 shared_label='shared', moving_label='moving'):
         """
         rna_fov_matrices/dna_fov_matrices: {hybe: 3x3} -- each modality's own
         already-established within-experiment matrices (same input
@@ -1107,8 +1115,16 @@ class PipelineCanvas():
         not something the cross-modal comparison should re-litigate.
         Omitting either dict (back-compat) falls back to identity, same as
         link_cross_modal's own .get(hybe, identity) default.
+
+        shared_label/moving_label: the REAL modality names for the title
+        -- the rna_/dna_ positional slots have carried shared-hub/moving
+        semantics since the hub+bridges refactor, and the old hardcoded
+        '(DNA)'/'(RNA)' parentheticals therefore captioned every preview
+        and saved PNG with the modalities SWAPPED in the default
+        DNA-first-hub configuration (confirmed by audit). Callers pass
+        the names they already hold locally -- no I/O here, per P1.
         """
-        mip_fn = vlinks_store.fiducial_channel_mip if channel_type == 'fiducial' else vlinks_store.readout_channel_mip
+        mip_fn = analysis_store.fiducial_channel_mip if channel_type == 'fiducial' else analysis_store.readout_channel_mip
         rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
         dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
 
@@ -1119,7 +1135,8 @@ class PipelineCanvas():
         dna_mip_corrected = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
         self.draw_alignment_preview(rna_mip_corrected, dna_mip_corrected, H_across,
-                                    f'{dna_reference_hybe} (DNA) -> {rna_reference_hybe} (RNA), {channel_type}',
+                                    f'{dna_reference_hybe} ({moving_label}) -> '
+                                    f'{rna_reference_hybe} ({shared_label}), {channel_type}',
                                     save_path=save_path)
 
 
@@ -1141,10 +1158,10 @@ def _bare_hybe(matrices):
 def _read_mip(storage_path, fov, hybe, channel):
     """
     This hybe's MIP straight from vlinks.h5 (see
-    vlinks_store.write_hybe_mip) -- previously opened the raw
+    analysis_store.write_hybe_mip) -- previously opened the raw
     {hybe}_stack.h5 directly. Per explicit principle, display/preview code
     should never need the raw stack file; only ingestion (which just wrote
     it) and 3D localization (which needs the full Z-stack, not just the
     MIP) are allowed to touch it.
     """
-    return vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    return analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)

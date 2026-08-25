@@ -95,7 +95,7 @@ def assign_spots(spots, cells, frame_shape, cells_by_id=None,
     matrix_to_shared: optional callable (hybe, modality, cell) ->
     (H_yx 3x3, dz planes) into the shared frame -- a bare 3x3 is also
     accepted (dz = 0.0, kept for older callers/tests). When given, a
-    spot's `coordinate` is recomputed IN FULL 3D: (y, x) through H, and
+    spot's `adj_coordinate` is recomputed IN FULL 3D: (y, x) through H, and
     z as raw_z + dz. Per confirmed real bug: the recast used to carry z
     over untouched, so a cell's own dz and the cross-modal z drift never
     reached any persisted coordinate no matter how many saves ran --
@@ -154,7 +154,7 @@ def _apply_transform(spot, resolved):
         return False
     cy, cx = H[:2] @ np.array([float(spot.raw_coordinate[0]),
                                float(spot.raw_coordinate[1]), 1.0])
-    spot.coordinate = (float(cy), float(cx), float(spot.raw_coordinate[2]) + dz)
+    spot.adj_coordinate = (float(cy), float(cx), float(spot.raw_coordinate[2]) + dz)
     return True
 
 
@@ -180,7 +180,7 @@ def _memoized(matrix_to_shared):
 
 def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
     """
-    Rewrite every ASSIGNED spot's shared-frame `coordinate` from its own
+    Rewrite every ASSIGNED spot's shared-frame `adj_coordinate` from its own
     raw_coordinate under the CURRENT matrices -- ownership untouched.
 
     The coordinates-only counterpart of assign_spots (which recasts as a

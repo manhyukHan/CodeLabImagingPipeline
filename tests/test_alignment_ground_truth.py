@@ -30,7 +30,7 @@ import numpy as np
 
 from codelab_pipeline.alignment import chain as alignment
 from codelab_pipeline.alignment.convention import as_cv2, to_yx
-from codelab_pipeline.io import vlinks_store
+from codelab_pipeline.io import analysis_store as vlinks_store
 
 STORE = os.environ.get('CODELAB_GT_STORE', 'data/chr19_downstream_new/RNA_queue')
 FOV, HYBE, CHANNEL = 1, 'Hyb_101', 555

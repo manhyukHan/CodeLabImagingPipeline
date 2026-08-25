@@ -111,17 +111,20 @@ def populate_allele_tree(tree, allele_dicts):
 def populate_matrix_tree(tree, rows):
     """
     rows: [{'fov':, 'modality':, 'same_modality': [(hybe, summary_str), ...],
-    'cross_modal': summary_str or None}, ...] -- one top-level item per
-    (FOV, modality), children = one per same-modality hybe plus, when that
-    modality has an accepted cross-modal link, one more for it. Keyed by
-    modality as well as FOV because matrices are the one modality-scoped
-    thing in vlinks: the bridge hybe (e.g. Hyb_130) appears under BOTH
-    modalities meaning different things. Pure ground-truth
-    display of whatever's persisted (see MainWindow._refresh_cell_spot_
-    status_matrix_panel's own docstring for exactly what's read and why)
-    -- summary_str is already-formatted text (dx/dy/angle), no further
-    nesting needed the way _add_tree_children's own recursive dict/list
-    handling is for (this data isn't a save()-shaped dict).
+    'cross_modal': summary_str or None, 'cross_modal_label': str or None},
+    ...] -- one top-level item per (FOV, modality), children = one per
+    same-modality hybe plus, when that modality has an accepted cross-modal
+    link, one more for it (labeled by the caller -- '{moving}->{shared}
+    (cross-modal)' or '{hub} (shared frame)', since the pair is no longer
+    a fixed DNA->RNA). Keyed by modality as well as FOV because matrices
+    are the one modality-scoped thing in vlinks: the bridge hybe (e.g.
+    Hyb_130) appears under BOTH modalities meaning different things. Pure
+    ground-truth display of whatever's persisted (see MainWindow._refresh_
+    cell_spot_status_matrix_panel's own docstring for exactly what's read
+    and why) -- summary_str is already-formatted text (dx/dy/angle, dz,
+    fit residuals), no further nesting needed the way _add_tree_children's
+    own recursive dict/list handling is for (this data isn't a
+    save()-shaped dict).
     """
     tree.clear()
     for row in rows:
@@ -132,7 +135,8 @@ def populate_matrix_tree(tree, rows):
         for hybe, summary in row['same_modality']:
             top.addChild(QtWidgets.QTreeWidgetItem([hybe, summary]))
         if row['cross_modal'] is not None:
-            top.addChild(QtWidgets.QTreeWidgetItem(['DNA->RNA (cross-modal)', row['cross_modal']]))
+            top.addChild(QtWidgets.QTreeWidgetItem(
+                [row.get('cross_modal_label') or 'cross-modal', row['cross_modal']]))
 
 
 def populate_spot_tree(tree, indexed_spot_dicts):
@@ -227,7 +231,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         matrixLayout.addWidget(self.MatrixCountLabel)
         self.MatrixTree = QtWidgets.QTreeWidget()
         self.MatrixTree.setColumnCount(2)
-        self.MatrixTree.setHeaderLabels(['Hybe', 'dx, dy, angle'])
+        self.MatrixTree.setHeaderLabels(['Hybe', 'dx, dy, angle (cross-modal rows add dz + fit residuals)'])
         self.MatrixTree.header().setStretchLastSection(False)  # see CellTree's own comment on this
         self.MatrixTree.setMaximumHeight(220)
         matrixLayout.addWidget(self.MatrixTree, stretch=1)
@@ -320,7 +324,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         combo.blockSignals(True)
         combo.clear()
         for fov in fov_list:
-            combo.addItem(f'FOV{fov:02d}', fov)
+            combo.addItem(f'FOV{fov:03d}', fov)
         if current in fov_list:
             combo.setCurrentIndex(fov_list.index(current))
         combo.blockSignals(False)
@@ -343,13 +347,22 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     def current_allele_fov(self):
         return self.AlleleFovComboBox.currentData()
 
-    def set_spot_hybe_choices(self, hybes):
-        current = self.SpotHybeComboBox.currentText()
+    def set_spot_hybe_choices(self, hybe_modality_pairs):
+        """hybe_modality_pairs: [(hybe, modality), ...]. The PAIR is the
+        choice -- a bare hybe name is ambiguous once two modalities share
+        hybe folder names (e.g. both carry 'H0_F'), and selecting by name
+        alone silently merged both modalities' spot slices into one tree."""
+        current = self.SpotHybeComboBox.currentData()
         self.SpotHybeComboBox.blockSignals(True)
         self.SpotHybeComboBox.clear()
-        self.SpotHybeComboBox.addItems(hybes)
-        if current in hybes:
-            self.SpotHybeComboBox.setCurrentText(current)
+        modalities = {m for _h, m in hybe_modality_pairs}
+        for hybe, modality in hybe_modality_pairs:
+            label = hybe if len(modalities) <= 1 else f'{hybe} ({modality})'
+            self.SpotHybeComboBox.addItem(label, (hybe, modality))
+        if current is not None:
+            idx = self.SpotHybeComboBox.findData(current)
+            if idx >= 0:
+                self.SpotHybeComboBox.setCurrentIndex(idx)
         self.SpotHybeComboBox.blockSignals(False)
 
     def set_spot_channel_choices(self, channels):
@@ -362,7 +375,8 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         self.SpotChannelComboBox.blockSignals(False)
 
     def current_spot_hybe(self):
-        return self.SpotHybeComboBox.currentText() or None
+        """(hybe, modality) pair, or None -- see set_spot_hybe_choices."""
+        return self.SpotHybeComboBox.currentData()
 
     def current_spot_channel(self):
         text = self.SpotChannelComboBox.currentText()

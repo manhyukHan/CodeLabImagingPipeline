@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from codelab_pipeline.io import vlinks_store as V
+from codelab_pipeline.io import analysis_store as V
 from codelab_pipeline.localization import assignment
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
@@ -48,7 +48,7 @@ def make_spots(n, shape, rng):
         s.modality = MODALITY
         s.set_metadata(uid=i + 1, fov=FOV, hybe=HYBE, channel=635,
                        raw_coordinate=(float(ys[i]), float(xs[i]), 0.0),
-                       coordinate=(float(ys[i]), float(xs[i]), 0.0))
+                       adj_coordinate=(float(ys[i]), float(xs[i]), 0.0))
         out.append(s)
     return out
 
@@ -167,7 +167,7 @@ def test_matrix_resolution_is_memoized_per_cell():
         s = ASpot(); s.modality = MODALITY
         s.set_metadata(uid=i + 1, fov=FOV, hybe=HYBE, channel=635, cell=int(rng.choice(ids)),
                        raw_coordinate=(float(rng.uniform(0, 1024)), float(rng.uniform(0, 1024)), 0.0),
-                       coordinate=(0.0, 0.0, 0.0))
+                       adj_coordinate=(0.0, 0.0, 0.0))
         spots.append(s)
     calls = {'n': 0}
 
@@ -198,7 +198,7 @@ def test_unassigned_spots_are_recast_too():
     H = np.eye(3); H[0, 2], H[1, 2] = 5.0, -3.0
     n = assignment.recast_spots_to_shared([s], lambda h, m, o: H, {c.id: c for c in cells})
     assert n == 1, 'the unassigned spot must be recast'
-    assert s.coordinate == (15.0, 17.0, 4.0), s.coordinate
+    assert s.adj_coordinate == (15.0, 17.0, 4.0), s.adj_coordinate
 
 
 def test_recast_applies_the_z_leg():
@@ -214,8 +214,8 @@ def test_recast_applies_the_z_leg():
     n = assignment.recast_spots_to_shared([s], lambda h, m, o: (H, -2.0),
                                           {c.id: c for c in cells})
     assert n == 1
-    assert abs(s.coordinate[2] - 85.76) < 1e-9, s.coordinate
-    assert abs(s.coordinate[0] - 10.4287) < 1e-9 and abs(s.coordinate[1] - 20.0276) < 1e-9
+    assert abs(s.adj_coordinate[2] - 85.76) < 1e-9, s.adj_coordinate
+    assert abs(s.adj_coordinate[0] - 10.4287) < 1e-9 and abs(s.adj_coordinate[1] - 20.0276) < 1e-9
 
 
 def _run_all():

@@ -18,7 +18,7 @@ class AnAllele():
        through every other hybe for this allele (see
        localization.localize_chromatin_trace_hybe).
      coordinate: tuple (y, x, z) -- rasterized order (convention.py); anchor position in the
-       pipeline's ONE shared reference frame (same frame ASpot.coordinate
+       pipeline's ONE shared reference frame (same frame ASpot.adj_coordinate
        lives in) -- the point every hybe's own crop is centered around
        (via spot_mapper.reference_to_raw), never itself re-fit.
      raw_coordinate: tuple (y, x, z) -- that same anchor position in

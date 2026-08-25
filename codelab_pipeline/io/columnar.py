@@ -182,7 +182,7 @@ def pack_spots(grp, dicts):
     strs = {k: [] for k in ('modality', 'hybe', 'celltype', 'linked_at')}
     mix, mix_off = [], [0]
     for i, d in enumerate(dicts):
-        c, r = d['coordinate'], d['raw_coordinate']
+        c, r = d['adj_coordinate'], d['raw_coordinate']
         tab[i] = (d['uid'], d['fov'], d['channel'], d['cell'],
                   c[0], c[1], c[2], r[0], r[1], r[2],
                   d.get('size', 0.0), d.get('brightness', 0.0), bool(d.get('linked', False)))
@@ -216,7 +216,7 @@ def unpack_spots(grp):
             'modality': _rd(strs['modality'][i]), 'hybe': _rd(strs['hybe'][i]),
             'channel': int(tab['channel'][i]), 'cell': int(tab['cell'][i]),
             'celltype': _rd(strs['celltype'][i]),
-            'coordinate': (float(tab['y'][i]), float(tab['x'][i]), float(tab['z'][i])),
+            'adj_coordinate': (float(tab['y'][i]), float(tab['x'][i]), float(tab['z'][i])),
             'raw_coordinate': (float(tab['ry'][i]), float(tab['rx'][i]), float(tab['rz'][i])),
             'size': float(tab['size'][i]), 'brightness': float(tab['brightness'][i]),
             'linked': bool(tab['linked'][i]),

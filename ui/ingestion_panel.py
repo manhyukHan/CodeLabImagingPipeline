@@ -1,25 +1,67 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
+
 from PyQt5 import QtWidgets, QtCore, QtGui
 
 from codelab_pipeline.io import preprocess
 
 
+# {(dax_directory, folder): bool} -- session cache of "does this hybe
+# folder hold real .dax data". Raw acquisition data essentially never
+# disappears mid-session, and the probe is the measured bottleneck of
+# Parse Layouts: one listdir per hybe folder over the DAX NAS share, 43 ms
+# a round-trip on the real store, 222 of them serial for a two-modality
+# 111-hybe project = ~9.5 s of every click (~55% of the whole parse) --
+# for information that was identical to the click before. Cached, a
+# re-parse pays zero DAX round-trips; the ONE explicit invalidation is
+# re-confirming a modality's DAX field (editingFinished ->
+# refresh_hybe_checks probes fresh and overwrites the cache).
+_DAX_PRESENCE_CACHE = {}
+
+
+def _probe_dax_presence(pairs, refresh=False):
+    """
+    {(dax_directory, folder): bool} for every requested pair, probing
+    uncached (or, with refresh=True, ALL) pairs through a thread pool --
+    the probes are pure SMB metadata waits (os.listdir releases the GIL),
+    so overlapping them is where the parse-speed win lives; 16 in flight
+    matches the storage-bound worker counts used elsewhere in this app.
+    Callers pass only pairs with a REAL dax_directory -- the blank-
+    directory default (checked, never probed, see _has_dax_data) is the
+    caller's own branch, kept out of the cache so a later real directory
+    can't be shadowed by a cached blank-default True.
+    """
+    unique = list(dict.fromkeys(pairs))
+    todo = [p for p in unique if refresh or p not in _DAX_PRESENCE_CACHE]
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(16, len(todo))) as pool:
+            for pair, present in zip(todo, pool.map(
+                    lambda p: IngestionPanelUI._has_dax_data(p[0], p[1]), todo)):
+                _DAX_PRESENCE_CACHE[pair] = present
+    return {p: _DAX_PRESENCE_CACHE[p] for p in unique}
+
+
 class IngestionPanelUI(object):
     """
-    Pick an ExperimentLayout.xlsx + DAX directory + storage path + modality,
-    parse the layout, select which hybes/FOVs to actually ingest (real
-    datasets have far too many to always ingest in full), and run.
+    The combinatorial ingestion form: EVERY modality's own
+    (ExperimentLayout.xlsx, DAX repository) input pair is visible at once,
+    with ONE project root (storage) and ONE FOV list shared by all of
+    them -- per explicit design, there is no per-modality storage path or
+    FOV list left to mismatch (storage_path IS <project root>/<modality>,
+    the v2 layout contract in io/paths.py). Parse Layouts parses every
+    configured modality; the combined hybe checklist below concatenates
+    each modality's hybes (each row tagged + keyed by (folder, modality));
+    Run Ingestion ingests exactly the checked set, every modality in ONE
+    FOV-major combined run (see IngestionWorker).
     """
     def setupUi(self, Widget):
         Widget.setObjectName('IngestionPanel')
         layout = QtWidgets.QVBoxLayout(Widget)
 
-        # -- modality setup: how many modalities, what they're named, and
-        # which one the rest of this tab (+ every downstream panel's own
-        # mirrored ModalityComboBox) is currently pointed at. Count/names
-        # default to 2 (DNA, RNA) so nothing changes for anyone who never
-        # touches this group -- Set/Activate only matter for a different
-        # count or custom names. --
+        # -- modality setup: how many modalities and what they're named.
+        # Count/names default to 2 (DNA, RNA) so nothing changes for
+        # anyone who never touches this group -- Set/Activate only matter
+        # for a different count or custom names. --
         modalityGroup = QtWidgets.QGroupBox('Modality Setup')
         modalityLayout = QtWidgets.QVBoxLayout(modalityGroup)
 
@@ -45,51 +87,56 @@ class IngestionPanelUI(object):
         self.ActivateModalitiesPushButton = QtWidgets.QPushButton('Activate Modalities')
         modalityLayout.addWidget(self.ActivateModalitiesPushButton)
 
-        # -- The modality registry and mode live HERE, on the ingestion
-        # panel, not on MainWindow. Per explicit principle: the system's
-        # modality is an INGESTION concept -- each modality needs its own
-        # DAX directory and storage path, so the combo below legitimately
-        # exists -- and nothing outside ingestion may hold a "current
-        # modality". Non-ingestion code reads the REGISTRY (which
-        # modalities exist, their storage paths) through MainWindow's
-        # accessor helpers, and derives any per-datum modality from the
-        # datum itself ((hybe, modality) keys, cell.modality,
-        # spot.modality, vlinks_store.modality_of). current_modality is
-        # panel display state: which modality's fields the ingestion tab
-        # is showing. If code outside the ingestion cluster reads it,
-        # that is a bug of the class that stamped every cell 'DNA'.
+        # -- The modality registry lives HERE, on the ingestion panel, not
+        # on MainWindow. Per explicit principle: modality is an INGESTION
+        # concept -- each modality needs its own ExperimentLayout + DAX
+        # repository -- and nothing anywhere may hold a "current
+        # modality". There IS no current_modality any more: the
+        # combinatorial form shows every modality's inputs at once (per
+        # explicit design), so even the panel-display-state version of
+        # the concept is gone. Non-ingestion code reads the REGISTRY
+        # (modality_names order + modality_data paths) through
+        # MainWindow's accessor helpers, and derives any per-datum
+        # modality from the datum itself ((hybe, modality) keys,
+        # cell.modality, spot.modality, vlinks_store.modality_of).
+        # modality_names ORDER is semantic and must be preserved: the
+        # first configured entry is the cross-modal hub frame
+        # (_shared_frame_modality), and a loaded config's modality order
+        # means "first = hub".
         self.modality_names = ['DNA', 'RNA']
         self.modality_data = {}           # {name: modality-state dict}
-        self.current_modality = None      # panel display state ONLY
-        self.ModalityComboBox = QtWidgets.QComboBox()
-        modalityLayout.addWidget(QtWidgets.QLabel('Current modality (switches everything below that is not global):'))
-        modalityLayout.addWidget(self.ModalityComboBox)
 
         layout.addWidget(modalityGroup)
         self.build_modality_name_fields(2)
-        self.ModalityComboBox.addItems(['DNA', 'RNA'])
+
+        # -- combinatorial inputs: one (layout, DAX) row pair per
+        # modality, all always visible; rebuilt wholesale by
+        # build_modality_input_rows on activation, so MainWindow re-wires
+        # the rows' signals after every rebuild (same
+        # rebuild-then-reconnect convention as AlignmentPanel's
+        # build_cell_reference_hybe_fields combos). --
+        self.ModalityInputsContainer = QtWidgets.QWidget()
+        self.ModalityInputsLayout = QtWidgets.QFormLayout(self.ModalityInputsContainer)
+        self.ModalityInputsLayout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.ModalityInputsContainer)
+        self.modality_input_rows = {}     # {name: {'layout': QLineEdit, 'dax': QLineEdit}}
+        self.build_modality_input_rows(self.modality_names)
 
         form = QtWidgets.QFormLayout()
         layout.addLayout(form)
 
-        self.LayoutPathLineEdit, layoutPathRow = self._path_row('Select ExperimentLayout.xlsx', is_file=True,
-                                                                 name_filter='Excel files (*.xlsx)')
-        form.addRow('ExperimentLayout.xlsx:', layoutPathRow)
-
-        self.DaxDirectoryLineEdit, daxDirRow = self._path_row('Select DAX directory', is_file=False)
-        form.addRow('DAX directory:', daxDirRow)
-
-        self.StoragePathLineEdit, storagePathRow = self._path_row('Select storage directory', is_file=False)
-        form.addRow('Storage path:', storagePathRow)
+        self.ProjectRootLineEdit, projectRootRow = self._path_row('Select project root (storage) directory',
+                                                                  is_file=False)
+        form.addRow('Project root (storage):', projectRootRow)
 
         self.FovListLineEdit = QtWidgets.QLineEdit()
         self.FovListLineEdit.setPlaceholderText('e.g. 1,2,3 or 1-10,15,20-25 or 1 2 3 (comma and/or space separated)')
-        form.addRow('FOV list:', self.FovListLineEdit)
+        form.addRow('FOV list (all modalities):', self.FovListLineEdit)
 
-        self.ParseLayoutPushButton = QtWidgets.QPushButton('Parse Layout')
+        self.ParseLayoutPushButton = QtWidgets.QPushButton('Parse Layouts (all modalities)')
         layout.addWidget(self.ParseLayoutPushButton)
 
-        layout.addWidget(QtWidgets.QLabel('Hybes to ingest:'))
+        layout.addWidget(QtWidgets.QLabel('Hybes to ingest (all modalities combined -- [modality] tags each row):'))
         self.HybeListWidget = QtWidgets.QListWidget()
         # ExtendedSelection (not NoSelection) -- lets the user click+drag,
         # shift-click, or ctrl-click to highlight many rows at once, then
@@ -138,6 +185,13 @@ class IngestionPanelUI(object):
 
         self.RunIngestionPushButton = QtWidgets.QPushButton('Run Ingestion')
         self.RunIngestionPushButton.setEnabled(False)
+        self.RunIngestionPushButton.setToolTip(
+            'Ingests exactly the checked hybes above -- every modality in ONE combined run: each '
+            "FOV's hybes are converted across every checked modality before any modality's hybes "
+            'for the next FOV, so early FOVs finish across every modality together (they can be '
+            'analyzed while the rest still ingests). One shared Parallel workers pool bounds the '
+            'whole run regardless of how many modalities are checked. To ingest a single modality, '
+            "uncheck the other modalities' rows.")
         layout.addWidget(self.RunIngestionPushButton)
 
         self.CheckIngestionStatusPushButton = QtWidgets.QPushButton('Check Ingestion Status')
@@ -145,8 +199,8 @@ class IngestionPanelUI(object):
         self.IngestionStatusTextEdit = QtWidgets.QTextEdit()
         self.IngestionStatusTextEdit.setReadOnly(True)
         self.IngestionStatusTextEdit.setPlaceholderText(
-            'Per-FOV/per-hybe readiness (does {storage path}/FOV##/{hybe}_stack.h5 exist with real data?) '
-            'shows here after Parse Layout + Check Ingestion Status.')
+            'Per-modality, per-FOV hybe readiness (is each hybe really ingested under '
+            '{project root}/{modality}?) shows here after Parse Layouts + Check Ingestion Status.')
         self.IngestionStatusTextEdit.setMaximumHeight(140)
         layout.addWidget(self.IngestionStatusTextEdit)
 
@@ -245,6 +299,42 @@ class IngestionPanelUI(object):
     def modality_name_values(self):
         return [c.currentText().strip() for c in self.ModalityNameComboBoxes]
 
+    def build_modality_input_rows(self, names):
+        """
+        Rebuild the per-modality (ExperimentLayout.xlsx, DAX directory)
+        row pairs -- one pair per modality, ALL always visible: the
+        combinatorial form has no current-modality switching, per
+        explicit design. Rebuilding replaces the row widgets wholesale,
+        so MainWindow must re-wire their signals after every call
+        (_wire_modality_input_rows -- same rebuild-then-reconnect
+        convention as AlignmentPanel's build_cell_reference_hybe_fields).
+        """
+        while self.ModalityInputsLayout.rowCount():
+            self.ModalityInputsLayout.removeRow(0)
+        self.modality_input_rows = {}
+        for name in names:
+            layout_edit, layout_row = self._path_row(f'Select {name} ExperimentLayout.xlsx', is_file=True,
+                                                     name_filter='Excel files (*.xlsx)')
+            self.ModalityInputsLayout.addRow(f'{name} ExperimentLayout.xlsx:', layout_row)
+            dax_edit, dax_row = self._path_row(f'Select {name} DAX directory', is_file=False)
+            self.ModalityInputsLayout.addRow(f'{name} DAX directory:', dax_row)
+            self.modality_input_rows[name] = {'layout': layout_edit, 'dax': dax_edit}
+
+    def modality_input_values(self):
+        """{name: {'layout_path':..., 'dax_directory':...}} read live off the N row pairs."""
+        return {name: {'layout_path': edits['layout'].text().strip(),
+                       'dax_directory': edits['dax'].text().strip()}
+                for name, edits in self.modality_input_rows.items()}
+
+    def set_modality_input_values(self, fields_by_name):
+        """Fill the row pairs from {name: {'layout_path', 'dax_directory'}} -- names without a row (not activated) are ignored."""
+        for name, fields in (fields_by_name or {}).items():
+            edits = self.modality_input_rows.get(name)
+            if not edits:
+                continue
+            edits['layout'].setText(fields.get('layout_path', ''))
+            edits['dax'].setText(fields.get('dax_directory', ''))
+
     def lock_modality_setup(self):
         self.NumModalitiesLineEdit.setEnabled(False)
         self.SetNumModalitiesPushButton.setEnabled(False)
@@ -258,7 +348,13 @@ class IngestionPanelUI(object):
             item.setCheckState(check_state)
 
     def hybe_checkbox_items(self):
-        """Currently-checked hybe folder names from HybeListWidget."""
+        """
+        Currently-checked (hybe_folder, modality) pairs from the combined
+        HybeListWidget. The modality element is load-bearing, not
+        cosmetic: hybe folder names legitimately collide across
+        modalities (the cross-modal bridge hybe exists in BOTH layouts),
+        so a bare folder name cannot identify a checked row.
+        """
         checked = []
         for i in range(self.HybeListWidget.count()):
             item = self.HybeListWidget.item(i)
@@ -266,31 +362,59 @@ class IngestionPanelUI(object):
                 checked.append(item.data(QtCore.Qt.UserRole))
         return checked
 
-    def populate_hybe_list(self, hybe_records, dax_directory=None):
+    def populate_hybe_list(self, tagged_records, dax_directories=None):
         """
-        Default-checks every hybe -- there's no reason to make the user
-        manually re-check each one every time. If dax_directory is given
-        (already set when Parse Layout runs), a hybe only gets checked if
-        it actually has real DAX data present ({dax_directory}/{folder}/
-        contains at least one .dax file) -- still opt-out-by-default
-        overall, just not for hybes that couldn't possibly ingest anyway.
+        Rebuild the COMBINED checklist. tagged_records: [(hybe_record,
+        modality), ...] -- every modality's parsed hybes concatenated in
+        modality order, each row labeled with and UserRole-keyed by
+        (folder, modality) (see hybe_checkbox_items for why the pair).
+        Default-checks each row iff its OWN modality's DAX directory
+        (dax_directories: {name: dir}) has real data for that folder --
+        still opt-out-by-default overall (an absent/blank directory
+        defaults to checked, see _has_dax_data), just evaluated per
+        modality instead of against one shared directory. Presence is
+        answered by _probe_dax_presence (pooled probes + session cache --
+        see its own comment for the measured 9.5 s this took serially),
+        so a re-parse costs zero DAX round-trips; re-confirm a DAX field
+        to force a fresh probe of that modality (refresh_hybe_checks).
         """
+        dax_directories = dax_directories or {}
+        presence = _probe_dax_presence(
+            [(dax_directories[modality], record['folder'])
+             for record, modality in tagged_records if dax_directories.get(modality)])
         self.HybeListWidget.clear()
-        for record in hybe_records:
+        for record, modality in tagged_records:
             folder = record['folder']
-            label = f"{folder}  (readout_id={record['readout_id']}, datatype={record['datatype']}, " \
+            label = f"{folder} [{modality}]  (readout_id={record['readout_id']}, datatype={record['datatype']}, " \
                    f"channels={record['channels']}, name={record['readout_name'] or '-'})"
             item = QtWidgets.QListWidgetItem(label)
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Checked if self._has_dax_data(dax_directory, folder) else QtCore.Qt.Unchecked)
-            item.setData(QtCore.Qt.UserRole, folder)
+            dax_directory = dax_directories.get(modality)
+            has_data = presence.get((dax_directory, folder), True) if dax_directory else True
+            item.setCheckState(QtCore.Qt.Checked if has_data else QtCore.Qt.Unchecked)
+            item.setData(QtCore.Qt.UserRole, (folder, modality))
             self.HybeListWidget.addItem(item)
 
-    def refresh_hybe_checks(self, dax_directory):
-        """Re-evaluate checked state for the already-populated list against a (possibly just-changed) DAX directory."""
+    def refresh_hybe_checks(self, modality, dax_directory):
+        """Re-evaluate checked state for ONLY `modality`'s rows against a
+        (possibly just-changed) DAX directory -- other modalities' rows
+        are left exactly as they are, since their own DAX repositories
+        did not change. Probes FRESH (refresh=True), overwriting the
+        session cache: this is the one explicit invalidation for DAX
+        presence, so re-confirming the DAX field is how newly-copied
+        data becomes visible without restarting."""
+        rows = []
         for i in range(self.HybeListWidget.count()):
             item = self.HybeListWidget.item(i)
-            item.setCheckState(QtCore.Qt.Checked if self._has_dax_data(dax_directory, item.data(QtCore.Qt.UserRole)) else QtCore.Qt.Unchecked)
+            folder, row_modality = item.data(QtCore.Qt.UserRole)
+            if row_modality != modality:
+                continue
+            rows.append((item, folder))
+        presence = _probe_dax_presence([(dax_directory, folder) for _item, folder in rows],
+                                       refresh=True) if dax_directory else {}
+        for item, folder in rows:
+            has_data = presence.get((dax_directory, folder), True) if dax_directory else True
+            item.setCheckState(QtCore.Qt.Checked if has_data else QtCore.Qt.Unchecked)
 
     @staticmethod
     def _has_dax_data(dax_directory, folder):
@@ -303,12 +427,10 @@ class IngestionPanelUI(object):
         """
         total_active_hybe_list: [(hybe_record, modality_name), ...] --
         every configured modality's active hybes at once, so MIP Viewer
-        can show a hybe from EITHER modality without first switching
-        Ingestion's own ModalityComboBox (that combo now only drives
-        which modality's layout/dax/storage-path fields are showing, see
-        MainWindow._switch_current_modality). Same itemData-tagged,
-        selection-preserving pattern as SpotLocalizationPanel.
-        populate_hybe_choices.
+        can show a hybe from ANY modality directly (there is no
+        current-modality switcher left to flip first). Same
+        itemData-tagged, selection-preserving pattern as
+        SpotLocalizationPanel.populate_hybe_choices.
         """
         current = self.current_viewer_hybe_key()
         self.ViewerHybeComboBox.blockSignals(True)
@@ -358,12 +480,16 @@ class IngestionPanelUI(object):
         self.ViewerChannelComboBox.currentIndexChanged.emit(self.ViewerChannelComboBox.currentIndex())
 
     def add_job_item(self, job):
-        """job: dict with layout_path, dax_directory, storage_path, modality,
-        fov_list (list[int]), selected_records (list of hybe record dicts),
-        hybe_records (full parsed layout for the job's ExperimentLayout.xlsx)."""
-        hybe_names = ','.join(r['folder'] for r in job['selected_records'])
+        """job: {'jobs': [{'fov_list', 'hybe_records', 'dax_directory',
+        'storage_path', 'modality'}, ...], 'fov_list': list[int]} -- the
+        SAME multi-job shape IngestionWorker takes (one inner dict per
+        modality with checked hybes), snapshotted whole at Add time so
+        Run Queued Jobs hands each queue entry straight to the worker
+        with no re-derivation from live form state."""
+        modalities = '+'.join(j['modality'] for j in job['jobs'])
+        n_hybes = sum(len(j['hybe_records']) for j in job['jobs'])
         fov_text = ','.join(str(f) for f in job['fov_list'])
-        label = f"{job['modality']} | {job['layout_path'].split('/')[-1]} | FOV {fov_text} | {hybe_names}"
+        label = f"{modalities} | FOV {fov_text} | {n_hybes} hybe(s)"
         item = QtWidgets.QListWidgetItem(label)
         item.setData(QtCore.Qt.UserRole, job)
         self.JobQueueListWidget.addItem(item)

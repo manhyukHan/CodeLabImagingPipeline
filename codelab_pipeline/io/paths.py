@@ -12,14 +12,23 @@ v1 (legacy)  storage_path IS a per-modality queue directory:
 
 v2           storage_path = <dp>/{modality} inside a project root <dp>
              carrying a manifest.json (see write_manifest):
-               <dp>/{modality}/stacks/FOV##/{hybe}.h5   chunked, write-once
-               <dp>/{modality}/mips/FOV##/{hybe}.h5     per-hybe, written
+               <dp>/{modality}/stacks/fov###/{hybe}.h5  chunked, write-once
+               <dp>/{modality}/mips/fov###/{hybe}.h5    per-hybe, written
                                                         ATOMICALLY by the
                                                         ingestion worker
                                                         (existence == complete)
-               <dp>/analysis/vlinks.h5                  cells/spots/alleles/
-                                                        matrices/params only
-               <dp>/figures/{category}/FOV##/*.png      all rendered outputs
+               <dp>/analysis/fov###/...                 per-FOV analysis
+                                                        capsules (see
+                                                        io/analysis_store.py;
+                                                        replaces the single
+                                                        analysis/vlinks.h5,
+                                                        now retired)
+               <dp>/analysis/params.json                experiment params
+               <dp>/figures/{modality}/{category}/fov###/*.png
+                                                        all rendered outputs
+                                                        ({category}:
+                                                        'alignment', 'cells',
+                                                        'alleles', ...)
 
 Why modality-major (dp/{modality}/...) rather than FOV-major: the whole
 pipeline keys modality by storage path (modality_of and its ~20 callers;
@@ -145,19 +154,58 @@ def modality_from_path(storage_path):
 
 # -- file resolution -----------------------------------------------------
 
+def fov_dir_name(fov):
+    """THE v2 FOV directory name: fov### everywhere (stacks, mips,
+    analysis, figures) -- 3-digit because experiments already exceed 99
+    FOVs. v1's FOV## naming survives only inside the frozen legacy
+    layout and the legacy vlinks.h5 group paths."""
+    return f'fov{int(fov):03d}'
+
+
+_FOV_NAMING_CHECKED = set()
+
+
+def _require_fov3(storage_path):
+    """Refuse a v2 store whose stacks/mips still carry 2-digit FOV##
+    directories: resolving fov### paths against them would silently
+    report every FOV as un-ingested (Windows' case-insensitive matching
+    hides the case difference, but not the digit count). One listdir per
+    root, once per process per storage_path."""
+    key = os.path.abspath(storage_path)
+    if key in _FOV_NAMING_CHECKED:
+        return
+    for sub in ('stacks', 'mips'):
+        root = os.path.join(storage_path, sub)
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for name in entries:
+            if name[:3].lower() == 'fov' and name[3:].isdigit() and len(name[3:]) != 3:
+                raise RuntimeError(
+                    f'{root} still uses the retired {name!r}-style FOV '
+                    f'directory naming -- run tools/migrate_fov_naming.py '
+                    f'once on this project to rename every FOV directory '
+                    f'to fov###.')
+    _FOV_NAMING_CHECKED.add(key)
+
+
 def stack_path(storage_path, fov, hybe):
     if is_v2(storage_path):
-        return os.path.join(storage_path, 'stacks', f'FOV{fov:02d}', f'{hybe}.h5')
+        _require_fov3(storage_path)
+        return os.path.join(storage_path, 'stacks', fov_dir_name(fov), f'{hybe}.h5')
     return os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
 
 
 def mip_path(storage_path, fov, hybe):
     """v2 only -- v1 keeps MIPs inside vlinks.h5 (callers branch on is_v2)."""
-    return os.path.join(storage_path, 'mips', f'FOV{fov:02d}', f'{hybe}.h5')
+    _require_fov3(storage_path)
+    return os.path.join(storage_path, 'mips', fov_dir_name(fov), f'{hybe}.h5')
 
 
 def mips_dir(storage_path, fov):
-    return os.path.join(storage_path, 'mips', f'FOV{fov:02d}')
+    _require_fov3(storage_path)
+    return os.path.join(storage_path, 'mips', fov_dir_name(fov))
 
 
 def vlinks_path(storage_path):
@@ -167,20 +215,48 @@ def vlinks_path(storage_path):
     return os.path.join(dp, 'vlinks.h5')
 
 
+def analysis_dir(storage_path):
+    """v2 only: the project's analysis root, <dp>/analysis."""
+    return os.path.join(project_root(storage_path), 'analysis')
+
+
+def analysis_fov_dir(storage_path, fov):
+    """
+    v2 only: one FOV's analysis capsule directory,
+    <dp>/analysis/fov### (fov_dir_name -- the one v2 FOV naming).
+    """
+    return os.path.join(analysis_dir(storage_path), fov_dir_name(fov))
+
+
 def figure_path(storage_path, category, fov, filename):
     """
-    All rendered outputs live under <dp>/figures/{category}/FOV##/ in a
-    v2 store (per explicit decision: theoretically every analysis output
-    is stored, so categories keep them distinguishable -- 'alignment',
-    'cells', 'celltype', 'chromatin', ...). v1 keeps the legacy
+    All rendered outputs live under <dp>/figures/{modality}/{category}/
+    fov###/ in a v2 store -- modality-major like the data tree itself
+    (per explicit decision: figures did not distinguish modalities, so
+    two modalities sharing a hybe name overwrote each other's overlays),
+    then by category ('alignment' for FOV-level overlays, 'cells',
+    'alleles', 'celltype', ...). The modality comes from the
+    storage_path the figure was rendered for; a figure rendered outside
+    any single modality lands under 'shared'. v1 keeps the legacy
     dump-beside-the-data location.
+
+    Figures already on disk under the pre-modality layout
+    (figures/{category}/FOV##/) are regenerable outputs and are simply
+    left where they are -- nothing reads figures back.
     """
-    if is_v2(storage_path):
-        d = os.path.join(project_root(storage_path), 'figures', category, f'FOV{fov:02d}')
-    else:
-        d = os.path.join(storage_path, f'FOV{fov:02d}')
+    d = figure_dir(storage_path, category, fov)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, filename)
+
+
+def figure_dir(storage_path, category, fov):
+    """The directory figure_path resolves into, WITHOUT creating it --
+    for callers that only offer it as a default save location."""
+    if is_v2(storage_path):
+        modality = modality_from_path(storage_path) or 'shared'
+        return os.path.join(project_root(storage_path), 'figures', modality,
+                            category, fov_dir_name(fov))
+    return os.path.join(storage_path, f'FOV{fov:02d}')
 
 
 def mips_present(storage_path, fov):

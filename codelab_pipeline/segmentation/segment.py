@@ -7,7 +7,8 @@ from scipy import ndimage as scind
 import warnings
 
 from ..io import paths
-from ..io import vlinks_store
+from ..io import analysis_store
+from ..io import stack_cache
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
 
@@ -25,7 +26,7 @@ def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_siz
                 projection_mode='MIP (stored)', z_plane=None, z_range=None):
     """
     Bulk (non-interactive) cell segmentation for one FOV -- reads the
-    reference MIP from vlinks.h5 (vlinks_store.read_hybe_mip), a real copy
+    reference MIP from vlinks.h5 (analysis_store.read_hybe_mip), a real copy
     written by ingestion, not the raw per-hybe {hybe}_stack.h5 -- per
     explicit principle, segmentation is display/2D-analysis, not ingestion
     or 3D localization, so it should never need the raw stack file.
@@ -45,7 +46,7 @@ def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_siz
     reference_image = read_projection(storage_path, fov, reference_hybe, channel,
                                       mode=projection_mode, z_plane=z_plane, z_range=z_range)
     if reference_image is None:
-        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
+        raise ValueError(f'FOV{fov:03d} {reference_hybe} ch{channel} not ingested -- ingest it first.')
 
     # eval()'s return tuple length varies by cellpose version/model class
     # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
@@ -113,7 +114,7 @@ def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='ot
     reference_image = read_projection(storage_path, fov, reference_hybe, channel,
                                       mode=projection_mode, z_plane=z_plane, z_range=z_range)
     if reference_image is None:
-        raise ValueError(f'FOV{fov:02d} {reference_hybe} ch{channel} not in vlinks.h5 -- ingest it first.')
+        raise ValueError(f'FOV{fov:03d} {reference_hybe} ch{channel} not ingested -- ingest it first.')
 
     if method == 'absolute':
         cutoff = float(absolute_cutoff)
@@ -184,14 +185,36 @@ def focus_profile(storage_path, fov, hybe, channel, step=1, crop=512):
     keep it cheap (h5py slices per plane, never materializing the stack).
     """
     h5path = paths.stack_path(storage_path, fov, hybe)
-    with h5py.File(h5path, 'r') as f:
-        ds = f[f'/stack/ch{channel}']
-        height, width, depth = ds.shape
-        half = min(crop, height, width) // 2
-        y0, y1 = height // 2 - half, height // 2 + half
-        x0, x1 = width // 2 - half, width // 2 + half
-        zs = list(range(0, depth, max(step, 1)))
-        vals = [float(scind.laplace(ds[y0:y1, x0:x1, z].astype(np.float32)).var()) for z in zs]
+    shape = stack_cache.stack_shape(h5path, channel)
+    if shape is None:
+        return np.array([]), np.array([])
+    height, width, depth, _slab = shape
+    half = min(crop, height, width) // 2
+    y0, y1 = height // 2 - half, height // 2 + half
+    x0, x1 = width // 2 - half, width // 2 + half
+    zs = list(range(0, depth, max(step, 1)))
+    if not stack_cache.enabled():
+        # Cache off: read only the central crop each plane needs. Going
+        # through slab() here would inflate the FULL frame's chunks once
+        # per plane with nothing retained -- measured 4x SLOWER than this
+        # direct read (113 s vs 24.7 s per hybe on the real store).
+        with h5py.File(h5path, 'r') as f:
+            ds = f[f'/stack/ch{channel}']
+            vals = [float(scind.laplace(ds[y0:y1, x0:x1, z].astype(np.float32)).var()) for z in zs]
+        return np.array(zs), np.array(vals)
+    # Through the slab cache: reading one plane inflates its whole chunk
+    # slab anyway, so profiling every plane costs ceil(depth/slab) slab
+    # reads instead of `depth` of them -- measured 24.7 s -> ~3 s per
+    # hybe on the real store, and the slabs stay cached for the
+    # plane-scrolling that usually follows. See io/stack_cache.py.
+    vals = []
+    for z in zs:
+        got = stack_cache.slab(h5path, channel, z)
+        if got is None:
+            return np.array([]), np.array([])
+        arr, s0 = got
+        window = arr[y0:y1, x0:x1, z - s0].astype(np.float32)
+        vals.append(float(scind.laplace(window).var()))
     return np.array(zs), np.array(vals)
 
 
@@ -212,19 +235,24 @@ def read_projection(storage_path, fov, hybe, channel, mode='MIP (stored)', z_pla
     metric only samples the centre.
     """
     if mode == 'MIP (stored)':
-        return vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        return analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    # Depth-resolved modes go through the slab cache: a single-plane read
+    # measured 2.3-4.6 s on the real store (1024 gzip chunks inflated to
+    # hand back one 2 MB plane), which is a per-tick freeze when the
+    # Z-plane spinbox drives this. Cached, every other plane in the same
+    # 64-plane slab is free. See io/stack_cache.py.
     h5path = paths.stack_path(storage_path, fov, hybe)
-    with h5py.File(h5path, 'r') as f:
-        ds = f[f'/stack/ch{channel}']
-        depth = ds.shape[2]
-        if mode == 'single plane':
-            z = int(np.clip(z_plane if z_plane is not None else depth // 2, 0, depth - 1))
-            return ds[:, :, z].astype(np.float32)
-        z0, z1 = z_range if z_range else (0, depth - 1)
-        z0, z1 = int(np.clip(z0, 0, depth - 1)), int(np.clip(z1, 0, depth - 1))
-        if z1 < z0:
-            z0, z1 = z1, z0
-        sub = ds[:, :, z0:z1 + 1].astype(np.float32)
+    shape = stack_cache.stack_shape(h5path, channel)
+    if shape is None:
+        return None
+    depth = shape[2]
+    if mode == 'single plane':
+        z = int(np.clip(z_plane if z_plane is not None else depth // 2, 0, depth - 1))
+        return stack_cache.plane(h5path, channel, z)
+    z0, z1 = z_range if z_range else (0, depth - 1)
+    sub = stack_cache.planes(h5path, channel, z0, z1)
+    if sub is None:
+        return None
     return sub.max(axis=2) if mode == 'range MIP' else sub.mean(axis=2)
 
 

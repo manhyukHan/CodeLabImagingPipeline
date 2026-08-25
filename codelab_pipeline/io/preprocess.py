@@ -149,6 +149,18 @@ def parse_experiment_layout(xlsx_path):
     # doors per click (~46 ms at 16 hybes, ~300 ms at the real 111 --
     # per call, over NAS). Copies out so a caller mutating its records
     # cannot poison later parses.
+    #
+    # MULTI-ENTRY, not the single slot it used to be: the combinatorial
+    # ingestion form asks for EVERY modality's records back-to-back in
+    # many code paths (parse-all, cell-alignment passes, per-path record
+    # lookups), and the old clear-then-store slot meant each DNA/RNA
+    # alternation evicted the other layout -- every "cached" call was
+    # really a fresh 300 ms xlsx read over NAS, and under ingestion load
+    # (the DAX share saturated by the workers) each re-read stretched to
+    # seconds, which is what made cell-alignment PREPARATION look stuck
+    # mid-ingestion (confirmed real, 2026-08-24). A handful of layouts
+    # per session, each a small list of dicts -- keeping them all is
+    # bytes, re-reading them is seconds.
     try:
         key = (os.path.abspath(xlsx_path), os.stat(xlsx_path).st_mtime_ns)
     except OSError:
@@ -173,7 +185,11 @@ def parse_experiment_layout(xlsx_path):
             'readout_name': readout_name,
         })
     if key is not None:
-        _LAYOUT_CACHE.clear()          # one layout per modality in practice; keep it tiny
+        # bounded, oldest-out: a stale (path, old-mtime) entry for a
+        # re-saved xlsx is dead weight, and 8 comfortably covers every
+        # modality of a real project plus a re-save or two
+        while len(_LAYOUT_CACHE) >= 8:
+            _LAYOUT_CACHE.pop(next(iter(_LAYOUT_CACHE)))
         _LAYOUT_CACHE[key] = records
         return [dict(r) for r in records]
     return records
@@ -377,6 +393,40 @@ def stack_is_complete(stack_h5name, channels, expected_depth):
     return True
 
 
+def _restore_missing_mip(storage_path, fov, folder, channels, fiducial_channel):
+    """
+    Heal the crash window between stack publish and MIP publish: the MIP
+    file is the ingestion-completeness FLAG (mips_present -- existence ==
+    ingested), written only AFTER the stack lands, so a kill in between
+    leaves a complete stack that every readiness check reports as
+    un-ingested. Without this, append mode's complete-stack early return
+    skipped the hybe forever -- ingested but permanently invisible, the
+    exact failure class the atomic publish exists to prevent.
+
+    The stack file carries its own /mip/ch* datasets (written in the same
+    pass as the stack data), so restoring the flag is a ~2 MB read plus
+    one atomic MIP write -- no DAX access. Returns True when the MIP file
+    exists (already, or after restoring it); False means the caller must
+    rebuild from the DAX. v1 stores keep their in-vlinks MIPs and are not
+    handled here.
+    """
+    if not paths.is_v2(storage_path):
+        return True
+    if os.path.exists(paths.mip_path(storage_path, fov, folder)):
+        return True
+    try:
+        with h5py.File(paths.stack_path(storage_path, fov, folder), 'r') as f:
+            channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
+        from . import analysis_store
+        analysis_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
+                                      fiducial_channel=fiducial_channel)
+        logging.info(f'FOV {fov} {folder}: restored missing MIP from the complete stack')
+        return True
+    except (OSError, KeyError) as e:
+        logging.warning(f'FOV {fov} {folder}: MIP restore failed ({e})')
+        return False
+
+
 def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False):
     """
     Convert one FOV's raw .dax for one hybe into a per-(fov,hybe) H5 file,
@@ -405,9 +455,16 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
         # which makes this failure class self-healing on the next ordinary run
         # rather than requiring a full-store overwrite to clear.
         if stack_is_complete(stack_h5name, channels, expected_depth):
-            return fov, folder, None
-        logging.warning(f'FOV {fov} {folder}: existing stack is incomplete or unreadable '
-                        f'-- rebuilding it despite append mode')
+            if _restore_missing_mip(storage_path, fov, folder, channels,
+                                    hybe_record['fiducial_channel']):
+                return fov, folder, None
+            # complete stack but its MIP flag could not be restored --
+            # fall through and rebuild the pair from the DAX
+            logging.warning(f'FOV {fov} {folder}: complete stack but its MIP '
+                            f'could not be restored -- rebuilding despite append mode')
+        else:
+            logging.warning(f'FOV {fov} {folder}: existing stack is incomplete or unreadable '
+                            f'-- rebuilding it despite append mode')
 
     dax_path = os.path.join(dax_directory, folder, f'ConvZscan_{fov-1:02d}.dax')
     # Bound before the try: every handler below cleans it up, including the
@@ -490,15 +547,15 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
 
         if channel_mips is not None:
             # v2: this worker writes the per-hybe MIP file itself
-            # (atomically -- see vlinks_store.write_hybe_mip's v2 branch),
+            # (atomically -- see analysis_store.write_hybe_mip's v2 branch),
             # so the coordinator never touches MIPs and vlinks.h5 sees no
             # ingestion traffic at all: the UI stays live mid-ingestion
             # and each hybe becomes browsable the moment ITS file lands.
             # Written AFTER the stack is published, so the only interruption
             # window left leaves a complete stack with a stale MIP -- fully
             # recoverable, since the MIP is derived from the stack.
-            from . import vlinks_store
-            vlinks_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
+            from . import analysis_store
+            analysis_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
                                         fiducial_channel=hybe_record['fiducial_channel'])
         logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')
         return fov, folder, None

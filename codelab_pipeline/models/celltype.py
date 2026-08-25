@@ -149,7 +149,7 @@ def classify_spot_barcode(xy_by_channel, fov, images, celltype_determination):
 
     xy_by_channel: {(hybe, channel): (x, y)} -- this spot's position,
     already transformed into EACH barcode channel's own hybe-native frame
-    (via spot_mapper.reference_to_raw(spot.coordinate[:2], hybe,
+    (via spot_mapper.reference_to_raw(spot.adj_coordinate[:2], hybe,
     fov_matrices, cell=owning_cell) per channel -- the caller's job, same
     reasoning as classify_cell_barcode above).
     """

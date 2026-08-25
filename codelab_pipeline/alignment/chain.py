@@ -13,7 +13,7 @@ from skimage.feature import peak_local_max
 
 from ..io import paths
 from ..io import preprocess
-from ..io import vlinks_store
+from ..io import analysis_store
 import cv2
 
 # Hard, non-configurable engine-level bounds on any fitted alignment matrix
@@ -657,7 +657,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     align_same_modality so the write step can be deferred (manual
     review mode) or run standalone.
 
-    Delegates to vlinks_store rather than writing into each hybe's own raw
+    Delegates to analysis_store rather than writing into each hybe's own raw
     {hybe}_stack.h5 (the previous behavior) -- per explicit principle,
     vlinks.h5 must be the pipeline's authoritative store for this, not N
     scattered raw per-hybe files that require heavy I/O (opening every
@@ -665,7 +665,7 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     ingestion and 3D localization, the raw stack files should not need to
     be touched at all.
     """
-    vlinks_store.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
+    analysis_store.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
 
 
 def read_same_modality_matrices(storage_path, fov, hybe_records):
@@ -686,13 +686,13 @@ def read_same_modality_matrices(storage_path, fov, hybe_records):
     reflect whatever alignment has already been computed and written,
     without the user needing to re-run alignment just to see it again.
 
-    Delegates to vlinks_store.read_same_modality_matrices instead of
+    Delegates to analysis_store.read_same_modality_matrices instead of
     opening each hybe's own raw
     {hybe}_stack.h5 -- this is now a single vlinks.h5 open, not N raw file
     opens, so callers can refresh this freely.
     """
     hybe_list = [record['folder'] for record in hybe_records]
-    return vlinks_store.read_same_modality_matrices(storage_path, fov, hybe_list)
+    return analysis_store.read_same_modality_matrices(storage_path, fov, hybe_list)
 
 
 # -- parallel same-modality alignment (see align_same_modality) -----------
@@ -722,7 +722,7 @@ def _init_align_worker(storage_path, fov, reference_hybe, ref_channel):
     pool slower than the serial loop it replaced.
     """
     cv2.setNumThreads(1)
-    _ALIGN_WORKER_REFERENCE['mip'] = vlinks_store.read_hybe_mip(
+    _ALIGN_WORKER_REFERENCE['mip'] = analysis_store.read_hybe_mip(
         storage_path, fov, reference_hybe, ref_channel)
 
 
@@ -732,7 +732,7 @@ def _align_one_hybe(task):
     reference_mip = _ALIGN_WORKER_REFERENCE.get('mip')
     if reference_mip is None:
         return hybe, None, 'reference MIP unavailable in worker'
-    moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    moving_mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
     if moving_mip is None:
         return hybe, None, 'not ingested'
     H = align_readout_to_reference(moving_mip, reference_mip, lb, ub,
@@ -856,9 +856,9 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
     # (3D spot localization, 3D cell-based alignment, 3D spot-based
     # alignment) -- reads vlinks.h5's real MIP copy, never the raw stack
     # file.
-    reference_mip = vlinks_store.read_hybe_mip(storage_path, fov, reference_hybe, ref_record['fiducial_channel'])
+    reference_mip = analysis_store.read_hybe_mip(storage_path, fov, reference_hybe, ref_record['fiducial_channel'])
     if reference_mip is None:
-        raise ValueError(f'FOV{fov:02d} {reference_hybe} not in vlinks.h5 -- ingest it first.')
+        raise ValueError(f'FOV{fov:03d} {reference_hybe} not ingested -- ingest it first.')
 
     matrices = {reference_hybe: np.eye(3)}
     todo = [r for r in hybe_records if r['folder'] != reference_hybe]
@@ -896,17 +896,17 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
             for future in as_completed(tasks):
                 hybe, H, err = future.result()
                 if err == 'not ingested':
-                    raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+                    raise ValueError(f'FOV{fov:03d} {hybe} not ingested -- ingest it first.')
                 if err is not None:
-                    raise ValueError(f'FOV{fov:02d} {hybe}: {err}')
+                    raise ValueError(f'FOV{fov:03d} {hybe}: {err}')
                 matrices[hybe] = H
                 _report(hybe)
     else:
         for record in todo:
             hybe = record['folder']
-            moving_mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, record['fiducial_channel'])
+            moving_mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, record['fiducial_channel'])
             if moving_mip is None:
-                raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+                raise ValueError(f'FOV{fov:03d} {hybe} not ingested -- ingest it first.')
             matrices[hybe] = align_readout_to_reference(moving_mip, reference_mip, lb, ub,
                                                         border_trim=border_trim, max_shift=max_shift)
             _report(hybe)
@@ -925,7 +925,7 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
                       rna_fov_matrices, dna_fov_matrices,
                       rna_reference_hybe='Hyb_500', dna_reference_hybe='Hyb_400',
                       channel_type='readout', lb=0.3, ub=0.9999,
-                      border_trim=0, max_shift=None):
+                      border_trim=0, max_shift=None, with_residuals=False):
     """
     Align the two experiments using the specified channel of each reference
     hybe -- 'readout' (default) uses each hybe's non-fiducial channel, e.g.
@@ -967,15 +967,34 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     border_trim/max_shift: passed straight through to
     align_readout_to_reference for the actual DNA->RNA correlation step --
     see that function's docstring. Both default to no-op (0 / None).
+
+    with_residuals (default False, no behavior change): return
+    (H_across, {'residual_before', 'residual_after'}) instead of bare
+    H_across. Both numbers are the signal-gated reconstruction MSD
+    (_reconstruction_residual) measured on the SAME trimmed+normalized
+    pair the fit itself was scored on -- 'before' under identity (no
+    correction), 'after' under the returned H_across -- so they are a
+    measured quality of THIS result, comparable across FOVs of one run.
+    Lower is better; after >= before means the fit did not actually
+    improve the match and the result deserves a human look. Persisted
+    beside the matrix at accept time (analysis_store.write_cross_modal_
+    quality), per explicit request: the status viewer must be able to
+    report the bridge's fit quality, not just its dx/dy/angle.
     """
     # Cross-modality alignment is not one of the 3D exceptions -- reads
     # vlinks.h5's real MIP copies, never the raw stack file.
-    mip_fn = vlinks_store.fiducial_channel_mip if channel_type == 'fiducial' else vlinks_store.readout_channel_mip
+    mip_fn = analysis_store.fiducial_channel_mip if channel_type == 'fiducial' else analysis_store.readout_channel_mip
     rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
     dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
     if rna_mip is None or dna_mip is None:
-        raise ValueError(f'FOV{fov:02d}: {rna_reference_hybe} (RNA) and/or {dna_reference_hybe} (DNA) '
-                         f'not in vlinks.h5 -- ingest them first.')
+        # real modality names, not the historical RNA/DNA slot names --
+        # the positional slots carry shared/moving semantics since the
+        # hub+bridges refactor, and the FrameMatrices already know whose
+        # they are (zero extra I/O)
+        shared_name = getattr(rna_fov_matrices, 'modality', None) or 'shared'
+        moving_name = getattr(dna_fov_matrices, 'modality', None) or 'moving'
+        raise ValueError(f'FOV{fov:03d}: {rna_reference_hybe} ({shared_name}) and/or '
+                         f'{dna_reference_hybe} ({moving_name}) not in vlinks.h5 -- ingest them first.')
 
     h, w = rna_mip.shape
     H_rna_within = rna_fov_matrices.get((rna_reference_hybe, rna_fov_matrices.modality), np.eye(3))
@@ -983,7 +1002,23 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     rna_mip_aligned = cv2.warpAffine(rna_mip.astype(np.float32), as_cv2(H_rna_within)[:2], (w, h))
     dna_mip_aligned = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
-    return align_readout_to_reference(dna_mip_aligned, rna_mip_aligned, lb, ub, border_trim=border_trim, max_shift=max_shift)
+    H_across = align_readout_to_reference(dna_mip_aligned, rna_mip_aligned, lb, ub,
+                                          border_trim=border_trim, max_shift=max_shift)
+    if not with_residuals:
+        return H_across
+    # Score on exactly what the fit saw: same trim, same normalization.
+    # Measured on real 1024x1024 MIPs from the NAS store: 97 ms for this
+    # whole block vs 8.0 s for the fit itself (~1.2%) -- not worth a
+    # separate opt-out.
+    moving, reference = dna_mip_aligned, rna_mip_aligned
+    if border_trim > 0:
+        moving = moving[border_trim:-border_trim, border_trim:-border_trim]
+        reference = reference[border_trim:-border_trim, border_trim:-border_trim]
+    moving_norm = preprocess.normalize_to_uint8(moving, lb, ub)
+    reference_norm = preprocess.normalize_to_uint8(reference, lb, ub)
+    residuals = {'residual_before': _reconstruction_residual(moving_norm, reference_norm, np.eye(3)),
+                 'residual_after': _reconstruction_residual(moving_norm, reference_norm, as_cv2(H_across))}
+    return H_across, residuals
 
 
 MAX_CROSS_MODAL_Z_PLANES = 80.0
@@ -1130,12 +1165,46 @@ def pick_channel_by_type(record, channel_type):
     return readout[0] if readout else fiducial
 
 
+def _cell_native_crop(ctx, hybe, channel):
+    """
+    The crop resolver formerly closed over compute_cell_alignment's
+    locals -- top-level now so _cell_hybe_task can run in a spawn-pool
+    child. `ctx` is the plain-dict loop-invariant context that function
+    builds (see its executor parameter); everything read here is
+    picklable by construction.
+    """
+    height, width = ctx['frame_shape']
+    # cell.reference_hybe's frame -> hybe's own native frame, via
+    # hybe_to_cellref_matrix (see its own docstring) -- always the
+    # SAME general formula, no "is this hybe special" branch; see
+    # compute_cell_alignment's original inline comment for the
+    # mispositioned-crop bug this formula fixed.
+    H_to_hybe = la.inv(hybe_to_cellref_matrix(ctx['fov_matrices'], ctx['cell_reference_hybe_matrix'], hybe))
+    cy, cx = align_cell((ctx['y_ref'], ctx['x_ref']), H_to_hybe, (height, width))
+    x, y = cx, cy
+    if len(x) == 0:
+        return None  # cell doesn't overlap this hybe's frame at all
+    pad = ctx['pad']
+    ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
+    xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
+    # YX (2D) residual fit -- not one of the 3D exceptions (only the
+    # ZX/depth leg, via hybe_zx_projection, genuinely needs the raw
+    # Z-stack) -- reads vlinks.h5's real MIP copy, window-only (the
+    # bounds are already known; measured 58x cheaper than a full read).
+    mip = analysis_store.read_hybe_mip(ctx['storage_path'], ctx['fov'], hybe, channel,
+                                     window=(ymin, ymax, xmin, xmax))
+    if mip is None:
+        return None  # not ingested -- same graceful "no crop" path as no-overlap
+    crop = preprocess.normalize_to_uint8(mip, ctx['lb'], ctx['ub'])
+    return crop, (ymin, ymax, xmin, xmax)
+
+
 def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            reference_hybe=None, channel_type='readout',
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
                            cell_reference_hybe_matrix=None, modality=None,
                            background_clip=None, fit_method='phase_correlation',
-                           integer_shift=False, z_max_shift=None):
+                           integer_shift=False, z_max_shift=None, executor=None):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -1272,6 +1341,17 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     related come from different modalities/runs -- same-modality
     composition never needs the shared frame at all, since both sides
     already share this run's own reference_hybe by construction.
+
+    executor: None (default -- serial per-hybe loop, byte-identical to
+    the pre-refactor behavior) or a spawn-context ProcessPoolExecutor to
+    fan the per-hybe work (_cell_hybe_task: crop reads, fit, gates, Z
+    leg) across children. Measured on the real store, a cell's cost is
+    99.5% NAS I/O (2 file opens + 2 reads per hybe), so overlapping the
+    hybes is the whole win. THE ONE-AXIS RULE (per explicit design):
+    only the SINGLE-task path (Preview This Cell / a one-cell FOV) may
+    pass an executor -- CellAlignmentWorker's multi-cell batch already
+    parallelizes across cells and its pool children call this with
+    executor=None, so per-hybe and per-cell pooling can never stack.
     """
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
@@ -1280,50 +1360,27 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     if cell_reference_hybe_matrix is None:
         cell_reference_hybe_matrix = fov_matrices.get((cell.reference_hybe, cell.reference_modality), np.eye(3))
 
-    def _native_crop(hybe, channel):
-        # cell.reference_hybe's frame -> hybe's own native frame, via
-        # hybe_to_cellref_matrix (see its own docstring) -- always the
-        # SAME general formula, no "is this hybe special" branch. When
-        # hybe IS cell.reference_hybe (same modality too), this
-        # mathematically reduces to exactly identity on its own (both
-        # legs of the composition become the same fov_matrices lookup
-        # and cancel) -- align_cell itself checks the MATRIX for that,
-        # once, and skips its own resampling machinery accordingly, so
-        # there's no need (and no precision cost) to special-case it
-        # here too. Previously this used fov_matrices[hybe] directly,
-        # silently assuming cell.reference_hybe's frame WAS fov_matrices'
-        # own shared frame -- true only when segmentation and FOV/cell
-        # alignment share the same reference hybe. When they don't,
-        # every non-cell.reference_hybe crop -- including THIS RUN'S OWN
-        # reference_hybe crop -- was mispositioned by cell.reference_hybe's
-        # own real FOV correction, so phase correlation rediscovered that
-        # same correction as a "residual" and it got applied AGAIN on top
-        # of the already-correct FOV matrix (observed on real data: a
-        # real -3.2px FOV correction plus a "residual" phase correlation
-        # found by comparing crops that never had that correction applied
-        # -> -6.2px total applied, when ~0px residual was correct).
-        H_to_hybe = la.inv(hybe_to_cellref_matrix(fov_matrices, cell_reference_hybe_matrix, hybe))
-        cy, cx = align_cell((y_ref, x_ref), H_to_hybe, (height, width))
-        x, y = cx, cy
-        if len(x) == 0:
-            return None  # cell doesn't overlap this hybe's frame at all
-        ymin, ymax = max(0, int(y.min()) - pad), min(height, int(y.max()) + pad + 1)
-        xmin, xmax = max(0, int(x.min()) - pad), min(width, int(x.max()) + pad + 1)
-        # YX (2D) residual fit -- not one of the 3D exceptions (only the
-        # ZX/depth leg below, via hybe_zx_projection, genuinely needs the
-        # raw Z-stack) -- reads vlinks.h5's real MIP copy.
-        # Read ONLY the crop window. The bounds are already known here, and the
-        # MIP is gzip-chunked, so this reads the handful of chunks the crop
-        # covers instead of inflating all 1024x1024 to keep ~0.6% of it --
-        # measured 58x cheaper on the real store, and ~33% of a cell's total
-        # alignment time. `dset[y0:y1, x0:x1]` is exactly `dset[:][y0:y1,
-        # x0:x1]`, so the crop is unchanged, not approximated.
-        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel,
-                                         window=(ymin, ymax, xmin, xmax))
-        if mip is None:
-            return None  # not ingested -- same graceful "no crop" path as no-overlap
-        crop = preprocess.normalize_to_uint8(mip, lb, ub)
-        return crop, (ymin, ymax, xmin, xmax)
+    # The loop-invariant context every per-hybe task reads -- a PLAIN,
+    # picklable dict, because _cell_hybe_task must be able to run in a
+    # spawn-pool child (see `executor` above). The reference-derived
+    # entries (ref_channel/crop/window, H_ref_to_shared) are filled in
+    # just below, once the reference crop exists; ref_zx stays None until
+    # the first task that needs it fills it (serial path -- same lazy
+    # semantics as before: a call with no processable hybes does no Z
+    # read at all) or the pooled dispatch fills it eagerly (children get
+    # pickled COPIES of this dict, so a child's lazy fill could never
+    # propagate back and each child would pay its own reference read).
+    ctx = {
+        'storage_path': storage_path, 'fov': fov, 'frame_shape': (height, width),
+        'y_ref': y_ref, 'x_ref': x_ref, 'pad': pad, 'lb': lb, 'ub': ub,
+        'fov_matrices': fov_matrices, 'cell_reference_hybe_matrix': cell_reference_hybe_matrix,
+        'reference_hybe': reference_hybe, 'channel_type': channel_type,
+        'background_clip': background_clip, 'fit_method': fit_method,
+        'integer_shift': integer_shift, 'including_z': including_z,
+        'z_max_shift': z_max_shift, 'cell_id': cell.id,
+        'ref_channel': None, 'reference_crop_for_fit': None, 'ref_window': None,
+        'ref_zx': None, 'H_ref_to_shared': None,
+    }
 
     record_by_folder = {r['folder']: r for r in hybe_records}
     if reference_hybe not in record_by_folder:
@@ -1337,30 +1394,30 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                          f"it likely belongs to a different modality.")
     ref_record = record_by_folder[reference_hybe]
     ref_channel = pick_channel_by_type(ref_record, channel_type)
-    ref_result = _native_crop(reference_hybe, ref_channel)
+    ctx['ref_channel'] = ref_channel
+    ref_result = _cell_native_crop(ctx, reference_hybe, ref_channel)
     if ref_result is None:
         raise ValueError(f"Cell {cell.id} doesn't overlap reference hybe {reference_hybe}'s frame")
-    reference_crop, (rymin, rymax, rxmin, rxmax) = ref_result
+    reference_crop, ref_window = ref_result
+    ctx['ref_window'] = ref_window
     # Optional background suppression, computed ONCE for reference_crop
     # (fixed for the whole call) -- see _clip_background's own docstring.
-    # Only affects the phase-correlation fit and the quality gate below;
-    # never applied to `reference_crop`/`target_crop` themselves, which
-    # stay the plain quantile-normalized crops everywhere else (matrix_
-    # provenance, callers) that might reasonably expect them.
-    reference_crop_for_fit = (_clip_background(reference_crop, background_clip)
-                              if background_clip else reference_crop)
+    # Only affects the phase-correlation fit and the quality gate in the
+    # per-hybe task; never applied to `reference_crop`/`target_crop`
+    # themselves, which stay the plain quantile-normalized crops
+    # everywhere else (matrix_provenance, callers) that might reasonably
+    # expect them.
+    ctx['reference_crop_for_fit'] = (_clip_background(reference_crop, background_clip)
+                                     if background_clip else reference_crop)
 
-    # The Z leg's REFERENCE projection is a loop invariant: it depends only on
-    # reference_hybe, ref_channel and (rymin, rymax, rxmin, rxmax), all fixed
-    # above, plus lb/ub. It was being re-read from disk once per hybe -- 110
-    # identical windowed stack reads per cell on a real FOV, measured at
-    # 14.6 ms each, i.e. 1.61 s of a 7.99 s cell (20%) spent re-reading the
-    # same bytes. Not something the OS cache absorbs, either: this store's
-    # working set is ~28 GB, so those repeats really did reach the disk.
-    #
-    # Filled lazily on the first hybe that needs it rather than eagerly here,
-    # so a call with no processable hybes still does no Z read at all.
-    ref_zx = None
+    # The Z leg's REFERENCE projection (ctx['ref_zx']) is a loop
+    # invariant: it depends only on reference_hybe, ref_channel and
+    # ref_window, all fixed above, plus lb/ub. It used to be re-read from
+    # disk once per hybe -- 110 identical windowed stack reads per cell
+    # on a real FOV, measured at 14.6 ms each (20% of a cell). Filled
+    # lazily by the first task that needs it (serial), or eagerly by the
+    # pooled dispatch below -- see the ctx comment above.
+
     # relative transform FROM reference_hybe's native frame TO the shared
     # FOV frame -- identity when reference_hybe is also the FOV-alignment's
     # own reference hybe (fov_matrices always carries a real entry per
@@ -1369,24 +1426,50 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     # docstring for why, and ACell.matrix_to/matrix_between for how a
     # consumer uses it to bridge across modalities when needed.
     H_ref_to_shared = fov_matrices.get((reference_hybe, fov_matrices.modality), np.eye(3))
+    ctx['H_ref_to_shared'] = H_ref_to_shared
     cell.matrix_anchors[modality] = H_ref_to_shared
 
+    # This run is the sole source of truth for every hybe in
+    # hybe_records -- clear any stale entry up front so a hybe that fails
+    # in its task (out-of-frame or rejected), or that changed roles
+    # between runs (e.g. was a regular target hybe with a real residual
+    # in a previous run but IS this run's reference_hybe), ends up with
+    # exactly what this run computed, never a leftover from a previous
+    # call on this same (real, persisted-to-disk) cell object with
+    # different params or before the reject bound existed.
+    for record in hybe_records:
+        stale_key = (record['folder'], modality)
+        cell.matrices.pop(stale_key, None)
+        cell.matrix_provenance.pop(stale_key, None)
+
+    targets = [r for r in hybe_records if r['folder'] != reference_hybe]
+    results_by_hybe = {}
+    if executor is not None and len(targets) > 1:
+        # Per-hybe fan-out across the caller's spawn pool -- the
+        # single-task path's ONE axis of parallelism (see `executor` in
+        # this function's docstring: the across-cells batch pool never
+        # passes one, so the two axes can never stack). Children receive
+        # pickled COPIES of ctx, so the reference Z projection is read
+        # once HERE rather than lazily (a lazy fill inside a child could
+        # never propagate back, and every child would pay its own read).
+        if including_z and ctx['ref_zx'] is None:
+            ctx['ref_zx'] = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
+                                               *ref_window, lb, ub)
+        futures = [executor.submit(_cell_hybe_task, ctx, r) for r in targets]
+        for future in as_completed(futures):
+            hybe_result, entry, provenance = future.result()
+            results_by_hybe[hybe_result] = (entry, provenance)
+    else:
+        for r in targets:
+            hybe_result, entry, provenance = _cell_hybe_task(ctx, r)
+            results_by_hybe[hybe_result] = (entry, provenance)
+
+    # Merge in hybe_records order -- identical insertion order to the old
+    # inline loop, pooled or not, so nothing downstream can observe which
+    # dispatch ran.
     for record in hybe_records:
         hybe = record['folder']
-        # This run is the sole source of truth for every hybe in
-        # hybe_records -- clear any stale entry up front (both branches
-        # below) so a hybe that fails further down (out-of-frame or
-        # rejected), or that changed roles between runs (e.g. was a
-        # regular target hybe with a real residual in a previous run but
-        # IS this run's reference_hybe), ends up with exactly what this
-        # run computed, never a leftover from a previous call on this
-        # same (real, persisted-to-disk) cell object with different
-        # params or before the reject bound existed. Re-added below only
-        # on success.
         key = (hybe, modality)
-        cell.matrices.pop(key, None)
-        cell.matrix_provenance.pop(key, None)
-
         if hybe == reference_hybe:
             # hybe's own transform into ITSELF (this run's reference_hybe)
             # is trivially identity -- no fitting to do (a frame's position
@@ -1402,6 +1485,34 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # that real correction rather than compute it.
             cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
             continue
+        entry, provenance = results_by_hybe[hybe]
+        cell.matrices[key] = entry
+        cell.matrix_provenance[key] = provenance
+    return
+
+
+def _cell_hybe_task(ctx, record):
+        """
+        The per-hybe body of compute_cell_alignment -- native crop,
+        residual fit, three reject gates, Z leg -- returning (hybe,
+        matrices entry, provenance entry) instead of writing to the cell,
+        so the single-task path can run it in spawn-pool children (see
+        compute_cell_alignment's `executor` parameter). The body below is
+        the old inline loop body moved VERBATIM (the deep indent is the
+        price of that byte-level fidelity), equivalence verified against
+        a captured pre-refactor baseline on the real store, serial AND
+        pooled.
+        """
+        hybe = record['folder']
+        storage_path, fov = ctx['storage_path'], ctx['fov']
+        reference_hybe, ref_channel = ctx['reference_hybe'], ctx['ref_channel']
+        fov_matrices, H_ref_to_shared = ctx['fov_matrices'], ctx['H_ref_to_shared']
+        reference_crop_for_fit = ctx['reference_crop_for_fit']
+        (rymin, rymax, rxmin, rxmax) = ctx['ref_window']
+        pad, lb, ub = ctx['pad'], ctx['lb'], ctx['ub']
+        channel_type, background_clip = ctx['channel_type'], ctx['background_clip']
+        fit_method, integer_shift = ctx['fit_method'], ctx['integer_shift']
+        including_z, z_max_shift = ctx['including_z'], ctx['z_max_shift']
 
         # H1 (hybe's native frame -> shared frame -> reference_hybe's
         # native frame -> cell.reference_hybe's frame) is pure matrix
@@ -1411,7 +1522,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         H1 = compose_chain([fov_matrices[(hybe, fov_matrices.modality)], la.inv(H_ref_to_shared)])
 
         target_channel = pick_channel_by_type(record, channel_type)
-        result = _native_crop(hybe, target_channel)
+        result = _cell_native_crop(ctx, hybe, target_channel)
         if result is None:
             # Cell doesn't overlap this hybe's frame at all -- no crop
             # exists to fit a cell-level residual against. Per the same
@@ -1424,14 +1535,12 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # H1 is deliberately NOT baked in: it is recomposed at read
             # time from the CURRENT FOV matrices, so re-running FOV
             # alignment updates this cell without a re-fit.
-            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}
-            cell.matrix_provenance[key] = {
-                'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe} '
+            return hybe, {'yx': np.eye(3), 'dz': 0.0, 'yx_is_residual': True}, {
+                'reference_sequence': f'{hybe}(cell {ctx["cell_id"]})->{reference_hybe} '
                                       f'[cell-level residual SKIPPED: cell does not overlap this hybe\'s frame, '
                                       f'fell back to FOV/cross-modal only]',
                 'steps': np.stack([H1, np.eye(3)]),
             }
-            continue
         target_crop, (cymin, cymax, cxmin, cxmax) = result
         target_crop_for_fit = (_clip_background(target_crop, background_clip)
                                if background_clip else target_crop)
@@ -1571,9 +1680,14 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             # channel as the YX fit (ref_channel/target_channel) -- a
             # readout-channel Z crop should show the readout signal, not
             # silently fall back to fiducial regardless of channel_type.
-            if ref_zx is None:
-                ref_zx = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
-                                            rymin, rymax, rxmin, rxmax, lb, ub)
+            if ctx['ref_zx'] is None:
+                # the serial path's lazy fill -- the SAME ctx dict is
+                # reused across hybes there, so this reads at most once;
+                # pooled children always receive it pre-filled (see the
+                # dispatch in compute_cell_alignment)
+                ctx['ref_zx'] = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
+                                                   rymin, rymax, rxmin, rxmax, lb, ub)
+            ref_zx = ctx['ref_zx']
             target_zx = hybe_zx_projection(storage_path, fov, hybe, target_channel,
                                            cymin, cymax, cxmin, cxmax, lb, ub)
             # hybe_zx_projection returns (width, depth), not (height,
@@ -1673,8 +1787,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
             reject_note = f' [cell-level residual REJECTED: {reject_reason}, fell back to FOV/cross-modal only]'
         else:
             reject_note = ''
-        cell.matrices[key] = {'yx': H_yx, 'dz': float(z_shift), 'yx_is_residual': True}
-        cell.matrix_provenance[key] = {
-            'reference_sequence': f'{hybe}(cell {cell.id})->{reference_hybe}' + reject_note + zx_note,
+        return hybe, {'yx': H_yx, 'dz': float(z_shift), 'yx_is_residual': True}, {
+            'reference_sequence': f'{hybe}(cell {ctx["cell_id"]})->{reference_hybe}' + reject_note + zx_note,
             'steps': np.stack([H1, H2]),
         }

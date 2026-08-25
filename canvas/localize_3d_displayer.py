@@ -65,7 +65,7 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
     either: Run actually refines and SAVES the Z (mutating, undoable)
     and never touches the grid pop-up at all; View (ViewPushButton/
     view_requested) runs the identical fit but only ever DISPLAYS the
-    result there -- never touches spot.coordinate/raw_coordinate, never
+    result there -- never touches spot.adj_coordinate/raw_coordinate, never
     pushes undo -- a pure preview for "would this spot's Z fit succeed
     and where would the peak land" before committing to Run. A spot with
     no accepted fit still renders its crop in the grid, just without the

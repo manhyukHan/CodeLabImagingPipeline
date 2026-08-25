@@ -14,7 +14,7 @@ from .engine import make_engine
 import cv2
 
 from ..alignment import chain as alignment
-from ..io import vlinks_store
+from ..io import analysis_store
 from ..alignment import spot_mapper
 
 def cell_z_offset(cell, hybe, modality, resolver=None):
@@ -819,9 +819,9 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
         z1 = z + cell_z_offset(cell, hybe, modality, resolver)
 
         spot = ASpot()
-        spot.modality = vlinks_store.modality_of(storage_path)
+        spot.modality = analysis_store.modality_of(storage_path)
         spot.set_metadata(fov=fov, hybe=hybe, channel=channel, cell=cell.id,
-                          coordinate=(float(y1), float(x1), float(z1)),
+                          adj_coordinate=(float(y1), float(x1), float(z1)),
                           raw_coordinate=(float(raw_y), float(raw_x), float(z)),
                           brightness=float(brightness[j]))
         spots.append(spot)
@@ -1072,12 +1072,27 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                                  storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
                                  max_fiducial_drift_z=10.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
-                                 collect_debug=False, resolver=None, z_boundary_trim=0, executor=None):
+                                 collect_debug=False, resolver=None, z_boundary_trim=0, executor=None,
+                                 append=False):
     """
     Fills in allele.fiducial_trace/polymer/rejected_hybes for every hybe in
-    `hybes` (folder names) -- full replace, same "re-run overwrites"
-    convention as _replace_cell_spots/_replace_fov_unassigned_spots
-    elsewhere in this app. Two phases:
+    `hybes` (folder names) -- full replace by default, same "re-run
+    overwrites" convention as _replace_cell_spots/_replace_fov_unassigned_
+    spots elsewhere in this app.
+
+    append=True (the mid-ingestion delta mode -- see MainWindow's batch
+    Fit All FOVs Append option): the three dicts are NOT reset, only the
+    requested `hybes` are (re)fitted and merged in, and the reference
+    hybe's fiducial baseline is REUSED from the allele's stored
+    fiducial_trace when present (a fiducial baseline is a physical fact
+    about the reference stack -- new hybes landing on disk do not change
+    it; AnAllele.save round-trips fiducial_trace, so the baseline
+    survives sessions). When the stored baseline is missing and
+    reference_hybe is not among `hybes`, its fiducial alone is fitted as
+    an extra so phase 2's delta gate has a real baseline rather than
+    rejecting everything with 'reference hybe fiducial not found'.
+
+    Two phases:
 
     1. Fiducial-only fit for every hybe (_localize_fiducial_hybe) ->
        allele.fiducial_trace[hybe].
@@ -1144,9 +1159,17 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
 
     Mutates allele in place either way.
     """
-    allele.fiducial_trace = {}
-    allele.polymer = {}
-    allele.rejected_hybes = {}
+    if not append:
+        allele.fiducial_trace = {}
+        allele.polymer = {}
+        allele.rejected_hybes = {}
+    else:
+        # merge mode: keep what earlier passes established; a hybe in
+        # `hybes` still gets fully re-derived below (its own entries are
+        # overwritten), only hybes OUTSIDE the request are left alone.
+        for hybe in hybes:
+            allele.rejected_hybes.pop(hybe, None)
+            allele.polymer.pop(hybe, None)
     shared_xy = (allele.coordinate[0], allele.coordinate[1])
     debug = {} if collect_debug else None
 
@@ -1170,6 +1193,17 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.rejected_hybes[hybe] = 'no fiducial channel configured'
             continue
         fid_todo.append((hybe, fid_channel))
+    if append and reference_hybe not in hybes and allele.fiducial_trace.get(reference_hybe) is None:
+        # the delta gate below needs the reference baseline; in append
+        # mode it normally comes stored from the earlier pass, but a
+        # first-ever append (or a legacy allele saved without it) must
+        # fit it once -- fiducial only, never gated/traced itself here.
+        ref_channel = hybe_fiducial_channels.get(reference_hybe)
+        if ref_channel is not None:
+            if debug is not None:
+                debug[reference_hybe] = {'fiducial_cubic': None, 'fiducial_centroid': None,
+                                         'readout_cubic': None, 'readout_centroids': None}
+            fid_todo.append((reference_hybe, ref_channel))
 
     def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid):
         allele.fiducial_trace[hybe] = fid_result

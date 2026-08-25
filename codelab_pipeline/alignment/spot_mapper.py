@@ -4,7 +4,7 @@ import numpy.linalg as la
 import h5py
 
 from ..io import paths
-from ..io import vlinks_store
+from ..io import analysis_store
 
 """
 Generic single-coordinate mapper between a hybe's own native (raw,
@@ -123,9 +123,9 @@ def crop_for_localization(storage_path, fov, hybe, channel, native_coordinate, p
     """
     y, x = native_coordinate
     if not use_stack:
-        mip = vlinks_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
         if mip is None:
-            raise ValueError(f'FOV{fov:02d} {hybe} not in vlinks.h5 -- ingest it first.')
+            raise ValueError(f'FOV{fov:03d} {hybe} not ingested -- ingest it first.')
         height, width = mip.shape[0], mip.shape[1]
         ymin, ymax = max(0, int(round(y)) - pad), min(height, int(round(y)) + pad + 1)
         xmin, xmax = max(0, int(round(x)) - pad), min(width, int(round(x)) + pad + 1)

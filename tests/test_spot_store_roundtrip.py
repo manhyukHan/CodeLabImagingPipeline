@@ -41,7 +41,7 @@ from skimage.feature import peak_local_max
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from codelab_pipeline.io import vlinks_store as V
+from codelab_pipeline.io import analysis_store as V
 from codelab_pipeline.models.spot import ASpot
 
 REAL = 'data/chr19_downstream_new'
@@ -102,7 +102,7 @@ def detect(hybe, modality, channel, queue):
         s = ASpot()
         s.set_metadata(fov=FOV, hybe=hybe, channel=int(channel), cell=-1,
                        raw_coordinate=(float(y), float(x), 0.0),
-                       coordinate=(float(y), float(x), 0.0),
+                       adj_coordinate=(float(y), float(x), 0.0),
                        brightness=float(mip[y, x]))
         spots.append(s)
     return spots

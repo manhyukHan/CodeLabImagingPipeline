@@ -88,11 +88,11 @@ def main():
     # sp/stacks/FOV##/{hybe}.h5, v1 under sp/FOV##/{hybe}_stack.h5
     from codelab_pipeline.io import paths
     if paths.is_v2(sp):
-        fov_dir = os.path.join(sp, 'stacks', f'FOV{fov:02d}')
+        fov_dir = os.path.join(sp, 'stacks', paths.fov_dir_name(fov))
         stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('.h5')) if os.path.isdir(fov_dir) else []
         hybes = [s[:-3] for s in stacks]
     else:
-        fov_dir = os.path.join(sp, f'FOV{fov:02d}')
+        fov_dir = os.path.join(sp, paths.fov_dir_name(fov))
         stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('_stack.h5')) if os.path.isdir(fov_dir) else []
         hybes = [s[:-len('_stack.h5')] for s in stacks]
     if stacks:

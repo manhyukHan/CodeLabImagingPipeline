@@ -28,11 +28,14 @@ class ASpot():
      channel: int (physical imaging channel, e.g. 555/635)
      cell: int (owning cell id, -1 if homeless)
      celltype: str
-     coordinate: tuple (y, x, z) -- rasterized order (convention.py); final position, after H_within/H_across/H_cell
-       composition; z is 0.0 for a 2D-only pipeline, but the field always exists
+     adj_coordinate: tuple (y, x, z) -- rasterized order (convention.py);
+       final ADJUSTED position, after H_within/H_across/H_cell composition;
+       z is 0.0 for a 2D-only pipeline, but the field always exists.
+       (Renamed from `coordinate` -- the adj_ prefix names what it is:
+       the alignment-adjusted counterpart of raw_coordinate.)
      raw_coordinate: tuple (y, x, z) -- position in this spot's own hybe's native
        (raw, untransformed) full-frame pixel coordinates, before any alignment
-       matrix is applied. Kept alongside coordinate so raw data can be
+       matrix is applied. Kept alongside adj_coordinate so raw data can be
        re-accessed by locality later without inverting any matrix.
      size: float
      brightness: float
@@ -40,7 +43,7 @@ class ASpot():
        spot's own Z was refined via the multi-Gaussian mixture path (see
        localization.refine_spot_z) and the crop held more than one real
        component. Holds EVERY accepted component's own real/shared-frame
-       coordinate (same frame as `coordinate`), including this spot's own
+       coordinate (same frame as `adj_coordinate`), including this spot's own
        (its entry is whichever one is brightest -- see refine_spot_z), so
        the sibling positions survive even though they no longer spawn
        separate ASpot records. Empty tuple otherwise (single-component fit,
@@ -54,7 +57,7 @@ class ASpot():
         self.channel = 0
         self.cell = -1
         self.celltype = ''
-        self.coordinate = (0.0, 0.0, 0.0)
+        self.adj_coordinate = (0.0, 0.0, 0.0)
         self.raw_coordinate = (0.0, 0.0, 0.0)
         self.size = 0.0
         self.brightness = 0.0
@@ -70,7 +73,11 @@ class ASpot():
         if 'channel' in kwargs: self.channel = int(kwargs['channel'])
         if 'cell' in kwargs: self.cell = int(kwargs['cell'])
         if 'celltype' in kwargs: self.celltype = str(kwargs['celltype'])
-        if 'coordinate' in kwargs: self.coordinate = tuple(kwargs['coordinate'])
+        if 'adj_coordinate' in kwargs: self.adj_coordinate = tuple(kwargs['adj_coordinate'])
+        elif 'coordinate' in kwargs:
+            # v1 stores persisted pickled dicts under the old key; data on
+            # disk outlives the API rename, so the alias stays read-only here
+            self.adj_coordinate = tuple(kwargs['coordinate'])
         if 'raw_coordinate' in kwargs: self.raw_coordinate = tuple(kwargs['raw_coordinate'])
         if 'size' in kwargs: self.size = float(kwargs['size'])
         if 'brightness' in kwargs: self.brightness = float(kwargs['brightness'])
@@ -99,7 +106,7 @@ class ASpot():
                 'channel': int(self.channel),
                 'cell': int(self.cell),
                 'celltype': str(self.celltype),
-                'coordinate': tuple(r2(v) for v in self.coordinate),
+                'adj_coordinate': tuple(r2(v) for v in self.adj_coordinate),
                 'raw_coordinate': tuple(r2(v) for v in self.raw_coordinate),
                 'size': r2(self.size),
                 'brightness': r2(self.brightness),

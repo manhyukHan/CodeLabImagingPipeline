@@ -234,6 +234,12 @@ class AlignmentPanelUI(object):
         # written to vlinks.h5 or drawn to a PNG until Accept.
         cellLayout.addRow(self.PreviewThisCellPushButton)
         self.CellResultsListWidget = QtWidgets.QListWidget()
+        # One row per (hybe, modality) -- 111+ rows on the real project, so
+        # a default-height list showed a handful at a time (explicitly
+        # reported too short). Minimum raised so a real per-hybe review is
+        # possible without fighting the scrollbar; still grows with the
+        # panel.
+        self.CellResultsListWidget.setMinimumHeight(320)
         # Each row is one cell in whichever FOV is picked via Overlay FOV
         # below; its text re-derives against whichever hybe is currently
         # picked in Preview reference hybe below (see MainWindow._refresh_
@@ -249,23 +255,20 @@ class AlignmentPanelUI(object):
         # -- tier 2: whole-FOV commit --
         self.CellOverlayAutoSaveThresholdSpinBox = QtWidgets.QSpinBox()
         self.CellOverlayAutoSaveThresholdSpinBox.setRange(0, 500)
-        # 10 px, raised from 5. At 5 a routine FOV auto-saved far more overlays
-        # than anyone looks at, and each one costs ~9x the cell's own alignment
-        # fit -- the same "PNG work dominates the run" problem the FOV-level
-        # overlay had. 10 px still flags a genuinely unusual cell-level
-        # residual: the fit is bounded by pad (10 px default) in the first
-        # place, so this now means "at the edge of what this refinement is even
-        # allowed to move," which is the thing actually worth a human look.
-        self.CellOverlayAutoSaveThresholdSpinBox.setValue(10)
+        # 0 px = save EVERY cell's overlay, and that is now the default
+        # (lowered from 10). The old default existed only because drawing
+        # was on the GUI thread and dominated the run; overlay rendering
+        # now happens in a background worker on its own Agg figure, so the
+        # run itself is no longer held up by it. Saving as many as
+        # possible is what makes viewing cheap: the "Results (per cell,
+        # overlay)" viewer SHOWS the saved PNG instead of recomputing a
+        # ~35 s composite (see MainWindow._show_cell_all_readouts_overlay),
+        # so an overlay that exists on disk is an overlay that opens
+        # instantly. Raise this if a run's background overlay pass is
+        # taking longer than you want to leave running.
+        self.CellOverlayAutoSaveThresholdSpinBox.setValue(0)
         self.CellOverlayAutoSaveThresholdSpinBox.setSuffix(' px')
-        # Automatic-mode overlay PNGs are no longer generated for every
-        # cell (too slow -- drawing+saving one is ~9x the cost of the
-        # actual per-cell alignment fit itself). Instead a cell's overlay
-        # is auto-saved only when its own cell-level residual shift
-        # exceeds this threshold -- flags the cells worth a human look
-        # without paying the cost for the (usual) well-behaved majority.
-        # Use Save All Cell Overlays below to generate every cell's
-        # overlay on demand regardless of this threshold.
+        self.CellOverlayAutoSaveThresholdSpinBox.setSpecialValueText('every cell')
         cellLayout.addRow('Auto-save overlay if shift >', self.CellOverlayAutoSaveThresholdSpinBox)
         self.RunCellAlignmentPushButton = QtWidgets.QPushButton('Align All Cells in FOV')
         # Uses the SAME FOV/Reference hybe/Channel type/Pad values as the
@@ -415,7 +418,7 @@ class AlignmentPanelUI(object):
         combo per name in modality_names, all shown as separate rows in
         self.CellReferenceHybeFormLayout -- called whenever the configured
         modality set changes (MainWindow._activate_modalities, same hook
-        point ip.ModalityComboBox itself already uses). Closest existing
+        point the Ingestion panel's modality setup already uses). Closest existing
         precedent: ingestion_panel.build_modality_name_fields (a
         positional-list rebuild of the same kind), adapted here to a
         name-keyed dict since each combo needs to be addressed by its own
