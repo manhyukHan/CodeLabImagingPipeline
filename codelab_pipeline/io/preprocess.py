@@ -407,11 +407,8 @@ def _restore_missing_mip(storage_path, fov, folder, channels, fiducial_channel):
     pass as the stack data), so restoring the flag is a ~2 MB read plus
     one atomic MIP write -- no DAX access. Returns True when the MIP file
     exists (already, or after restoring it); False means the caller must
-    rebuild from the DAX. v1 stores keep their in-vlinks MIPs and are not
-    handled here.
+    rebuild from the DAX.
     """
-    if not paths.is_v2(storage_path):
-        return True
     if os.path.exists(paths.mip_path(storage_path, fov, folder)):
         return True
     try:
@@ -536,20 +533,18 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
                 create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
             attributes['shape'] = dat.shape
             f.attrs.update(attributes)
-        channel_mips = None
-        if paths.is_v2(storage_path):
-            # Read the MIPs back out of the .part BEFORE publishing, so a
-            # failure here still leaves the previous stack untouched.
-            with h5py.File(tmp_h5name, 'r') as f:
-                channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
+        # Read the MIPs back out of the .part BEFORE publishing, so a
+        # failure here still leaves the previous stack untouched.
+        with h5py.File(tmp_h5name, 'r') as f:
+            channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
 
         os.replace(tmp_h5name, stack_h5name)
 
         if channel_mips is not None:
-            # v2: this worker writes the per-hybe MIP file itself
-            # (atomically -- see analysis_store.write_hybe_mip's v2 branch),
-            # so the coordinator never touches MIPs and vlinks.h5 sees no
-            # ingestion traffic at all: the UI stays live mid-ingestion
+            # this worker writes the per-hybe MIP file itself
+            # (atomically -- see analysis_store.write_hybe_mip), so the
+            # coordinator never touches MIPs and the analysis store sees
+            # no ingestion traffic at all: the UI stays live mid-ingestion
             # and each hybe becomes browsable the moment ITS file lands.
             # Written AFTER the stack is published, so the only interruption
             # window left leaves a complete stack with a stale MIP -- fully

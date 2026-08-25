@@ -46,18 +46,16 @@ next append pass -- false negatives only, never a claim about data that
 is not there. tools/verify_store.py-style rebuilding lives in
 _rebuild_manifest and runs automatically when a manifest is missing.
 
-v1 (pre-manifest) stores: every public function delegates to the
-frozen legacy module (vlinks_store) when storage_path is not a v2
-project -- v1 stays readable, and is simply never created any more.
-A v2 project that still carries analysis/vlinks.h5 refuses loudly and
-names tools/migrate_vlinks.py, rather than silently reading an empty
+This module is the ONLY analysis store. The pre-manifest v1 layout is
+gone from the live pipeline -- its reader lives in
+legacy/vlinks_store.py and nothing here imports it. A project that
+still carries analysis/vlinks.h5 refuses loudly and names
+tools/migrate_vlinks.py, rather than silently reading an empty
 new-layout store beside a full old one.
 
-Model-facing shapes are unchanged: functions here accept and return
-exactly what their vlinks_store namesakes did (ACell/ASpot/AnAllele
-.save() dicts, FrameMatrices, plain params dicts), serialized through
-the same columnar packers, so tests/test_columnar_roundtrip.py's
-fidelity contract carries over verbatim.
+Functions here accept and return the models' own shapes (ACell/ASpot/
+AnAllele .save() dicts, FrameMatrices, plain params dicts), serialized
+through io/columnar.py's packers.
 """
 import collections
 import contextlib
@@ -73,17 +71,72 @@ import numpy as np
 
 from . import columnar
 from . import paths
-from . import vlinks_store as _legacy
 from ..alignment.frames import FrameMatrices
 
-# Layout-agnostic pieces the legacy module already owns (modality comes
-# from the manifest for v2, from ingested stack attrs / declaration for
-# v1) -- one registry, not two.
-modality_of = _legacy.modality_of
-declare_modality = _legacy.declare_modality
 
-CROSS_MODAL_QUALITY_KEYS = _legacy.CROSS_MODAL_QUALITY_KEYS
-MODALITY_SCOPED_PARAMS = _legacy.MODALITY_SCOPED_PARAMS
+# -- modality registry ---------------------------------------------------
+
+_DECLARED_MODALITY = {}
+
+
+def declare_modality(storage_path, name):
+    """
+    Register which configured modality owns storage_path, from the UI's
+    own Ingestion state. This is what lets a FRESH project work: before
+    the manifest names a modality (or before it is written at all),
+    every modality-scoped path would otherwise raise -- a boot gate on
+    the very first Parse Layout of a new dataset (confirmed real).
+    """
+    if storage_path and name:
+        _DECLARED_MODALITY[os.path.abspath(storage_path)] = str(name)
+
+
+def modality_of(storage_path):
+    """
+    Which modality owns this store directory.
+
+    The project manifest IS the registry: storage_path's basename names
+    the modality, validated against manifest.json. No HDF5, no
+    bootstrapping order. A path not yet in a manifest falls back to
+    whatever the UI declared for it (declare_modality) so a brand-new
+    project works before anything is ingested.
+    """
+    declared_v2 = paths.modality_from_path(storage_path)
+    if declared_v2:
+        return declared_v2
+    declared = _DECLARED_MODALITY.get(os.path.abspath(storage_path))
+    if declared:
+        return declared
+    raise ValueError(
+        f'cannot determine modality for {storage_path}: it is not a '
+        f'modality declared in the project manifest, and no modality was '
+        f'declared for it (MainWindow declares every configured storage '
+        f'path via declare_modality).')
+
+
+MODALITY_SCOPED_PARAMS = frozenset({
+    'layout_path',
+    'dax_directory',
+    'same_modality_reference_hybe',
+    'same_modality_channel_type',
+})
+"""
+Params that describe ONE modality rather than the project. They live
+under /modalities/{modality} in params.json so two modalities cannot
+overwrite each other. Everything not listed here describes the project
+or the RELATIONSHIP between modalities (the cross-modal shared modality
+and channel type, cell-alignment settings) and is stored once.
+"""
+
+CROSS_MODAL_QUALITY_KEYS = ('residual_before', 'residual_after', 'z_quality')
+"""
+The measured fit-quality components of one cross-modal result, stored
+beside its matrix/z: residual_before/residual_after are the
+signal-gated reconstruction MSD of the bridge pair under identity vs.
+under the accepted H_across (lower is better; after >= before means the
+fit did not help), z_quality is estimate_cross_modal_z's peak
+normalized correlation (1.0 = perfect).
+"""
 
 
 # -- atomic file primitives ----------------------------------------------
@@ -245,23 +298,6 @@ def _fov_dir(storage_path, fov):
     return paths.analysis_fov_dir(storage_path, int(fov))
 
 
-def _routed(fn):
-    """v2 -> this module's implementation; anything else -> the frozen
-    legacy vlinks_store function of the same name (v1 readability is a
-    standing commitment)."""
-    legacy_fn = getattr(_legacy, fn.__name__)
-
-    def wrapped(storage_path, *args, **kwargs):
-        if paths.is_v2(storage_path):
-            return fn(storage_path, *args, **kwargs)
-        return legacy_fn(storage_path, *args, **kwargs)
-
-    wrapped.__name__ = fn.__name__
-    wrapped.__doc__ = fn.__doc__
-    wrapped.__wrapped__ = fn
-    return wrapped
-
-
 def distinct_stores(storage_paths):
     """One representative storage_path per distinct physical analysis
     store (v2: the project root; v1: the resolved vlinks.h5) -- the
@@ -270,10 +306,7 @@ def distinct_stores(storage_paths):
     for path in storage_paths:
         if not path:
             continue
-        if paths.is_v2(path):
-            resolved = ('v2', os.path.abspath(paths.project_root(path)))
-        else:
-            resolved = ('v1', os.path.abspath(paths.vlinks_path(path)))
+        resolved = os.path.abspath(paths.project_root(path))
         if resolved in seen:
             continue
         seen.add(resolved)
@@ -422,7 +455,6 @@ def _spots_dir(storage_path, fov):
     return os.path.join(_fov_dir(storage_path, fov), 'spots')
 
 
-@_routed
 def allocate_spot_uids(storage_path, fov, count):
     """`count` fresh, never-before-used spot uids for this FOV.
 
@@ -471,7 +503,6 @@ def write_spot_dicts(storage_path, fov, modality, hybe, channel, payload):
         lambda m: m.setdefault('spots', {}).__setitem__(name, len(payload)))
 
 
-@_routed
 def write_spots(storage_path, fov, modality, hybe, channel, spots):
     """
     Full replace of ONE (modality, hybe, channel) slice with `spots` --
@@ -501,7 +532,6 @@ def _read_slice_file(path):
     return _cached(path, 'spots', load)
 
 
-@_routed
 def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
     """
     ASpot.save()-shaped dicts. With modality/hybe/channel given, just
@@ -524,7 +554,6 @@ def read_spots(storage_path, fov, modality=None, hybe=None, channel=None):
     return out
 
 
-@_routed
 def spot_slices(storage_path, fov):
     """[(modality, hybe, channel), ...] of every spot slice this FOV
     holds -- ONE directory listing, no file opened."""
@@ -559,7 +588,6 @@ def write_cell_dicts(storage_path, fov, dicts):
                                           'saved_at': datetime.now().isoformat()}))
 
 
-@_routed
 def write_cells(storage_path, fov, cell_container):
     """One FOV's cells (with their per-hybe matrices; spots live in the
     FOV's own slice files) into the FOV's cells.h5 capsule."""
@@ -567,7 +595,6 @@ def write_cells(storage_path, fov, cell_container):
                      [cell.save() for cell in cell_container.get_cells(fov)])
 
 
-@_routed
 def read_cells(storage_path, fov):
     """
     (cell_dicts, '') -- ACell.save()-shaped dicts for
@@ -609,14 +636,12 @@ def write_allele_dicts(storage_path, fov, payload):
                                             'saved_at': datetime.now().isoformat()}))
 
 
-@_routed
 def write_fov_alleles(storage_path, fov, alleles):
     """One FOV's chromatin-tracing alleles (AnAllele objects), full
     replace of the FOV's alleles.h5 capsule."""
     write_allele_dicts(storage_path, fov, [a.save() for a in alleles])
 
 
-@_routed
 def read_fov_alleles(storage_path, fov):
     """AnAllele.save()-shaped dicts, or [] if none persisted yet."""
     path = os.path.join(_fov_dir(storage_path, fov), 'alleles.h5')
@@ -638,7 +663,6 @@ def mirror_write_fov_alleles(storage_paths, fov, alleles):
 
 # -- counts (status panels) ----------------------------------------------
 
-@_routed
 def fov_counts(storage_path, fovs):
     """{fov: {'cells': n, 'spots': n, 'alleles': n}} for many FOVs --
     one manifest.json read per FOV, no HDF5 opened."""
@@ -695,7 +719,6 @@ def _read_matrices_raw(path, fresh=False):
     return _cached(path, 'matrices', load)
 
 
-@_routed
 def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
     """
     Merge an already-computed {hybe: matrix} dict into this (FOV,
@@ -731,7 +754,6 @@ def write_same_modality_matrices(storage_path, fov, matrices, reference_hybe):
                 modality, sorted(merged.keys())))
 
 
-@_routed
 def read_same_modality_matrices(storage_path, fov, hybe_list):
     """
     FrameMatrices keyed (hybe, modality) for each hybe in hybe_list. An
@@ -754,7 +776,6 @@ def read_same_modality_matrices(storage_path, fov, hybe_list):
     return matrices
 
 
-@_routed
 def aligned_hybes(storage_path, fov):
     """The set of hybe names with a REAL persisted matrix for this
     (modality, FOV) -- the append-mode primitive, answered from the
@@ -793,7 +814,6 @@ def _crossmodal_update(storage_path, fov, modality, key, value):
         _poke_cache(path, 'crossmodal', json.loads(json.dumps(data)))
 
 
-@_routed
 def write_cross_modal_matrix(storage_path, fov, H, modality=None):
     """The accepted H_across for one FOV's bridge, keyed by the bridging
     modality (star topology -- two bridges never overwrite each other)."""
@@ -801,7 +821,6 @@ def write_cross_modal_matrix(storage_path, fov, H, modality=None):
                        np.asarray(H, dtype='float64').tolist())
 
 
-@_routed
 def read_cross_modal_matrix(storage_path, fov, modality=None):
     """The persisted H_across (ndarray) or None. modality-keyed entry
     first, migrated-flat '_' fallback."""
@@ -813,7 +832,6 @@ def read_cross_modal_matrix(storage_path, fov, modality=None):
     return None
 
 
-@_routed
 def write_cross_modal_z(storage_path, fov, dz, modality=None):
     """FOV-level cross-modal Z drift in PLANES, beside the 2D matrix as
     its own scalar (z is an additive channel alongside the affine
@@ -821,7 +839,6 @@ def write_cross_modal_z(storage_path, fov, dz, modality=None):
     _crossmodal_update(storage_path, fov, modality, 'z', float(dz))
 
 
-@_routed
 def read_cross_modal_z(storage_path, fov, modality=None):
     """Planes, bridging frame -> shared frame; 0.0 when never written."""
     data = _crossmodal_read(storage_path, fov)
@@ -832,7 +849,6 @@ def read_cross_modal_z(storage_path, fov, modality=None):
     return 0.0
 
 
-@_routed
 def write_cross_modal_quality(storage_path, fov, quality, modality=None):
     """The measured fit quality of one FOV's cross-modal result --
     whichever CROSS_MODAL_QUALITY_KEYS `quality` carries."""
@@ -844,7 +860,6 @@ def write_cross_modal_quality(storage_path, fov, quality, modality=None):
         _crossmodal_update(storage_path, fov, modality, 'quality', payload)
 
 
-@_routed
 def read_cross_modal_quality(storage_path, fov, modality=None):
     """{key: float} of the persisted quality components, or {} -- never
     fabricated."""
@@ -877,7 +892,6 @@ def _jsonable(v):
     return v
 
 
-@_routed
 def write_global_params(storage_path, **params):
     """
     Whole-experiment metadata as human-readable JSON at
@@ -904,7 +918,6 @@ def write_global_params(storage_path, **params):
         _poke_cache(path, 'params', json.loads(json.dumps(data)))
 
 
-@_routed
 def read_global_params(storage_path):
     """{key: value} -- the shared section merged with this
     storage_path's own modality section, or {}."""
@@ -931,7 +944,6 @@ def _celltype_config_path(storage_path):
     return os.path.join(_analysis_root(storage_path), 'celltype_config.pkl')
 
 
-@_routed
 def write_celltype_config(storage_path, fov_ranges_by_celltype,
                           barcode_channel_by_celltype, calibration,
                           barcode_method=None):
@@ -949,7 +961,6 @@ def write_celltype_config(storage_path, fov_ranges_by_celltype,
     _atomic_bytes(_celltype_config_path(storage_path), pickle.dumps(payload))
 
 
-@_routed
 def read_celltype_config(storage_path):
     """(fov_ranges, barcode_channels, calibration, method) or the empty
     shape if nothing persisted yet."""
@@ -982,12 +993,10 @@ def mirror_write_celltype_config(storage_paths, fov_ranges_by_celltype,
 
 # -- MIPs (v2: standalone per-hybe files under <modality>/mips/) ---------
 
-@_routed
 def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None):
     """One small standalone MIP file per (modality, FOV, hybe), written
     atomically by the ingestion worker itself -- existence ==
-    completeness, no shared-file contention (v1 delegates to the legacy
-    in-vlinks copy)."""
+    completeness, no shared-file contention."""
     target = paths.mip_path(storage_path, fov, hybe)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     tmp = target + '.part'
@@ -1001,7 +1010,6 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     _replace(tmp, target)
 
 
-@_routed
 def read_hybe_mip(storage_path, fov, hybe, channel, window=None):
     """One hybe/channel's stored MIP (or None). window=(ymin, ymax,
     xmin, xmax) reads only the covering chunks -- measured 58x cheaper
@@ -1019,7 +1027,6 @@ def read_hybe_mip(storage_path, fov, hybe, channel, window=None):
         return None
 
 
-@_routed
 def fiducial_channel_mip(storage_path, fov, hybe):
     """The fiducial channel's MIP for a hybe, resolved from the MIP
     file's own fiducial_channel attr; None if not ingested/stamped."""
@@ -1033,7 +1040,6 @@ def fiducial_channel_mip(storage_path, fov, hybe):
         return None
 
 
-@_routed
 def readout_channel_mip(storage_path, fov, hybe):
     """The one non-fiducial channel's MIP for a hybe (falls back to the
     fiducial when the hybe genuinely has no other channel); None if not
@@ -1051,7 +1057,6 @@ def readout_channel_mip(storage_path, fov, hybe):
         return None
 
 
-@_routed
 def mip_channels_present(storage_path, fov, hybe):
     """{channel(str): True} for the channels this hybe's MIP holds, or
     None if never ingested. The MIP file is written atomically, so its

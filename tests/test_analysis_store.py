@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
 
 from codelab_pipeline.io import analysis_store as A          # noqa: E402
-from codelab_pipeline.io import vlinks_store as LEGACY       # noqa: E402
+from legacy import vlinks_store as LEGACY                  # noqa: E402
 from codelab_pipeline.io import paths                        # noqa: E402
 import migrate_vlinks                                        # noqa: E402
 

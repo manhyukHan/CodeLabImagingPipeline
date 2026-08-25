@@ -7,13 +7,13 @@ convert_dax_to_h5_worker in overwrite mode does os.remove(stack) and THEN
 rebuilds it, and the rebuild is a plain h5py.File(..., 'w') -- not atomic.
 Kill the run inside that window and the stack is either gone or truncated,
 while its MIP (written atomically, .part + os.replace, and only AFTER the
-stack) survives from the earlier run. So on a v2 store:
+stack) survives from the earlier run. So:
 
   MIP present, stack MISSING    -> overwrite deleted it, never rebuilt it
   MIP present, stack UNREADABLE -> killed mid-rebuild
   stack present, MIP missing    -> killed between the two writes
 
-None of this is caught by the app's own checkup, which on a v2 store only
+None of this is caught by the app's own checkup, which only
 lists the MIP directory. Existence really is completeness for MIPs, since
 they are written atomically -- but that says nothing about the stack file
 sitting beside them, which is the one that actually holds the pixels.
@@ -124,9 +124,8 @@ def check_one(job):
 
 def enumerate_files(storage_path):
     """{(fov, hybe): {'stack': path or None, 'mip': path or None}}"""
-    v2 = paths.is_v2(storage_path)
     out = {}
-    stacks_root = os.path.join(storage_path, 'stacks') if v2 else storage_path
+    stacks_root = os.path.join(storage_path, 'stacks')
     if os.path.isdir(stacks_root):
         for fov_dir in sorted(d for d in os.listdir(stacks_root) if d[:3].lower() == 'fov'):
             full = os.path.join(stacks_root, fov_dir)
@@ -134,27 +133,23 @@ def enumerate_files(storage_path):
                 continue
             fov = int(fov_dir[3:])
             for name in sorted(os.listdir(full)):
-                if v2 and name.endswith('.h5'):
-                    hybe = name[:-3]
-                elif not v2 and name.endswith('_stack.h5'):
-                    hybe = name[:-len('_stack.h5')]
-                else:
+                if not name.endswith('.h5'):
                     continue
+                hybe = name[:-3]
                 entry = out.setdefault((fov, hybe), {'stack': None, 'mip': None})
                 entry['stack'] = os.path.join(full, name)
-    if v2:
-        mips_root = os.path.join(storage_path, 'mips')
-        if os.path.isdir(mips_root):
-            for fov_dir in sorted(d for d in os.listdir(mips_root) if d[:3].lower() == 'fov'):
-                full = os.path.join(mips_root, fov_dir)
-                if not os.path.isdir(full):
+    mips_root = os.path.join(storage_path, 'mips')
+    if os.path.isdir(mips_root):
+        for fov_dir in sorted(d for d in os.listdir(mips_root) if d[:3].lower() == 'fov'):
+            full = os.path.join(mips_root, fov_dir)
+            if not os.path.isdir(full):
+                continue
+            fov = int(fov_dir[3:])
+            for name in sorted(os.listdir(full)):
+                if not name.endswith('.h5'):
                     continue
-                fov = int(fov_dir[3:])
-                for name in sorted(os.listdir(full)):
-                    if not name.endswith('.h5'):
-                        continue
-                    entry = out.setdefault((fov, name[:-3]), {'stack': None, 'mip': None})
-                    entry['mip'] = os.path.join(full, name)
+                entry = out.setdefault((fov, name[:-3]), {'stack': None, 'mip': None})
+                entry['mip'] = os.path.join(full, name)
     return out
 
 
@@ -172,18 +167,16 @@ def main():
     if not os.path.isdir(sp):
         ap.error('not a directory: %s' % sp)
 
-    v2 = paths.is_v2(sp)
     pairs = enumerate_files(sp)
     strays = [os.path.join(dp, f)
               for dp, _, fs in os.walk(sp) for f in fs if f.endswith('.part')]
 
     print('store   : %s' % sp)
-    print('layout  : %s' % ('v2' if v2 else 'v1'))
     print('pairs   : %d (fov, hybe) entries' % len(pairs))
     print('.part   : %d interrupted atomic write(s)' % len(strays))
 
     missing_stack = sorted(k for k, v in pairs.items() if v['stack'] is None)
-    missing_mip = sorted(k for k, v in pairs.items() if v2 and v['mip'] is None)
+    missing_mip = sorted(k for k, v in pairs.items() if v['mip'] is None)
 
     jobs = []
     for entry in pairs.values():

@@ -3,14 +3,9 @@ THE storage-layout resolver: every file path in a project goes through
 here, so the on-disk layout is a versioned, swappable fact instead of a
 convention smeared across call sites.
 
-Two layouts exist:
+The layout:
 
-v1 (legacy)  storage_path IS a per-modality queue directory:
-               storage_path/FOV##/{hybe}_stack.h5
-               <parent>/vlinks.h5            (stacks + MIPs + analysis)
-               storage_path/FOV##/*.png      (figures, dumped beside data)
-
-v2           storage_path = <dp>/{modality} inside a project root <dp>
+storage_path = <dp>/{modality} inside a project root <dp>
              carrying a manifest.json (see write_manifest):
                <dp>/{modality}/stacks/fov###/{hybe}.h5  chunked, write-once
                <dp>/{modality}/mips/fov###/{hybe}.h5    per-hybe, written
@@ -46,9 +41,10 @@ plain existence check IS the completeness check -- the ingestion
 checkup becomes one directory listing instead of thousands of vlinks
 opens.
 
-Detection is by manifest: a storage_path whose PARENT holds
-manifest.json is v2. Everything else is v1. No behavior of v1 stores
-changes.
+A project is identified by manifest.json in the parent of every
+modality store (see is_project). The pre-manifest v1 layout is gone
+from the live pipeline; its reader is frozen in legacy/vlinks_store.py
+and tools/migrate_vlinks.py converts an old store once.
 """
 import json
 import os
@@ -104,42 +100,13 @@ def write_manifest(dp, modalities, layout_paths=None, dax_directories=None):
     return m
 
 
-def is_v2(storage_path):
+def is_project(storage_path):
+    """True when storage_path sits inside a manifest-bearing project.
+    The layout is no longer versioned -- there is exactly one, described
+    by manifest.json -- so this only answers "is this a real project
+    store", never "which layout"."""
     return read_manifest(project_root(storage_path)) is not None
 
-
-def looks_like_v1_store(storage_path):
-    """
-    True when storage_path ALREADY holds v1 data (FOV##/{hybe}_stack.h5).
-
-    Exists to tell an existing v1 store apart from a merely empty path, so
-    that new work can default to v2 without touching old datasets. v1 stays
-    readable for as long as anyone has one; it is simply never created any
-    more. Nothing here converts a store -- that is
-    tools/migrate_store_v2.py's job, deliberately explicit and one-shot.
-
-    Cheap on purpose: one listdir of the store plus one per FOV directory
-    until the first hit, and it stops at the first _stack.h5 it sees. It is
-    called from Parse Layout, not from a loop.
-    """
-    if not os.path.isdir(storage_path):
-        return False
-    try:
-        entries = sorted(os.listdir(storage_path))
-    except OSError:
-        return False
-    for name in entries:
-        if not name.startswith('FOV'):
-            continue
-        fov_dir = os.path.join(storage_path, name)
-        if not os.path.isdir(fov_dir):
-            continue
-        try:
-            if any(f.endswith('_stack.h5') for f in os.listdir(fov_dir)):
-                return True
-        except OSError:
-            continue
-    return False
 
 
 def modality_from_path(storage_path):
@@ -191,14 +158,12 @@ def _require_fov3(storage_path):
 
 
 def stack_path(storage_path, fov, hybe):
-    if is_v2(storage_path):
-        _require_fov3(storage_path)
-        return os.path.join(storage_path, 'stacks', fov_dir_name(fov), f'{hybe}.h5')
-    return os.path.join(storage_path, f'FOV{fov:02d}', f'{hybe}_stack.h5')
+    _require_fov3(storage_path)
+    return os.path.join(storage_path, 'stacks', fov_dir_name(fov), f'{hybe}.h5')
 
 
 def mip_path(storage_path, fov, hybe):
-    """v2 only -- v1 keeps MIPs inside vlinks.h5 (callers branch on is_v2)."""
+    """One standalone MIP file per (modality, FOV, hybe)."""
     _require_fov3(storage_path)
     return os.path.join(storage_path, 'mips', fov_dir_name(fov), f'{hybe}.h5')
 
@@ -207,12 +172,6 @@ def mips_dir(storage_path, fov):
     _require_fov3(storage_path)
     return os.path.join(storage_path, 'mips', fov_dir_name(fov))
 
-
-def vlinks_path(storage_path):
-    dp = project_root(storage_path)
-    if read_manifest(dp) is not None:
-        return os.path.join(dp, 'analysis', 'vlinks.h5')
-    return os.path.join(dp, 'vlinks.h5')
 
 
 def analysis_dir(storage_path):
@@ -252,11 +211,9 @@ def figure_path(storage_path, category, fov, filename):
 def figure_dir(storage_path, category, fov):
     """The directory figure_path resolves into, WITHOUT creating it --
     for callers that only offer it as a default save location."""
-    if is_v2(storage_path):
-        modality = modality_from_path(storage_path) or 'shared'
-        return os.path.join(project_root(storage_path), 'figures', modality,
-                            category, fov_dir_name(fov))
-    return os.path.join(storage_path, f'FOV{fov:02d}')
+    modality = modality_from_path(storage_path) or 'shared'
+    return os.path.join(project_root(storage_path), 'figures', modality,
+                        category, fov_dir_name(fov))
 
 
 def mips_present(storage_path, fov):

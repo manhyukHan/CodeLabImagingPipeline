@@ -6,7 +6,7 @@ before/after numbers on record.
     python tools/perf_harness.py <storage_path> [--fov N] [--json out.json]
 
 <storage_path> is a queue/modality dir exactly as the app takes it (the
-harness resolves vlinks/stacks through the same vlinks_store/spot_mapper
+harness resolves the analysis store/stacks through the same analysis_store/spot_mapper
 doors the app uses, so a storage-layout change is measured through the
 code that serves it, not through hand-rolled paths).
 
@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import h5py
 import numpy as np
 
-from codelab_pipeline.io import vlinks_store, preprocess
+from codelab_pipeline.io import analysis_store, preprocess
 from codelab_pipeline.alignment import spot_mapper
 
 
@@ -69,25 +69,20 @@ def main():
 
     print(f'perf harness on {sp} (FOV{fov:02d})')
 
-    vp = vlinks_store._vlinks_path(sp)
-    rec('open_vlinks', timed(lambda: h5py.File(vp, 'r').close(), 10))
-
     cells_holder = {}
     def read_cells():
-        cells_holder['dicts'], _ = vlinks_store.read_cells(sp, fov)
-    rec('read_cells', timed(read_cells),
-        f"{len(cells_holder['dicts'] or [])} cells, blob {os.path.getsize(vp)//1_000_000} MB store")
+        cells_holder['dicts'], _ = analysis_store.read_cells(sp, fov)
+    rec('read_cells', timed(read_cells), f"{len(cells_holder['dicts'] or [])} cells")
 
     spots_holder = {}
     def read_spots():
-        spots_holder['d'] = vlinks_store.read_spots(sp, fov)
+        spots_holder['d'] = analysis_store.read_spots(sp, fov)
     rec('read_spots', timed(read_spots), f"{len(spots_holder['d'])} spots")
 
     # a real (hybe, channel) with a stack file on disk, from the store
-    # itself -- layout-aware (io/paths.py): v2 keeps stacks under
-    # sp/stacks/FOV##/{hybe}.h5, v1 under sp/FOV##/{hybe}_stack.h5
+    # itself (io/paths.py): stacks live under sp/stacks/fov###/{hybe}.h5
     from codelab_pipeline.io import paths
-    if paths.is_v2(sp):
+    if True:
         fov_dir = os.path.join(sp, 'stacks', paths.fov_dir_name(fov))
         stacks = sorted(f for f in os.listdir(fov_dir) if f.endswith('.h5')) if os.path.isdir(fov_dir) else []
         hybes = [s[:-3] for s in stacks]
@@ -120,7 +115,7 @@ def main():
 
         def checkup():
             for h in hybes:
-                vlinks_store.mip_channels_present(sp, fov, h)
+                analysis_store.mip_channels_present(sp, fov, h)
         rec('checkup', timed(checkup), f'{len(stacks)} per-hybe MIP-presence checks (1 FOV)')
 
     layout = None
@@ -134,9 +129,9 @@ def main():
         assert any(k in sp for k in ('veri_data', 'clone', 'scratch', 'bench')), \
             '--allow-writes refused: store path does not look like a clone'
         from codelab_pipeline.models.cell_container import CellContainer
-        dicts, modality = vlinks_store.read_cells(sp, fov)
+        dicts, modality = analysis_store.read_cells(sp, fov)
         cont = CellContainer.load({fov: dicts}, modality=modality)
-        rec('write_cells', timed(lambda: vlinks_store.write_cells(sp, fov, cont), 3),
+        rec('write_cells', timed(lambda: analysis_store.write_cells(sp, fov, cont), 3),
             f'full blob rewrite, {len(dicts or [])} cells')
 
     if args.json:

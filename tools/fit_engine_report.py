@@ -32,7 +32,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from codelab_pipeline.io import vlinks_store as V
+from codelab_pipeline.io import analysis_store as V
 from codelab_pipeline.alignment import spot_mapper
 from codelab_pipeline.localization import localization as L
 from test_fit_engine_vs_matlab import fitpsf3d_reference, make_stack, AMPLITUDES, N_PER_CONDITION

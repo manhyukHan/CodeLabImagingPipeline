@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import h5py
 import numpy as np
 
-from codelab_pipeline.io import vlinks_store as V
+from codelab_pipeline.io import analysis_store as V
 from codelab_pipeline.io import columnar
 
 STORE = os.environ.get('CODELAB_COL_STORE', 'data/chr19_downstream_new/RNA_queue')
@@ -79,11 +79,7 @@ def main():
     ok = True
     cells, _ = V.read_cells(STORE, FOV)
     if cells:
-        with h5py.File(V._vlinks_path(STORE), 'r') as f:
-            blob = f[f'FOV{FOV:02d}/cells/blob'].nbytes if f'FOV{FOV:02d}/cells' in f and \
-                'blob' in f[f'FOV{FOV:02d}/cells'] else 0
-        ok &= _run('cells', cells, columnar.pack_cells, columnar.unpack_cells,
-                   f' vs {blob/1e6:.1f} MB pickle blob' if blob else '')
+        ok &= _run('cells', cells, columnar.pack_cells, columnar.unpack_cells)
     spots = V.read_spots(STORE, FOV)
     if spots:
         ok &= _run('spots', spots, columnar.pack_spots, columnar.unpack_spots)
