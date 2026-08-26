@@ -59,21 +59,6 @@ class AlignmentPanelUI(object):
         self.SameModalityMaxShiftSpinBox.setSpecialValueText('unbounded')
         self.SameModalityMaxShiftSpinBox.setSuffix(' px')
         sameModalityLayout.addRow('Max shift (0 = unbounded):', self.SameModalityMaxShiftSpinBox)
-        self.RunFovAlignmentPushButton = QtWidgets.QPushButton('Run Current FOV Alignment')
-        sameModalityLayout.addRow(self.RunFovAlignmentPushButton)
-        self.SameModalityAcceptPushButton, self.SameModalityRejectPushButton, sameModalityAcceptRow = self._accept_reject_row()
-        sameModalityLayout.addRow(sameModalityAcceptRow)
-        self.RunAllFovAlignmentPushButton = QtWidgets.QPushButton('Run All FOV Alignment (Auto-Save)')
-        # Every FOV in the Ingestion tab's FOV list, computed AND saved
-        # immediately -- no staging, no Accept step. Use Run Current FOV
-        # Alignment above first to confirm the parameters on one real FOV.
-        sameModalityLayout.addRow(self.RunAllFovAlignmentPushButton)
-        self.SameModalityResultsListWidget = QtWidgets.QListWidget()
-        sameModalityLayout.addRow('Results:', self.SameModalityResultsListWidget)
-        self.SameModalityOverlayFovSpinBox = QtWidgets.QSpinBox()
-        self.SameModalityOverlayFovSpinBox.setRange(1, 100000)
-        self.SameModalityOverlayFovSpinBox.setValue(1)
-        sameModalityLayout.addRow('Overlay FOV:', self.SameModalityOverlayFovSpinBox)
         self.SameModalityChannelTypeComboBox = QtWidgets.QComboBox()
         # fiducial FIRST, so it is the default. The matrices on this tab are
         # always fitted fiducial-to-fiducial regardless of this setting (see
@@ -84,8 +69,31 @@ class AlignmentPanelUI(object):
         # residual misregistration is hard to distinguish from real signal
         # change. Showing readout by default meant the default view was the one
         # that answers the question least directly.
+        #
+        # Sits with the run settings rather than down by the overlay
+        # controls: the current-FOV run pops its own overlay immediately,
+        # so this is read at RUN time too, not only when Show is clicked.
         self.SameModalityChannelTypeComboBox.addItems(['fiducial', 'readout'])
         sameModalityLayout.addRow('Overlay channel:', self.SameModalityChannelTypeComboBox)
+        self.RunFovAlignmentPushButton = QtWidgets.QPushButton('Run Current FOV Alignment')
+        sameModalityLayout.addRow(self.RunFovAlignmentPushButton)
+        self.SameModalityAcceptPushButton, self.SameModalityRejectPushButton, sameModalityAcceptRow = self._accept_reject_row()
+        sameModalityLayout.addRow(sameModalityAcceptRow)
+        self.RunAllFovAlignmentPushButton = QtWidgets.QPushButton('Run All FOV Alignment (Auto-Save)')
+        # Every FOV in the Ingestion tab's FOV list, computed AND saved
+        # immediately -- no staging, no Accept step. Use Run Current FOV
+        # Alignment above first to confirm the parameters on one real FOV.
+        sameModalityLayout.addRow(self.RunAllFovAlignmentPushButton)
+        self.SameModalityResultsListWidget = QtWidgets.QListWidget()
+        # One row per (hybe, modality) for ONE FOV -- 100+ rows on the real
+        # project, so a default-height list showed a handful at a time.
+        # Same minimum as the per-cell results list below.
+        self.SameModalityResultsListWidget.setMinimumHeight(320)
+        sameModalityLayout.addRow('Results:', self.SameModalityResultsListWidget)
+        self.SameModalityOverlayFovSpinBox = QtWidgets.QSpinBox()
+        self.SameModalityOverlayFovSpinBox.setRange(1, 100000)
+        self.SameModalityOverlayFovSpinBox.setValue(1)
+        sameModalityLayout.addRow('Overlay FOV:', self.SameModalityOverlayFovSpinBox)
         self.SameModalityShowOverlayPushButton = QtWidgets.QPushButton('Show All-Readouts Overlay')
         sameModalityLayout.addRow(self.SameModalityShowOverlayPushButton)
         controls_layout.addWidget(sameModalityGroup)
@@ -139,7 +147,10 @@ class AlignmentPanelUI(object):
         # Every FOV with either a disk-persisted or in-session cross-modal
         # result -- not just whichever FOV was aligned most recently.
         # Clicking a row shows that FOV's overlay.
-        self.CrossModalResultsListWidget.setMaximumHeight(120)
+        # Scoped to ONE FOV (the spinbox above) across every modality, so
+        # it is short -- but give it room to show every bridge at once
+        # rather than a two-row window.
+        self.CrossModalResultsListWidget.setMinimumHeight(160)
         crossLayout.addRow('Results:', self.CrossModalResultsListWidget)
         self.CrossModalAcceptPushButton, self.CrossModalRejectPushButton, crossAcceptRow = self._accept_reject_row()
         crossLayout.addRow(crossAcceptRow)

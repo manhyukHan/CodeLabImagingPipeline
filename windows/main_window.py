@@ -1376,6 +1376,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # _refresh_same_modality_results_list is itself scoped to
         # whichever reference hybe (and FOV list) is currently picked.
         ap.SameModalityFovSpinBox.valueChanged.connect(lambda _: self._refresh_same_modality_results_list())
+        # both Results lists are scoped to their OWN FOV spinbox now, so
+        # each has to refresh when its FOV changes
+        ap.CrossModalFovSpinBox.valueChanged.connect(lambda _: self._refresh_cross_modal_results_list())
         # (the per-modality reference combos are rebuilt on every modality
         # change, so they are connected in _activate_modalities, not here)
         ap.SameModalityResultsListWidget.itemClicked.connect(self._show_same_modality_preview)
@@ -2353,9 +2356,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
         references = ap.same_modality_references()      # {modality: hybe}
-        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        # ONE FOV -- the one picked in this section's own FOV spinbox --
+        # across EVERY modality, exactly like "Results (per cell, per
+        # hybe)" is scoped to one cell. Listing every FOV in the ingestion
+        # list put ~100 hybes x 40 FOVs x 2 modalities in one widget,
+        # where the rows you actually want are the ones for the FOV you
+        # are looking at.
+        fov_list = [ap.SameModalityFovSpinBox.value()]
         ap.SameModalityResultsListWidget.clear()
-        if not references or not fov_list:
+        if not references:
             return
         # EVERY configured modality, each against its own reference --
         # alignment is per-modality maths, so the list has to show them
@@ -2403,7 +2412,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for fov in sorted(display_results):
             for modality in sorted(display_results[fov]):
                 suffix = ' [pending]' if (fov, modality) in pending else ''
-                for key, H in display_results[fov][modality].items():
+                for key, H in sorted(display_results[fov][modality].items(),
+                                     key=lambda kv: kv[0][0] if isinstance(kv[0], tuple) else kv[0]):
                     hybe = key[0] if isinstance(key, tuple) else key
                     item = QtWidgets.QListWidgetItem(
                         f'FOV{fov:03d} ({modality}) {_matrix_summary(hybe, H)}{suffix}')
@@ -8134,11 +8144,13 @@ One PNG PER MODALITY: each modality has its own reference and its
         mirror means "never accepted", and the correct answer to that is
         no bridge at all -- identity, FrameResolver's documented default.
         """
-        ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
+        ap = self.ui.AlignmentPanel
         shared = self._shared_frame_modality()
-        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        # ONE FOV -- this section's own FOV spinbox -- across every moving
+        # modality. Same scoping rule as the FOV-alignment list above.
+        fov_list = [ap.CrossModalFovSpinBox.value()]
         ap.CrossModalResultsListWidget.clear()
-        if not shared or not fov_list:
+        if not shared:
             return
         for moving in self._cross_modal_moving_modalities():
             msp = self._storage_path_for_modality(moving)
