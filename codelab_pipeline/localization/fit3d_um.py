@@ -89,6 +89,75 @@ BACKGROUNDS = ('constant', 'linear_z', 'linear')
 _N_BG = {'constant': 1, 'linear_z': 2, 'linear': 4}
 
 
+def intensity_centroid(cube, centre_yxz, half_yxz, voxel_um=DEFAULT_VOXEL_UM,
+                       floor_quantile=0.5):
+    """
+    Intensity-weighted centroid within a box, in VOXEL INDICES.
+
+    A better seed than either of the two the pipeline uses today. The
+    argmax is one voxel and therefore as noisy as one voxel, and it
+    chases whatever is brightest in view; the crop centre is where the
+    alignment says the emitter is, which is a prior, not an observation.
+    The centroid uses every voxel in the box and is the natural
+    first-moment estimate of where the light is.
+
+    Weights are intensity above `floor_quantile` of the box (default the
+    median), clipped at zero: without a floor the background -- which
+    occupies most of any box -- drags the centroid toward the box centre
+    regardless of where the emitter is.
+
+    Returns None when the box holds no signal above the floor.
+    """
+    cy, cx, cz = centre_yxz
+    hy, hx, hz = half_yxz
+    ny, nx, nz = cube.shape
+    y0, y1 = max(0, int(round(cy - hy))), min(ny, int(round(cy + hy)) + 1)
+    x0, x1 = max(0, int(round(cx - hx))), min(nx, int(round(cx + hx)) + 1)
+    z0, z1 = max(0, int(round(cz - hz))), min(nz, int(round(cz + hz)) + 1)
+    sub = cube[y0:y1, x0:x1, z0:z1]
+    if sub.size == 0 or not np.isfinite(sub).any():
+        return None
+    floor = np.nanquantile(sub, floor_quantile)
+    w = np.clip(sub - floor, 0, None)
+    w = np.where(np.isfinite(w), w, 0.0)
+    total = w.sum()
+    if total <= 0:
+        return None
+    iy, ix, iz = np.indices(sub.shape)
+    return (float((w * iy).sum() / total) + y0,
+            float((w * ix).sum() / total) + x0,
+            float((w * iz).sum() / total) + z0)
+
+
+def extract_box(cube, centre_yxz, half_yxz):
+    """
+    A fixed-shape box around `centre_yxz`, NaN-PADDED where it runs off
+    the crop rather than clipped.
+
+    Clipping would silently change the box's shape and its centre when
+    an emitter sits near the top or bottom of the acquired slab, so two
+    hybes' boxes would no longer be the same volume and their fits would
+    not be comparable. NaN padding keeps the geometry identical
+    everywhere and marks missing data as missing -- which every fit in
+    this module already handles, since it masks on isfinite.
+
+    Returns (box, origin_yxz) where origin is the index in `cube` of the
+    box's [0,0,0] corner (may be negative, which is the point).
+    """
+    cy, cx, cz = (int(round(v)) for v in centre_yxz)
+    hy, hx, hz = (int(round(v)) for v in half_yxz)
+    shape = (2 * hy + 1, 2 * hx + 1, 2 * hz + 1)
+    box = np.full(shape, np.nan, dtype=float)
+    y0, x0, z0 = cy - hy, cx - hx, cz - hz
+    sy0, sy1 = max(0, y0), min(cube.shape[0], y0 + shape[0])
+    sx0, sx1 = max(0, x0), min(cube.shape[1], x0 + shape[1])
+    sz0, sz1 = max(0, z0), min(cube.shape[2], z0 + shape[2])
+    if sy1 > sy0 and sx1 > sx0 and sz1 > sz0:
+        box[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0, sz0 - z0:sz1 - z0] = \
+            cube[sy0:sy1, sx0:sx1, sz0:sz1]
+    return box, (y0, x0, z0)
+
+
 def _model(p, y, x, z, background='constant'):
     amp, y0, x0, z0, sy, sx, sz = p[:7]
     gauss = amp * np.exp(-(((y - y0) ** 2) / (2 * sy ** 2)
@@ -102,7 +171,8 @@ def _model(p, y, x, z, background='constant'):
 
 
 def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
-                       peak_bound_um=0.416, min_sigma_um=0.02,
+                       peak_bound_um=0.416, peak_bound_z_um=None,
+                       min_sigma_um=0.02,
                        max_sigma_xy_um=0.520, max_sigma_z_um=1.000,
                        min_hb_ratio=1.2, min_ah_ratio=0.25,
                        max_uncert_um=0.416, fit_radius_um=None,
@@ -161,9 +231,16 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
     s_xy0 = min(0.25, max_sigma_xy_um * 0.6)
     s_z0 = min(0.50, max_sigma_z_um * 0.6)
     p0 = [amp0, y0u, x0u, z0u, s_xy0, s_xy0, s_z0, off0]
-    lb = [0.0, y0u - peak_bound_um, x0u - peak_bound_um, z0u - peak_bound_um,
+    # Lateral and axial position bounds are SEPARATE physical distances.
+    # One shared number tied x/y/z together as if a pixel and a plane
+    # were the same thing; they are different lengths and the drift
+    # along z is far larger, so a bound that is right laterally is wrong
+    # axially. Defaults to peak_bound_um when not given, which keeps the
+    # previous single-bound behaviour.
+    pb_z = peak_bound_um if peak_bound_z_um is None else peak_bound_z_um
+    lb = [0.0, y0u - peak_bound_um, x0u - peak_bound_um, z0u - pb_z,
           min_sigma_um, min_sigma_um, min_sigma_um, 0.0]
-    ub = [65535.0, y0u + peak_bound_um, x0u + peak_bound_um, z0u + peak_bound_um,
+    ub = [65535.0, y0u + peak_bound_um, x0u + peak_bound_um, z0u + pb_z,
           max_sigma_xy_um, max_sigma_xy_um, max_sigma_z_um, 65535.0]
     names = ['amplitude', 'y', 'x', 'z', 'sigma_y', 'sigma_x', 'sigma_z', 'offset']
     # Background SLOPES are signed and effectively unbounded -- a

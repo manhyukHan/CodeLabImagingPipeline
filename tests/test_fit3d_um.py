@@ -167,6 +167,47 @@ def main():
               abs(small.z_um - full.z_um) < 0.02,
               f'{small.z_um:.4f} vs {full.z_um:.4f}')
 
+    # -- 7. extract_box: NaN-padded, never clipped --
+    img, _c = synth(noise=8.0)
+    box, origin = U.extract_box(img, (10, 10, 20), (5, 5, 15))
+    check('a box fully inside the crop has the requested shape',
+          box.shape == (11, 11, 31), str(box.shape))
+    check('and holds no NaN', np.isfinite(box).all())
+    # a box hanging off the bottom of the slab
+    edge, origin = U.extract_box(img, (10, 10, 2), (5, 5, 15))
+    check('a box running off the slab keeps the SAME shape (not clipped)',
+          edge.shape == (11, 11, 31), str(edge.shape))
+    check('the missing depth is NaN, not fabricated', np.isnan(edge).any())
+    check('the box origin reports where it started, negative included',
+          origin[2] == 2 - 15, str(origin))
+    n_nan = int(np.isnan(edge).sum())
+    check('exactly the out-of-slab voxels are NaN',
+          n_nan == 11 * 11 * 13, f'{n_nan} vs {11 * 11 * 13}')
+
+    # -- 8. intensity_centroid: finds the light, not the box centre --
+    off_centre = (2.08 + 0.30, 2.08, 4.0)          # 0.30 um off centre in y
+    img, _c = synth(centre_um=off_centre, noise=8.0)
+    cen = U.intensity_centroid(img, (10, 10, 20), (5, 5, 15), voxel_um=voxel)
+    check('the centroid is found', cen is not None)
+    if cen is not None:
+        cy_um = cen[0] * dy
+        check('the centroid follows the emitter, not the box centre',
+              abs(cy_um - off_centre[0]) < 0.10,
+              f'{cy_um:.3f} vs true {off_centre[0]:.3f} (box centre 2.08)')
+    flat = np.full((21, 21, 41), 100.0)
+    check('a box with no signal above the floor returns None',
+          U.intensity_centroid(flat, (10, 10, 20), (5, 5, 15)) is None)
+
+    # -- 9. lateral and axial position bounds are independent --
+    img, _c = synth(noise=8.0)
+    f = U.fit_gaussian_3d_um(img, 10.0, 10.0, 14.0, voxel_um=voxel,
+                             peak_bound_um=1.04, peak_bound_z_um=0.02,
+                             max_sigma_xy_um=1.0, max_sigma_z_um=2.0)
+    check('a tight AXIAL bound rails z without touching x/y',
+          f is None or ('z' in f.at_bound and 'x' not in f.at_bound
+                        and 'y' not in f.at_bound),
+          'None' if f is None else str(f.at_bound))
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
