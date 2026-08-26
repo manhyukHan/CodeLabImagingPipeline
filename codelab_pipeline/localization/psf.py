@@ -103,6 +103,20 @@ def gaussian_halo_psf(dy, dx, dz, s_xy, s_z, halo_frac=0.15, halo_scale=3.0):
 
     Two extra parameters: what fraction of the peak lives in the halo,
     and how much wider it is than the core.
+
+    halo_frac is bounded BELOW 0.5 by definition, not by taste. Let it
+    past a half and the wide component becomes the majority of the
+    emitter, at which point core and halo swap roles and the pair is
+    unidentifiable: the fit can describe one broad blob either as a core
+    of width s, or as a vanishing core plus a halo of width s*scale.
+    Measured on real fiducial crops, it took the second route --
+    sigma_xy 0.0388 um with halo_scale pinned at 8.0, whose product is
+    0.310 um, against 0.312 um from a plain Gaussian on the same data.
+    Same answer, degenerate parameterisation, and the residual could not
+    tell the difference (rss/vox 2986 vs 2931), so no score comparison
+    would have caught it. A calibrated PSF reporting a 39 nm core -- far
+    below the diffraction limit -- would then be trusted by everything
+    downstream.
     """
     core = gaussian_psf(dy, dx, dz, s_xy, s_z)
     halo = gaussian_psf(dy, dx, dz, s_xy * halo_scale, s_z * halo_scale)
@@ -120,7 +134,10 @@ FAMILIES = {
     'gaussian_halo': (gaussian_halo_psf,
                       ('sigma_xy_um', 'sigma_z_um', 'halo_frac', 'halo_scale'),
                       (0.13, 0.35, 0.15, 3.0),
-                      ((0.03, 1.5), (0.05, 3.0), (0.0, 0.6), (1.5, 8.0))),
+                      # halo_frac < 0.5 keeps the core the majority
+                      # component, which is what makes the split
+                      # identifiable at all (see gaussian_halo_psf)
+                      ((0.03, 1.5), (0.05, 3.0), (0.0, 0.45), (1.5, 6.0))),
 }
 
 
@@ -243,7 +260,19 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
                 n += got[1]
             return (rss / n) if n else np.inf
 
+        # BOUNDS ARE PASSED. FAMILIES declares them, and this call used to
+        # ignore them -- Nelder-Mead without bounds wanders wherever the
+        # objective leads. Measured consequence on real crops: the
+        # fiducial calibration converged to sigma_xy 0.037 um (37 nm, far
+        # below the diffraction limit) with halo_scale 8.36, OUTSIDE the
+        # declared upper bound of 8.0. That is the model degenerating --
+        # a near-delta core with a huge halo doing all the work -- and it
+        # scored slightly WORSE than the sane answer (rss/vox 2986 vs
+        # 2931), so a plain score comparison would not have caught it
+        # either. A calibrated PSF that is physically impossible is worse
+        # than no calibration, because everything downstream trusts it.
         res = minimize(total, np.array(init, dtype=float), method='Nelder-Mead',
+                       bounds=bounds,
                        options={'xatol': 1e-3, 'fatol': 1e-2, 'maxiter': 120})
         params = {k: float(v) for k, v in zip(names, res.x)}
         results[family] = {'params': params, 'score': float(res.fun),

@@ -156,16 +156,27 @@ def pair_stats(fits, bench, kind, keep, pairs=None, fiducials=None):
 def sweep(fits, bench, kind, pairs=None, fiducials=None):
     """One gate at a time, the other two wide open, so each curve shows
     that gate's own effect rather than the product of three."""
+    # Every threshold is a PHYSICAL length in NANOMETRES, and lateral and
+    # axial are swept INDEPENDENTLY.
+    #
+    # v1 expressed its position gate in pixels and then wrote z as
+    # `2 * max_uncert`, which silently assumed a plane is twice a pixel.
+    # Here a plane is 0.2 um and a pixel 0.208 um, so that factor was
+    # wrong in this experiment and would be wrong differently on any
+    # other objective or z-step. A bound in nm means the same distance on
+    # both axes and travels between experiments; a bound in px does not.
     grids = {
         'min_hb_ratio': np.round(np.arange(1.00, 2.61, 0.10), 2),
         'min_ah_ratio': np.round(np.arange(0.00, 1.01, 0.05), 2),
-        'max_uncert_um': np.round(np.arange(0.02, 0.62, 0.02), 3),
+        'max_uncert_xy_nm': np.arange(20, 620, 20),
+        'max_uncert_z_nm': np.arange(20, 1220, 40),
     }
     keeps = {
         'min_hb_ratio': lambda f, t: f.peak_bg_ratio >= t,
         'min_ah_ratio': lambda f, t: f.amp_h_ratio >= t,
-        'max_uncert_um': lambda f, t: (2 * f.ci_y_um < t and 2 * f.ci_x_um < t
-                                       and 2 * f.ci_z_um < 2 * t),
+        'max_uncert_xy_nm': lambda f, t: (2000 * f.ci_y_um < t
+                                          and 2000 * f.ci_x_um < t),
+        'max_uncert_z_nm': lambda f, t: 2000 * f.ci_z_um < t,
     }
     curves = {}
     for name, grid in grids.items():
@@ -239,7 +250,8 @@ def render_distributions(fits, kind, out_dir, v1_defaults):
     series = {
         'min_hb_ratio': [f.peak_bg_ratio for f in fits.values()],
         'min_ah_ratio': [f.amp_h_ratio for f in fits.values()],
-        'max_uncert_um': [2 * max(f.ci_y_um, f.ci_x_um) for f in fits.values()],
+        'max_uncert_xy_nm': [2000 * max(f.ci_y_um, f.ci_x_um) for f in fits.values()],
+        'max_uncert_z_nm': [2000 * f.ci_z_um for f in fits.values()],
     }
     fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
     fig.suptitle(f'Distribution of each gate quantity -- {kind} channel '
@@ -276,7 +288,11 @@ def main():
                          '(drops toehold rounds, which are displacement controls)')
     a = ap.parse_args()
 
-    v1_defaults = {'min_hb_ratio': 1.2, 'min_ah_ratio': 0.25, 'max_uncert_um': 0.416}
+    # v1's own values, converted so they can be drawn on a nm axis:
+    # max_uncert 2.0 px -> 416 nm laterally, and its doubled-for-z rule
+    # -> 4.0 planes -> 800 nm axially.
+    v1_defaults = {'min_hb_ratio': 1.2, 'min_ah_ratio': 0.25,
+                   'max_uncert_xy_nm': 416, 'max_uncert_z_nm': 800}
     bench = np.load(a.bench, allow_pickle=False)
     pairs, dropped = valid_pairs(bench, a.layout)
     print(f'scoring against {len(pairs)} replicate pairs per allele')
