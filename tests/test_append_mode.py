@@ -116,22 +116,29 @@ def main():
           and w.fov_ready_hybes[('DNA', 1)] == {'H1', 'H2', 'H3'})
 
     # -- 3. AlignmentWorker per-FOV subsets ----------------------------------
+    # specs are per (FOV, modality) now -- one pool per FOV covering every
+    # modality (see tests/test_fov_alignment_multimodality.py).
     calls = []
-    def fake_align(storage_path, fov, hybe_records, reference_hybe, **kw):
-        calls.append((fov, tuple(r['folder'] for r in hybe_records)))
-        if kw.get('progress'):
-            kw['progress'](len(hybe_records), len(hybe_records), fov, 'x')
-        return {r['folder']: np.eye(3) for r in hybe_records}
-    aw = AlignmentWorker(dna_sp, [1, 2], {1: [records[2]], 2: records[:2]}, 'H1', write=False)
-    with mock.patch.object(chain, 'align_same_modality', side_effect=fake_align):
+    def fake_align(fov, specs, **kw):
+        for sp in specs:
+            calls.append((fov, tuple(r['folder'] for r in sp['hybe_records'])))
+            if kw.get('progress'):
+                kw['progress'](len(sp['hybe_records']), len(sp['hybe_records']), fov, 'x')
+        return {sp['modality']: {r['folder']: np.eye(3) for r in sp['hybe_records']}
+                for sp in specs}
+
+    def _spec(recs):
+        return [{'modality': 'DNA', 'storage_path': dna_sp,
+                 'hybe_records': recs, 'reference_hybe': 'H1'}]
+    aw = AlignmentWorker([1, 2], {1: _spec([records[2]]), 2: _spec(records[:2])}, write=False)
+    with mock.patch.object(chain, 'align_fov_all_modalities', side_effect=fake_align):
         aw.run()   # synchronous call, no thread start
     check('worker hands each FOV exactly its own subset',
           calls == [(1, ('H3',)), (2, ('H1', 'H2'))], str(calls))
 
     # -- 4. _run_fov_alignment_all append composition -------------------------
     ap = w.ui.AlignmentPanel
-    ap.current_reference_hybe = lambda: 'H1'
-    ap.current_reference_modality = lambda: 'DNA'
+    ap.same_modality_references = lambda: {'DNA': 'H1'}
     ip.modality_data['DNA']['active_hybe_list'] = records
     ip.FovListLineEdit.setText('1,2,3')
     w._ready_hybes = lambda m, fov: {1: {'H1', 'H2', 'H3'}, 2: {'H1', 'H2'}, 3: {'H2'}}[fov]
@@ -139,14 +146,15 @@ def main():
 
     class FakeAW(AlignmentWorker):
         def start(self):
-            captured['records_by_fov'] = self.records_by_fov
+            captured['specs_by_fov'] = self.specs_by_fov
             captured['fov_list'] = self.fov_list
     with mock.patch.object(w, '_confirm_batch_mode', return_value='append'), \
          mock.patch('windows.main_window.AlignmentWorker', FakeAW):
         w._run_fov_alignment_all()
     # persisted for FOV1: H1, H2 -> FOV1 delta = H3; FOV2 nothing persisted,
     # ready H1+H2 -> both; FOV3 reference H1 not ready -> skipped whole.
-    rbf = {fov: tuple(r['folder'] for r in v) for fov, v in captured.get('records_by_fov', {}).items()}
+    rbf = {fov: tuple(r['folder'] for sp in specs for r in sp['hybe_records'])
+           for fov, specs in captured.get('specs_by_fov', {}).items()}
     check('append delta: ready minus persisted, per FOV',
           rbf == {1: ('H3',), 2: ('H1', 'H2')}, str(rbf))
     check('FOV without a ready reference skipped whole', 3 not in rbf and captured['fov_list'] == [1, 2])

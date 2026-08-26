@@ -410,22 +410,20 @@ class AlignmentWorker(QtCore.QThread):
     # frozen window for minutes with nothing to look at. Same total cost,
     # completely different experience -- the freeze is now one FOV long, and
     # between FOVs the previous result is on screen and the app responds.
-    fov_done = QtCore.pyqtSignal(int, dict)   # (fov, {hybe: H})
-    finished_ok = QtCore.pyqtSignal(dict)  # {fov: {hybe: H}}
+    fov_done = QtCore.pyqtSignal(int, dict)   # (fov, {modality: {hybe: H}})
+    finished_ok = QtCore.pyqtSignal(dict)     # {fov: {modality: {hybe: H}}}
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, storage_path, fov_list, records_by_fov, reference_hybe, write=True, border_trim=0, max_shift=None):
+    def __init__(self, fov_list, specs_by_fov, write=True, border_trim=0, max_shift=None):
         super().__init__()
-        self.storage_path = storage_path
         self.fov_list = fov_list
-        # {fov: [hybe_record, ...]} -- PER-FOV record lists, so an
-        # append-mode run can hand each FOV exactly its own
-        # persisted-missing delta (per explicit decision: per-(FOV, hybe)
-        # grain) while an overwrite run simply maps every FOV to the full
-        # list. write_same_modality_matrices merges per-hybe datasets, so
-        # a subset write never disturbs a FOV's other persisted matrices.
-        self.records_by_fov = records_by_fov
-        self.reference_hybe = reference_hybe
+        # {fov: [{'modality','storage_path','hybe_records','reference_hybe'}, ...]}
+        # -- EVERY modality's own work for that FOV, per FOV. Per-FOV
+        # record lists so an append-mode run can hand each FOV exactly
+        # its own persisted-missing delta (per-(FOV, hybe) grain); a
+        # subset write never disturbs a FOV's other persisted matrices,
+        # since write_same_modality_matrices merges.
+        self.specs_by_fov = specs_by_fov
         self.write = write
         self.border_trim = border_trim
         self.max_shift = max_shift
@@ -433,32 +431,40 @@ class AlignmentWorker(QtCore.QThread):
     def run(self):
         try:
             results = {}
-            # Per-HYBE totals, not per-FOV. align_same_modality is ~3.5 s a
-            # hybe on real data, so a single-FOV run used to emit exactly
-            # one progress signal, ~4.5 minutes in -- indistinguishable
-            # from a hang. Now every hybe reports.
-            total = max(sum(len(self.records_by_fov.get(fov, [])) for fov in self.fov_list), 1)
+            # Per-HYBE totals across EVERY modality, not per-FOV. A fit is
+            # ~3.5 s a hybe on real data, so a single-FOV run used to emit
+            # one progress signal minutes in -- indistinguishable from a
+            # hang. Now every hybe reports.
+            total = max(sum(len(sp['hybe_records'])
+                            for fov in self.fov_list
+                            for sp in self.specs_by_fov.get(fov, [])), 1)
             base = 0
             for fov in self.fov_list:
-                records = self.records_by_fov.get(fov, [])
-                if not records:
+                specs = [sp for sp in self.specs_by_fov.get(fov, []) if sp['hybe_records']]
+                if not specs:
                     continue
 
-                def _on_hybe(done, of, fov_r, hybe, _base=base):
+                def _on_hybe(done, of, fov_r, label, _base=base):
                     self.progress.emit(_base + done, total,
-                                       f'FOV{fov_r:03d} {hybe}: aligned ({done}/{of})')
-                matrices = alignment.align_same_modality(self.storage_path, fov, records,
-                                                              self.reference_hybe, write=self.write,
-                                                              border_trim=self.border_trim, max_shift=self.max_shift,
-                                                              progress=_on_hybe)
-                results[fov] = matrices
-                base += len(records)
-                self.progress.emit(base, total, f'FOV{fov:03d}: {len(matrices)} hybe(s) aligned')
+                                       f'FOV{fov_r:03d} {label}: aligned ({done}/{of})')
+                # ONE pool for the whole FOV, carrying every (modality,
+                # hybe) it needs -- a FOV finishes completely before the
+                # next one starts, instead of each modality advancing in
+                # lockstep. Same rule ingestion follows.
+                per_modality = alignment.align_fov_all_modalities(
+                    fov, specs, write=self.write, border_trim=self.border_trim,
+                    max_shift=self.max_shift, progress=_on_hybe)
+                results[fov] = per_modality
+                base += sum(len(sp['hybe_records']) for sp in specs)
+                n = sum(len(m) for m in per_modality.values())
+                self.progress.emit(base, total,
+                                   f'FOV{fov:03d}: {n} hybe(s) aligned across '
+                                   f'{len(per_modality)} modality(ies)')
                 # Queued across the thread boundary, so the receiving slot runs
                 # on the GUI thread (matplotlib + preview_canvas are not usable
                 # from here) while THIS thread carries straight on to the next
                 # FOV's fit. The two overlap instead of queueing up at the end.
-                self.fov_done.emit(fov, matrices)
+                self.fov_done.emit(fov, per_modality)
             self.finished_ok.emit(results)
         except Exception as e:
             self.failed.emit(str(e))
@@ -1370,7 +1376,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # _refresh_same_modality_results_list is itself scoped to
         # whichever reference hybe (and FOV list) is currently picked.
         ap.SameModalityFovSpinBox.valueChanged.connect(lambda _: self._refresh_same_modality_results_list())
-        ap.ReferenceHybeComboBox.currentIndexChanged.connect(lambda _: self._refresh_same_modality_results_list())
+        # (the per-modality reference combos are rebuilt on every modality
+        # change, so they are connected in _activate_modalities, not here)
         ap.SameModalityResultsListWidget.itemClicked.connect(self._show_same_modality_preview)
         ap.SameModalityShowOverlayPushButton.clicked.connect(self._show_same_modality_all_readouts_overlay)
         ap.SameModalityAcceptPushButton.clicked.connect(self._accept_same_modality_alignment)
@@ -1560,7 +1567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # have a same-named hybe folder.
         reference_hybe = params.get('same_modality_reference_hybe')
         if reference_hybe and this_modality:
-            ap.select_reference_hybe(reference_hybe, this_modality)
+            ap.select_same_modality_reference_hybe(this_modality, reference_hybe)
         channel_type = params.get('same_modality_channel_type')
         if channel_type:
             ap.SameModalityChannelTypeComboBox.setCurrentText(channel_type)
@@ -1702,6 +1709,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(roots) == 1:
             ip.ProjectRootLineEdit.setText(next(iter(roots)))
         ap = self.ui.AlignmentPanel
+        ap.build_same_modality_reference_hybe_fields(names)
         ap.build_cell_reference_hybe_fields(names)
         ap.build_cross_modal_reference_hybe_fields(names)
         ap.CrossModalSharedFrameLabel.setText(names[0] if names else '-')
@@ -1710,6 +1718,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # in __init__) -- reconnect here every time.
         for combo in ap.CellReferenceHybeComboBoxes.values():
             combo.currentIndexChanged.connect(lambda _: self._refresh_cell_per_hybe_results_from_spinboxes())
+        for combo in ap.SameModalityReferenceHybeComboBoxes.values():
+            combo.currentIndexChanged.connect(lambda _: self._refresh_same_modality_results_list())
         # Parse EVERY configured modality in one pass (the old tail only
         # ever parsed names[0] via the now-removed modality switch, so a
         # loaded two-modality config left the second modality's combos
@@ -1951,7 +1961,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # them have a modality selector (there is no current-modality
         # concept anywhere any more); each combo item carries its own
         # modality tag instead.
-        ap.populate_reference_hybe_choices(self.total_active_hybe_list)
+        ap.populate_same_modality_reference_hybe_choices(self.total_active_hybe_list)
         self.ui.CellSegmentPanel.populate_reference_hybe_choices(self.total_active_hybe_list)
         self.ui.SpotLocalizationPanel.populate_hybe_choices(self.total_active_hybe_list)
         self.ui.CelltypeDeterminationPanel.populate_hybe_choices(self.total_active_hybe_list)
@@ -2342,55 +2352,63 @@ class MainWindow(QtWidgets.QMainWindow):
         alignment yet.
         """
         ip, ap = self.ui.IngestionPanel, self.ui.AlignmentPanel
-        reference_hybe = ap.current_reference_hybe()
-        modality = ap.current_reference_modality()
-        storage_path = self._storage_path_for_modality(modality)
-        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
+        references = ap.same_modality_references()      # {modality: hybe}
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         ap.SameModalityResultsListWidget.clear()
-        if not storage_path or not reference_hybe or not fov_list or not hybe_records:
+        if not references or not fov_list:
             return
+        # EVERY configured modality, each against its own reference --
+        # alignment is per-modality maths, so the list has to show them
+        # side by side rather than whichever one a shared combo picked.
+        specs = []
+        for modality, reference_hybe in references.items():
+            storage_path = self._storage_path_for_modality(modality)
+            hybe_records = ip.modality_data.get(modality, {}).get('active_hybe_list', [])
+            if storage_path and hybe_records:
+                specs.append((modality, storage_path, reference_hybe, hybe_records))
+        if not specs:
+            return
+        self._same_modality_context = {'specs': specs}
         disk_results = {}
         # The disk phase runs unconditionally: it is one directory
         # listing plus one small capsule read per FOV (7 ms for a full
         # 40-FOV sweep of the real store). It used to be skipped during
         # ingestion, which left an already-ingested FOV showing only its
         # reference hybe -- see tests/test_analysis_during_ingestion.py.
-        for fov in fov_list:
-            ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, hybe_records)
-            if not ready:
-                continue
-            ready_records = [r for r in hybe_records if r['folder'] in ready]
-            matrices = alignment.read_same_modality_matrices(storage_path, fov, ready_records)
-            if matrices:
-                disk_results[fov] = matrices
-        if disk_results:
-            for _fov, _m in disk_results.items():
-                self._merge_fov_matrices(_fov, _m)
+        for modality, storage_path, _reference_hybe, hybe_records in specs:
+            for fov in fov_list:
+                ready, _, _ = self._ingested_hybes_for_fov(storage_path, fov, hybe_records)
+                if not ready:
+                    continue
+                ready_records = [r for r in hybe_records if r['folder'] in ready]
+                matrices = alignment.read_same_modality_matrices(storage_path, fov, ready_records)
+                if matrices:
+                    disk_results.setdefault(fov, {})[modality] = matrices
+                    self._merge_fov_matrices(fov, matrices)
 
-        display_results = dict(disk_results)
-        # Keyed by FOV now, spanning both modalities -- narrow to the one
-        # this list is showing rather than filtering on an outer path key.
-        for fov in self.fov_matrices:
-            matrices = self._fov_matrices_for(storage_path, fov)
-            if matrices:
-                display_results[fov] = matrices
-        pending_fovs = set()
+        display_results = {fov: dict(by_mod) for fov, by_mod in disk_results.items()}
+        for modality, storage_path, _reference_hybe, _records in specs:
+            for fov in self.fov_matrices:
+                matrices = self._fov_matrices_for(storage_path, fov)
+                if matrices:
+                    display_results.setdefault(fov, {})[modality] = matrices
+        pending = set()
         if self._pending_same_modality_alignment:
-            for fov, matrices in self._pending_same_modality_alignment.items():
-                display_results[fov] = matrices
-                pending_fovs.add(fov)
+            for fov, by_modality in self._pending_same_modality_alignment.items():
+                for modality, matrices in by_modality.items():
+                    display_results.setdefault(fov, {})[modality] = matrices
+                    pending.add((fov, modality))
         if not display_results:
             return
-        self._same_modality_context = {'storage_path': storage_path, 'hybe_records': hybe_records, 'reference_hybe': reference_hybe}
-        for fov in sorted(display_results.keys()):
-            matrices = display_results[fov]
-            suffix = ' [pending]' if fov in pending_fovs else ''
-            for key, H in matrices.items():
-                hybe = key[0] if isinstance(key, tuple) else key
-                item = QtWidgets.QListWidgetItem(f'FOV{fov:03d} {_matrix_summary(hybe, H)}{suffix}')
-                item.setData(QtCore.Qt.UserRole, (fov, hybe))
-                ap.SameModalityResultsListWidget.addItem(item)
+        for fov in sorted(display_results):
+            for modality in sorted(display_results[fov]):
+                suffix = ' [pending]' if (fov, modality) in pending else ''
+                for key, H in display_results[fov][modality].items():
+                    hybe = key[0] if isinstance(key, tuple) else key
+                    item = QtWidgets.QListWidgetItem(
+                        f'FOV{fov:03d} ({modality}) {_matrix_summary(hybe, H)}{suffix}')
+                    item.setData(QtCore.Qt.UserRole, (fov, hybe, modality))
+                    ap.SameModalityResultsListWidget.addItem(item)
 
     def _compose_checked_ingestion_jobs(self, warn_title):
         """
@@ -7674,48 +7692,76 @@ class MainWindow(QtWidgets.QMainWindow):
         Accept. Run All FOV Alignment below (_run_fov_alignment_all) is the
         always-auto-save, no-staging counterpart for every FOV at once."""
         ap = self.ui.AlignmentPanel
-        reference_hybe = ap.current_reference_hybe()
-        modality = ap.current_reference_modality()
-        if not reference_hybe or not modality:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first, then pick a reference hybe.')
-            return
-        storage_path = self._storage_path_for_modality(modality)
         fov = ap.SameModalityFovSpinBox.value()
-        if not storage_path:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path in the Ingestion tab first.')
+        specs, problems = self._same_modality_specs()
+        if not specs:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run FOV Alignment',
+                'Nothing to align: ' + ('; '.join(problems) or
+                'parse a layout and pick a reference hybe per modality.'))
             return
-
-        # active_hybe_list, never the Ingestion tab's hybe-to-ingest
-        # checkboxes -- a checked hybe only means the user WANTS it
-        # ingested (see _run_ingestion), not that it actually has a real
-        # {hybe}_stack.h5 on disk yet. Using checkbox state here let a
-        # checked-but-never-ingested hybe reach align_same_modality's
-        # bare h5py.File() open and crash.
-        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', [])
-        if not hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
-                                          'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
-            return
-        if reference_hybe not in {r['folder'] for r in hybe_records}:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Reference hybe must be an ingested hybe.')
-            return
+        if problems:
+            self.log('FOV alignment: ' + '; '.join(problems))
 
         border_trim = ap.SameModalityBorderTrimSpinBox.value()
         max_shift = ap.SameModalityMaxShiftSpinBox.value() or None
 
         ap.RunFovAlignmentPushButton.setEnabled(False)
-        self.statusBar().showMessage('Running FOV alignment...')
-        self._alignment_worker = AlignmentWorker(storage_path, [fov], {fov: hybe_records}, reference_hybe, write=False,
-                                                  border_trim=border_trim, max_shift=max_shift)
+        self.statusBar().showMessage('Running FOV alignment (all modalities)...')
+        self._alignment_worker = AlignmentWorker([fov], {fov: specs}, write=False,
+                                                 border_trim=border_trim, max_shift=max_shift)
         self._alignment_worker.progress.connect(self._on_alignment_progress)
         self._alignment_worker.finished_ok.connect(
-            lambda results: self._on_fov_alignment_finished(results, storage_path, hybe_records, reference_hybe))
+            lambda results: self._on_fov_alignment_finished(results, specs))
         self._alignment_worker.failed.connect(self._on_fov_alignment_failed)
         self._alignment_worker.start()
 
-    def _on_fov_alignment_finished(self, results, storage_path, hybe_records, reference_hybe):
+    def _same_modality_specs(self, records_by_modality=None):
+        """
+        ([{'modality','storage_path','hybe_records','reference_hybe'}, ...],
+        [problem, ...]) -- one spec per configured modality that has a
+        usable reference AND ingested hybes.
+
+        Reads active_hybe_list, never the Ingestion tab's checkboxes: a
+        checked hybe only means the user WANTS it ingested, not that a
+        real file exists yet, and a checked-but-never-ingested hybe used
+        to reach a bare h5py open and crash.
+
+        A modality that is not ready is REPORTED and skipped rather than
+        blocking the ones that are -- each modality aligns to its own
+        reference independently, so one missing reference must not stop
+        the others.
+
+        records_by_modality: optional {modality: [record, ...]} override,
+        used by append mode to hand each modality exactly its own
+        persisted-missing delta.
+        """
+        ap, ip = self.ui.AlignmentPanel, self.ui.IngestionPanel
+        specs, problems = [], []
+        for modality, reference_hybe in ap.same_modality_references().items():
+            storage_path = self._storage_path_for_modality(modality)
+            if not storage_path:
+                problems.append('%s: no storage path' % modality)
+                continue
+            active = ip.modality_data.get(modality, {}).get('active_hybe_list', [])
+            if not active:
+                problems.append('%s: no ingested hybes yet' % modality)
+                continue
+            if reference_hybe not in {r['folder'] for r in active}:
+                problems.append('%s: reference %s is not ingested' % (modality, reference_hybe))
+                continue
+            records = active if records_by_modality is None else records_by_modality.get(modality, [])
+            if not records:
+                continue
+            specs.append({'modality': modality, 'storage_path': storage_path,
+                          'hybe_records': records, 'reference_hybe': reference_hybe})
+        return specs, problems
+
+    def _on_fov_alignment_finished(self, results, specs):
         ap = self.ui.AlignmentPanel
-        self._same_modality_context = {'storage_path': storage_path, 'hybe_records': hybe_records, 'reference_hybe': reference_hybe}
+        self._same_modality_context = {
+            'specs': [(sp['modality'], sp['storage_path'], sp['reference_hybe'],
+                       sp['hybe_records']) for sp in specs]}
         self._pending_same_modality_alignment = results
         self._refresh_same_modality_results_list()
         ap.RunFovAlignmentPushButton.setEnabled(True)
@@ -7732,10 +7778,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # auto-popups for N FOVs would just be noise.
         fov = list(results.keys())[0]
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
+        # One overlay PER MODALITY -- each is that modality's own hybes
+        # against its own reference, so they cannot share a figure. The
+        # last one drawn stays on screen; the rest are reachable from the
+        # Results list.
         self.alignment_preview_window.show_canvas()
         self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, hybe_records, reference_hybe, results[fov],
-                                                  channel_type=channel_type)
+        for sp in specs:
+            matrices = results.get(fov, {}).get(sp['modality'])
+            if matrices:
+                self.preview_canvas.draw_fov_all_readouts_overlay(
+                    sp['storage_path'], fov, sp['hybe_records'], sp['reference_hybe'],
+                    matrices, channel_type=channel_type)
 
     def _on_fov_alignment_failed(self, message):
         self.ui.AlignmentPanel.RunFovAlignmentPushButton.setEnabled(True)
@@ -7748,25 +7802,16 @@ class MainWindow(QtWidgets.QMainWindow):
         Alignment above first to confirm the parameters on one real FOV."""
         ap = self.ui.AlignmentPanel
         ip = self.ui.IngestionPanel
-        reference_hybe = ap.current_reference_hybe()
-        modality = ap.current_reference_modality()
-        if not reference_hybe or not modality:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Parse a layout first, then pick a reference hybe.')
-            return
-        storage_path = self._storage_path_for_modality(modality)
+        base_specs, problems = self._same_modality_specs()
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
-        if not storage_path or not fov_list:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Set storage path and FOV list in the Ingestion tab first.')
+        if not base_specs or not fov_list:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run FOV Alignment',
+                'Nothing to align: ' + ('; '.join(problems) or
+                'set the FOV list, then pick a reference hybe per modality.'))
             return
-
-        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', [])
-        if not hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment',
-                                          'No ingested hybes found for this modality/FOV list yet -- run ingestion first.')
-            return
-        if reference_hybe not in {r['folder'] for r in hybe_records}:
-            QtWidgets.QMessageBox.warning(self, 'Run FOV Alignment', 'Reference hybe must be an ingested hybe.')
-            return
+        if problems:
+            self.log('FOV alignment: ' + '; '.join(problems))
 
         border_trim = ap.SameModalityBorderTrimSpinBox.value()
         max_shift = ap.SameModalityMaxShiftSpinBox.value() or None
@@ -7774,45 +7819,55 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self._confirm_batch_mode('Run FOV Alignment (all FOVs)', 'FOV/hybe matrices')
         if mode is None:
             return
+
+        specs_by_fov = {}
         if mode == 'append':
-            # Per-(FOV, hybe) delta, per explicit decision: each FOV gets
-            # exactly the hybes that are READY on disk for it but carry NO
-            # persisted matrix yet (analysis_store.aligned_hybes -- the
-            # identity-defaulting reader can't answer this) -- so the
-            # button is re-runnable as ingestion advances, each pass
-            # filling exactly the gap that opened since the last one. An
-            # FOV whose reference hybe isn't ready yet is skipped whole
-            # (nothing can be aligned against a missing reference).
-            records_by_fov = {}
+            # Per-(FOV, hybe, MODALITY) delta: each FOV gets exactly the
+            # hybes that are READY on disk for it but carry NO persisted
+            # matrix yet (analysis_store.aligned_hybes -- the
+            # identity-defaulting reader cannot answer this), computed
+            # independently per modality. So the button is re-runnable as
+            # ingestion advances, each pass filling exactly the gap that
+            # opened since the last one. A (FOV, modality) whose own
+            # reference is not ready is skipped whole -- nothing can be
+            # aligned against a missing reference -- without holding up
+            # the other modality.
             skipped = []
             for fov in fov_list:
-                ready = self._ready_hybes(modality, fov)
-                if reference_hybe not in ready:
-                    skipped.append(f'FOV{fov:03d} (reference not ingested yet)')
-                    continue
-                done = analysis_store.aligned_hybes(storage_path, fov)
-                todo = [r for r in hybe_records
-                        if r['folder'] in ready and r['folder'] not in done]
-                if todo:
-                    records_by_fov[fov] = todo
+                per_modality = {}
+                for sp in base_specs:
+                    modality = sp['modality']
+                    ready = self._ready_hybes(modality, fov)
+                    if sp['reference_hybe'] not in ready:
+                        skipped.append(f'FOV{fov:03d} ({modality}: reference not ingested yet)')
+                        continue
+                    done = analysis_store.aligned_hybes(sp['storage_path'], fov)
+                    todo = [r for r in sp['hybe_records']
+                            if r['folder'] in ready and r['folder'] not in done]
+                    if todo:
+                        per_modality[modality] = todo
+                if per_modality:
+                    specs, _ = self._same_modality_specs(records_by_modality=per_modality)
+                    if specs:
+                        specs_by_fov[fov] = specs
             if skipped:
                 self.log(f"FOV alignment append: skipping {', '.join(skipped)}.")
-            if not records_by_fov:
+            if not specs_by_fov:
                 QtWidgets.QMessageBox.information(
                     self, 'Run FOV Alignment',
                     'Nothing to append -- every ready (FOV, hybe) already has a persisted matrix.')
                 return
-            n_todo = sum(len(v) for v in records_by_fov.values())
+            n_todo = sum(len(sp['hybe_records']) for v in specs_by_fov.values() for sp in v)
             self.log(f'FOV alignment append: {n_todo} missing (FOV, hybe) pair(s) '
-                     f'across {len(records_by_fov)} FOV(s).')
+                     f'across {len(specs_by_fov)} FOV(s).')
         else:
-            records_by_fov = {fov: hybe_records for fov in fov_list}
+            specs_by_fov = {fov: base_specs for fov in fov_list}
 
-        run_fovs = [fov for fov in fov_list if records_by_fov.get(fov)]
+        run_fovs = [fov for fov in fov_list if specs_by_fov.get(fov)]
         ap.RunAllFovAlignmentPushButton.setEnabled(False)
         self.statusBar().showMessage('Running FOV alignment for all FOVs...')
-        self._alignment_worker = AlignmentWorker(storage_path, run_fovs, records_by_fov, reference_hybe, write=True,
-                                                  border_trim=border_trim, max_shift=max_shift)
+        self._alignment_worker = AlignmentWorker(run_fovs, specs_by_fov, write=True,
+                                                 border_trim=border_trim, max_shift=max_shift)
         self._alignment_worker.progress.connect(self._on_alignment_progress)
         # Draw+save each FOV's overlay AS IT LANDS, not all of them at the end.
         # Resolve channel_type per FOV inside the slot rather than capturing it
@@ -7822,26 +7877,31 @@ class MainWindow(QtWidgets.QMainWindow):
         # see _save_fov_alignment_overlay's merge parameter.
         self._fov_overlays_saved = 0
         self._alignment_worker.fov_done.connect(
-            lambda fov, matrices: self._save_fov_alignment_overlay(
-                fov, matrices, storage_path, hybe_records, reference_hybe,
+            lambda fov, per_modality: self._save_fov_alignment_overlay(
+                fov, per_modality, specs_by_fov.get(fov, base_specs),
                 merge_persisted=(mode == 'append')))
         self._alignment_worker.finished_ok.connect(
-            lambda results: self._on_fov_alignment_all_finished(results, storage_path, hybe_records, reference_hybe))
+            lambda results: self._on_fov_alignment_all_finished(results, base_specs))
         self._alignment_worker.failed.connect(self._on_fov_alignment_all_failed)
         self._alignment_worker.start()
 
-    def _save_fov_alignment_overlay(self, fov, matrices, storage_path, hybe_records, reference_hybe,
+    def _save_fov_alignment_overlay(self, fov, per_modality, specs,
                                     merge_persisted=False):
         """
         One FOV's all-readouts overlay PNG, drawn as that FOV completes.
 
-        merge_persisted=True (append-mode runs): `matrices` is only this
-        run's DELTA -- drawing it alone would render an overlay of just
-        the newly aligned hybes. The full persisted set (already written
-        by the worker before fov_done fired) is read back and the delta
-        overlaid on top, so the PNG always shows the FOV's complete
-        current alignment. Bare-hybe keys throughout, matching what
-        align_same_modality emits.
+One PNG PER MODALITY: each modality has its own reference and its
+        own hybes, so they cannot share a figure. `per_modality` is
+        {modality: {hybe: H}} and `specs` carries each modality's storage
+        path / records / reference.
+
+        merge_persisted=True (append-mode runs): the matrices are only
+        this run's DELTA -- drawing them alone would render an overlay of
+        just the newly aligned hybes. The full persisted set (already
+        written by the worker before fov_done fired) is read back and the
+        delta overlaid on top, so the PNG always shows that modality's
+        complete current alignment. Bare-hybe keys throughout, matching
+        what the aligner emits.
 
         Runs on the GUI thread (AlignmentWorker.fov_done crosses the thread
         boundary as a queued connection) because it touches preview_canvas and
@@ -7857,36 +7917,52 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ap = self.ui.AlignmentPanel
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
-        try:
-            if merge_persisted:
-                persisted = analysis_store.read_same_modality_matrices(
-                    storage_path, fov, [r['folder'] for r in hybe_records])
-                merged = {h: H for (h, _m), H in persisted.items()}
-                merged.update(matrices)
-                matrices = merged
-            save_path = paths.figure_path(storage_path, 'alignment', fov, 'alignment_overlay.png')
-            self.preview_canvas.draw_fov_all_readouts_overlay(
-                storage_path, fov, hybe_records, reference_hybe, matrices,
-                save_path=save_path, channel_type=channel_type)
-            self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
-            self.log(f'FOV{fov:03d}: overlay image saved.')
-        except Exception as e:
-            self.log(f'FOV{fov:03d}: overlay image could not be saved ({e}); '
-                     f'matrices are unaffected.')
+        spec_by_modality = {sp['modality']: sp for sp in specs}
+        for modality, matrices in per_modality.items():
+            sp = spec_by_modality.get(modality)
+            if sp is None or not matrices:
+                continue
+            storage_path = sp['storage_path']
+            hybe_records = sp['hybe_records']
+            try:
+                if merge_persisted:
+                    persisted = analysis_store.read_same_modality_matrices(
+                        storage_path, fov, [r['folder'] for r in hybe_records])
+                    merged = {h: H for (h, _m), H in persisted.items()}
+                    merged.update(matrices)
+                    matrices = merged
+                save_path = paths.figure_path(storage_path, 'alignment', fov,
+                                              'alignment_overlay.png')
+                self.preview_canvas.draw_fov_all_readouts_overlay(
+                    storage_path, fov, hybe_records, sp['reference_hybe'], matrices,
+                    save_path=save_path, channel_type=channel_type)
+                self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
+                self.log(f'FOV{fov:03d} ({modality}): overlay image saved.')
+            except Exception as e:
+                self.log(f'FOV{fov:03d} ({modality}): overlay image could not be saved '
+                         f'({e}); matrices are unaffected.')
 
-    def _on_fov_alignment_all_finished(self, results, storage_path, hybe_records, reference_hybe):
+    def _on_fov_alignment_all_finished(self, results, specs):
         ap = self.ui.AlignmentPanel
-        self._same_modality_context = {'storage_path': storage_path, 'hybe_records': hybe_records, 'reference_hybe': reference_hybe}
-        for _fov, _m in results.items():
-            self._merge_fov_matrices(_fov, _m)
+        self._same_modality_context = {
+            'specs': [(sp['modality'], sp['storage_path'], sp['reference_hybe'],
+                       sp['hybe_records']) for sp in specs]}
+        for _fov, per_modality in results.items():
+            for _modality, _m in per_modality.items():
+                self._merge_fov_matrices(_fov, _m)
         self._pending_same_modality_alignment = None
         self._refresh_same_modality_results_list()
         ap.RunAllFovAlignmentPushButton.setEnabled(True)
         self.statusBar().showMessage('FOV alignment computed.', 5000)
 
+        # Each modality records its OWN reference hybe under its OWN
+        # storage path -- same_modality_reference_hybe is a
+        # modality-scoped param (analysis_store.MODALITY_SCOPED_PARAMS).
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
-        analysis_store.write_global_params(storage_path, same_modality_reference_hybe=reference_hybe,
-                                         same_modality_channel_type=channel_type)
+        for sp in specs:
+            analysis_store.write_global_params(
+                sp['storage_path'], same_modality_reference_hybe=sp['reference_hybe'],
+                same_modality_channel_type=channel_type)
         # Overlays are NOT drawn here any more -- each one was already written
         # by _save_fov_alignment_overlay as its FOV finished. Drawing them in
         # this slot meant every FOV's matplotlib work happened after the last
@@ -7922,22 +7998,35 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._pending_same_modality_alignment or ctx is None:
             return
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
-        analysis_store.write_global_params(ctx['storage_path'], same_modality_reference_hybe=ctx['reference_hybe'],
-                                         same_modality_channel_type=channel_type)
-        for fov, matrices in self._pending_same_modality_alignment.items():
-            alignment.write_same_modality_matrices(ctx['storage_path'], fov, matrices, ctx['reference_hybe'])
-            save_path = paths.figure_path(ctx['storage_path'], 'alignment', fov, 'alignment_overlay.png')
-            self.preview_canvas.draw_fov_all_readouts_overlay(ctx['storage_path'], fov, ctx['hybe_records'],
-                                                      ctx['reference_hybe'], matrices, save_path=save_path,
-                                                      channel_type=channel_type)
+        spec_by_modality = {sp[0]: sp for sp in ctx.get('specs', [])}
+        # Per modality, under its OWN storage path: the reference hybe is
+        # a modality-scoped param, and writing one modality's anchor into
+        # another's store would silently mislabel it.
+        for modality, storage_path, reference_hybe, _records in ctx.get('specs', []):
+            analysis_store.write_global_params(
+                storage_path, same_modality_reference_hybe=reference_hybe,
+                same_modality_channel_type=channel_type)
+        for fov, by_modality in self._pending_same_modality_alignment.items():
+            for modality, matrices in by_modality.items():
+                spec = spec_by_modality.get(modality)
+                if spec is None or not matrices:
+                    continue
+                _m, storage_path, reference_hybe, hybe_records = spec
+                alignment.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
+                save_path = paths.figure_path(storage_path, 'alignment', fov,
+                                              'alignment_overlay.png')
+                self.preview_canvas.draw_fov_all_readouts_overlay(
+                    storage_path, fov, hybe_records, reference_hybe, matrices,
+                    save_path=save_path, channel_type=channel_type)
         # Capture the CHANGED FOV set before pending is nulled -- the
         # recast below is scoped to exactly these, per audit: recasting
         # every loaded FOV (34 at real scale) turned a one-FOV accept
         # into thousands of NAS opens rewriting slices whose matrices
         # never moved.
         changed_fovs = list(self._pending_same_modality_alignment.keys())
-        for _fov, _m in self._pending_same_modality_alignment.items():
-            self._merge_fov_matrices(_fov, _m)
+        for _fov, _by_modality in self._pending_same_modality_alignment.items():
+            for _modality, _m in _by_modality.items():
+                self._merge_fov_matrices(_fov, _m)
         self._pending_same_modality_alignment = None
         self._refresh_same_modality_results_list()
         ap.SameModalityAcceptPushButton.setEnabled(False)
@@ -7962,26 +8051,33 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.SameModalityRejectPushButton.setEnabled(False)
 
     def _show_same_modality_preview(self, item):
-        fov, hybe = item.data(QtCore.Qt.UserRole)
+        fov, hybe, modality = item.data(QtCore.Qt.UserRole)
         ctx = self._same_modality_context
         if ctx is None:
             return
+        # the row names its own modality, so the preview resolves that
+        # modality's storage path / records / reference rather than a
+        # single "current" one
+        spec = next((sp for sp in ctx.get('specs', []) if sp[0] == modality), None)
+        if spec is None:
+            return
+        _modality, storage_path, reference_hybe, hybe_records = spec
         # the reference hybe's own row is a legitimate result too (its
         # matrix is the identity, by construction -- see
         # align_same_modality) -- show it like any other, not a
         # silent no-op, so before/after correctly display as identical.
-        fiducial_channels = {r['folder']: r['fiducial_channel'] for r in ctx['hybe_records']}
+        fiducial_channels = {r['folder']: r['fiducial_channel'] for r in hybe_records}
         # a staged (not-yet-accepted) manual result takes priority so the
         # preview shows what the user is actually about to accept/reject,
         # not a stale prior result
-        matrices = ((self._pending_same_modality_alignment or {}).get(fov)
-                    or self._fov_matrices_for(ctx['storage_path'], fov))
+        matrices = ((self._pending_same_modality_alignment or {}).get(fov, {}).get(modality)
+                    or self._fov_matrices_for(storage_path, fov))
         if matrices is None:
             return
         self.alignment_preview_window.show_canvas()
         self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_same_modality_preview(ctx['storage_path'], fov, ctx['reference_hybe'], hybe,
-                                                    fiducial_channels, matrices)
+        self.preview_canvas.draw_same_modality_preview(storage_path, fov, reference_hybe, hybe,
+                                                       fiducial_channels, matrices)
 
     def _show_same_modality_all_readouts_overlay(self):
         """
@@ -7995,29 +8091,30 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ap = self.ui.AlignmentPanel
         fov = ap.SameModalityOverlayFovSpinBox.value()
-        reference_hybe = ap.current_reference_hybe()
-        modality = ap.current_reference_modality()
-        storage_path = self._storage_path_for_modality(modality)
-        hybe_records = self.ui.IngestionPanel.modality_data.get(modality, {}).get('active_hybe_list', []) if modality else []
-        if not storage_path or not reference_hybe or not hybe_records:
-            QtWidgets.QMessageBox.warning(self, 'Show All-Readouts Overlay',
-                                          'Set storage path (Ingestion tab) and reference hybe first.')
+        specs, problems = self._same_modality_specs()
+        if not specs:
+            QtWidgets.QMessageBox.warning(
+                self, 'Show All-Readouts Overlay',
+                'Nothing to show: ' + ('; '.join(problems) or
+                'set storage path (Ingestion tab) and a reference hybe per modality.'))
             return
-
-        ctx = self._same_modality_context
-        matrices = None
-        if ctx is not None and ctx.get('storage_path') == storage_path:
-            matrices = (self._pending_same_modality_alignment or {}).get(fov)
-        if matrices is None:
-            matrices = self._fov_matrices_for(storage_path, fov)
-        if matrices is None:
-            matrices = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
 
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
         self.alignment_preview_window.show_canvas()
         self.alignment_preview_window.raise_()
-        self.preview_canvas.draw_fov_all_readouts_overlay(storage_path, fov, hybe_records, reference_hybe, matrices,
-                                                  channel_type=channel_type)
+        # One figure per modality -- each has its own reference and hybes.
+        for sp in specs:
+            storage_path, hybe_records = sp['storage_path'], sp['hybe_records']
+            matrices = (self._pending_same_modality_alignment or {}).get(fov, {}).get(sp['modality'])
+            if matrices is None:
+                matrices = self._fov_matrices_for(storage_path, fov)
+            if matrices is None:
+                matrices = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
+            if not matrices:
+                continue
+            self.preview_canvas.draw_fov_all_readouts_overlay(
+                storage_path, fov, hybe_records, sp['reference_hybe'], matrices,
+                channel_type=channel_type)
 
     # -- cross-modal alignment --
 
@@ -9987,7 +10084,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'z_end': ('CellSegmentPanel', 'ZEndSpinBox'),
         },
         'fov_alignment': {
-            'reference_hybe': ('AlignmentPanel', 'ReferenceHybeComboBox'),
+            # reference_hybe is per-modality now (reference_hybe_{name}),
+            # written/read alongside cell_alignment's own -- see
+            # _collect_config_params / _apply_config_params.
             'channel_type': ('AlignmentPanel', 'SameModalityChannelTypeComboBox'),
             'border_trim': ('AlignmentPanel', 'SameModalityBorderTrimSpinBox'),
             'max_shift': ('AlignmentPanel', 'SameModalityMaxShiftSpinBox'),
@@ -10090,6 +10189,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for section, entries in self._CONFIG_PARAM_MAP.items():
             out[section] = {param: self._widget_value(getattr(getattr(self.ui, panel), widget))
                             for param, (panel, widget) in entries.items()}
+        for name, hybe in self.ui.AlignmentPanel.same_modality_references().items():
+            out['fov_alignment'][f'reference_hybe_{name}'] = hybe
         for name, hybe in self.ui.AlignmentPanel.cell_align_references().items():
             out['cell_alignment'][f'reference_hybe_{name}'] = hybe
         for name, hybe in self.ui.AlignmentPanel.cross_modal_references().items():
@@ -10114,6 +10215,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for section, fields in params.items():
             entries = self._CONFIG_PARAM_MAP.get(section, {})
             for param, value in fields.items():
+                if section == 'fov_alignment' and param.startswith('reference_hybe_'):
+                    self.ui.AlignmentPanel.select_same_modality_reference_hybe(
+                        param[len('reference_hybe_'):], value)
+                    continue
                 if section == 'cell_alignment' and param.startswith('reference_hybe_'):
                     self.ui.AlignmentPanel.select_cell_reference_hybe(
                         param[len('reference_hybe_'):], value)

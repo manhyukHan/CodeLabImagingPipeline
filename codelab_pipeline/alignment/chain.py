@@ -741,6 +741,138 @@ def _align_one_hybe(task):
     return hybe, H, None
 
 
+# -- FOV-major, all-modalities alignment ----------------------------------
+#
+# One pool per FOV carrying every (modality, hybe) that FOV needs, rather
+# than one pool per (modality, FOV) run back to back. Same rule ingestion
+# follows: finish a FOV completely across every modality, then move to
+# the next one, so a FOV becomes fully usable as early as possible
+# instead of every modality advancing in lockstep.
+#
+# The single-value reference cache above cannot serve this -- two
+# modalities in one pool means two different (storage_path, reference
+# hybe) pairs -- so the multi-modality worker keys its cache and fills it
+# lazily. Each reference MIP is still read at most once per child.
+
+_ALIGN_REFERENCE_CACHE = {}
+
+
+def _init_align_worker_multi():
+    """Pin OpenCV to one thread per child (see _init_align_worker); the
+    reference MIPs are cached lazily per key instead of up front."""
+    cv2.setNumThreads(1)
+
+
+def _align_one_hybe_multi(task):
+    """One (modality, hybe -> that modality's reference) fit."""
+    (modality, storage_path, fov, hybe, channel, reference_hybe,
+     ref_channel, lb, ub, border_trim, max_shift) = task
+    key = (storage_path, fov, reference_hybe, ref_channel)
+    if key not in _ALIGN_REFERENCE_CACHE:
+        _ALIGN_REFERENCE_CACHE[key] = analysis_store.read_hybe_mip(
+            storage_path, fov, reference_hybe, ref_channel)
+    reference_mip = _ALIGN_REFERENCE_CACHE[key]
+    if reference_mip is None:
+        return modality, hybe, None, f'reference {reference_hybe} not ingested'
+    moving_mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
+    if moving_mip is None:
+        return modality, hybe, None, 'not ingested'
+    H = align_readout_to_reference(moving_mip, reference_mip, lb, ub,
+                                   border_trim=border_trim, max_shift=max_shift)
+    return modality, hybe, H, None
+
+
+def align_fov_all_modalities(fov, specs, lb=0.3, ub=0.9999, write=True,
+                             border_trim=0, max_shift=None, progress=None,
+                             workers=None):
+    """
+    Align EVERY configured modality's hybes for ONE FOV, in one pool.
+
+    specs: [{'modality', 'storage_path', 'hybe_records', 'reference_hybe'},
+    ...] -- one entry per modality. Each modality aligns to ITS OWN
+    reference hybe: alignment is per-modality maths (a hybe is comparable
+    only to another hybe of the same modality, fiducial to fiducial), and
+    only the SCHEDULING is shared.
+
+    Returns {modality: {hybe: 3x3}}. The reference hybe of each modality
+    maps to identity by construction.
+
+    progress: callable(done, total, fov, label) after every hybe, where
+    total counts hybes across ALL modalities -- this is one FOV's work,
+    so it reports as one unit.
+
+    write=True persists each modality's matrices under its own storage
+    path, exactly as align_same_modality does.
+    """
+    per_modality = {}
+    tasks = []
+    total = 0
+    for spec in specs:
+        modality = spec['modality']
+        storage_path = spec['storage_path']
+        reference_hybe = spec['reference_hybe']
+        records = list(spec['hybe_records'])
+        by_folder = {r['folder']: r for r in records}
+        ref_record = by_folder.get(reference_hybe)
+        if ref_record is None:
+            raise ValueError(f"reference hybe {reference_hybe} is not in {modality}'s "
+                             f"hybe list for FOV{fov:03d}")
+        per_modality[modality] = {reference_hybe: np.eye(3)}
+        total += len(records)
+        for r in records:
+            if r['folder'] == reference_hybe:
+                continue
+            tasks.append((modality, storage_path, fov, r['folder'], r['fiducial_channel'],
+                          reference_hybe, ref_record['fiducial_channel'],
+                          lb, ub, border_trim, max_shift))
+
+    done = [0]
+
+    def _report(label):
+        done[0] += 1
+        if progress is not None:
+            progress(done[0], max(total, 1), fov, label)
+
+    for spec in specs:                       # the identity references
+        _report(f"{spec['reference_hybe']} ({spec['modality']})")
+
+    n_workers = max_alignment_workers() if workers is None else max(1, int(workers))
+    executor = None
+    if n_workers > 1 and len(tasks) > 1:
+        try:
+            executor = ProcessPoolExecutor(
+                max_workers=min(n_workers, len(tasks)),
+                mp_context=multiprocessing.get_context('spawn'),
+                initializer=partial(process_guard.child_initializer,
+                                    _init_align_worker_multi))
+        except Exception:
+            executor = None                  # degrade to serial, never fail here
+
+    if executor is not None:
+        with executor:
+            futures = [executor.submit(_align_one_hybe_multi, t) for t in tasks]
+            for future in as_completed(futures):
+                modality, hybe, H, err = future.result()
+                if err is not None:
+                    raise ValueError(f'FOV{fov:03d} {hybe} ({modality}): {err}')
+                per_modality[modality][hybe] = H
+                _report(f'{hybe} ({modality})')
+    else:
+        for task in tasks:
+            modality, hybe, H, err = _align_one_hybe_multi(task)
+            if err is not None:
+                raise ValueError(f'FOV{fov:03d} {hybe} ({modality}): {err}')
+            per_modality[modality][hybe] = H
+            _report(f'{hybe} ({modality})')
+
+    if write:
+        for spec in specs:
+            modality = spec['modality']
+            write_same_modality_matrices(spec['storage_path'], fov,
+                                         per_modality[modality], spec['reference_hybe'])
+    return per_modality
+
+
 def max_alignment_workers(hard_ceiling=32):
     """
     How many hybe fits to run at once.
