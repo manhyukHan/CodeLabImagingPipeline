@@ -2396,14 +2396,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._merge_fov_matrices(fov, matrices)
 
         display_results = {fov: dict(by_mod) for fov, by_mod in disk_results.items()}
+        # EVERY source is scoped to the SELECTED FOV, not just the disk
+        # one. self.fov_matrices accumulates every FOV visited this
+        # session and the staged dict spans whatever was last run, so
+        # iterating those made the list GROW as you moved the spinbox
+        # instead of re-scoping -- it looked like it was appending FOVs.
+        selected = set(fov_list)
         for modality, storage_path, _reference_hybe, _records in specs:
-            for fov in self.fov_matrices:
+            for fov in selected:
                 matrices = self._fov_matrices_for(storage_path, fov)
                 if matrices:
                     display_results.setdefault(fov, {})[modality] = matrices
         pending = set()
         if self._pending_same_modality_alignment:
             for fov, by_modality in self._pending_same_modality_alignment.items():
+                if fov not in selected:
+                    continue
                 for modality, matrices in by_modality.items():
                     display_results.setdefault(fov, {})[modality] = matrices
                     pending.add((fov, modality))
@@ -8160,13 +8168,18 @@ One PNG PER MODALITY: each modality has its own reference and its
                 if H is not None:
                     display[fov] = H
                     self.cross_modal_result[(msp, fov)] = H
+            # scoped to the SELECTED FOV like the disk read above --
+            # cross_modal_result and the staged dict both span every FOV
+            # touched this session, so iterating them unscoped made the
+            # list grow instead of re-scope.
+            selected = set(fov_list)
             for (sp, fov), H in self.cross_modal_result.items():
-                if sp == msp:
+                if sp == msp and fov in selected:
                     display[fov] = H
             pending_fovs = set()
             if self._pending_cross_modal:
                 for (sp, fov), H in self._pending_cross_modal.items():
-                    if sp == msp:
+                    if sp == msp and fov in selected:
                         display[fov] = H
                         pending_fovs.add(fov)
             for fov in sorted(display):

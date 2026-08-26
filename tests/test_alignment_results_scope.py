@@ -96,9 +96,22 @@ def main():
     mw._storage_path_for_modality = lambda m: {'DNA': '/store/DNA', 'RNA': '/store/RNA'}[m]
     mw._ingested_hybes_for_fov = lambda sp, fov, recs: ([r['folder'] for r in recs], [], [])
     mw._merge_fov_matrices = lambda *a, **k: None
-    mw._fov_matrices_for = lambda sp, fov: None
-    mw.fov_matrices = {}
-    mw._pending_same_modality_alignment = None
+    # The in-memory cache holds EVERY FOV visited this session and the
+    # staged dict spans whatever was last run. Both used to be iterated
+    # unscoped, so the list grew as the spinbox moved rather than
+    # re-scoping -- the reported "it appends FOVs". Populate both with
+    # OTHER FOVs so a leak is visible.
+    mw.fov_matrices = {1: object(), 2: object(), 3: object(), 7: object()}
+    # path-aware, like the real one: each storage path answers with its
+    # OWN modality's matrices (a path-blind stub would have one modality
+    # overwrite the other's row and prove nothing)
+    mw._fov_matrices_for = lambda sp, fov: (
+        {('D_ref', 'DNA'): np.eye(3), ('D_a', 'DNA'): np.eye(3)} if 'DNA' in sp
+        else {('R_ref', 'RNA'): np.eye(3), ('R_a', 'RNA'): np.eye(3)})
+    # staged rows belong to ANOTHER run's FOV only -- a staged entry on
+    # the selected FOV legitimately REPLACES that modality's rows (it is
+    # what Accept would write), so it would mask the completeness check
+    mw._pending_same_modality_alignment = {9: {'DNA': {'D_ref': np.eye(3)}}}
 
     def fake_read(sp, fov, recs):
         # every FOV has matrices, so any FOV leaking in would be visible
@@ -114,6 +127,8 @@ def main():
     fovs = {f for f, _h, _m in rows}
     mods = {m for _f, _h, m in rows}
     check('same-modality list shows ONLY the spinbox FOV', fovs == {2}, str(fovs))
+    check('in-memory FOVs (1, 3, 7) do not leak in', not ({1, 3, 7} & fovs), str(fovs))
+    check('staged FOVs from another run (9) do not leak in', 9 not in fovs, str(fovs))
     check('same-modality list shows EVERY modality for it', mods == {'DNA', 'RNA'}, str(mods))
     check('every hybe of that FOV is listed',
           {(h, m) for _f, h, m in rows}
@@ -127,13 +142,16 @@ def main():
                  for i in range(ap.SameModalityResultsListWidget.count())]
     check('changing the FOV spinbox re-scopes the list',
           {f for f, _h, _m in rows3} == {3}, str({f for f, _h, _m in rows3}))
+    check('the list REPLACES rather than appends across refreshes',
+          len(rows3) == len(rows), f'{len(rows)} then {len(rows3)}')
 
     # --- FOV scoping, cross-modal -----------------------------------
     mw._shared_frame_modality = lambda: 'RNA'
     mw._cross_modal_moving_modalities = lambda: ['DNA']
-    mw.cross_modal_result = {}
+    # again, other FOVs present in memory and staged
+    mw.cross_modal_result = {('/store/DNA', 1): np.eye(3), ('/store/DNA', 5): np.eye(3)}
     mw.cross_modal_z = {}
-    mw._pending_cross_modal = None
+    mw._pending_cross_modal = {('/store/DNA', 8): np.eye(3)}
     mw._pending_cross_modal_z = None
     mw._pending_cross_modal_quality = None
     with mock.patch.object(MW.analysis_store, 'read_cross_modal_matrix',
@@ -148,6 +166,8 @@ def main():
                  for i in range(ap.CrossModalResultsListWidget.count())]
     check('cross-modal list shows ONLY the spinbox FOV',
           len(xrows) == 1 and xrows[0].startswith('FOV002'), str(xrows))
+    check('cross-modal in-memory/staged FOVs do not leak in',
+          not any(r.startswith(('FOV001', 'FOV005', 'FOV008')) for r in xrows), str(xrows))
 
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
