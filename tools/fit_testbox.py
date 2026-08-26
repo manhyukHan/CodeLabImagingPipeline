@@ -79,6 +79,31 @@ SEED = 20260826
 
 # -- stage 1: harvest ----------------------------------------------------
 
+DEFAULT_FIGURES_DIR = os.path.join('notes', 'chromatin_tracing_optimization')
+
+
+def anchor_label(fov, spot_dict):
+    """
+    A name that identifies the SOURCE SPOT, not the allele's position in
+    a selection.
+
+    An allele's id is just its index in whatever was selected, so
+    "allele 1" means nothing once the selection changes and cannot be
+    traced back to anything on disk. The anchor can: uid is the spot's
+    unique key within its FOV, and the cell / hybe / channel /
+    coordinate make it findable by eye in the Spot panel. Filename-safe,
+    so the same string works as figure title and file name.
+    """
+    y, x, z = spot_dict['adj_coordinate']
+    cell = int(spot_dict['cell'])
+    # -1 is the real "no owning cell" value; printing it as cell-01 reads
+    # like a cell id, which it is not
+    cell_bit = 'cellNONE' if cell == -1 else f'cell{cell:03d}'
+    return (f'FOV{fov:03d}_uid{int(spot_dict.get("uid", 0)):05d}_{cell_bit}'
+            f'_{spot_dict["hybe"]}-ch{int(spot_dict["channel"])}'
+            f'_y{y:.0f}-x{x:.0f}-z{z:.0f}')
+
+
 def _save_allele_figures(mw, allele, debug, out_dir, label):
     """
     The four pop-ups View Crop opens, rendered straight to PNG.
@@ -163,16 +188,26 @@ def harvest(out_path, n_alleles, figures_dir=None):
           f'(reference {REFERENCE_HYBE})')
     print(f'replicates : {len(replicate_pairs(records))} same-locus pairs')
 
-    pool = []
+    # STRATIFIED by FOV, not a flat random draw: a flat sample of 12 from
+    # 439 legitimately put both of the first probe's alleles in one FOV,
+    # and a bench that silently covers one FOV cannot show a per-FOV
+    # effect (segmentation, drift and focus all vary FOV to FOV).
+    rng = random.Random(SEED)
+    by_fov, chosen = {}, []
     for fov in FOVS:
-        for d in V.read_spots(sp, fov, MODALITY, ANCHOR_HYBE, ANCHOR_CHANNEL):
-            pool.append((fov, d))
-    print(f'candidates : {len(pool)} {ANCHOR_HYBE}/ch{ANCHOR_CHANNEL} spots '
-          f'over FOV {list(FOVS)}')
-    chosen = random.Random(SEED).sample(pool, min(n_alleles, len(pool)))
-    print(f'selected   : {len(chosen)} alleles (seed {SEED})\n')
+        by_fov[fov] = V.read_spots(sp, fov, MODALITY, ANCHOR_HYBE, ANCHOR_CHANNEL)
+    total = sum(len(v) for v in by_fov.values())
+    per_fov = max(1, n_alleles // len(FOVS))
+    for fov in FOVS:
+        pool = by_fov[fov]
+        for d in rng.sample(pool, min(per_fov, len(pool))):
+            chosen.append((fov, d))
+    print(f'candidates : {total} {ANCHOR_HYBE}/ch{ANCHOR_CHANNEL} spots '
+          f'over FOV {list(FOVS)} '
+          f'({", ".join(f"FOV{f:03d}:{len(by_fov[f])}" for f in FOVS)})')
+    print(f'selected   : {len(chosen)} alleles, {per_fov} per FOV (seed {SEED})\n')
 
-    frozen, meta, zpred = {}, [], {}
+    frozen, meta, zpred, labels = {}, [], {}, []
     t_start = time.perf_counter()
     for i, (fov, d) in enumerate(chosen, start=1):
         mw._activate_fov(fov)
@@ -212,13 +247,13 @@ def harvest(out_path, n_alleles, figures_dir=None):
                 frozen[f'a{i}|{hybe}|{kind}'] = np.asarray(cube, dtype=np.float32)
                 kept += 1
         meta.append((i, fov, d.get('uid', 0), d['cell'], kept))
+        label = anchor_label(fov, d)
+        labels.append(f'a{i}|{label}')
         note = ''
         if figures_dir:
-            label = f'FOV{fov:03d}_allele{i}'
             written = _save_allele_figures(mw, allele, debug, figures_dir, label)
             note = f'  +{len(written)} figures'
-        print(f'  allele {i:>3} FOV{fov:03d} cell={d["cell"]:<5} '
-              f'{kept:>3} crops  {dt:6.1f}s{note}')
+        print(f'  [{i:>3}/{len(chosen)}] {label}  {kept:>3} crops  {dt:6.1f}s{note}')
 
     np.savez_compressed(
         out_path,
@@ -226,6 +261,9 @@ def harvest(out_path, n_alleles, figures_dir=None):
         __hybes__=np.array(hybes),
         __pairs__=np.array([f'{a}|{b}|{r}' for a, b, r in replicate_pairs(records)]),
         __zpred__=np.array([f'{k}|{v[0]:.4f}|{v[1]:.4f}' for k, v in zpred.items()]),
+        # a{i} -> the SOURCE SPOT, so a frozen bench stays traceable back
+        # to the store after the selection that produced it is gone
+        __labels__=np.array(labels),
         **frozen)
     print(f'\nfroze {len(frozen)} crops from {len(meta)} alleles -> {out_path} '
           f'({os.path.getsize(out_path) / 1e6:.1f} MB) '
@@ -260,14 +298,123 @@ def _load(bench_path):
     return b, zpred, pairs
 
 
-def _seed_z(cube, key, zpred, source):
-    """Where the fit starts in depth. 'argmax' is what ships today."""
+def _seed(cube, key, zpred, source, zhalf=15):
+    """
+    Where the fit starts, as (y, x, z).
+
+    'argmax' is what ships today: the brightest voxel in the whole
+    ~110-plane column, XY and Z together.
+
+    'predicted' uses the pipeline's own answer for the depth -- allele z
+    (shared) minus this hybe's cell_z_offset -- and then takes XY from
+    the brightest voxel WITHIN that depth neighbourhood. Taking XY from
+    the global argmax instead would be a rigged comparison: that voxel
+    can sit at a completely different depth, so the seed would be a point
+    no emitter occupies.
+    """
     if source == 'argmax':
-        return float(np.unravel_index(int(np.nanargmax(cube)), cube.shape)[2])
+        iy, ix, iz = np.unravel_index(int(np.nanargmax(cube)), cube.shape)
+        return float(iy), float(ix), float(iz)
     zp = zpred.get(key.rsplit('|', 1)[0], (None, None))[0]
     if zp is None:
-        return float(np.unravel_index(int(np.nanargmax(cube)), cube.shape)[2])
-    return float(np.clip(zp, 0, cube.shape[2] - 1))
+        return _seed(cube, key, zpred, 'argmax')
+    zc = int(np.clip(round(zp), 0, cube.shape[2] - 1))
+    lo, hi = max(0, zc - zhalf), min(cube.shape[2], zc + zhalf + 1)
+    window = cube[:, :, lo:hi]
+    if not np.isfinite(window).any():
+        return _seed(cube, key, zpred, 'argmax')
+    iy, ix, iz = np.unravel_index(int(np.nanargmax(window)), window.shape)
+    return float(iy), float(ix), float(iz + lo)
+
+
+def _fit_one(cube, zhalf, peak_bound, max_sigma):
+    """
+    One crop, fitted the way the pipeline does it, optionally with the
+    fit restricted to +/-zhalf planes around the seed.
+
+    Returns (result_in_full_crop_coords, seed, railed_flags) or None.
+    zhalf=None is what ships today: the whole ~110-plane column.
+
+    SEEDING MATCHES PRODUCTION EXACTLY, and the two axes differ:
+    _localize_fiducial_hybe seeds XY at the ANCHOR's mapped position
+    (x0 = raw_x - xmin, i.e. the crop centre -- the allele is where the
+    alignment says it is) but seeds Z at the crop's global ARGMAX,
+    because the anchor carries no usable depth. Seeding XY at the argmax
+    instead measures a fit the pipeline never performs.
+    """
+    from codelab_pipeline.localization import localization as L
+    iz = int(np.unravel_index(int(np.nanargmax(cube)), cube.shape)[2])
+    iy, ix = (cube.shape[0] - 1) / 2.0, (cube.shape[1] - 1) / 2.0
+    if zhalf is None:
+        sub, z_off = cube, 0
+    else:
+        lo, hi = max(0, iz - zhalf), min(cube.shape[2], iz + zhalf + 1)
+        sub, z_off = cube[:, :, lo:hi], lo
+    r = L.fit_gaussian_3d(sub, float(ix), float(iy), float(iz - z_off),
+                          peak_bound=peak_bound, max_sigma=max_sigma)
+    if r is None:
+        return None
+    amp, x0, y0, z0, sx, sy, sz, off = r
+    railed_pos = abs(abs(z0 - (iz - z_off)) - peak_bound) < 1e-6
+    railed_sig = (abs(sx - max_sigma) < 1e-6 or abs(sy - max_sigma) < 1e-6
+                  or abs(sz - 2 * max_sigma) < 1e-6)
+    return (y0, x0, z0 + z_off), railed_pos, railed_sig
+
+
+def volumes(bench_path, zhalves, peak_bound, max_sigma):
+    """
+    Does restricting the FIT VOLUME change the answer? Reported against
+    the replicate-pair ground truth, per channel, with railing counts so
+    a change in accuracy can be read together with a change in how often
+    the fit hit a constraint instead of an optimum.
+    """
+    b, zpred, pairs = _load(bench_path)
+    meta = b['__meta__']
+    print(f'bench      : {bench_path}')
+    print(f'alleles    : {len(meta)}   crops: {len(b.files) - 5}')
+    print(f'bounds     : peak_bound={peak_bound}  max_sigma={max_sigma}\n')
+
+    for kind in ('fiducial', 'readout'):
+        keys = [k for k in b.files if k.endswith('|' + kind)]
+        depth = b[keys[0]].shape[2]
+        print(f'--- {kind}: {len(keys)} crops, full depth {depth} planes ---')
+        hdr = (f'{"fit volume":<22}{"accepted":>11}{"pos railed":>12}'
+               f'{"sig railed":>12}{"pairs":>10}{"median XY":>12}{"p90":>8}')
+        print(hdr)
+        print('-' * len(hdr))
+        for zhalf in zhalves:
+            found, rp, rs, n = {}, 0, 0, 0
+            for k in keys:
+                out = _fit_one(b[k].astype(float), zhalf, peak_bound, max_sigma)
+                if out is None:
+                    continue
+                pos, railed_pos, railed_sig = out
+                n += 1
+                rp += railed_pos
+                rs += railed_sig
+                found[k] = pos
+            dists, both, either = [], 0, 0
+            for aid, *_r in meta:
+                for a, bb, _rid in pairs:
+                    ka, kb = f'a{aid}|{a}|{kind}', f'a{aid}|{bb}|{kind}'
+                    if ka not in b.files or kb not in b.files:
+                        continue
+                    either += 1
+                    pa, pb2 = found.get(ka), found.get(kb)
+                    if pa is None or pb2 is None:
+                        continue
+                    both += 1
+                    dists.append(float(np.linalg.norm(
+                        np.array(pa[:2]) - np.array(pb2[:2]))))
+            d = np.array(dists) if dists else np.array([np.nan])
+            label = 'full column (SHIPS)' if zhalf is None else f'+/-{zhalf} planes'
+            med, p90 = np.nanmedian(d), np.nanpercentile(d, 90)
+            print(f'{label:<22}{n:>5}/{len(keys):<5}{rp:>7}/{n:<4}{rs:>7}/{n:<4}'
+                  f'{both:>6}/{either:<3}{med:>11.3f}px{p90:>7.3f}')
+        print()
+    print('median XY = distance between two rounds of the SAME locus in the SAME')
+    print('allele; lower is better. "railed" = the fit stopped on a constraint')
+    print('rather than at an optimum, so its value and its CI are not measurements.')
 
 
 def score(bench_path, sources, n_max):
@@ -275,9 +422,15 @@ def score(bench_path, sources, n_max):
     b, zpred, pairs = _load(bench_path)
     meta = b['__meta__']
     crops = [k for k in b.files if not k.startswith('__')]
+    labels = dict(s.split('|', 1) for s in b['__labels__']) if '__labels__' in b.files else {}
     print(f'bench      : {bench_path}')
     print(f'alleles    : {len(meta)}   crops: {len(crops)}')
-    print(f'replicates : {len(pairs)} same-locus pairs per allele\n')
+    print(f'replicates : {len(pairs)} same-locus pairs per allele')
+    if labels:
+        print('anchors    :')
+        for aid, *_rest in meta:
+            print(f'   a{aid:<4} {labels.get(f"a{aid}", "?")}')
+    print()
 
     # -- how far apart are the two candidate seeds, before any fitting? --
     gaps = []
@@ -285,8 +438,8 @@ def score(bench_path, sources, n_max):
         if not k.endswith('|readout'):
             continue
         cube = b[k]
-        gaps.append(abs(_seed_z(cube, k, zpred, 'argmax')
-                        - _seed_z(cube, k, zpred, 'predicted')))
+        gaps.append(abs(_seed(cube, k, zpred, 'argmax')[2]
+                        - _seed(cube, k, zpred, 'predicted')[2]))
     gaps = np.array(gaps)
     print('SEED DISAGREEMENT (readout crops), |argmax z - predicted z|, planes')
     print(f'  median {np.median(gaps):6.1f}   mean {gaps.mean():6.1f}   '
@@ -304,9 +457,7 @@ def score(bench_path, sources, n_max):
         t0 = time.perf_counter()
         for k in crops:
             cube = b[k]
-            z0 = _seed_z(cube, k, zpred, source)
-            iy, ix, _iz = np.unravel_index(int(np.nanargmax(cube)), cube.shape)
-            spots = engine.localize(cube, seed_yxz=(float(iy), float(ix), z0),
+            spots = engine.localize(cube, seed_yxz=_seed(cube, k, zpred, source),
                                     n_max=n_max)
             if spots:
                 s = spots[0]
@@ -347,16 +498,26 @@ def main():
     h = sub.add_parser('harvest', help='freeze real crops to an .npz (slow, NAS)')
     h.add_argument('--out', required=True)
     h.add_argument('--alleles', type=int, default=12)
-    h.add_argument('--figures', default=None,
-                   help='also render View Crop\'s four figures per allele into this directory')
+    h.add_argument('--figures', nargs='?', const=DEFAULT_FIGURES_DIR, default=None,
+                   help=f'also render View Crop\'s four figures per allele; '
+                        f'bare --figures uses {DEFAULT_FIGURES_DIR}')
     s = sub.add_parser('score', help='replay frozen crops (fast, local)')
     s.add_argument('bench')
     s.add_argument('--z-source', action='append', default=None,
                    choices=['argmax', 'predicted'])
     s.add_argument('--n-max', type=int, default=1)
+    v = sub.add_parser('volumes', help='does restricting the FIT VOLUME help?')
+    v.add_argument('bench')
+    v.add_argument('--peak-bound', type=float, default=2.0)
+    v.add_argument('--max-sigma', type=float, default=2.5)
+    v.add_argument('--z-half', action='append', type=int, default=None,
+                   help='half-window in planes; repeatable. Full column always included.')
     a = ap.parse_args()
     if a.cmd == 'harvest':
         harvest(a.out, a.alleles, a.figures)
+    elif a.cmd == 'volumes':
+        volumes(a.bench, [None] + (a.z_half or [25, 15, 8]),
+                a.peak_bound, a.max_sigma)
     else:
         score(a.bench, a.z_source or ['argmax', 'predicted'], a.n_max)
 
