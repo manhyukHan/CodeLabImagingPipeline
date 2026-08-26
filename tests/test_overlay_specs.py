@@ -279,6 +279,36 @@ def main():
               for sc in lw.findChildren(QtWidgets.QShortcut)
               + mw.spot_crop_displayer.findChildren(QtWidgets.QShortcut)))
 
+    # 9. the Barcode Overview and the Celltype Result must give the SAME
+    #    celltype the SAME colour. They used to colour independently --
+    #    the overview by its channel dict's insertion order (i.e. the
+    #    order celltypes were assigned), the result by sorted name -- so
+    #    with WT/4A3/8B1 assigned in that order WT drew red in one window
+    #    and green in the other, side by side on screen.
+    from canvas.barcode_overview_displayer import BarcodeOverviewDisplayer
+    from canvas.celltype_result_displayer import CelltypeResultDisplayer
+    from canvas import celltype_colors
+    import numpy as _np
+
+    chans = [('Hyb_130', 635, 'DNA'), ('Hyb_132', 635, 'DNA'), ('Hyb_135', 635, 'DNA')]
+    ct_names = ['WT', '4A3', '8B1']          # deliberately NOT alphabetical
+    ct_by_chan = dict(zip(chans, ct_names))
+    ov = BarcodeOverviewDisplayer()
+    ov.set_data({c: _np.zeros((16, 16), dtype=_np.uint16) for c in chans},
+                {c: f'{n}: {c[0]}' for c, n in zip(chans, ct_names)},
+                celltype_by_channel=ct_by_chan)
+    overview_colors = {ct_by_chan[c]: ov._color_for(i, c) for i, c in enumerate(chans)}
+    result_colors = celltype_colors.colors_for_names(ct_names)
+    check('overview and result agree on every celltype colour',
+          all(overview_colors[n] == result_colors[n] for n in ct_names),
+          str({n: (celltype_colors.hex_of(overview_colors[n]),
+                   celltype_colors.hex_of(result_colors[n])) for n in ct_names}))
+    check('colour depends on the NAME, not on assignment order',
+          celltype_colors.colors_for_names(['WT', '4A3', '8B1'])
+          == celltype_colors.colors_for_names(['8B1', 'WT', '4A3']))
+    check('each celltype gets a distinct colour',
+          len({tuple(v) for v in result_colors.values()}) == len(ct_names))
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:

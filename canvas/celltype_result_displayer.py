@@ -6,14 +6,8 @@ import matplotlib.cm as cm
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
+from canvas import celltype_colors
 
-# same categorical palette as canvas/barcode_overview_displayer.py -- one
-# distinct color per celltype name, not a gradient, since celltypes are
-# genuinely different unordered categories
-_CATEGORICAL_COLORS = [
-    (0.90, 0.10, 0.10), (0.10, 0.65, 0.90), (0.15, 0.80, 0.15), (0.95, 0.75, 0.10),
-    (0.70, 0.20, 0.90), (0.95, 0.45, 0.10), (0.10, 0.85, 0.75), (0.85, 0.10, 0.55),
-]
 
 
 class CelltypeResultDisplayer(QtWidgets.QMainWindow):
@@ -87,14 +81,17 @@ class CelltypeResultDisplayer(QtWidgets.QMainWindow):
         ax[1].set_title('Celltype', fontsize=10)
         ax[1].axis('off')
 
+        # ONE shared rule, keyed on the celltype NAME -- see
+        # canvas/celltype_colors.py for why this must not be re-derived
+        # per view (WT drew red here and green in the Barcode Overview).
         names = sorted(set(v for v in self.celltype_by_id.values() if v))
-        color_by_name = {name: _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)] for i, name in enumerate(names)}
+        color_by_name = celltype_colors.colors_for_names(names)
         counts = {name: 0 for name in names}
         counts['(unclassified)'] = 0
         for cell_id in np.unique(self.mask)[1:]:
             cell_id = int(cell_id)
             name = self.celltype_by_id.get(cell_id)
-            color = color_by_name.get(name, (0.55, 0.55, 0.55))
+            color = color_by_name.get(name, celltype_colors.UNCLASSIFIED_COLOR)
             counts[name if name in color_by_name else '(unclassified)'] += 1
             cell_mask = (self.mask == cell_id).astype(np.uint8)
             boundary = cell_mask - cv2.erode(cell_mask, np.ones((3, 3), np.uint8), iterations=1)
@@ -103,7 +100,7 @@ class CelltypeResultDisplayer(QtWidgets.QMainWindow):
 
         legend_parts = []
         for name in names:
-            rgb_hex = '#%02x%02x%02x' % tuple(int(c * 255) for c in color_by_name[name])
+            rgb_hex = celltype_colors.hex_of(color_by_name[name])
             legend_parts.append(f'<span style="color:{rgb_hex}">&#9632;</span> {name} ({counts[name]})')
         if counts['(unclassified)']:
             legend_parts.append(f'<span style="color:#8c8c8c">&#9632;</span> (unclassified) ({counts["(unclassified)"]})')

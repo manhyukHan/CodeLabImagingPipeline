@@ -6,17 +6,8 @@ from matplotlib.cm import ScalarMappable
 
 from canvas.scale_control import ScaleControlWidget
 from canvas import zoom_pan
+from canvas import celltype_colors
 
-# distinct categorical colors, one per barcode channel -- unlike the
-# alignment all-readouts overlay (canvas/pipeline_canvas.py), which
-# deliberately switched to a sequential red-cyan gradient for a
-# before/after single-transform comparison, here every channel is a
-# genuinely different population/marker the user needs to tell apart at a
-# glance, so a categorical palette is the right choice, not a gradient.
-_CATEGORICAL_COLORS = [
-    (0.90, 0.10, 0.10), (0.10, 0.65, 0.90), (0.15, 0.80, 0.15), (0.95, 0.75, 0.10),
-    (0.70, 0.20, 0.90), (0.95, 0.45, 0.10), (0.10, 0.85, 0.75), (0.85, 0.10, 0.55),
-]
 
 
 class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
@@ -42,6 +33,7 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         self.setWindowTitle('Barcode Channel Overview')
         self.resize(680, 560)
         self.images_by_channel = {}   # {(hybe,channel): warped ndarray}
+        self.celltype_by_channel = {}  # {(hybe,channel): celltype name}
         self.labels_by_channel = {}   # {(hybe,channel): display label str}
         self._scale_controls = {}     # {(hybe,channel): ScaleControlWidget}
 
@@ -68,14 +60,22 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         self._scale_controls_layout.setContentsMargins(0, 0, 0, 0)
         self._layout.addWidget(self._scale_controls_container)
 
-    def set_data(self, images_by_channel, labels_by_channel):
+    def set_data(self, images_by_channel, labels_by_channel, celltype_by_channel=None):
         """
         images_by_channel: {(hybe,channel): ndarray}, already warped into
         one common frame by the caller. labels_by_channel: {(hybe,channel):
         str} -- e.g. "TypeA: Hyb_105 ch555".
+
+        celltype_by_channel: {(hybe,channel): celltype name} -- what makes
+        this window agree with the Celltype Determination Result. Colour
+        is keyed on the celltype NAME through the one shared rule
+        (canvas/celltype_colors.py), not on this dict's own order, which
+        is the order celltypes happened to be assigned. Without it the
+        same celltype drew a different colour in each window.
         """
         self.images_by_channel = images_by_channel
         self.labels_by_channel = labels_by_channel
+        self.celltype_by_channel = celltype_by_channel or {}
 
         # rebuild one ScaleControlWidget per channel (channel set can
         # change between calibration sessions as celltypes get assigned).
@@ -103,6 +103,19 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
             self._scale_controls[bch] = control
         self._redraw(keep_view=False)
 
+    def _color_for(self, index, bch):
+        """This channel's colour: keyed on the CELLTYPE it was assigned
+        to, through the one shared rule, so this window agrees with the
+        Celltype Determination Result. Falls back to positional colour
+        only for a channel with no celltype (nothing to agree about)."""
+        name = self.celltype_by_channel.get(bch)
+        if name:
+            colors = celltype_colors.colors_for_names(self.celltype_by_channel.values())
+            if name in colors:
+                return colors[name]
+        palette = celltype_colors.CATEGORICAL_COLORS
+        return palette[index % len(palette)]
+
     def _redraw(self, keep_view=True):
         if not self.images_by_channel:
             return
@@ -110,13 +123,13 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         composite = np.zeros((*shape, 3), dtype=float)
         legend_parts = []
         for i, (bch, img) in enumerate(self.images_by_channel.items()):
-            color = _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
+            color = self._color_for(i, bch)
             control = self._scale_controls.get(bch)
             vmin, vmax = control.vmin_vmax(img) if control is not None else (np.nanmin(img), np.nanmax(img))
             norm = np.clip((img.astype(float) - vmin) / max(vmax - vmin, 1e-9), 0, 1)
             layer = np.stack([norm * c for c in color], axis=-1)
             composite = np.maximum(composite, layer)
-            rgb_hex = '#%02x%02x%02x' % tuple(int(c * 255) for c in color)
+            rgb_hex = celltype_colors.hex_of(color)
             legend_parts.append(f'<span style="color:{rgb_hex}">&#9632;</span> {self.labels_by_channel.get(bch, str(bch))}')
 
         fig = self.canvas.figure
@@ -148,7 +161,7 @@ class BarcodeOverviewDisplayer(QtWidgets.QMainWindow):
         # up," not a shared/misleading scale.
         x = main_left + main_width + img_to_cb_gap
         for i, (bch, img) in enumerate(self.images_by_channel.items()):
-            color = _CATEGORICAL_COLORS[i % len(_CATEGORICAL_COLORS)]
+            color = self._color_for(i, bch)
             control = self._scale_controls.get(bch)
             vmin, vmax = control.vmin_vmax(img) if control is not None else (float(np.nanmin(img)), float(np.nanmax(img)))
             cmap = LinearSegmentedColormap.from_list(f'barcode_ch{i}', [(0, 0, 0), color])

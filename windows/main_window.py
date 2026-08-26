@@ -7241,7 +7241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if fov is None:
             QtWidgets.QMessageBox.warning(self, 'Show Barcode Overview', 'Set an FOV.')
             return
-        images_by_channel, labels_by_channel = {}, {}
+        images_by_channel, labels_by_channel, celltype_by_channel = {}, {}, {}
         for name in ctp.celltype_names():
             bch = self._barcode_channel_by_celltype.get(name)
             if bch is None:
@@ -7267,10 +7267,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 img = cv2.warpAffine(img.astype(np.float32), as_cv2(H)[:2], (width, height))
             images_by_channel[bch] = img
             labels_by_channel[bch] = f'{name}: {hybe} ch{channel} ({modality})'
+            # the celltype this channel belongs to -- what lets this
+            # window colour by the SAME rule as the Celltype
+            # Determination Result (canvas/celltype_colors.py)
+            celltype_by_channel[bch] = name
         if not images_by_channel:
             QtWidgets.QMessageBox.warning(self, 'Show Barcode Overview', 'Assign at least one celltype to a barcode channel first.')
             return
-        self.barcode_overview_displayer.set_data(images_by_channel, labels_by_channel)
+        self.barcode_overview_displayer.set_data(images_by_channel, labels_by_channel,
+                                                 celltype_by_channel=celltype_by_channel)
         self.barcode_overview_displayer.show()
         self.barcode_overview_displayer.raise_()
 
