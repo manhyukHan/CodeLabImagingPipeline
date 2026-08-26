@@ -1,7 +1,7 @@
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import reduce
+from functools import partial, reduce
 import numpy as np
 
 from .frames import FrameMatrices  # re-exported: callers reach it as alignment.FrameMatrices
@@ -13,6 +13,7 @@ from skimage.feature import peak_local_max
 
 from ..io import paths
 from ..io import preprocess
+from .. import process_guard
 from ..io import analysis_store
 import cv2
 
@@ -882,7 +883,7 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
             executor = ProcessPoolExecutor(
                 max_workers=min(n_workers, len(todo)),
                 mp_context=multiprocessing.get_context('spawn'),
-                initializer=_init_align_worker,
+                initializer=partial(process_guard.child_initializer, _init_align_worker),
                 initargs=(storage_path, fov, reference_hybe, ref_record['fiducial_channel']))
         except Exception:
             executor = None      # degrade to the serial loop below, never fail here

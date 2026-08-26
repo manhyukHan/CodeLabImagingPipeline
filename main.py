@@ -65,6 +65,13 @@ def _install_error_dialog_hook():
 
 
 if __name__ == '__main__':
+    # BEFORE any pool can be created: put this process under an OS-level
+    # guarantee that its children cannot outlive it. Confirmed real --
+    # a force-kill once left 97 pool workers alive for 2.7 days, holding
+    # 5 GB and locking the conda env. See codelab_pipeline/process_guard.py.
+    from codelab_pipeline import process_guard
+    _guard_state = process_guard.install_parent_guard()
+
     _install_error_dialog_hook()
     question_app = QtWidgets.QApplication(sys.argv)
     question_app.setWindowIcon(QtGui.QIcon(ICON_PATH))
@@ -79,5 +86,8 @@ if __name__ == '__main__':
     # the combined log comes up with the app; shown first so the main
     # window lands on top of it
     window.show_log_window()
+    # Logged, not silent: a guard that failed to install is worse than
+    # none, because nobody would go looking for orphaned workers.
+    window.log(f'Worker-process guard: {_guard_state}')
     window.show()
     sys.exit(app.exec_())

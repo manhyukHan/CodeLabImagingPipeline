@@ -42,7 +42,7 @@ checkup becomes one directory listing instead of thousands of vlinks
 opens.
 
 A project is identified by manifest.json in the parent of every
-modality store (see is_project). The pre-manifest v1 layout is gone
+modality store. The pre-manifest v1 layout is gone
 from the live pipeline; its reader is frozen in legacy/vlinks_store.py
 and tools/migrate_vlinks.py converts an old store once.
 """
@@ -98,14 +98,6 @@ def write_manifest(dp, modalities, layout_paths=None, dax_directories=None):
     os.replace(tmp, manifest_path(dp))
     _MANIFEST_CACHE.pop(dp, None)
     return m
-
-
-def is_project(storage_path):
-    """True when storage_path sits inside a manifest-bearing project.
-    The layout is no longer versioned -- there is exactly one, described
-    by manifest.json -- so this only answers "is this a real project
-    store", never "which layout"."""
-    return read_manifest(project_root(storage_path)) is not None
 
 
 

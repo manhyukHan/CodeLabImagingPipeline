@@ -4,6 +4,7 @@ import re
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import partial
 from copy import deepcopy
 from datetime import datetime
 
@@ -27,6 +28,7 @@ from canvas.mip_viewer import MipViewerDisplayer
 from canvas.cell_spot_status_displayer import CellSpotStatusDisplayer
 from canvas.alignment_preview_window import AlignmentPreviewWindow
 from canvas.chromatin_trace_grid_displayer import ChromatinTraceGridDisplayer
+from codelab_pipeline import process_guard
 from codelab_pipeline.io import paths
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import analysis_store
@@ -185,7 +187,8 @@ class IngestionWorker(QtCore.QThread):
             if self.max_workers > 1 and len(tasks) > 1:
                 try:
                     executor = ProcessPoolExecutor(max_workers=min(self.max_workers, len(tasks)),
-                                                   mp_context=multiprocessing.get_context('spawn'))
+                                                   mp_context=multiprocessing.get_context('spawn'),
+                                                   initializer=process_guard.child_initializer)
                 except Exception as e:
                     self.progress.emit(0, len(tasks), f'process pool unavailable ({e}) -- running sequentially')
 
@@ -563,7 +566,8 @@ class CellAlignmentWorker(QtCore.QThread):
                     executor = ProcessPoolExecutor(
                         max_workers=min(n_workers, len(tasks)),
                         mp_context=multiprocessing.get_context('spawn'),
-                        initializer=alignment._init_cell_align_worker)
+                        initializer=partial(process_guard.child_initializer,
+                                            alignment._init_cell_align_worker))
                 except Exception:
                     executor = None   # degrade to the serial loop, never fail here
 
@@ -607,7 +611,8 @@ class CellAlignmentWorker(QtCore.QThread):
                         hybe_pool = ProcessPoolExecutor(
                             max_workers=n_workers,
                             mp_context=multiprocessing.get_context('spawn'),
-                            initializer=alignment._init_cell_align_worker)
+                            initializer=partial(process_guard.child_initializer,
+                                                alignment._init_cell_align_worker))
                     except Exception:
                         hybe_pool = None   # degrade to serial, never fail here
                 try:
@@ -796,7 +801,8 @@ class ChromatinTracingWorker(QtCore.QThread):
                     executor = ProcessPoolExecutor(
                         max_workers=n_workers,
                         mp_context=multiprocessing.get_context('spawn'),
-                        initializer=localization._init_tracing_worker)
+                        initializer=partial(process_guard.child_initializer,
+                                            localization._init_tracing_worker))
                 except Exception:
                     executor = None   # degrade to the serial per-hybe loop
             try:
@@ -1630,7 +1636,7 @@ class MainWindow(QtWidgets.QMainWindow):
         real slowness: this scans EVERY FOV in the Ingestion tab's FOV
         list (a directory listing per FOV even on the cheap v2 path), yet
         it is called from over a dozen sites INCLUDING per-cell loops
-        (_save_cell_overlay's own auto-save pass calls it once per cell
+        (the auto-save pass calls it once per cell
         whose residual shift crosses the threshold -- 27 cells measured
         on one real 100-cell FOV) and _run_cell_alignment's own
         preamble, all on the GUI thread before any worker even starts.
@@ -6703,7 +6709,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pool = ProcessPoolExecutor(
                     max_workers=localization.max_tracing_workers(),
                     mp_context=multiprocessing.get_context('spawn'),
-                    initializer=localization._init_tracing_worker)
+                    initializer=partial(process_guard.child_initializer,
+                                        localization._init_tracing_worker))
             except Exception:
                 pool = None
             try:
@@ -9161,27 +9168,6 @@ class MainWindow(QtWidgets.QMainWindow):
             for prov in cell.matrix_provenance.values()
         )
 
-    def _save_cell_overlay(self, cell, fov, storage_path, channel_type, pad, overlay_reference_hybe=None, modality=None):
-        """Draws + saves one cell's all-readouts overlay PNG. overlay_
-        reference_hybe/modality should be the SAME alignment run's own
-        anchor hybe/modality this cell was actually aligned against
-        (falls back to cell.reference_hybe/reference_modality -- the
-        segmentation hybe -- only when not given, matching compute_cell_
-        alignment's own reference_hybe=None default) -- using cell.
-        reference_hybe unconditionally here previously redrew the overlay
-        against a DIFFERENT hybe than the one actually used to compute
-        it, which crashed _read_mip whenever that hybe wasn't ingested
-        under storage_path's own modality. Returns False (no-op) if the
-        resolved reference hybe's record can't be found in that
-        modality's own hybe list, matching the automatic-mode skip that
-        already existed before this was factored out."""
-        args = self._cell_overlay_draw_args(cell, fov, storage_path, channel_type, pad,
-                                            overlay_reference_hybe=overlay_reference_hybe, modality=modality)
-        if args is None:
-            return False
-        self.preview_canvas.draw_cell_all_readouts_overlay(**args)
-        return True
-
     def _cell_overlay_draw_args(self, cell, fov, storage_path, channel_type, pad,
                                 overlay_reference_hybe=None, modality=None):
         """
@@ -9189,7 +9175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         resolved on the GUI thread (it reads session containers and
         matrices), or None when the reference hybe can't be resolved.
 
-        Split out from _save_cell_overlay so a BACKGROUND worker can do
+        Resolved here so a BACKGROUND worker can do
         the expensive half: resolving is in-memory and fast, while the
         draw itself reads 3 ZX stack crops per hybe -- measured 110 ms
         per crop on the real NAS store, i.e. ~35 s per cell at 100
