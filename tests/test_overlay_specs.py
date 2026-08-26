@@ -208,6 +208,53 @@ def main():
     check('highlight of an absent cell changes nothing',
           lines == {'yellow'} and set(labels.values()) == {'yellow'}, f'{lines} {labels}')
 
+    # 8. O/P step the View list with wrap-around
+    from PyQt5 import QtCore as _Qt
+    mw = MainWindow()
+    sp_panel = mw.ui.SpotLocalizationPanel
+    mw._on_spot_cell_selected = lambda *a: None      # isolate the stepping
+
+    class _Cell:
+        def __init__(self, i):
+            self.id = i
+            self.fov = 1
+
+    sp_panel.populate_cell_choices([_Cell(44), _Cell(45), _Cell(46)], {})
+    lw = sp_panel.CellListWidget
+    check('View list is FOV row + one row per cell', lw.count() == 4, str(lw.count()))
+
+    lw.setCurrentRow(0)
+    rows = []
+    for _ in range(4):
+        mw._step_spot_view(+1)
+        rows.append(lw.currentRow())
+    check('P walks forward and wraps last -> FOV row', rows == [1, 2, 3, 0], str(rows))
+
+    lw.setCurrentRow(0)
+    mw._step_spot_view(-1)
+    check('O from the FOV row wraps to the LAST cell', lw.currentRow() == 3, str(lw.currentRow()))
+    mw._step_spot_view(-1)
+    check('O keeps walking backward', lw.currentRow() == 2, str(lw.currentRow()))
+
+    sp_panel.populate_cell_choices([], {})
+    lw.setCurrentRow(0)
+    mw._step_spot_view(+1)
+    p_row = lw.currentRow()
+    mw._step_spot_view(-1)
+    check('with no cells (FOV row only) both keys do nothing',
+          lw.count() == 1 and p_row == 0 and lw.currentRow() == 0,
+          f'count={lw.count()} afterP={p_row} afterO={lw.currentRow()}')
+
+    keys = sorted(sc.key().toString() for sc in lw.findChildren(QtWidgets.QShortcut))
+    win_keys = sorted(sc.key().toString()
+                      for sc in mw.spot_crop_displayer.findChildren(QtWidgets.QShortcut))
+    check('O/P bound on the View list and the crop window',
+          keys == ['O', 'P'] and win_keys == ['O', 'P'], f'{keys} {win_keys}')
+    check('shortcuts are scoped, never application-wide',
+          all(sc.context() != _Qt.Qt.ApplicationShortcut
+              for sc in lw.findChildren(QtWidgets.QShortcut)
+              + mw.spot_crop_displayer.findChildren(QtWidgets.QShortcut)))
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:

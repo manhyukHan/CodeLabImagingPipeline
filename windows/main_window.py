@@ -11,7 +11,7 @@ import numpy as np
 import numpy.linalg as la
 import h5py
 import cv2
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 
 from config import path as repo_path, config_name
 from ui.main_window_ui import MainWindowUI
@@ -1284,6 +1284,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.RefreshCellListPushButton.clicked.connect(self._refresh_spot_cell_list)
         sp.FovSpinBox.valueChanged.connect(lambda _: self._refresh_spot_cell_list())
         sp.CellListWidget.itemClicked.connect(self._on_spot_cell_selected)
+        self._install_spot_view_shortcuts()
         sp.FovListWidget.itemClicked.connect(self._on_fov_list_item_clicked)
         sp.HybeComboBox.currentIndexChanged.connect(self._show_spot_displayer)
         sp.ChannelComboBox.currentIndexChanged.connect(self._show_spot_displayer)
@@ -5035,6 +5036,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self._load_spot_crop_for_display()
         else:
             self._load_fov_spot_display()
+
+    def _install_spot_view_shortcuts(self):
+        """
+        O / P step BACKWARD / FORWARD through the View list (the
+        CellListWidget: row 0 is the FOV pseudo-row, rows 1+ are cells),
+        wrapping at both ends -- O on the FOV row lands on the last cell,
+        P on the last cell lands back on the FOV row.
+
+        Deliberately NOT application-wide shortcuts: scoped to the View
+        list itself and to the crop displayer window, the two places a
+        user is actually looking while stepping through cells. A global
+        'O'/'P' would fire while typing into any field in the app.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        for widget, context in ((sp.CellListWidget, QtCore.Qt.WidgetShortcut),
+                                (self.spot_crop_displayer, QtCore.Qt.WindowShortcut)):
+            for key, delta in (('O', -1), ('P', +1)):
+                shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(key), widget)
+                shortcut.setContext(context)
+                shortcut.activated.connect(lambda d=delta: self._step_spot_view(d))
+
+    def _step_spot_view(self, delta):
+        """
+        Move the View selection by `delta` rows with wrap-around, then
+        run the ordinary selection handler so everything downstream (the
+        breakdown, and the crop displayer if it is open) follows exactly
+        as it does for a mouse click.
+
+        A list holding ONLY the FOV row has nothing to cycle through, so
+        both directions are a no-op there rather than re-selecting the
+        row and redrawing for nothing.
+        """
+        lw = self.ui.SpotLocalizationPanel.CellListWidget
+        count = lw.count()
+        if count <= 1:
+            return
+        row = lw.currentRow()
+        lw.setCurrentRow(((0 if row < 0 else row) + delta) % count)
+        self._on_spot_cell_selected()
 
     def _on_spot_cell_selected(self, *_args):
         """
