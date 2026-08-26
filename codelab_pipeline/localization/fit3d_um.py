@@ -57,7 +57,14 @@ FitUm = namedtuple('FitUm', [
     'amplitude', 'y', 'x', 'z',                      # planes/pixels, for callers
     'y_um', 'x_um', 'z_um',
     'sigma_y_um', 'sigma_x_um', 'sigma_z_um',
-    'offset', 'at_bound', 'n_voxels', 'rss'])
+    'offset', 'at_bound', 'n_voxels', 'rss',
+    # -- the quantities the acceptance gates are computed FROM, carried
+    # on every fit so thresholds can be re-derived post-hoc against real
+    # data instead of inherited as constants. See apply_gates. --
+    'ci_y_um', 'ci_x_um', 'ci_z_um',   # 95% CI half-widths on position
+    'peak_bg_ratio',                   # raw seed voxel / background AT THE SPOT
+    'amp_h_ratio',                     # fitted amplitude / raw seed voxel
+    'gates_passed'])                   # None when gating was not applied
 
 
 # How the non-spot signal is modelled. NOT a noise term -- noise is the
@@ -99,7 +106,7 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
                        max_sigma_xy_um=0.520, max_sigma_z_um=1.000,
                        min_hb_ratio=1.2, min_ah_ratio=0.25,
                        max_uncert_um=0.416, fit_radius_um=None,
-                       background='constant'):
+                       background='constant', apply_gates=True):
     """
     Fit one 3D Gaussian to `cubic` in micrometres.
 
@@ -200,8 +207,15 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
     # Same three gates as v1, with the position CI now in micrometres so
     # one number bounds all three axes honestly instead of x/y sharing a
     # pixel bound and z silently getting twice it.
-    if (2 * ci[1] >= max_uncert_um or 2 * ci[2] >= max_uncert_um
-            or 2 * ci[3] >= 2 * max_uncert_um):
+    #
+    # apply_gates=False returns the fit WITH its gate quantities instead
+    # of rejecting: thresholds inherited from a flat-background,
+    # whole-column fit do not carry over to a local background, and
+    # re-deriving them means fitting once and sweeping afterwards, not
+    # refitting per candidate threshold.
+    gate_uncert = not (2 * ci[1] >= max_uncert_um or 2 * ci[2] >= max_uncert_um
+                       or 2 * ci[3] >= 2 * max_uncert_um)
+    if apply_gates and not gate_uncert:
         return None
     # The peak/background gate must use the background AT THE SPOT, not
     # the intercept: with a slope, `off` is the background extrapolated
@@ -214,9 +228,11 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
         bg_at_spot = off + res.x[8] * fz
     else:
         bg_at_spot = off + res.x[8] * fy + res.x[9] * fx + res.x[10] * fz
-    if bg_at_spot <= 0 or h / bg_at_spot < min_hb_ratio:
-        return None
-    if h <= 0 or amp / h < min_ah_ratio:
+    peak_bg = (h / bg_at_spot) if bg_at_spot > 0 else 0.0
+    amp_h = (amp / h) if h > 0 else 0.0
+    gate_hb = bg_at_spot > 0 and peak_bg >= min_hb_ratio
+    gate_ah = h > 0 and amp_h >= min_ah_ratio
+    if apply_gates and not (gate_hb and gate_ah):
         return None
 
     return FitUm(amplitude=float(amp),
@@ -224,4 +240,8 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
                  y_um=float(fy), x_um=float(fx), z_um=float(fz),
                  sigma_y_um=float(sy), sigma_x_um=float(sx), sigma_z_um=float(sz),
                  offset=float(bg_at_spot), at_bound=at_bound,
-                 n_voxels=int(values.size), rss=rss)
+                 n_voxels=int(values.size), rss=rss,
+                 ci_y_um=float(ci[1]), ci_x_um=float(ci[2]), ci_z_um=float(ci[3]),
+                 peak_bg_ratio=float(peak_bg), amp_h_ratio=float(amp_h),
+                 gates_passed=(gate_uncert and gate_hb and gate_ah)
+                 if apply_gates else None)
