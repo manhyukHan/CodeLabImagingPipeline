@@ -35,6 +35,11 @@ SIZES = [1_000, 10_000, 50_000, 100_000]
 
 def load_cells():
     dicts, modality = V.read_cells(STORAGE, FOV)
+    assert dicts, (
+        f'no cells at {STORAGE!r} FOV{FOV} -- this test runs on REAL '
+        f'segmented cells (throughput at real scale is the whole question, '
+        f'so synthetic cells would answer nothing). Set CODELAB_COST_STORE '
+        f'to a modality store whose analysis capsule has cells for that FOV.')
     container = CellContainer.load({FOV: dicts}, modality=modality)
     return container.get_cells(FOV)
 

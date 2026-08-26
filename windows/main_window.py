@@ -1165,6 +1165,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_cross_modal_quality = {}  # {(msp, fov): {residual_before/after, z_quality}} staged alongside
         # Align All Cells in FOV always computes AND saves immediately (no
         # staging) -- only the per-cell tuning tool below stages a result.
+        # background cell-overlay pipeline (see _queue_cell_overlays)
+        self._overlay_pending = []     # [(cell, fov), ...] not yet resolved
+        self._overlay_ready = []       # resolved draw-args awaiting a free pool
+        self._overlay_timer = None
+        self._overlay_total = 0
+        self._overlay_done = 0
+        self._overlay_ctx = None
+        self._overlay_label = 'Cell overlays'
         self._pending_per_cell_alignment = None  # (real_cell, staged_cell) awaiting Accept/Reject, or None
         self._pending_per_cell_alignment_fov = None
         self._pending_per_cell_alignment_params = None
@@ -1236,11 +1244,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._quitting:   # re-entered via closeAllWindows() below
             event.accept()
             return
+        # Overlays can legitimately still be rendering for hours after a
+        # whole-project run. They are only PICTURES -- every matrix is
+        # already on disk -- but losing an hour of rendering to a routine
+        # quit is worth one sentence of warning.
+        queued, rendering = self._overlays_in_flight()
+        overlay_note = ''
+        if queued or rendering:
+            overlay_note = (f'\n\nCell overlay images are still rendering in the background '
+                            f'({queued} queued{", 1 batch in progress" if rendering else ""}). '
+                            f'Quitting discards the unrendered ones -- the alignment matrices '
+                            f'themselves are already saved and are not affected. They can be '
+                            f'regenerated later with Save All Cell Overlays.')
         reply = QtWidgets.QMessageBox.question(
             self, 'Quit',
             'Really quit the CODE Lab Imaging Pipeline?\n\n'
             'Every window will close, and any running task (ingestion, '
-            'alignment, tracing, ...) will be killed.',
+            'alignment, tracing, ...) will be killed.' + overlay_note,
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         if reply != QtWidgets.QMessageBox.Yes:
@@ -1248,6 +1268,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._quitting = True
         event.accept()
+        if getattr(self, '_overlay_timer', None) is not None:
+            self._overlay_timer.stop()
+        self._overlay_pending = []
+        self._overlay_ready = []
         killed = self._kill_running_work()
         QtWidgets.QApplication.closeAllWindows()
         QtWidgets.QApplication.quit()
@@ -9404,8 +9428,14 @@ One PNG PER MODALITY: each modality has its own reference and its
                                                cell_alignment_pad=pad, **cell_alignment_kwargs)
 
         threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
-        overlay_jobs = []
+        pending_overlays = []
         n_cells = 0
+        # PASS 1 -- persist every FOV. Nothing here waits on rendering:
+        # resolving one cell's overlay args costs ~55 ms on the real store
+        # (measured), so interleaving them with the writes made later
+        # FOVs' saves queue behind earlier FOVs' rendering prep. Matrices
+        # and recast spots are the results; overlays are a picture OF
+        # them, and pictures come last.
         for fov, cells in results:
             container = containers_by_fov.get(fov)
             if container is None:
@@ -9432,22 +9462,25 @@ One PNG PER MODALITY: each modality has its own reference and its
             except Exception as e:
                 self.statusBar().showMessage(
                     f'spot reassignment after cell alignment failed for FOV{fov}: {e}')
+            # only WHICH cells need an overlay is decided here (a cheap
+            # in-memory residual check); the expensive arg resolution is
+            # deferred to the background pipeline below.
             for cell in cells:
                 if self._cell_max_residual_shift(cell) >= max(threshold, 1e-9):
-                    args = self._cell_overlay_draw_args(
-                        cell, fov, storage_path, channel_type, pad,
-                        overlay_reference_hybe=cell_reference_hybe, modality=cell_modality)
-                    if args is not None:
-                        overlay_jobs.append(args)
+                    pending_overlays.append((cell, fov))
 
         self._refresh_cell_fov_panels(self.ui.AlignmentPanel.CellFovSpinBox.value())
-        if overlay_jobs:
-            self._start_cell_overlay_save_worker(overlay_jobs, 'Cell alignment overlays (all FOVs)')
         self.statusBar().showMessage('Cell alignment computed for all FOVs.', 5000)
         QtWidgets.QMessageBox.information(
             self, 'Cell alignment complete',
-            f'{n_cells} cell(s) across {len(results)} FOV(s) aligned and saved.\n\n'
-            f'{len(overlay_jobs)} overlay image(s) rendering in the background.')
+            f'{n_cells} cell(s) across {len(results)} FOV(s) aligned and SAVED.\n\n'
+            f'{len(pending_overlays)} overlay image(s) will render in the background -- '
+            f'the app stays usable, and quitting will warn if any are still running.')
+        # PASS 2 -- overlays, entirely in the background, only after every
+        # matrix is on disk.
+        self._queue_cell_overlays(pending_overlays, storage_path, channel_type, pad,
+                                  cell_reference_hybe, cell_modality,
+                                  label='Cell alignment overlays (all FOVs)')
 
     def _on_cell_alignment_all_failed(self, message):
         self.ui.AlignmentPanel.RunCellAlignmentAllPushButton.setEnabled(True)
@@ -9600,6 +9633,87 @@ One PNG PER MODALITY: each modality has its own reference and its
     # bound, and these processes compete with whatever else is running.
     CELL_OVERLAY_RENDER_WORKERS = 3
 
+    # Cells whose args are resolved per GUI-idle tick. ~55 ms each on the
+    # real store, so a chunk of 4 is ~0.2 s -- short enough that typing
+    # and clicking stay responsive, long enough not to spend the whole
+    # time in timer overhead.
+    OVERLAY_RESOLVE_CHUNK = 4
+
+    def _queue_cell_overlays(self, pending, storage_path, channel_type, pad,
+                             reference_hybe, modality, label='Cell overlays'):
+        """
+        Render N cell overlays in the background WITHOUT ever blocking the
+        GUI, and without making anything else wait for them.
+
+        The render itself already runs in child processes (see
+        _start_cell_overlay_save_worker). What used to block was the other
+        half: resolving each cell's draw args reads session containers and
+        matrices, so it must happen on the GUI thread, and at ~55 ms per
+        cell (measured on the real store) a whole-project run spent ~3.5
+        minutes frozen before a single pixel was drawn.
+
+        So resolution is drip-fed a few cells per idle tick, and each
+        resolved batch is handed to the render pool as soon as the
+        previous batch finishes. Nothing waits: matrices are already
+        saved, the window stays usable, and the work simply proceeds.
+        """
+        self._overlay_pending = list(pending)
+        self._overlay_ctx = (storage_path, channel_type, pad, reference_hybe, modality)
+        self._overlay_label = label
+        self._overlay_ready = []
+        self._overlay_total = len(pending)
+        self._overlay_done = 0
+        if not self._overlay_pending:
+            return
+        if getattr(self, '_overlay_timer', None) is None:
+            self._overlay_timer = QtCore.QTimer(self)
+            self._overlay_timer.setInterval(0)          # idle-ish, not a busy loop
+            self._overlay_timer.timeout.connect(self._resolve_overlay_chunk)
+        self._overlay_timer.start()
+        self.statusBar().showMessage(f'{label}: preparing {self._overlay_total}...')
+
+    def _resolve_overlay_chunk(self):
+        """One small batch of arg resolution per tick, then hand whatever
+        is ready to the render pool when it is free."""
+        # Nothing armed (no run has queued overlays) -- the timer can be
+        # ticked by anything, so this must be a no-op rather than an
+        # unpack of None.
+        if self._overlay_ctx is None or not (self._overlay_pending or self._overlay_ready):
+            if getattr(self, '_overlay_timer', None) is not None:
+                self._overlay_timer.stop()
+            return
+        storage_path, channel_type, pad, reference_hybe, modality = self._overlay_ctx
+        for _ in range(self.OVERLAY_RESOLVE_CHUNK):
+            if not self._overlay_pending:
+                break
+            cell, fov = self._overlay_pending.pop(0)
+            try:
+                args = self._cell_overlay_draw_args(
+                    cell, fov, storage_path, channel_type, pad,
+                    overlay_reference_hybe=reference_hybe, modality=modality)
+            except Exception as e:
+                self.log(f'FOV{fov:03d} cell {getattr(cell, "id", "?")}: overlay could not '
+                         f'be prepared ({e}); its matrices are unaffected.')
+                args = None
+            if args is not None:
+                self._overlay_ready.append(args)
+
+        worker = getattr(self, '_cell_overlay_worker', None)
+        busy = worker is not None and worker.isRunning()
+        if self._overlay_ready and not busy:
+            batch, self._overlay_ready = self._overlay_ready, []
+            self._start_cell_overlay_save_worker(batch, self._overlay_label)
+        if not self._overlay_pending and not self._overlay_ready:
+            self._overlay_timer.stop()
+
+    def _overlays_in_flight(self):
+        """(queued, rendering) -- what a quit would throw away."""
+        queued = len(getattr(self, '_overlay_pending', []) or []) + \
+            len(getattr(self, '_overlay_ready', []) or [])
+        worker = getattr(self, '_cell_overlay_worker', None)
+        rendering = bool(worker is not None and worker.isRunning())
+        return queued, rendering
+
     def _start_cell_overlay_save_worker(self, jobs, label, on_done=None):
         """
         Render + save N cell overlay PNGs in SEPARATE PROCESSES.
@@ -9622,8 +9736,16 @@ One PNG PER MODALITY: each modality has its own reference and its
 
         def _done(results):
             n_saved = sum(1 for r in results if r)
-            self.statusBar().showMessage(f'{label}: {n_saved} overlay image(s) saved.', 8000)
+            self._overlay_done = getattr(self, '_overlay_done', 0) + n_saved
+            total = getattr(self, '_overlay_total', 0)
+            progress = f' ({self._overlay_done}/{total})' if total else ''
+            self.statusBar().showMessage(
+                f'{label}: {self._overlay_done if total else n_saved} overlay image(s) saved{progress}.', 8000)
             self.log(f'{label}: {n_saved} overlay PNG(s) written in background processes.')
+            # more waiting to be resolved/rendered -> keep the drip going
+            if getattr(self, '_overlay_timer', None) is not None and (
+                    getattr(self, '_overlay_pending', None) or getattr(self, '_overlay_ready', None)):
+                self._overlay_timer.start()
             if on_done is not None:
                 on_done(n_saved)
 

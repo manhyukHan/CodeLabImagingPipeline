@@ -2,7 +2,7 @@
 Acceptance test for the unified spot store.
 
 Detects real spots in four (hybe, modality, channel) slices, writes them
-through vlinks_store, and reads them back. Two of the four are different
+through analysis_store, and reads them back. Two of the four are different
 hybes in the SAME modality and channel, one is a different channel in that
 modality, and one is a different modality entirely:
 
@@ -29,70 +29,73 @@ the line and detect nothing meaningful.
 Runs entirely inside a scratch project built from copies of the real MIPs, so
 it can never write to real data even if it fails partway.
 
+Needs a v2 project to copy those four MIPs out of. Point
+CODELAB_SPOT_STORE_PROJECT at one (a project root -- the directory holding
+manifest.json and the per-modality subdirectories).
+
 Run: python tests/test_spot_store_roundtrip.py
 """
 import os
 import shutil
 import sys
 
-import h5py
 import numpy as np
 from skimage.feature import peak_local_max
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from codelab_pipeline.io import analysis_store as V
+from codelab_pipeline.io import paths
 from codelab_pipeline.models.spot import ASpot
 
-REAL = 'data/chr19_downstream_new'
+REAL = os.environ.get('CODELAB_SPOT_STORE_PROJECT',
+                      'data/Codelab_imaging_pipeline_test')
 SCRATCH = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'spot_store_acceptance')
 FOV = 1
 THRESHOLD_PCT = 40.0
 MIN_DISTANCE = 5
 
-# (hybe, modality, channel, queue-dir name)
+# (hybe, modality, channel). In a v2 project the modality IS the store
+# directory, so it needs no separate queue-dir name.
 SLICES = [
-    ('Hyb_101', 'RNA', 635, 'RNA_queue'),
-    ('Hyb_105', 'RNA', 635, 'RNA_queue'),
-    ('Hyb_500', 'RNA', 555, 'RNA_queue'),
-    ('Hyb_002', 'DNA', 555, 'DNA_queue'),
+    ('Hyb_101', 'RNA', 635),
+    ('Hyb_105', 'RNA', 635),
+    ('Hyb_500', 'RNA', 555),
+    ('Hyb_002', 'DNA', 555),
 ]
+MODALITIES = sorted({m for _h, m, _c in SLICES})
 
 
 def build_scratch():
     """
-    A minimal project holding only the four MIPs under test. Copying the
-    whole 80MB vlinks would work but is slow per run; more importantly a
-    scratch project means a failure part-way cannot leave spots behind in
-    real data.
+    A minimal v2 project holding only the four MIPs under test. Copying
+    the whole real project would work but is slow per run; more
+    importantly a scratch project means a failure part-way cannot leave
+    spots behind in real data.
+
+    Both ends go through analysis_store's own MIP reader/writer, so the
+    copy carries the coordinate_order stamp the readers require rather
+    than this file restating a storage detail it does not own.
     """
     if os.path.exists(SCRATCH):
         shutil.rmtree(SCRATCH)
-    for _, modality, _, queue in SLICES:
-        os.makedirs(os.path.join(SCRATCH, queue, f'FOV{FOV:02d}'), exist_ok=True)
-        stub = os.path.join(SCRATCH, queue, f'FOV{FOV:02d}', 'Hyb_stub_stack.h5')
-        with h5py.File(stub, 'w') as f:          # _modality_of reads this attr
-            f.attrs['modality'] = modality
-    with h5py.File(os.path.join(REAL, 'vlinks.h5'), 'r') as src, \
-            h5py.File(os.path.join(SCRATCH, 'vlinks.h5'), 'w') as dst:
-        for hybe, modality, channel, _ in SLICES:
-            path = f'FOV{FOV:02d}/mip/{modality}/{hybe}/ch{channel}'
-            if path not in src:
-                raise AssertionError(f'{path} missing from the real vlinks')
-            g = dst.require_group(os.path.dirname(path))
-            g.create_dataset(os.path.basename(path), data=src[path][()])
-        # Raw h5py creation bypasses vlinks_store's writers, so stamp the
-        # order ourselves -- MIPs are rasters, truthfully (y, x)-major.
-        dst.attrs['coordinate_order'] = 'yx'
+    paths.write_manifest(SCRATCH, MODALITIES)
+    for hybe, modality, channel in SLICES:
+        mip = V.read_hybe_mip(store(modality, real=True), FOV, hybe, channel)
+        assert mip is not None, \
+            (f'{REAL}: no MIP for {modality}/{hybe}/ch{channel} in FOV{FOV} '
+             f'-- set CODELAB_SPOT_STORE_PROJECT to a v2 project that has one')
+        V.write_hybe_mip(store(modality), FOV, hybe, {channel: mip})
 
 
-def queue_path(queue):
-    return os.path.join(SCRATCH, queue)
+def store(modality, real=False):
+    """The storage_path for one modality -- <project>/{modality} in v2."""
+    return os.path.join(REAL if real else SCRATCH, modality)
 
 
-def detect(hybe, modality, channel, queue):
+def detect(hybe, modality, channel):
     """Mirror of MainWindow._run_spot_auto_detect_body's FOV-view branch."""
-    mip = V.read_hybe_mip(queue_path(queue), FOV, hybe, channel)
+    mip = V.read_hybe_mip(store(modality), FOV, hybe, channel)
     assert mip is not None, f'no MIP for {modality}/{hybe}/ch{channel}'
     threshold_abs = (THRESHOLD_PCT / 100.0) * float(mip.max())
     coords = peak_local_max(mip, min_distance=MIN_DISTANCE, exclude_border=1,
@@ -125,10 +128,10 @@ def populate():
         _real_spots_before = _real_spot_state()
     build_scratch()
     _detected.clear()
-    for hybe, modality, channel, queue in SLICES:
-        spots = detect(hybe, modality, channel, queue)
+    for hybe, modality, channel in SLICES:
+        spots = detect(hybe, modality, channel)
         _detected[(modality, hybe, channel)] = spots
-        V.write_spots(queue_path(queue), FOV, modality, hybe, channel, spots)
+        V.write_spots(store(modality), FOV, modality, hybe, channel, spots)
 
 
 def test_detection_finds_spots_in_every_slice():
@@ -140,9 +143,9 @@ def test_detection_finds_spots_in_every_slice():
 
 def test_every_slice_round_trips():
     populate()
-    for hybe, modality, channel, queue in SLICES:
+    for hybe, modality, channel in SLICES:
         spots = _detected[(modality, hybe, channel)]
-        back = V.read_spots(queue_path(queue), FOV, modality, hybe, channel)
+        back = V.read_spots(store(modality), FOV, modality, hybe, channel)
         assert len(back) == len(spots), f'{modality}/{hybe}: wrote {len(spots)}, read {len(back)}'
         wrote = {(round(s.raw_coordinate[0], 2), round(s.raw_coordinate[1], 2)) for s in spots}
         read = {(d['raw_coordinate'][0], d['raw_coordinate'][1]) for d in back}
@@ -156,18 +159,18 @@ def test_all_four_slices_coexist():
     """
     populate()
     total = 0
-    for hybe, modality, channel, queue in SLICES:
-        got = V.read_spots(queue_path(queue), FOV, modality, hybe, channel)
+    for hybe, modality, channel in SLICES:
+        got = V.read_spots(store(modality), FOV, modality, hybe, channel)
         assert len(got) == len(_detected[(modality, hybe, channel)]), \
             f'{modality}/{hybe}/ch{channel} lost spots to another slice write'
         total += len(got)
-    every = V.read_spots(queue_path('RNA_queue'), FOV)
+    every = V.read_spots(store('RNA'), FOV)
     assert len(every) == total, f'FOV-wide read got {len(every)}, expected {total}'
 
 
 def test_uids_are_unique_across_the_whole_fov():
     populate()
-    every = V.read_spots(queue_path('RNA_queue'), FOV)
+    every = V.read_spots(store('RNA'), FOV)
     uids = [d['uid'] for d in every]
     assert 0 not in uids, 'a spot reached storage without an allocated uid'
     assert len(set(uids)) == len(uids), 'uid collision -- uid no longer identifies one spot'
@@ -175,35 +178,35 @@ def test_uids_are_unique_across_the_whole_fov():
 
 def test_writing_one_slice_leaves_the_others_untouched():
     populate()
-    target = ('Hyb_101', 'RNA', 635, 'RNA_queue')
+    target = ('Hyb_101', 'RNA', 635)
     others = [s for s in SLICES if s != target]
-    before = {(m, h, c): len(V.read_spots(queue_path(q), FOV, m, h, c)) for h, m, c, q in others}
-    hybe, modality, channel, queue = target
-    V.write_spots(queue_path(queue), FOV, modality, hybe, channel,
+    before = {(m, h, c): len(V.read_spots(store(m), FOV, m, h, c)) for h, m, c in others}
+    hybe, modality, channel = target
+    V.write_spots(store(modality), FOV, modality, hybe, channel,
                   _detected[(modality, hybe, channel)][:1])
-    assert len(V.read_spots(queue_path(queue), FOV, modality, hybe, channel)) == 1
-    after = {(m, h, c): len(V.read_spots(queue_path(q), FOV, m, h, c)) for h, m, c, q in others}
+    assert len(V.read_spots(store(modality), FOV, modality, hybe, channel)) == 1
+    after = {(m, h, c): len(V.read_spots(store(m), FOV, m, h, c)) for h, m, c in others}
     assert before == after, f'a scoped write leaked into other slices: {before} -> {after}'
 
 
 def test_deletions_propagate_within_a_slice():
     populate()
-    hybe, modality, channel, queue = 'Hyb_500', 'RNA', 555, 'RNA_queue'
-    V.write_spots(queue_path(queue), FOV, modality, hybe, channel, [])
-    assert V.read_spots(queue_path(queue), FOV, modality, hybe, channel) == []
-    assert len(V.read_spots(queue_path('DNA_queue'), FOV, 'DNA', 'Hyb_002', 555)) > 0, \
+    hybe, modality, channel = 'Hyb_500', 'RNA', 555
+    V.write_spots(store(modality), FOV, modality, hybe, channel, [])
+    assert V.read_spots(store(modality), FOV, modality, hybe, channel) == []
+    assert len(V.read_spots(store('DNA'), FOV, 'DNA', 'Hyb_002', 555)) > 0, \
         'clearing one slice cleared another'
 
 
 def test_assigned_and_unassigned_share_a_slice():
     """They differ only in ASpot.cell -- no separate store, no separate flag."""
     populate()
-    hybe, modality, channel, queue = 'Hyb_105', 'RNA', 635, 'RNA_queue'
+    hybe, modality, channel = 'Hyb_105', 'RNA', 635
     spots = _detected[(modality, hybe, channel)][:6]
     for i, s in enumerate(spots):
         s.cell = 7 if i % 2 else -1
-    V.write_spots(queue_path(queue), FOV, modality, hybe, channel, spots)
-    back = V.read_spots(queue_path(queue), FOV, modality, hybe, channel)
+    V.write_spots(store(modality), FOV, modality, hybe, channel, spots)
+    back = V.read_spots(store(modality), FOV, modality, hybe, channel)
     assigned = [d for d in back if d['cell'] != -1]
     unassigned = [d for d in back if d['cell'] == -1]
     assert len(back) == len(spots)
@@ -214,23 +217,29 @@ _real_spots_before = None
 
 
 def _real_spot_state():
-    """Byte-level fingerprint of the real store's spot groups."""
+    """
+    Byte-level fingerprint of the real project's spot slice files.
+
+    In v2 a FOV's spots are one small file per (modality, hybe, channel)
+    under analysis/fov###/spots/, so the fingerprint is over those files
+    rather than over groups inside one vlinks.h5.
+    """
     import hashlib
     out = {}
-    with h5py.File(os.path.join(REAL, 'vlinks.h5'), 'r') as f:
-        for fov in (1, 2):
-            g = f.get(f'FOV{fov:02d}/spots')
-            if g is None:
-                out[fov] = None
-                continue
-            h = hashlib.md5()
-
-            def visit(name, obj):
-                if isinstance(obj, h5py.Dataset):
-                    h.update(name.encode())
-                    h.update(bytes(obj[()]))
-            g.visititems(visit)
-            out[fov] = h.hexdigest()
+    for fov in (1, 2):
+        d = os.path.join(paths.analysis_fov_dir(store(MODALITIES[0], real=True), fov),
+                         'spots')
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            out[fov] = None
+            continue
+        h = hashlib.md5()
+        for name in names:
+            h.update(name.encode())
+            with open(os.path.join(d, name), 'rb') as f:
+                h.update(f.read())
+        out[fov] = h.hexdigest()
     return out
 
 
@@ -267,9 +276,9 @@ def test_harness_detects_the_old_unscoped_store():
         # ignores (modality, hybe, channel) -- one pool per FOV, replaced whole
         unscoped[fov] = list(spots)
         real_write(storage_path, fov, modality, hybe, channel, spots)
-        for other_h, other_m, other_c, other_q in SLICES:
+        for other_h, other_m, other_c in SLICES:
             if (other_m, other_h, other_c) != (modality, hybe, channel):
-                real_write(queue_path(other_q), fov, other_m, other_h, other_c, [])
+                real_write(store(other_m), fov, other_m, other_h, other_c, [])
 
     V.write_spots = old_style
     try:

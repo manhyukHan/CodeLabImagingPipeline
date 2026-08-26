@@ -18,10 +18,20 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
-from PyQt5 import QtWidgets, QtGui
-
-from config import path
-from windows.main_window import MainWindow
+# The GUI stack is imported INSIDE the __main__ guard, not here.
+#
+# On Windows every multiprocessing 'spawn' child re-imports the parent's
+# __main__ module (as __mp_main__) so pickled references resolve. With
+# these imports at module level, each of the N children of every pool --
+# ingestion, FOV alignment, cell alignment, tracing, overlays -- paid for
+# PyQt5 and matplotlib before it could run a single task.
+#
+# Measured: 8 children became usable in 2222 ms with the GUI stack at
+# module level (1552 modules each) vs 137 ms without it (133 modules).
+# That startup storm is what made the app hitch AT POOL CREATION, before
+# any fitting had begun, and it got worse the more workers a pool asked
+# for. The children need none of it: their entry points live in Qt-free
+# modules and take only plain data.
 
 # The CODE Lab 'O' mark (tools/make_app_icon.py regenerates it) -- set as
 # the application icon so every window and the taskbar/dock entry carry
@@ -42,6 +52,8 @@ def _install_error_dialog_hook():
     ways the app is legitimately asked to stop.
     """
     import traceback
+
+    from PyQt5 import QtWidgets     # local: keeps module import Qt-free
 
     def hook(exc_type, exc, tb):
         if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
@@ -71,6 +83,13 @@ if __name__ == '__main__':
     # 5 GB and locking the conda env. See codelab_pipeline/process_guard.py.
     from codelab_pipeline import process_guard
     _guard_state = process_guard.install_parent_guard()
+
+    # Everything below is GUI-only, so it is imported HERE rather than at
+    # module level -- see the note at the top: spawn children re-import
+    # this file and must not pay for any of it.
+    from PyQt5 import QtWidgets, QtGui
+    from config import path
+    from windows.main_window import MainWindow
 
     _install_error_dialog_hook()
     question_app = QtWidgets.QApplication(sys.argv)

@@ -75,13 +75,22 @@ def tb_is_call_site(tb):
 
 
 def main():
-    app, w = build()
     failures = []
     skipped = []
+    # The mocks must cover CONSTRUCTION too, not just the sweep. A config
+    # whose project_root is missing makes _load_config raise a modal
+    # QMessageBox from inside __init__, before the window exists -- under
+    # the offscreen platform plugin that is an access violation, so the
+    # harness died with no output instead of reporting an unloadable
+    # config. Mocked, the same case prints the dialog text and the sweep
+    # still runs against a default-state window.
     with mock.patch.object(QtWidgets.QMessageBox, 'information'), \
             mock.patch.object(QtWidgets.QMessageBox, 'warning'), \
-            mock.patch.object(QtWidgets.QMessageBox, 'critical'), \
+            mock.patch.object(QtWidgets.QMessageBox, 'critical') as critical, \
             mock.patch.object(QtWidgets.QMessageBox, 'question'):
+        app, w = build()
+        for call in critical.call_args_list:
+            print(f'  dialog during load: {call.args[1:]}')
         methods = candidates(w)
         for name, fn in methods:
             try:

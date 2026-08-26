@@ -115,19 +115,56 @@ def main():
           'batch cleared it')
 
     # ---- persistence side: every FOV written, spots recast ----
-    written, recast = [], []
-    mw._recast_persisted_spots = lambda fov: recast.append(fov)
+    # ORDER matters: matrices must all be on disk BEFORE any overlay work
+    # starts. Resolving one cell's overlay args costs ~55 ms on the real
+    # store, so interleaving them made later FOVs' saves queue behind
+    # earlier FOVs' rendering prep.
+    events = []
+    mw._recast_persisted_spots = lambda fov: events.append(('recast', fov))
     mw._refresh_cell_fov_panels = lambda fov: None
-    mw._cell_overlay_draw_args = lambda *a, **k: None      # no overlays in this check
-    ap.CellOverlayAutoSaveThresholdSpinBox.setValue(500)   # nothing crosses it
+    mw._cell_overlay_draw_args = lambda c, fov, *a, **k: events.append(('resolve', fov)) or {'save_path': 'x'}
+    ap.CellOverlayAutoSaveThresholdSpinBox.setValue(0)     # every cell wants one
+    mw._cell_max_residual_shift = staticmethod(lambda c: 1.0)
     with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
-                           side_effect=lambda paths, fov, cont: written.append(fov)), \
+                           side_effect=lambda paths, fov, cont: events.append(('save', fov))), \
          mock.patch.object(MW.analysis_store, 'write_global_params'):
         mw._on_cell_alignment_all_finished(
             [(1, container.get_cells(1)), (3, container.get_cells(3))],
             {1: container, 3: container}, '/store/DNA', 'H1', 'DNA', 'fiducial', 10)
+    written = [f for k, f in events if k == 'save']
+    recast = [f for k, f in events if k == 'recast']
     check('every FOV persisted', written == [1, 3], str(written))
     check('every FOV had its spots recast', recast == [1, 3], str(recast))
+    kinds = [k for k, _f in events]
+    check('ALL saves happen before ANY overlay work',
+          'resolve' not in kinds or kinds.index('resolve') > max(
+              i for i, k in enumerate(kinds) if k == 'save'),
+          str(kinds))
+    check('overlays are queued, not resolved inline',
+          len(mw._overlay_pending) + len(mw._overlay_ready) > 0 or 'resolve' not in kinds,
+          f'pending={len(mw._overlay_pending)} ready={len(mw._overlay_ready)}')
+    check('queued overlay count matches the cells that wanted one',
+          mw._overlay_total == 3, str(mw._overlay_total))
+
+    # the drip resolves a few per tick and never all at once
+    before = len(mw._overlay_pending)
+    with mock.patch.object(mw, '_start_cell_overlay_save_worker') as starter:
+        mw._resolve_overlay_chunk()
+        after = len(mw._overlay_pending)
+        check('a tick resolves at most one chunk',
+              before - after <= mw.OVERLAY_RESOLVE_CHUNK, f'{before} -> {after}')
+        check('a resolved batch is handed to the render pool',
+              starter.called, 'pool never started')
+
+    # quit reporting
+    mw._overlay_pending = [(cell(1), 1)] * 5
+    mw._overlay_ready = []
+    q, rendering = mw._overlays_in_flight()
+    check('unfinished overlays are visible to the quit path', q == 5 and not rendering,
+          f'{q} {rendering}')
+    mw._overlay_pending = []
+    q, _r = mw._overlays_in_flight()
+    check('nothing in flight when the queue is empty', q == 0, str(q))
     check('staged preview STILL untouched after the finish handler',
           mw._pending_per_cell_alignment is not None, 'finish handler cleared it')
 
