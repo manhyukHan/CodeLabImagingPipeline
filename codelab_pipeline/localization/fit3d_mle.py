@@ -81,7 +81,8 @@ def _deviance_residuals(mu, y):
 def fit_gaussian_3d_mle(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
                         family='gaussian', shape_params=(0.15, 0.40),
                         free_shape=False, noise='poisson',
-                        peak_bound_um=0.416, fit_radius_um=(1.0, 1.0, 3.0),
+                        peak_bound_um=0.416, peak_bound_z_um=None,
+                        fit_radius_um=(1.0, 1.0, 3.0),
                         background='linear',
                         camera_gain=1.0, camera_offset=0.0,
                         min_hb_ratio=None, min_ah_ratio=None,
@@ -144,9 +145,11 @@ def fit_gaussian_3d_mle(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
         return mu - vals
 
     amp0 = float(max(np.nanmax(vals) - np.nanmedian(vals), 1.0))
+    # lateral and axial position bounds are separate physical lengths
+    pb_z = peak_bound_um if peak_bound_z_um is None else peak_bound_z_um
     p0 = [amp0, y0u, x0u, z0u]
-    lb = [0.0, y0u - peak_bound_um, x0u - peak_bound_um, z0u - peak_bound_um]
-    ub = [np.inf, y0u + peak_bound_um, x0u + peak_bound_um, z0u + peak_bound_um]
+    lb = [0.0, y0u - peak_bound_um, x0u - peak_bound_um, z0u - pb_z]
+    ub = [np.inf, y0u + peak_bound_um, x0u + peak_bound_um, z0u + pb_z]
     names = ['amplitude', 'y', 'x', 'z']
     if free_shape:
         for nm, v, (lo, hi) in zip(psf_mod.FAMILIES[family][1], shape_params,

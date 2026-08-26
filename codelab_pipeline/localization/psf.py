@@ -132,39 +132,55 @@ def evaluate(family, shape_params, dy, dx, dz):
 
 # -- calibration ---------------------------------------------------------
 
-def _fit_one_crop(cube, family, shape, voxel_um, fit_radius_um, seed_yxz):
+def _prepare_crop(cube, voxel_um, fit_radius_um, seed_yxz):
     """
-    Nuisance parameters for ONE crop with the PSF SHAPE HELD FIXED:
-    amplitude, centre and a linear background. Returns (rss, n) or None.
+    Everything about ONE crop that does NOT depend on the PSF shape:
+    the masked coordinate arrays, the values, and the seed in um.
 
-    The shape is what calibration is solving for and must be shared
-    across crops; everything else is per-spot and is profiled out here.
+    Split out because calibration evaluates many candidate shapes
+    against the same crops -- Nelder-Mead over 4 families is thousands
+    of inner fits -- and rebuilding the index mesh and radius mask each
+    time recomputed the identical geometry every call. Measured: that
+    waste was about half the total runtime.
+
+    Returns None when the crop has too few usable voxels.
     """
-    from scipy.optimize import least_squares
     dy_um, dx_um, dz_um = voxel_um
     iy, ix, iz = np.indices(cube.shape)
     Y, X, Z = iy * dy_um, ix * dx_um, iz * dz_um
     sy, sx, sz = seed_yxz
     y0u, x0u, z0u = sy * dy_um, sx * dx_um, sz * dz_um
-
-    m = np.isfinite(cube)
     ry, rx, rz = fit_radius_um
-    m = m & (np.abs(Y - y0u) <= ry) & (np.abs(X - x0u) <= rx) & (np.abs(Z - z0u) <= rz)
-    yv, xv, zv, vals = Y[m], X[m], Z[m], cube[m].astype(float)
-    if vals.size < 40:
+    m = (np.isfinite(cube) & (np.abs(Y - y0u) <= ry)
+         & (np.abs(X - x0u) <= rx) & (np.abs(Z - z0u) <= rz))
+    if m.sum() < 40:
         return None
+    vals = cube[m].astype(float)
+    return (Y[m], X[m], Z[m], vals, (y0u, x0u, z0u),
+            float(max(np.nanmax(vals) - np.nanmedian(vals), 1.0)),
+            float(np.nanmedian(vals)))
+
+
+def _fit_prepared(prep, family, shape):
+    """
+    Nuisance parameters for one prepared crop with the PSF SHAPE HELD
+    FIXED: amplitude, centre and a linear background. Returns (rss, n)
+    or None. The shape is what calibration solves for and must be shared
+    across crops; everything else is per-spot and is profiled out here.
+    """
+    from scipy.optimize import least_squares
+    yv, xv, zv, vals, (y0u, x0u, z0u), amp0, med = prep
 
     def resid(p):
         amp, cy, cx, cz, b0, by, bx, bz = p
-        psf = evaluate(family, shape, yv - cy, xv - cx, zv - cz)
-        return amp * psf + b0 + by * yv + bx * xv + bz * zv - vals
+        s = evaluate(family, shape, yv - cy, xv - cx, zv - cz)
+        return amp * s + b0 + by * yv + bx * xv + bz * zv - vals
 
-    amp0 = float(np.nanmax(vals) - np.nanmedian(vals))
-    p0 = [max(amp0, 1.0), y0u, x0u, z0u, float(np.nanmedian(vals)), 0.0, 0.0, 0.0]
+    p0 = [amp0, y0u, x0u, z0u, med, 0.0, 0.0, 0.0]
     lo = [0, y0u - 0.5, x0u - 0.5, z0u - 1.0, -np.inf, -np.inf, -np.inf, -np.inf]
     hi = [np.inf, y0u + 0.5, x0u + 0.5, z0u + 1.0, np.inf, np.inf, np.inf, np.inf]
     try:
-        r = least_squares(resid, p0, bounds=(lo, hi), max_nfev=300)
+        r = least_squares(resid, p0, bounds=(lo, hi), max_nfev=200)
     except Exception:
         return None
     if not r.success:
@@ -173,7 +189,7 @@ def _fit_one_crop(cube, family, shape, voxel_um, fit_radius_um, seed_yxz):
 
 
 def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
-              fit_radius_um=(0.8, 0.8, 2.0), verbose=True):
+              fit_radius_um=(0.8, 0.8, 2.0), verbose=True, z_centres=None):
     """
     Find the PSF shape that best describes `crops` -- a list of 3D
     (Y, X, Z) arrays from the REFERENCE hybe, which need no alignment.
@@ -188,13 +204,30 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
     """
     from scipy.optimize import minimize
     families = families or list(FAMILIES)
-    seeds = []
-    for c in crops:
-        iy, ix, iz = np.unravel_index(int(np.nanargmax(c)), c.shape)
-        # lateral seed is the crop CENTRE (where the alignment says the
-        # emitter is); axial seed is the brightest plane, since nothing
-        # upstream knows the depth
-        seeds.append(((c.shape[0] - 1) / 2.0, (c.shape[1] - 1) / 2.0, float(iz)))
+    # geometry is prepared ONCE per crop and reused for every candidate
+    # shape and every optimiser iteration (see _prepare_crop)
+    preps = []
+    for i, c in enumerate(crops):
+        # Lateral seed is the crop CENTRE -- where the alignment says the
+        # emitter is, which for a crop cut by reference_to_raw is a real
+        # prior and not a guess.
+        #
+        # Axial: prefer a z_centre supplied by the caller, which should
+        # come from the SAME consensus placement the fit itself uses. The
+        # fallback is this crop's own argmax over the full depth, and
+        # that fallback is known to misplace the box -- a pillar argmax
+        # chases whatever is brightest in the column, which may be a
+        # different object entirely. Calibrating on misplaced boxes would
+        # bias the very shape being measured, so callers with a baseline
+        # should always pass one.
+        if z_centres is not None and z_centres[i] is not None:
+            zc = float(np.clip(z_centres[i], 0, c.shape[2] - 1))
+        else:
+            zc = float(np.unravel_index(int(np.nanargmax(c)), c.shape)[2])
+        seed = ((c.shape[0] - 1) / 2.0, (c.shape[1] - 1) / 2.0, zc)
+        prep = _prepare_crop(c, voxel_um, fit_radius_um, seed)
+        if prep is not None:
+            preps.append(prep)
 
     results = {}
     for family in families:
@@ -202,9 +235,8 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
 
         def total(theta):
             rss, n = 0.0, 0
-            for cube, seed in zip(crops, seeds):
-                got = _fit_one_crop(cube, family, tuple(theta), voxel_um,
-                                    fit_radius_um, seed)
+            for prep in preps:
+                got = _fit_prepared(prep, family, tuple(theta))
                 if got is None:
                     continue
                 rss += got[0]
@@ -215,7 +247,7 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
                        options={'xatol': 1e-3, 'fatol': 1e-2, 'maxiter': 120})
         params = {k: float(v) for k, v in zip(names, res.x)}
         results[family] = {'params': params, 'score': float(res.fun),
-                           'n_crops': len(crops)}
+                           'n_crops': len(preps)}
         if verbose:
             pretty = '  '.join(f'{k}={v:.4f}' for k, v in params.items())
             print(f'   {family:<11} rss/voxel {res.fun:10.2f}   {pretty}', flush=True)
