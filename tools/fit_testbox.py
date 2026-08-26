@@ -270,12 +270,30 @@ def harvest(out_path, n_alleles, figures_dir=None):
           f'in {time.perf_counter() - t_start:.0f}s')
 
 
-def replicate_pairs(records):
-    """[(folder_a, folder_b, readout_id), ...] -- hybes probing one locus."""
+# Datatypes whose readout positions are REPLICATES of one another, i.e.
+# two independent measurements of the same physical locus that must land
+# in the same place.
+#
+# H (main hybridisation) and R (repeat) qualify. T (toehold) does NOT:
+# per explicit correction, a toehold round is a DISPLACEMENT CONTROL, so
+# its readout is not expected to sit where the H round's does -- treating
+# it as a replicate measures the displacement the control exists to
+# demonstrate, and scores it as localization error. It stays in the
+# TRACED set (it is a real round with a real fiducial); it is only
+# excluded from readout pairing.
+REPLICATE_DATATYPES = ('H', 'R')
+
+
+def replicate_pairs(records, datatypes=REPLICATE_DATATYPES):
+    """
+    [(folder_a, folder_b, readout_id), ...] -- rounds whose READOUT is a
+    genuine repeat measurement of one locus. See REPLICATE_DATATYPES for
+    why toehold rounds are excluded.
+    """
     from collections import defaultdict
     by_id = defaultdict(list)
     for r in records:
-        if str(r['datatype']).upper() in DATATYPES:
+        if str(r['datatype']).upper() in datatypes:
             by_id[r['readout_id']].append(r['folder'])
     out = []
     for rid, folders in sorted(by_id.items()):

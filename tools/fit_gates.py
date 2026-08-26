@@ -81,11 +81,44 @@ def fit_all(bench, kind, limit=None):
     return out, keys
 
 
-def pair_stats(fits, bench, kind, keep):
+def valid_pairs(bench, layout_path=None):
+    """
+    The pairs to score against.
+
+    Prefer re-deriving them from the layout: a bench frozen before the
+    toehold rounds were recognised as displacement controls has them
+    stored as replicates, and scoring against those measures the
+    displacement the control exists to show rather than localization
+    error. Re-deriving costs one spreadsheet read and repairs an old
+    bench without re-harvesting 2336 crops.
+    """
+    stored = [tuple(s.split('|')) for s in bench['__pairs__']]
+    if not layout_path:
+        return stored, None
+    from codelab_pipeline.io import preprocess
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'fit_testbox', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'fit_testbox.py'))
+    tb = importlib.util.module_from_spec(spec)
+    saved, sys.argv = sys.argv, ['fit_testbox']
+    try:
+        spec.loader.exec_module(tb)
+    finally:
+        sys.argv = saved
+    records = preprocess.parse_experiment_layout(layout_path)
+    derived = [(a, b, str(r)) for a, b, r in tb.replicate_pairs(records)]
+    dropped = [p for p in stored if p not in derived]
+    return derived, dropped
+
+
+def pair_stats(fits, bench, kind, keep, pairs=None, fiducials=None):
     """(n_pairs, median_xy_um, p90) over same-locus pairs both of whose
     rounds passed `keep`."""
     meta = bench['__meta__']
-    pairs = [tuple(s.split('|')) for s in bench['__pairs__']]
+    if pairs is None:
+        pairs = [tuple(s.split('|')) for s in bench['__pairs__']]
     d = []
     for aid, *_r in meta:
         for a, b, _rid in pairs:
@@ -93,14 +126,34 @@ def pair_stats(fits, bench, kind, keep):
             fa, fb = fits.get(ka), fits.get(kb)
             if fa is None or fb is None or not keep(fa) or not keep(fb):
                 continue
-            d.append(float(np.hypot(fa.y_um - fb.y_um, fa.x_um - fb.x_um)))
+            va = np.array([fa.y_um, fa.x_um, fa.z_um])
+            vb = np.array([fb.y_um, fb.x_um, fb.z_um])
+            if kind == 'readout' and fiducials is not None:
+                # THE PIPELINE'S OWN CORRECTION. A traced readout is
+                # reported as position + (fiducial(reference) -
+                # fiducial(this hybe)); comparing raw positions measures
+                # a quantity the pipeline never outputs. In the pair
+                # difference the reference fiducial cancels, and so do
+                # the crop origins -- a hybe's fiducial and readout crops
+                # are cut at the identical reference_to_raw point -- so
+                # the correction is just each readout minus its own
+                # hybe's fiducial. Measured: median replicate error
+                # 0.156 -> 0.090 um.
+                ga, gb = fiducials.get(f'a{aid}|{a}|fiducial'), fiducials.get(f'a{aid}|{b}|fiducial')
+                if ga is None or gb is None:
+                    continue
+                va = va - np.array([ga.y_um, ga.x_um, ga.z_um])
+                vb = vb - np.array([gb.y_um, gb.x_um, gb.z_um])
+            # 3D, not lateral: z is where the fit pathology lives, and a
+            # lateral-only metric cannot see it at all.
+            d.append(float(np.linalg.norm(va - vb)))
     if not d:
         return 0, float('nan'), float('nan')
     d = np.array(d)
     return len(d), float(np.median(d)), float(np.percentile(d, 90))
 
 
-def sweep(fits, bench, kind):
+def sweep(fits, bench, kind, pairs=None, fiducials=None):
     """One gate at a time, the other two wide open, so each curve shows
     that gate's own effect rather than the product of three."""
     grids = {
@@ -119,7 +172,8 @@ def sweep(fits, bench, kind):
         rows = []
         for t in grid:
             n, med, p90 = pair_stats(fits, bench, kind,
-                                     lambda f, t=t: keeps[name](f, t))
+                                     lambda f, t=t: keeps[name](f, t), pairs,
+                                     fiducials)
             kept = sum(1 for f in fits.values() if keeps[name](f, t))
             rows.append((float(t), kept, n, med, p90))
         curves[name] = rows
@@ -217,18 +271,31 @@ def main():
                     choices=['fiducial', 'readout'])
     ap.add_argument('--out', default=DEFAULT_OUT)
     ap.add_argument('--limit', type=int, default=None)
+    ap.add_argument('--layout', default=None,
+                    help='re-derive replicate pairs from this ExperimentLayout '
+                         '(drops toehold rounds, which are displacement controls)')
     a = ap.parse_args()
 
     v1_defaults = {'min_hb_ratio': 1.2, 'min_ah_ratio': 0.25, 'max_uncert_um': 0.416}
     bench = np.load(a.bench, allow_pickle=False)
+    pairs, dropped = valid_pairs(bench, a.layout)
+    print(f'scoring against {len(pairs)} replicate pairs per allele')
+    if dropped:
+        print(f'  dropped {len(dropped)} stored pair(s) that are NOT replicates:')
+        for x in dropped:
+            print(f'     {x[0]} vs {x[1]} (readout {x[2]})')
+    print()
     summary = {}
+    # the readout metric needs each hybe's own fiducial fit (see
+    # pair_stats), so fit that channel once up front
+    fid_fits, _ = fit_all(bench, 'fiducial', a.limit)
     for kind in (a.kind or ['fiducial', 'readout']):
         print(f'--- {kind} ---')
         fits, keys = fit_all(bench, kind, a.limit)
         if not fits:
             print('   nothing converged; skipping')
             continue
-        curves = sweep(fits, bench, kind)
+        curves = sweep(fits, bench, kind, pairs, fid_fits)
         fig1 = render(curves, kind, fits, a.out, v1_defaults)
         fig2 = render_distributions(fits, kind, a.out, v1_defaults)
         print(f'   wrote {fig1}')
