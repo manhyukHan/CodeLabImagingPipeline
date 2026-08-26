@@ -177,6 +177,37 @@ def main():
     check('celltype barcode mode fans out per FOV',
           'ThreadPoolExecutor' in ct_src)
 
+    # 7. cell view highlights the selected cell in the LEFT panel
+    from canvas.spot_crop_displayer import SpotCropDisplayer
+    import numpy as _np
+    d = SpotCropDisplayer()
+    ys_g, xs_g = _np.mgrid[0:64, 0:64]
+    masks = []
+    for cid, (cx, cy) in enumerate([(15, 15), (45, 20), (30, 45)], start=44):
+        m = (xs_g - cx) ** 2 + (ys_g - cy) ** 2 <= 8 ** 2
+        yy, xx = _np.where(m)
+        masks.append((cid, xx.astype(float), yy.astype(float)))
+    img = _np.zeros((64, 64), dtype=_np.float32)
+
+    def ctx_colors(highlight):
+        d.set_data(img[10:30, 10:30], [], context_image=img, context_masks=masks,
+                   context_title='t', context_highlight=highlight)
+        ax = d._context_axes if d._context_axes is not None else d.canvas.figure.axes[0]
+        return ({ln.get_color() for ln in ax.get_lines()},
+                {t.get_text(): t.get_color() for t in ax.texts})
+
+    lines, labels = ctx_colors(45)
+    check('selected cell contour turns red', lines == {'yellow', 'red'}, str(lines))
+    check('selected cell label turns red',
+          labels.get('45') == 'red' and labels.get('44') == 'yellow'
+          and labels.get('46') == 'yellow', str(labels))
+    lines, labels = ctx_colors(None)
+    check('no highlight -> everything stays yellow',
+          lines == {'yellow'} and set(labels.values()) == {'yellow'}, f'{lines} {labels}')
+    lines, labels = ctx_colors(999)
+    check('highlight of an absent cell changes nothing',
+          lines == {'yellow'} and set(labels.values()) == {'yellow'}, f'{lines} {labels}')
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:

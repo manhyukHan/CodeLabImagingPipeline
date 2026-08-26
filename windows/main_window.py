@@ -4915,6 +4915,9 @@ class MainWindow(QtWidgets.QMainWindow):
             crop['img'], existing_points, mask=crop['mask'],
             context_image=crop['full_mip'], context_masks=context_masks,
             context_title=f'FOV{fov:03d} {hybe} ch{channel} (full)',
+            # the cell the RIGHT panel is cropped to, drawn red among its
+            # yellow neighbours so the left panel says WHERE you are
+            context_highlight=cell.id,
             spot_indices=spot_indices, keep_view=keep_view)
         preserve_ids = self._selected_3d_spot_ids()
         self._current_view_spot_refs = [(s, cell) for s in scoped_spots]

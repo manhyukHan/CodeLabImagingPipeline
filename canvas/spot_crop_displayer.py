@@ -100,6 +100,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         self.readonly_indices = []
         self.context_image = None
         self.context_masks = None
+        self.context_highlight = None
         self.context_title = ''
         self._axes = None
         self._context_axes = None
@@ -147,6 +148,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
 
     def set_data(self, crop_image, spot_points, mask=None, color='red', readonly_points=None,
                  context_image=None, context_masks=None, context_title='',
+                 context_highlight=None,
                  spot_indices=None, readonly_indices=None, keep_view=False):
         """
         spot_indices/readonly_indices: optional lists of DISPLAY index
@@ -190,9 +192,16 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         one entry per cell to outline on the LEFT panel, already
         transformed into the CURRENT hybe's own frame by the caller (via
         ACell.get_area_in_readout), same "this class only draws plain
-        arrays" separation as mask/crop_image above. Cell view passes just
-        the one selected cell; FOV view passes every cell in the FOV.
+        arrays" separation as mask/crop_image above. Both views pass
+        EVERY cell in the FOV (the panel exists to orient you, and one
+        lone contour in a field of unmarked cells does not).
         Ignored when context_image is None.
+
+        context_highlight: optional label to draw in red instead of
+        yellow -- in cell view this is the cell the RIGHT panel is
+        cropped to, so the left panel says WHERE you are. Purely a
+        per-label colour choice at draw time: same contours, same
+        labels, no extra work. None (default) draws everything yellow.
 
         context_title: optional title string for the LEFT panel.
 
@@ -217,6 +226,7 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                                  else list(range(start, start + len(self.readonly_points))))
         self.context_image = context_image
         self.context_masks = list(context_masks) if context_masks else []
+        self.context_highlight = context_highlight
         self.context_title = context_title
         self._redraw(keep_view=keep_view)
 
@@ -332,9 +342,19 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         # into its own padded bbox and passing explicit X/Y coordinates, so
         # this is ~N small arrays rather than N full-frame ones.
         if self.context_masks:
-            for _, xs, ys in self.context_masks:
-                self._contour_one(ax, xs, ys)
-            for label, xs, ys in self.context_masks:
+            highlight = self.context_highlight
+            def _is_selected(label):
+                return highlight is not None and label is not None and label == highlight
+            # The selected cell is drawn LAST so its boundary sits on top
+            # where it touches a neighbour -- a shared edge otherwise
+            # takes whichever colour happened to be drawn second.
+            ordered = sorted(self.context_masks, key=lambda m: _is_selected(m[0]))
+            for label, xs, ys in ordered:
+                selected = _is_selected(label)
+                self._contour_one(ax, xs, ys,
+                                  color='red' if selected else 'yellow',
+                                  linewidth=2 if selected else 1)
+            for label, xs, ys in ordered:
                 if label is None or len(xs) == 0:
                     continue
                 # a thin black stroke keeps the label legible over both
@@ -342,7 +362,8 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                 # that the mask itself is just a boundary line, not a
                 # solid fill to sit on top of.
                 txt = ax.text(float(np.mean(xs)), float(np.mean(ys)), str(label),
-                              color='yellow', fontsize=8, fontweight='bold', ha='center', va='center')
+                              color='red' if _is_selected(label) else 'yellow',
+                              fontsize=8, fontweight='bold', ha='center', va='center')
                 txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='black')])
         if self.context_title:
             ax.set_title(self.context_title, fontsize=10)
