@@ -3,10 +3,16 @@ rem CODE Lab Imaging Pipeline launcher -- Windows (double-clickable).
 rem Same resolution order as launch_codelab.command, so both platforms
 rem behave identically:
 rem   1. CODELAB_PYTHON env var (explicit interpreter -- the reliable knob)
-rem   2. the cellclassifier conda env, if conda says it exists
+rem   2. the code_lab_imaging_pipeline conda env, if conda says it exists
+rem      (or the pre-rename "cellclassifier" env, if only that one exists)
 rem   3. offer to CREATE that env from requirements.txt and then use it
 rem   4. conda's base env, then plain python, and hope the active
 rem      environment has the deps
+rem
+rem CODELAB_LAUNCH_QUIET=1 (set by launch_codelab.vbs, the no-console
+rem launcher) means this window is HIDDEN: never prompt and never pause,
+rem because there is nothing on screen to answer and the wait would be
+rem invisible and forever. It reports through its exit code instead.
 rem
 rem Step 3 exists because base is not a safe fallback for this project any
 rem more: requirements.txt pins cellpose below 4 (4.x deleted the
@@ -17,7 +23,12 @@ rem chore, so the launcher offers to do it.
 setlocal
 cd /d "%~dp0"
 
-set "CODELAB_ENV=cellclassifier"
+set "CODELAB_ENV=code_lab_imaging_pipeline"
+rem The env was called "cellclassifier" before the project got its own
+rem name. An existing one is still perfectly good -- same
+rem requirements.txt -- so it is used rather than making anyone
+rem re-download several GB just because the canonical name changed.
+set "CODELAB_LEGACY_ENV=cellclassifier"
 set "CODELAB_PY_VERSION=3.11"
 
 if defined CODELAB_PYTHON (
@@ -44,8 +55,20 @@ set "ENV_FOUND="
 if not errorlevel 1 set "ENV_FOUND=1"
 if defined ENV_FOUND goto :run_env
 
+"%CONDA%" env list 2>nul | findstr /b /c:"%CODELAB_LEGACY_ENV% " >nul
+if errorlevel 1 goto :no_env
+echo [launcher] "%CODELAB_ENV%" not found; using the pre-rename env "%CODELAB_LEGACY_ENV%".
+set "CODELAB_ENV=%CODELAB_LEGACY_ENV%"
+goto :run_env
+
+:no_env
 echo [launcher] conda env "%CODELAB_ENV%" does not exist yet.
 if /i "%CODELAB_BOOTSTRAP%"=="never" goto :base_fallback
+if "%CODELAB_LAUNCH_QUIET%"=="1" (
+    echo [launcher] hidden launch -- not prompting. Run launch_codelab.bat
+    echo [launcher] directly once to create the environment.
+    goto :base_fallback
+)
 if /i "%CODELAB_BOOTSTRAP%"=="yes" goto :do_bootstrap
 echo [launcher] It can be created now from requirements.txt. That downloads
 echo [launcher] a few GB (CUDA torch) and takes several minutes, once.
@@ -93,6 +116,12 @@ if not errorlevel 1 (
 echo [launcher] No usable Python found.
 echo [launcher] Point CODELAB_PYTHON at the interpreter you want, e.g.
 echo [launcher]   setx CODELAB_PYTHON "%USERPROFILE%\anaconda3\python.exe"
+rem exit 1 so the hidden launcher can surface this in a dialog; a pause
+rem here would hang invisibly forever.
+if "%CODELAB_LAUNCH_QUIET%"=="1" (
+    endlocal
+    exit /b 1
+)
 pause
 goto :end
 

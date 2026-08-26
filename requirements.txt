@@ -1,4 +1,4 @@
-# Dependencies for the `cellclassifier` conda env. launch_codelab.bat /
+# Dependencies for the `code_lab_imaging_pipeline` conda env. launch_codelab.bat /
 # launch_codelab.command create that env from THIS file automatically the
 # first time they find it missing, so this list is the single source of
 # truth -- add a dependency here, not into an env by hand.

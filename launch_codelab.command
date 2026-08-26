@@ -3,7 +3,8 @@
 # Same resolution order as launch_codelab.bat, so both platforms behave
 # identically:
 #   1. CODELAB_PYTHON env var (explicit interpreter -- the reliable knob)
-#   2. the cellclassifier conda env, if conda says it exists
+#   2. the code_lab_imaging_pipeline conda env, if conda says it exists
+#      (or the pre-rename "cellclassifier" env, if only that one exists)
 #   3. offer to CREATE that env from requirements.txt and then use it
 #   4. conda's base env, then plain python3, and hope the active
 #      environment has the deps
@@ -15,7 +16,10 @@
 # A purpose-built env is the fix; creating it should not be a manual chore.
 cd "$(dirname "$0")" || exit 1
 
-CODELAB_ENV=${CODELAB_ENV:-cellclassifier}
+CODELAB_ENV=${CODELAB_ENV:-code_lab_imaging_pipeline}
+# Pre-rename name -- same requirements.txt, so an existing one is used
+# rather than forcing a multi-GB rebuild for a rename alone.
+CODELAB_LEGACY_ENV=${CODELAB_LEGACY_ENV:-cellclassifier}
 CODELAB_PY_VERSION=${CODELAB_PY_VERSION:-3.11}
 
 if [ -n "$CODELAB_PYTHON" ]; then
@@ -81,6 +85,13 @@ fi
 # it on any drive, and this project's own env does not live under the conda
 # install root.
 if "$CONDA" env list 2>/dev/null | grep -q "^$CODELAB_ENV[[:space:]]"; then
+    run_in_env
+fi
+
+# Pre-rename env: same requirements.txt, so use it rather than rebuilding.
+if "$CONDA" env list 2>/dev/null | grep -q "^$CODELAB_LEGACY_ENV[[:space:]]"; then
+    echo "[launcher] \"$CODELAB_ENV\" not found; using the pre-rename env \"$CODELAB_LEGACY_ENV\"."
+    CODELAB_ENV=$CODELAB_LEGACY_ENV
     run_in_env
 fi
 
