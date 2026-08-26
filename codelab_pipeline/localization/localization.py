@@ -1311,3 +1311,44 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
         else:
             allele.rejected_hybes[hybe] = 'no readout peak accepted'
     return (allele, debug) if collect_debug else allele
+
+def refine_spots_batch(targets, storage_path, fov, channel, hybe, modality,
+                       params, fov_matrices, resolver, want_grid=False):
+    """
+    Refine Z for a whole SELECTION in one call, in order -- the
+    child-process entry point behind Spot Localization's Run and View.
+
+    targets: [(spot, cell_or_None), ...]. The loop must stay sequential
+    and in this order: `claimed_positions` accumulates as it goes, so two
+    distinct spots sharing an ambiguous crop cannot collapse onto the
+    same blob (see refine_spot_z). Parallelising per spot would silently
+    change the result, so the whole batch is one job.
+
+    Returns [(index, new_coordinate, new_raw, mixture_centroids, cubic,
+    centroid), ...]; cubic/centroid are None unless want_grid (View needs
+    them to draw the fit-status grid, Run does not and they are the bulky
+    part of the payload). Index-keyed because the caller's spot objects
+    live in ANOTHER process -- it maps results back onto its own objects.
+
+    Runs where it is called from a process pool rather than a thread
+    because every crop here reads the raw stack, and h5py serialises
+    every HDF5 call in a process behind one lock -- as a thread this
+    starves the GUI's own image loads (measured 16.5 ms -> 2043 ms).
+    """
+    claimed_positions = []
+    out = []
+    for i, (spot, cell) in enumerate(targets):
+        new_coordinate, new_raw, cubic, centroid, _extra, mixture_centroids = refine_spot_z(
+            spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
+            spad=params['spad'], peak_bound=params['peak_bound'],
+            max_sigma=params['max_sigma'], max_uncert=params['max_uncert'],
+            min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
+            min_sep=params['min_sep'], claimed_positions=claimed_positions,
+            use_mixture=params['multi_mode'], z_window=params['z_window'],
+            fov_matrices=fov_matrices, resolver=resolver)
+        if new_raw is not None:
+            claimed_positions.append((new_raw[0], new_raw[1]))
+        out.append((i, new_coordinate, new_raw, mixture_centroids,
+                    cubic if want_grid else None,
+                    centroid if want_grid else None))
+    return out

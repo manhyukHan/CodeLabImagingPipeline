@@ -6,6 +6,45 @@ from codelab_pipeline.io import analysis_store
 from codelab_pipeline.alignment import chain as alignment
 from codelab_pipeline.alignment.convention import as_cv2  # y-major -> cv2 at warp boundaries
 
+class _NoCanvas:
+    """
+    Stands in for `self` when a drawing method is called with an explicit
+    figure= from a CHILD PROCESS, where no Qt canvas exists.
+
+    Those methods use `self` only to reach self.preview_canvas.figure,
+    and only when figure is None. If one ever grows another `self` use,
+    this turns a confusing AttributeError-on-None into a message that
+    says exactly what the rule is.
+    """
+    def __getattr__(self, name):
+        raise RuntimeError(
+            f'drawing code touched self.{name} while rendering off-process with '
+            f'an explicit figure= -- that path must stay Qt-free (see '
+            f'render_cell_overlay_to_png).')
+
+
+def render_cell_overlay_to_png(draw_args, figsize=(14, 9), dpi=150):
+    """
+    CHILD-PROCESS entry point: render one cell's all-readouts overlay and
+    write it to draw_args['save_path']. Returns that path.
+
+    Why a separate process rather than the QThread this used to run in:
+    h5py takes ONE process-wide lock for every HDF5 call, held for the
+    whole read including gzip inflation. A worker doing slab reads in a
+    thread therefore stalls the GUI's own image loads -- measured on the
+    real store, a 16.5 ms MIP open became 2043 ms while one background
+    thread read slabs, and 16.8 ms (i.e. unaffected) when the same reads
+    ran in a separate process. Separate processes, separate locks.
+
+    Module-level and taking only plain data, so it is picklable under the
+    'spawn' start method.
+    """
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=figsize, dpi=dpi)
+    PipelineCanvas.draw_cell_all_readouts_overlay(_NoCanvas(), figure=fig, **draw_args)
+    return draw_args.get('save_path')
+
+
 def _sequential_color(i, n):
     """
     Linear interpolation from red (1,0,0) at i=0 to cyan (0,1,1) at i=n-1 --

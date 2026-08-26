@@ -170,12 +170,36 @@ def main():
           '_start_cell_overlay_save_worker' in saveall_src
           and 'preview_canvas.draw_cell_all_readouts_overlay' not in saveall_src)
 
-    # 6. celltype determination is background + FOV-parallel
+    # 6. every worker that reads HDF5 must use PROCESSES, not threads.
+    #    h5py takes one process-wide lock for every call, held for the
+    #    whole read, so a thread doing stack/MIP reads starves the GUI's
+    #    own image loads -- measured 16.5 ms -> 2043 ms on the real
+    #    store, and 16.8 ms (unaffected) with the same reads in separate
+    #    processes. This is the contract that fix has to keep.
     ct_src = inspect.getsource(MainWindow._run_celltype_determination_body)
-    check('celltype barcode mode runs in a background worker',
-          'FnWorker' in ct_src and '_celltype_worker' in ct_src)
+    check('celltype barcode mode runs in background PROCESSES',
+          'ProcWorker' in ct_src and '_celltype_worker' in ct_src
+          and 'ThreadPoolExecutor' not in ct_src, 'still thread-backed')
     check('celltype barcode mode fans out per FOV',
-          'ThreadPoolExecutor' in ct_src)
+          '_classify_celltype_fov' in ct_src and 'max_workers' in ct_src)
+
+    for name in ('_start_cell_overlay_save_worker', '_run_3d_localize',
+                 '_view_3d_localize', '_apply_focus_detection'):
+        src = inspect.getsource(getattr(MainWindow, name))
+        check(f'{name} uses ProcWorker (h5py reads off this process)',
+              'ProcWorker' in src and 'FnWorker' not in src, 'still FnWorker')
+
+    # the child entry points must be module-level, or 'spawn' cannot pickle them
+    import codelab_pipeline.localization.localization as _loc
+    from canvas import pipeline_canvas as _pc
+    from codelab_pipeline.segmentation import segment as _seg
+    import pickle as _pickle
+    for fn in (_loc.refine_spots_batch, _pc.render_cell_overlay_to_png, _seg.focus_profile):
+        try:
+            _pickle.loads(_pickle.dumps(fn))
+            check(f'{fn.__name__} is picklable for spawn', True)
+        except Exception as e:
+            check(f'{fn.__name__} is picklable for spawn', False, str(e))
 
     # 7. cell view highlights the selected cell in the LEFT panel
     from canvas.spot_crop_displayer import SpotCropDisplayer

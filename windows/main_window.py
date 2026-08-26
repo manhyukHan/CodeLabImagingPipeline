@@ -3,7 +3,7 @@ import os
 import re
 import time
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from copy import deepcopy
 from datetime import datetime
@@ -16,6 +16,7 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 
 from config import path as repo_path, config_name
 from ui.main_window_ui import MainWindowUI
+from canvas import pipeline_canvas
 from canvas.pipeline_canvas import PipelineCanvas, _sequential_color
 from canvas.cell_displayer import CellDisplayer
 from ui.cytoplasm_panel import CytoplasmSegmentationWindow
@@ -309,6 +310,57 @@ class FnWorker(QtCore.QThread):
             self.finished_ok.emit(self._fn())
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class ProcWorker(QtCore.QThread):
+    """
+    Run picklable jobs in SEPARATE PROCESSES and report back on the GUI
+    thread -- the process-backed sibling of FnWorker.
+
+    Use this instead of FnWorker whenever the work reads HDF5. h5py takes
+    ONE process-wide lock for every call, held for the whole read
+    including gzip inflation, so a thread doing stack reads stalls the
+    GUI's own image loads no matter that it is "in the background".
+    Measured on the real store, one background thread doing slab reads
+    took a 16.5 ms MIP open to 2043 ms (124x); the same reads in separate
+    processes left it at 16.8 ms, i.e. untouched. Separate processes have
+    separate locks -- that is the whole fix.
+
+    jobs: [(fn, args), ...] where fn is a MODULE-LEVEL function and args
+    are picklable ('spawn' start method). Results come back in job order.
+    A pool failure is reported through `failed`, never raised into the
+    event loop.
+    """
+    finished_ok = QtCore.pyqtSignal(object)      # [result, ...] in job order
+    failed = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int, int)       # (done, total)
+
+    def __init__(self, jobs, max_workers=1):
+        super().__init__()
+        self.jobs = list(jobs)
+        self.max_workers = max(1, int(max_workers))
+
+    def run(self):
+        try:
+            results = [None] * len(self.jobs)
+            if not self.jobs:
+                self.finished_ok.emit(results)
+                return
+            workers = min(self.max_workers, len(self.jobs))
+            with ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=multiprocessing.get_context('spawn'),
+                    initializer=process_guard.child_initializer) as pool:
+                futures = {pool.submit(fn, *args): i
+                           for i, (fn, args) in enumerate(self.jobs)}
+                done = 0
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+                    done += 1
+                    self.progress.emit(done, len(self.jobs))
+            self.finished_ok.emit(results)
+        except Exception as e:
+            self.failed.emit(f'{type(e).__name__}: {e}')
 
 
 class ClassicalSegmentWorker(QtCore.QThread):
@@ -892,17 +944,77 @@ def _cross_modal_quality_text(quality):
     return text
 
 
-class MainWindow(QtWidgets.QMainWindow):
-    # Emitted FROM the overlay-render worker thread; Qt queues it onto the
-    # GUI thread, which is the only safe way for that thread to report
-    # progress (it must never touch a widget itself).
-    _overlay_progress = QtCore.pyqtSignal(int, int)   # (done, total)
+def _classify_celltype_fov(job, barcode_channel, storage_by_modality,
+                           celltype_determination, method):
+    """
+One FOV's barcode classification, in a CHILD PROCESS: read that
+FOV's barcode MIPs, clip each position against its own channel's
+frame, classify its cells and spots.
 
+Module-level and taking every input explicitly (it used to be a
+closure) so it is picklable under the 'spawn' start method. It
+must run in a process, not a thread: the MIP reads go through
+h5py, which serialises every HDF5 call in a process behind one
+lock, so a thread pool here stalls the GUI's own image loads.
+
+Touches no session state and no widget -- the geometry it works
+from was resolved on the GUI thread and shipped in `job`.
+"""
+    fov = job['fov']
+    fov_key = str(fov)
+    cache = {}
+    for bch in barcode_channel:
+        hybe, channel_id, bch_modality = bch
+        # each celltype's own barcode channel can belong to a
+        # DIFFERENT modality than the others -- resolve each
+        # one's real storage path independently.
+        bch_storage_path = storage_by_modality.get(bch_modality)
+        cache[bch] = (analysis_store.read_hybe_mip(bch_storage_path, fov, hybe, channel_id)
+                      if bch_storage_path else None)
+    # a barcode channel with no MIP is missing DATA -- the only
+    # honest skip. Alignment is NEVER a skip cause: an uncomputed
+    # layer is identity by the pipeline's own rule.
+    missing = [bch for bch in barcode_channel if cache.get(bch) is None]
+    if missing:
+        labels = ', '.join(f'{h}/ch{c} ({m})' for h, c, m in missing)
+        return {'fov': fov, 'skipped': job['n_in_map'],
+                'reason': f'no MIP for {labels}',
+                'log': (f'FOV{fov:03d}: skipped ({job["n_in_map"]} cell(s)) -- no MIP in '
+                        f'the store for barcode channel(s) {labels}. Ingest those '
+                        f'(hybe, channel) pairs; alignment is NOT required.'),
+                'cell_types': {}, 'spot_types': {}}
+
+    image_cache = {fov_key: cache}
+
+    def clipped(bch, x, y):
+        # an aligned position can land a pixel outside this
+        # channel's own frame, and an unclipped index crashed the
+        # WHOLE run (IndexError 1024)
+        height, width = cache[bch].shape
+        return np.clip(x, 0, width - 1), np.clip(y, 0, height - 1)
+
+    cell_types = {}
+    for cell_id, per_channel in job['cells'].items():
+        area_by_channel = {bch: clipped(bch, x, y) for bch, (x, y) in per_channel.items()}
+        cell_types[cell_id] = celltype.classify_cell_barcode(
+            area_by_channel, fov, image_cache, celltype_determination, method=method)
+    spot_types = {}
+    for uid, per_channel in job['spots'].items():
+        xy_by_channel = {}
+        for bch, (x, y) in per_channel.items():
+            cx, cy = clipped(bch, x, y)
+            xy_by_channel[bch] = (float(cx), float(cy))
+        spot_types[uid] = celltype.classify_spot_barcode(
+            xy_by_channel, fov, image_cache, celltype_determination)
+    return {'fov': fov, 'skipped': 0, 'reason': None, 'log': None,
+            'cell_types': cell_types, 'spot_types': spot_types}
+
+
+class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, config_file=None):
         super().__init__()
         self.ui = MainWindowUI()
         self.ui.setupUi(self)
-        self._overlay_progress.connect(self._on_overlay_progress)
 
         # {modality_name: [hybe_record, ...]} -- every configured
         # modality's parsed ExperimentLayout, written by _parse_layouts
@@ -3483,22 +3595,19 @@ class MainWindow(QtWidgets.QMainWindow):
         plateau as well as the single peak, since focus varies across the field
         while the metric only samples the centre.
 
-        Profiling runs in the BACKGROUND: it reads every z-slab of the raw
-        stack, measured 24.7 s before the slab cache and ~6.3 s after
-        (io/stack_cache.py), which is far too long to hold the GUI. The
-        slabs it pulls stay cached, so the plane-scrolling that always
-        follows is then ~10 ms per tick instead of seconds.
+        Profiling runs in a BACKGROUND PROCESS: it reads every z-slab of
+        the raw stack, measured 24.7 s before the slab cache and ~6.3 s
+        after (io/stack_cache.py) -- far too long to hold the GUI, and
+        as a thread it would hold h5py's process-wide lock for that whole
+        time and starve every GUI image load anyway (see ProcWorker).
         """
         panel.AutoFocusPushButton.setEnabled(False)
         self.statusBar().showMessage(f'Detecting focal plane for {hybe} ch{channel}...')
 
-        def _compute():
-            return segment.focus_profile(storage_path, fov, hybe, channel)
-
-        def _done(result):
+        def _done(results):
             panel.AutoFocusPushButton.setEnabled(True)
             self.statusBar().clearMessage()
-            zs, values = result
+            zs, values = results[0]
             if zs is None or len(zs) == 0:
                 QtWidgets.QMessageBox.warning(self, 'Detect Focal Plane',
                                               f"Can't read the raw stack for {hybe} ch{channel}.")
@@ -3511,7 +3620,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, 'Detect Focal Plane',
                                           f"Can't read the raw stack for {hybe} ch{channel}: {message}")
 
-        self._focus_worker = FnWorker(_compute)
+        # A PROCESS, not a thread: focus_profile reads every z-slab of the
+        # raw stack, and h5py's process-wide lock means doing that in a
+        # thread stalls the GUI's own image loads (16.5 ms -> 2043 ms
+        # measured). The cost is that the slabs warm the CHILD's cache,
+        # not this process's, so the first plane read after detection is
+        # cold again -- worth it to keep the window usable.
+        self._focus_worker = ProcWorker([(segment.focus_profile,
+                                          (storage_path, fov, hybe, channel))])
         self._focus_worker.finished_ok.connect(_done)
         self._focus_worker.failed.connect(_failed)
         self._focus_worker.start()
@@ -5269,43 +5385,32 @@ class MainWindow(QtWidgets.QMainWindow):
         # anchors silently dropped every XY residual to the FOV route.)
         resolver = self._frame_resolver(None, fov)
 
-        # Background (FnWorker): each refine reads a stack crop off NAS,
-        # so a large selection froze the window for its whole duration.
-        # The worker COMPUTES only -- every spot mutation, the undo
-        # bracket, and the refreshes happen in _done on the GUI thread,
-        # and both buttons are disabled so nothing else touches these
-        # spots meanwhile.
+        # Background PROCESS: each refine reads a stack crop off NAS, and
+        # h5py serialises every HDF5 call in a process behind one lock --
+        # in a thread this both froze nothing visibly AND starved the
+        # GUI's own image loads (16.5 ms -> 2043 ms measured). The child
+        # COMPUTES only; every spot mutation, the undo bracket and the
+        # refreshes happen in _done on the GUI thread, and both buttons
+        # are disabled so nothing else touches these spots meanwhile.
         d = self.localize_3d_displayer
         d.RunPushButton.setEnabled(False)
         d.ViewPushButton.setEnabled(False)
         d.StatusLabel.setText(f'{hybe} ch{channel}: refining Z for {len(targets)} spot(s) in background...')
 
-        def _compute():
-            t0 = time.perf_counter()
-            claimed_positions = []  # (abs_x, abs_y) of already-refined spots in THIS batch, so
-                                    # two distinct spots sharing an ambiguous crop don't collapse
-                                    # onto the same blob -- see refine_spot_z's own docstring
-            results = []
-            for spot, cell in targets:
-                new_coordinate, new_raw, _cubic, _centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
-                    spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
-                    spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
-                    max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
-                    min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                    z_window=params['z_window'], fov_matrices=fov_matrices, resolver=resolver)
-                results.append((spot, new_coordinate, new_raw, mixture_centroids))
-                if new_raw is not None:
-                    claimed_positions.append((new_raw[0], new_raw[1]))
-            return results, time.perf_counter() - t0
+        t_start = time.perf_counter()
 
-        def _done(payload):
+        def _done(results):
             d.RunPushButton.setEnabled(True)
             d.ViewPushButton.setEnabled(True)
-            results, elapsed = payload
+            elapsed = time.perf_counter() - t_start
+            # index-keyed: the child refined COPIES of these spots, so
+            # results are mapped back onto this process's own objects
+            refined = [(targets[i][0], coord, raw, mix)
+                       for i, coord, raw, mix, _c, _ct in results[0]]
             fp_undo = self._begin_spot_edit(fov)
             n_refined = 0
             n_mixture = 0
-            for spot, new_coordinate, new_raw, mixture_centroids in results:
+            for spot, new_coordinate, new_raw, mixture_centroids in refined:
                 if new_coordinate is not None:
                     spot.adj_coordinate = new_coordinate
                     spot.raw_coordinate = new_raw
@@ -5322,9 +5427,9 @@ class MainWindow(QtWidgets.QMainWindow):
             mode_label = 'mixture' if params['multi_mode'] else 'single'
             mixture_msg = f', {n_mixture} with >1 real component saved as mixture_centroids' if n_mixture else ''
             d.StatusLabel.setText(
-                f'{hybe} ch{channel}: {n_refined}/{len(results)} selected spot(s) refined with real Z '
-                f'({len(results) - n_refined} rejected -- z left as-is){mixture_msg}. '
-                f'[{mode_label} mode, {elapsed:.2f}s for {len(results)} spot(s)]')
+                f'{hybe} ch{channel}: {n_refined}/{len(refined)} selected spot(s) refined with real Z '
+                f'({len(refined) - n_refined} rejected -- z left as-is){mixture_msg}. '
+                f'[{mode_label} mode, {elapsed:.2f}s for {len(refined)} spot(s)]')
             self._refresh_spot_cell_list()
             if sp.current_view() == 'cell':
                 self._load_spot_crop_for_display()
@@ -5337,7 +5442,12 @@ class MainWindow(QtWidgets.QMainWindow):
             d.StatusLabel.setText(f'{hybe} ch{channel}: 3D refine failed -- {message}')
             self.log(f'3D localization (Run) failed for FOV{fov:03d} {hybe} ch{channel}: {message}')
 
-        self._localize3d_worker = FnWorker(_compute)
+        # Same reasoning as Run: a PROCESS, because the crops read the raw
+        # stack and h5py's one-lock-per-process would otherwise stall the
+        # GUI. want_grid=True -- the preview needs each fit's cubic.
+        self._localize3d_worker = ProcWorker([(localization.refine_spots_batch,
+                                               (targets, storage_path, fov, channel, hybe,
+                                                modality, params, fov_matrices, resolver, True))])
         self._localize3d_worker.finished_ok.connect(_done)
         self._localize3d_worker.failed.connect(_fail)
         self._localize3d_worker.start()
@@ -5364,40 +5474,32 @@ class MainWindow(QtWidgets.QMainWindow):
         titles = [self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
                   for spot, cell in targets]
 
-        # Background (FnWorker), same shape as _run_3d_localize: NAS
-        # stack-crop reads off the GUI thread, nothing mutated anywhere
-        # (this is the preview), display in _done.
+        # Background PROCESS, same shape as _run_3d_localize: the NAS
+        # stack-crop reads leave this process entirely (h5py's one lock
+        # per process), nothing is mutated anywhere -- this is the
+        # preview -- and the grid is drawn in _done.
         d = self.localize_3d_displayer
         d.RunPushButton.setEnabled(False)
         d.ViewPushButton.setEnabled(False)
         d.StatusLabel.setText(f'{hybe} ch{channel}: previewing {len(targets)} spot(s) in background...')
 
-        def _compute():
-            t0 = time.perf_counter()
-            n_would_accept = 0
-            n_would_be_mixture = 0
-            grid_results = []
-            claimed_positions = []  # see _run_3d_localize's own comment on this
-            for (spot, cell), title in zip(targets, titles):
-                _, new_raw, cubic, centroid, _extra_results, mixture_centroids = localization.refine_spot_z(
-                    spot, storage_path, fov, channel, hybe=hybe, cell=cell, modality=modality,
-                    spad=params['spad'], peak_bound=params['peak_bound'], max_sigma=params['max_sigma'],
-                    max_uncert=params['max_uncert'], min_hb_ratio=params['min_hb_ratio'], min_ah_ratio=params['min_ah_ratio'],
-                    min_sep=params['min_sep'], claimed_positions=claimed_positions, use_mixture=params['multi_mode'],
-                    z_window=params['z_window'], fov_matrices=fov_matrices, resolver=resolver)
-                if cubic is not None:
-                    grid_results.append((cubic, centroid, title))
-                if new_raw is not None:
-                    n_would_accept += 1
-                    claimed_positions.append((new_raw[0], new_raw[1]))
-                if mixture_centroids:
-                    n_would_be_mixture += 1
-            return grid_results, n_would_accept, n_would_be_mixture, time.perf_counter() - t0
+        t_start = time.perf_counter()
 
-        def _done(payload):
+        def _done(results):
             d.RunPushButton.setEnabled(True)
             d.ViewPushButton.setEnabled(True)
-            grid_results, n_would_accept, n_would_be_mixture, elapsed = payload
+            elapsed = time.perf_counter() - t_start
+            # want_grid=True, so each row carries its own cubic/centroid;
+            # titles are re-attached HERE because they were resolved from
+            # session containers on the GUI thread.
+            grid_results, n_would_accept, n_would_be_mixture = [], 0, 0
+            for i, _coord, new_raw, mixture_centroids, cubic, centroid in results[0]:
+                if cubic is not None:
+                    grid_results.append((cubic, centroid, titles[i]))
+                if new_raw is not None:
+                    n_would_accept += 1
+                if mixture_centroids:
+                    n_would_be_mixture += 1
             self.localize_3d_grid_displayer.show_fit_status_grid(grid_results)
             self.localize_3d_grid_displayer.show()
             self.localize_3d_grid_displayer.raise_()
@@ -5414,7 +5516,14 @@ class MainWindow(QtWidgets.QMainWindow):
             d.StatusLabel.setText(f'{hybe} ch{channel}: preview failed -- {message}')
             self.log(f'3D localization (View) failed for FOV{fov:03d} {hybe} ch{channel}: {message}')
 
-        self._localize3d_worker = FnWorker(_compute)
+        # A PROCESS, not a thread: every crop reads the raw stack, and
+        # h5py serialises all HDF5 calls in a process behind one lock --
+        # as a thread this starved the GUI's image loads (16.5 ms ->
+        # 2043 ms measured). One job, because the batch must stay
+        # sequential (see refine_spots_batch).
+        self._localize3d_worker = ProcWorker([(localization.refine_spots_batch,
+                                               (targets, storage_path, fov, channel, hybe,
+                                                modality, params, fov_matrices, resolver, False))])
         self._localize3d_worker.finished_ok.connect(_done)
         self._localize3d_worker.failed.connect(_fail)
         self._localize3d_worker.start()
@@ -6690,8 +6799,10 @@ class MainWindow(QtWidgets.QMainWindow):
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
         resolver = self._frame_resolver(None, fov)
 
-        # Background (FnWorker): even pooled, this click held the GUI for
-        # the whole fit (~seconds; ~85 s serial before the pool existed).
+        # Background thread that owns its OWN process pool: the per-hybe
+        # fits (and their stack reads) happen in the children, so h5py's
+        # process-wide lock is not held here. ~85 s serial before the
+        # pool existed.
         # The worker fits and returns debug; every displayer/list update
         # runs in _done on the GUI thread. The button is disabled so a
         # second fit cannot race this allele's in-place mutation.
@@ -7391,69 +7502,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                           f'({"; ".join(sorted(skip_reasons)) or "no cells"}).')
             return
 
-        def _classify_one_fov(job):
-            """Worker-side, one FOV: read its barcode MIPs, clip against
-            each channel's own frame, classify. Touches no session state
-            and no widget -- everything it needs was resolved above."""
-            fov = job['fov']
-            fov_key = str(fov)
-            cache = {}
-            for bch in barcode_channel:
-                hybe, channel_id, bch_modality = bch
-                # each celltype's own barcode channel can belong to a
-                # DIFFERENT modality than the others -- resolve each
-                # one's real storage path independently.
-                bch_storage_path = storage_by_modality.get(bch_modality)
-                cache[bch] = (analysis_store.read_hybe_mip(bch_storage_path, fov, hybe, channel_id)
-                              if bch_storage_path else None)
-            # a barcode channel with no MIP is missing DATA -- the only
-            # honest skip. Alignment is NEVER a skip cause: an uncomputed
-            # layer is identity by the pipeline's own rule.
-            missing = [bch for bch in barcode_channel if cache.get(bch) is None]
-            if missing:
-                labels = ', '.join(f'{h}/ch{c} ({m})' for h, c, m in missing)
-                return {'fov': fov, 'skipped': job['n_in_map'],
-                        'reason': f'no MIP for {labels}',
-                        'log': (f'FOV{fov:03d}: skipped ({job["n_in_map"]} cell(s)) -- no MIP in '
-                                f'the store for barcode channel(s) {labels}. Ingest those '
-                                f'(hybe, channel) pairs; alignment is NOT required.'),
-                        'cell_types': {}, 'spot_types': {}}
-
-            image_cache = {fov_key: cache}
-
-            def clipped(bch, x, y):
-                # an aligned position can land a pixel outside this
-                # channel's own frame, and an unclipped index crashed the
-                # WHOLE run (IndexError 1024)
-                height, width = cache[bch].shape
-                return np.clip(x, 0, width - 1), np.clip(y, 0, height - 1)
-
-            cell_types = {}
-            for cell_id, per_channel in job['cells'].items():
-                area_by_channel = {bch: clipped(bch, x, y) for bch, (x, y) in per_channel.items()}
-                cell_types[cell_id] = celltype.classify_cell_barcode(
-                    area_by_channel, fov, image_cache, celltype_determination, method=method)
-            spot_types = {}
-            for uid, per_channel in job['spots'].items():
-                xy_by_channel = {}
-                for bch, (x, y) in per_channel.items():
-                    cx, cy = clipped(bch, x, y)
-                    xy_by_channel[bch] = (float(cx), float(cy))
-                spot_types[uid] = celltype.classify_spot_barcode(
-                    xy_by_channel, fov, image_cache, celltype_determination)
-            return {'fov': fov, 'skipped': 0, 'reason': None, 'log': None,
-                    'cell_types': cell_types, 'spot_types': spot_types}
-
-        def _run_all():
-            # FOV-parallel: independent per FOV and I/O-bound (h5py
-            # releases the GIL on read), so threads fan out cleanly.
-            # Bounded well under the measured NAS optimum (12 readers at
-            # 117.6 MB/s; more workers measured SLOWER) -- these are
-            # ~2 MB MIP reads, not stacks, so the pool is small.
-            workers = max(1, min(8, len(jobs)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                return list(pool.map(_classify_one_fov, jobs))
-
         def _apply(results):
             ctp.RunCelltypeDeterminationPushButton.setEnabled(True)
             n_cells, n_spots = 0, 0
@@ -7505,7 +7553,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage(
             f'Classifying {len(jobs)} FOV(s) in the background...')
-        self._celltype_worker = FnWorker(_run_all)
+        # FOV-parallel in PROCESSES, not threads. The work is independent
+        # per FOV, but every MIP read goes through h5py, which serialises
+        # all HDF5 calls in a process behind one lock -- a thread pool
+        # here would fight itself AND stall the GUI's own image loads
+        # (16.5 ms -> 2043 ms measured). Bounded well under the measured
+        # NAS optimum (12 readers at 117.6 MB/s; more measured SLOWER).
+        proc_jobs = [(_classify_celltype_fov,
+                      (job, barcode_channel, storage_by_modality,
+                       celltype_determination, method))
+                     for job in jobs]
+        self._celltype_worker = ProcWorker(proc_jobs, max_workers=min(6, len(proc_jobs)))
         self._celltype_worker.finished_ok.connect(_apply)
         self._celltype_worker.failed.connect(_failed)
         self._celltype_worker.start()
@@ -9215,38 +9273,35 @@ class MainWindow(QtWidgets.QMainWindow):
         save door, read back by _show_cell_all_readouts_overlay."""
         return paths.figure_path(storage_path, 'cells', fov, f'cell{cell_id}_alignment_overlay.png')
 
+    # Bounded well under the measured NAS optimum (12 readers at 117.6
+    # MB/s; more measured SLOWER) -- overlay rendering is stack-read
+    # bound, and these processes compete with whatever else is running.
+    CELL_OVERLAY_RENDER_WORKERS = 3
+
     def _start_cell_overlay_save_worker(self, jobs, label, on_done=None):
         """
-        Render + save N cell overlay PNGs in a BACKGROUND thread.
+        Render + save N cell overlay PNGs in SEPARATE PROCESSES.
 
         jobs: [draw-args dict, ...] from _cell_overlay_draw_args (already
-        resolved on the GUI thread). Each is drawn onto the worker's OWN
-        Agg Figure -- never the GUI canvas -- so nothing here touches Qt:
-        the drawing code is the identical PipelineCanvas method, given a
-        `figure=` to paint into instead (see its own docstring).
+        resolved on the GUI thread, because that half reads session
+        containers). Each dict is plain data, so it ships to a child
+        under 'spawn'; the child draws with the identical PipelineCanvas
+        code onto its own Agg figure and writes the PNG.
 
-        This is what makes saving every cell's overlay affordable at all:
-        the work is ~35 s per cell on the real store, so a 67-cell FOV is
-        ~40 minutes -- acceptable in the background with progress, fatal
-        on the GUI thread.
+        Processes, not threads, and that distinction is the whole point:
+        this work is ~35 s per cell of ZX stack reads, and h5py holds ONE
+        process-wide lock for every HDF5 call. As a thread it starved the
+        GUI's own image loads -- 16.5 ms -> 2043 ms measured on the real
+        store. In child processes the GUI stays at 16.8 ms, and the
+        renders also run several-at-once instead of one after another.
         """
-        from matplotlib.figure import Figure
-
-        canvas = self.preview_canvas
         total = len(jobs)
+        proc_jobs = [(pipeline_canvas.render_cell_overlay_to_png, (args,)) for args in jobs]
 
-        def _render():
-            fig = Figure(figsize=(14, 9), dpi=150)
-            saved = 0
-            for i, args in enumerate(jobs, start=1):
-                canvas.draw_cell_all_readouts_overlay(figure=fig, **args)
-                saved += 1
-                self._overlay_progress.emit(i, total)
-            return saved
-
-        def _done(n_saved):
+        def _done(results):
+            n_saved = sum(1 for r in results if r)
             self.statusBar().showMessage(f'{label}: {n_saved} overlay image(s) saved.', 8000)
-            self.log(f'{label}: {n_saved} overlay PNG(s) written in the background.')
+            self.log(f'{label}: {n_saved} overlay PNG(s) written in background processes.')
             if on_done is not None:
                 on_done(n_saved)
 
@@ -9254,7 +9309,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f'{label} failed: {message}', 8000)
             self.log(f'{label} failed: {message}')
 
-        self._cell_overlay_worker = FnWorker(_render)
+        self._cell_overlay_worker = ProcWorker(
+            proc_jobs, max_workers=min(self.CELL_OVERLAY_RENDER_WORKERS, max(total, 1)))
+        self._cell_overlay_worker.progress.connect(self._on_overlay_progress)
         self._cell_overlay_worker.finished_ok.connect(_done)
         self._cell_overlay_worker.failed.connect(_fail)
         self._cell_overlay_worker.start()
