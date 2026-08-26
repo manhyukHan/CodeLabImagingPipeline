@@ -2,6 +2,30 @@ from PyQt5 import QtWidgets, QtCore
 import numpy as np
 
 
+def _index_of_data(combo, data):
+    """
+    Index of the item whose userData EQUALS `data`, or -1.
+
+    NOT QComboBox.findData: for a non-QVariant Python payload (here a
+    (hybe, modality) tuple) PyQt5 matches by OBJECT IDENTITY, so an
+    equal-but-freshly-built tuple never matches. Confirmed directly --
+    findData(('Hyb_020', 'DNA')) returns -1 for an item added with an
+    equal tuple, and returns -1 again for the very same value after a
+    clear()/repopulate cycle rebuilds the tuples.
+
+    That is exactly how the Spot panel's hybe combo broke: every
+    selection change repopulated the choices, the restore silently found
+    nothing, and the combo fell back to index 0 -- so picking any hybe
+    snapped straight back to the first one. FOV (int payload, restored
+    via list.index) and Channel (restored via setCurrentText) were
+    unaffected, which is why only the hybe combo looked dead.
+    """
+    for i in range(combo.count()):
+        if combo.itemData(i) == data:
+            return i
+    return -1
+
+
 def _format_value(value):
     """
     One-line display string for a leaf value -- numpy arrays get a
@@ -360,7 +384,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
             label = hybe if len(modalities) <= 1 else f'{hybe} ({modality})'
             self.SpotHybeComboBox.addItem(label, (hybe, modality))
         if current is not None:
-            idx = self.SpotHybeComboBox.findData(current)
+            idx = _index_of_data(self.SpotHybeComboBox, current)
             if idx >= 0:
                 self.SpotHybeComboBox.setCurrentIndex(idx)
         self.SpotHybeComboBox.blockSignals(False)
