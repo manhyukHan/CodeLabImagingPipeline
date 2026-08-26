@@ -147,6 +147,50 @@ def evaluate(family, shape_params, dy, dx, dz):
     return fn(dy, dx, dz, *shape_params)
 
 
+# -- plausibility --------------------------------------------------------
+
+# Smallest lateral sigma any objective in this class can produce. For an
+# oil objective around NA 1.4 at ~600 nm emission the diffraction-limited
+# Gaussian sigma is about 90 nm; 70 nm leaves margin for a genuinely
+# sharper setup while still rejecting the degenerate answers measured
+# here. A calibration below this is not a narrow PSF, it is a fit that
+# has collapsed its core and let some other component carry the width.
+MIN_PLAUSIBLE_SIGMA_XY_UM = 0.070
+MIN_PLAUSIBLE_SIGMA_Z_UM = 0.150
+
+
+def plausible(family, params, tol=1e-6):
+    """
+    (ok, reasons) for a calibrated shape.
+
+    Exists because a bad calibration is SILENT: measured on real readout
+    crops, small samples returned lorentzian with sigma_xy pinned at its
+    0.030 um lower bound -- a 30 nm core, well below anything the optics
+    can produce -- and the residual could not distinguish it from the
+    sane answer. Everything downstream trusts this shape, so it has to
+    refuse to hand over one that is physically impossible rather than
+    letting it propagate into every fit and every gate threshold.
+    """
+    reasons = []
+    names = FAMILIES[family][1]
+    bounds = FAMILIES[family][3]
+    for n, (lo, hi) in zip(names, bounds):
+        v = params[n]
+        if abs(v - lo) <= tol:
+            reasons.append(f'{n} at its lower bound ({lo})')
+        elif abs(v - hi) <= tol:
+            reasons.append(f'{n} at its upper bound ({hi})')
+    sxy = params.get('sigma_xy_um')
+    if sxy is not None and sxy < MIN_PLAUSIBLE_SIGMA_XY_UM:
+        reasons.append(f'sigma_xy {sxy * 1000:.0f} nm is below the optical '
+                       f'limit ({MIN_PLAUSIBLE_SIGMA_XY_UM * 1000:.0f} nm)')
+    sz = params.get('sigma_z_um')
+    if sz is not None and sz < MIN_PLAUSIBLE_SIGMA_Z_UM:
+        reasons.append(f'sigma_z {sz * 1000:.0f} nm is below the optical '
+                       f'limit ({MIN_PLAUSIBLE_SIGMA_Z_UM * 1000:.0f} nm)')
+    return (not reasons), reasons
+
+
 # -- calibration ---------------------------------------------------------
 
 def _prepare_crop(cube, voxel_um, fit_radius_um, seed_yxz):
@@ -281,8 +325,33 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
             pretty = '  '.join(f'{k}={v:.4f}' for k, v in params.items())
             print(f'   {family:<11} rss/voxel {res.fun:10.2f}   {pretty}', flush=True)
 
-    best = min(results, key=lambda f: results[f]['score'])
+    # Score alone must not choose: a degenerate shape can score as well as
+    # a sane one (measured: rss/vox 2986 vs 2931 for a 39 nm core against
+    # a 312 nm one). Prefer the best-scoring PLAUSIBLE candidate, and only
+    # fall back to the best overall when every candidate is implausible --
+    # which is itself the signal that this data cannot constrain a PSF and
+    # needs more crops, flagged rather than hidden.
+    for family in list(results):
+        ok, why = plausible(family, results[family]['params'])
+        results[family]['plausible'] = ok
+        results[family]['warnings'] = why
+    usable = [f for f in results
+              if isinstance(results[f], dict) and results[f].get('plausible')]
+    if usable:
+        best = min(usable, key=lambda f: results[f]['score'])
+        results['all_implausible'] = False
+    else:
+        best = min((f for f in results if isinstance(results[f], dict)
+                    and 'score' in results[f]),
+                   key=lambda f: results[f]['score'])
+        results['all_implausible'] = True
+        if verbose:
+            print('   WARNING: no candidate PSF is physically plausible; '
+                  'this calibration should not be used')
     results['best'] = best
+    if verbose and results[best].get('warnings'):
+        for w in results[best]['warnings']:
+            print(f'   WARNING: {w}')
     return results
 
 
