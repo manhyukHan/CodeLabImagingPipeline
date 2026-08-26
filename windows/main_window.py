@@ -1392,6 +1392,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ap.CrossModalAcceptPushButton.clicked.connect(self._accept_cross_modal)
         ap.CrossModalRejectPushButton.clicked.connect(self._reject_cross_modal)
         ap.RunCellAlignmentPushButton.clicked.connect(self._run_cell_alignment)
+        ap.RunCellAlignmentAllPushButton.clicked.connect(self._run_cell_alignment_all_fovs)
         # "Results (per cell, per hybe)" is scoped to the single cell/FOV/
         # reference hybe picked here (tier 1) -- refreshes live as any of
         # the three changes, per explicit request, independent of tier
@@ -4688,6 +4689,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self._pending_per_cell_alignment[0].id == cell_id):
             cell = self._pending_per_cell_alignment[1]
             pending = True
+        # A staged result SURVIVES moving the spinboxes (only Accept and
+        # Reject clear it, and Accept applies to its OWN recorded FOV, so
+        # nothing is mis-saved) -- but with the rows off-screen, leaving
+        # Accept/Reject enabled offered a commit for something invisible.
+        # They are live only while their own result is what is shown.
+        if self._pending_per_cell_alignment is not None:
+            ap.PerCellAcceptPushButton.setEnabled(pending)
+            ap.PerCellRejectPushButton.setEnabled(pending)
 
         ap.CellResultsListWidget.clear()
         if cell is None:
@@ -9258,6 +9267,192 @@ One PNG PER MODALITY: each modality has its own reference and its
                                                               cell_reference_hybe, cell_modality, channel_type, pad))
         self._cell_alignment_worker.failed.connect(self._on_cell_alignment_failed)
         self._cell_alignment_worker.start()
+
+    def _run_cell_alignment_all_fovs(self):
+        """
+        Cell-level residual alignment for EVERY FOV in the Ingestion
+        tab's FOV list, computed AND saved immediately -- the whole-
+        project counterpart of "Align All Cells in FOV", and the exact
+        shape "Run All FOV Alignment" already has one section up.
+
+        Auto-save, so there is no staging and no Accept: a staged result
+        that spans 40 FOVs is not reviewable anyway. That also means a
+        staged SINGLE-cell preview is left completely alone -- this run
+        never reads or clears _pending_per_cell_alignment, so a preview
+        you are still deciding on survives it untouched.
+
+        Append is honoured exactly as the per-FOV run honours it: the
+        worker fits only per-(cell, hybe) residuals not already in
+        cell.matrices, so this is re-runnable as ingestion and FOV
+        alignment advance, each pass filling the gap that opened since.
+
+        Cells are HYDRATED per FOV first (_activate_fov): a FOV never
+        visited this session has no cells resident, and skipping that
+        step would silently align only the FOVs that happened to be on
+        screen -- the same failure celltype determination had.
+        """
+        ap, ip = self.ui.AlignmentPanel, self.ui.IngestionPanel
+        fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        if not fov_list:
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment (all FOVs)',
+                                          "Set the FOV list in the Ingestion tab first.")
+            return
+
+        containers_by_fov, cells_by_fov, empty = {}, {}, []
+        for fov in fov_list:
+            self._activate_fov(fov)
+            container = None
+            if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
+                container = self.cell_container_permanent
+            elif self.cell_container is not None and self.cell_container.data.get(fov):
+                container = self.cell_container
+            if container is None:
+                empty.append(fov)
+                continue
+            cells = container.get_cells(fov)
+            if not cells:
+                empty.append(fov)
+                continue
+            containers_by_fov[fov] = container
+            cells_by_fov[fov] = cells
+        if empty:
+            self.log(f'Cell alignment (all FOVs): no segmented cells for '
+                     f'FOV(s) {sorted(empty)} -- skipped.')
+        if not cells_by_fov:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Cell Alignment (all FOVs)',
+                'No segmented cells in any FOV of the list -- run Cell Segmentation first.')
+            return
+
+        first = cells_by_fov[sorted(cells_by_fov)[0]][0]
+        cell_modality = first.reference_modality
+        cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
+        storage_path = self._storage_path_for_modality(cell_modality)
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment (all FOVs)',
+                                          f'No storage path configured for {cell_modality}.')
+            return
+
+        channel_type = ap.CellChannelTypeComboBox.currentText()
+        pad = ap.CellPadSpinBox.value()
+        z_max_shift = ap.CellZMaxShiftSpinBox.value()
+
+        mode = self._confirm_batch_mode('Run Cell Alignment (all FOVs)',
+                                        'per-cell residual matrices')
+        if mode is None:
+            return
+
+        n_cells = sum(len(c) for c in cells_by_fov.values())
+        threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
+        # The overlay pass is the expensive part by far, and at the
+        # default threshold (0 = every cell) a whole-project run would
+        # queue one ~35 s render per cell. Say so BEFORE starting, with
+        # the arithmetic, rather than letting it be discovered.
+        overlay_note = ''
+        if threshold == 0:
+            hours = n_cells * 35 / self.CELL_OVERLAY_RENDER_WORKERS / 3600
+            overlay_note = (f'\n\nOverlay auto-save is set to "every cell", so this will also '
+                            f'queue {n_cells} overlay PNG(s) -- roughly {hours:.1f} hour(s) of '
+                            f'background rendering. Raise "Auto-save overlay if shift >" '
+                            f'first if you do not want them all.')
+        if QtWidgets.QMessageBox.question(
+                self, 'Run Cell Alignment (all FOVs)',
+                f'Align {n_cells} cell(s) across {len(cells_by_fov)} FOV(s), '
+                f'saving immediately ({mode}).{overlay_note}\n\nProceed?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
+            return
+
+        ap.RunCellAlignmentAllPushButton.setEnabled(False)
+        self.statusBar().showMessage(
+            f'Computing cell alignment for {len(cells_by_fov)} FOV(s)...')
+        # One job per FOV, FOV-major inside the worker -- a FOV's cells
+        # finish together, and the worker's own pool parallelises the
+        # hybes within a cell.
+        jobs = [(fov, cells_by_fov[fov],
+                 self._cell_alignment_passes(cell_modality, storage_path, fov))
+                for fov in sorted(cells_by_fov)]
+        self._cell_alignment_worker = CellAlignmentWorker(
+            jobs, channel_type=channel_type, pad=pad, z_max_shift=z_max_shift,
+            append=(mode == 'append'))
+        self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
+        self._cell_alignment_worker.finished_ok.connect(
+            lambda results: self._on_cell_alignment_all_finished(
+                results, containers_by_fov, storage_path, cell_reference_hybe,
+                cell_modality, channel_type, pad))
+        self._cell_alignment_worker.failed.connect(self._on_cell_alignment_all_failed)
+        self._cell_alignment_worker.start()
+
+    def _on_cell_alignment_all_finished(self, results, containers_by_fov, storage_path,
+                                        cell_reference_hybe, cell_modality, channel_type, pad):
+        """
+        results: [(fov, cells), ...] -- the real objects, mutated in place
+        by compute_cell_alignment. Persists EVERY FOV, then queues the
+        overlay pass for all of them at once.
+
+        Deliberately does NOT touch _pending_per_cell_alignment: a staged
+        single-cell preview belongs to the user's own review loop and an
+        auto-save batch has no business discarding it.
+        """
+        ap = self.ui.AlignmentPanel
+        ap.RunCellAlignmentAllPushButton.setEnabled(True)
+        storage_paths = self._all_analysis_storage_paths()
+        cell_alignment_kwargs = ({f'cell_alignment_reference_hybe_{cell_modality}': cell_reference_hybe}
+                                 if cell_modality else {})
+        for path in storage_paths:
+            analysis_store.write_global_params(path, cell_alignment_channel_type=channel_type,
+                                               cell_alignment_pad=pad, **cell_alignment_kwargs)
+
+        threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
+        overlay_jobs = []
+        n_cells = 0
+        for fov, cells in results:
+            container = containers_by_fov.get(fov)
+            if container is None:
+                continue
+            n_cells += len(cells)
+            # The OTHER tier holds independent copies of the same cells;
+            # a later legitimate write from that tier would wipe these
+            # matrices from disk (confirmed real), so propagate first.
+            other = (self.cell_container if container is self.cell_container_permanent
+                     else self.cell_container_permanent)
+            if other is not None and other.data.get(fov):
+                src_by_id = {c.id: c for c in container.get_cells(fov)}
+                for twin in other.get_cells(fov):
+                    src = src_by_id.get(twin.id)
+                    if src is not None:
+                        twin.matrices = deepcopy(src.matrices)
+                        twin.matrix_anchors = deepcopy(src.matrix_anchors)
+                        twin.matrix_provenance = deepcopy(src.matrix_provenance)
+            if storage_paths:
+                analysis_store.mirror_write_cells(storage_paths, fov, container)
+            # matrices changed -> this FOV's spots are stale
+            try:
+                self._recast_persisted_spots(fov)
+            except Exception as e:
+                self.statusBar().showMessage(
+                    f'spot reassignment after cell alignment failed for FOV{fov}: {e}')
+            for cell in cells:
+                if self._cell_max_residual_shift(cell) >= max(threshold, 1e-9):
+                    args = self._cell_overlay_draw_args(
+                        cell, fov, storage_path, channel_type, pad,
+                        overlay_reference_hybe=cell_reference_hybe, modality=cell_modality)
+                    if args is not None:
+                        overlay_jobs.append(args)
+
+        self._refresh_cell_fov_panels(self.ui.AlignmentPanel.CellFovSpinBox.value())
+        if overlay_jobs:
+            self._start_cell_overlay_save_worker(overlay_jobs, 'Cell alignment overlays (all FOVs)')
+        self.statusBar().showMessage('Cell alignment computed for all FOVs.', 5000)
+        QtWidgets.QMessageBox.information(
+            self, 'Cell alignment complete',
+            f'{n_cells} cell(s) across {len(results)} FOV(s) aligned and saved.\n\n'
+            f'{len(overlay_jobs)} overlay image(s) rendering in the background.')
+
+    def _on_cell_alignment_all_failed(self, message):
+        self.ui.AlignmentPanel.RunCellAlignmentAllPushButton.setEnabled(True)
+        self.statusBar().clearMessage()
+        QtWidgets.QMessageBox.critical(self, 'Cell alignment error', message)
 
     def _on_cell_alignment_finished(self, results, fov, container, storage_path, cell_reference_hybe, cell_modality, channel_type, pad):
         """results: [(fov, cells)] -- cells are the real objects, mutated in

@@ -299,6 +299,13 @@ class AlignmentPanelUI(object):
         # before committing to the whole FOV, so a second review step here
         # would just be redundant.
         cellLayout.addRow(self.RunCellAlignmentPushButton)
+        self.RunCellAlignmentAllPushButton = QtWidgets.QPushButton(
+            'Align All Cells in ALL FOVs (Auto-Save)')
+        # Every FOV in the Ingestion tab's list, computed AND saved
+        # immediately -- no staging, no Accept, exactly like Run All FOV
+        # Alignment one section up. Validate the parameters with Preview
+        # This Cell / Align All Cells in FOV first; this is the commit.
+        cellLayout.addRow(self.RunCellAlignmentAllPushButton)
 
         # -- tier 3: visualization only (never computes or writes) --
         self.CellOverlayFovSpinBox = QtWidgets.QSpinBox()
