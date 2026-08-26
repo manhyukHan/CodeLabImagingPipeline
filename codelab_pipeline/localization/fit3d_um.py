@@ -60,18 +60,46 @@ FitUm = namedtuple('FitUm', [
     'offset', 'at_bound', 'n_voxels', 'rss'])
 
 
-def _model(p, y, x, z):
-    amp, y0, x0, z0, sy, sx, sz, off = p
-    return off + amp * np.exp(-(((y - y0) ** 2) / (2 * sy ** 2)
-                                + ((x - x0) ** 2) / (2 * sx ** 2)
-                                + ((z - z0) ** 2) / (2 * sz ** 2)))
+# How the non-spot signal is modelled. NOT a noise term -- noise is the
+# residual and least squares already accounts for it; this is the
+# deterministic part of the image that is not the emitter (out-of-focus
+# fluorescence from the cell, neighbouring structure, the emitter's own
+# axial tail).
+#
+#   'constant'  one offset. What v1 does. A constant has no degrees of
+#               freedom to represent a gradient, so any real trend is
+#               left in the residual, where the only parameters able to
+#               absorb it are the Gaussian's own centre and sigma.
+#   'linear_z'  offset + bz*z. The measured trend here is axial (1.09x
+#               to 1.75x end to end); lateral crops are only ~3.5 um
+#               wide and show far less.
+#   'linear'    offset + by*y + bx*x + bz*z, a tilted plane in 3D.
+#
+# A low-order background is only honest over a volume where the real
+# background IS low-order. Across a whole 110-plane column it is not --
+# see fit_radius_um.
+BACKGROUNDS = ('constant', 'linear_z', 'linear')
+_N_BG = {'constant': 1, 'linear_z': 2, 'linear': 4}
+
+
+def _model(p, y, x, z, background='constant'):
+    amp, y0, x0, z0, sy, sx, sz = p[:7]
+    gauss = amp * np.exp(-(((y - y0) ** 2) / (2 * sy ** 2)
+                           + ((x - x0) ** 2) / (2 * sx ** 2)
+                           + ((z - z0) ** 2) / (2 * sz ** 2)))
+    if background == 'constant':
+        return gauss + p[7]
+    if background == 'linear_z':
+        return gauss + p[7] + p[8] * z
+    return gauss + p[7] + p[8] * y + p[9] * x + p[10] * z
 
 
 def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
                        peak_bound_um=0.416, min_sigma_um=0.02,
                        max_sigma_xy_um=0.520, max_sigma_z_um=1.000,
                        min_hb_ratio=1.2, min_ah_ratio=0.25,
-                       max_uncert_um=0.416, fit_radius_um=None):
+                       max_uncert_um=0.416, fit_radius_um=None,
+                       background='constant'):
     """
     Fit one 3D Gaussian to `cubic` in micrometres.
 
@@ -116,6 +144,12 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
     else:
         h = float(np.nanmax(values))
 
+    if background not in BACKGROUNDS:
+        raise ValueError(f'background must be one of {BACKGROUNDS}, got {background!r}')
+    n_params = 7 + _N_BG[background]
+    if values.size <= n_params:
+        return None
+
     amp0, off0 = float(np.nanmax(values)), float(np.nanmin(values))
     s_xy0 = min(0.25, max_sigma_xy_um * 0.6)
     s_z0 = min(0.50, max_sigma_z_um * 0.6)
@@ -124,24 +158,33 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
           min_sigma_um, min_sigma_um, min_sigma_um, 0.0]
     ub = [65535.0, y0u + peak_bound_um, x0u + peak_bound_um, z0u + peak_bound_um,
           max_sigma_xy_um, max_sigma_xy_um, max_sigma_z_um, 65535.0]
+    names = ['amplitude', 'y', 'x', 'z', 'sigma_y', 'sigma_x', 'sigma_z', 'offset']
+    # Background SLOPES are signed and effectively unbounded -- a
+    # gradient that had to be positive would be a different assumption
+    # about the sample, not a safer one.
+    for slope in {'linear_z': ['bg_z'], 'linear': ['bg_y', 'bg_x', 'bg_z']}.get(background, []):
+        p0.append(0.0)
+        lb.append(-np.inf)
+        ub.append(np.inf)
+        names.append(slope)
     p0 = [min(max(v, lo), hi) for v, lo, hi in zip(p0, lb, ub)]
 
     try:
-        res = least_squares(lambda p: _model(p, yv, xv, zv) - values,
+        res = least_squares(lambda p: _model(p, yv, xv, zv, background) - values,
                             p0, bounds=(lb, ub))
     except Exception:
         return None
     if not res.success:
         return None
-    amp, fy, fx, fz, sy, sx, sz, off = res.x
+    amp, fy, fx, fz, sy, sx, sz, off = res.x[:8]
 
     # which parameters finished ON a constraint
-    names = ('amplitude', 'y', 'x', 'z', 'sigma_y', 'sigma_x', 'sigma_z', 'offset')
     tol = 1e-9
     at_bound = tuple(n for n, v, lo, hi in zip(names, res.x, lb, ub)
-                     if abs(v - lo) <= tol or abs(v - hi) <= tol)
+                     if (np.isfinite(lo) and abs(v - lo) <= tol)
+                     or (np.isfinite(hi) and abs(v - hi) <= tol))
 
-    dof = values.size - 8
+    dof = values.size - n_params
     if dof <= 0:
         return None
     rss = float(np.sum(res.fun ** 2))
@@ -160,7 +203,18 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
     if (2 * ci[1] >= max_uncert_um or 2 * ci[2] >= max_uncert_um
             or 2 * ci[3] >= 2 * max_uncert_um):
         return None
-    if off <= 0 or h / off < min_hb_ratio:
+    # The peak/background gate must use the background AT THE SPOT, not
+    # the intercept: with a slope, `off` is the background extrapolated
+    # to (0,0,0) -- a corner of the crop the emitter is nowhere near, and
+    # legitimately negative. Using it would change what the gate means
+    # the moment the background stops being flat.
+    if background == 'constant':
+        bg_at_spot = off
+    elif background == 'linear_z':
+        bg_at_spot = off + res.x[8] * fz
+    else:
+        bg_at_spot = off + res.x[8] * fy + res.x[9] * fx + res.x[10] * fz
+    if bg_at_spot <= 0 or h / bg_at_spot < min_hb_ratio:
         return None
     if h <= 0 or amp / h < min_ah_ratio:
         return None
@@ -169,5 +223,5 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
                  y=float(fy / dy), x=float(fx / dx), z=float(fz / dz),
                  y_um=float(fy), x_um=float(fx), z_um=float(fz),
                  sigma_y_um=float(sy), sigma_x_um=float(sx), sigma_z_um=float(sz),
-                 offset=float(off), at_bound=at_bound,
+                 offset=float(bg_at_spot), at_bound=at_bound,
                  n_voxels=int(values.size), rss=rss)
