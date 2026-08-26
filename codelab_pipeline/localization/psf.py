@@ -87,6 +87,28 @@ def lorentzian_psf(dy, dx, dz, s_xy, s_z):
     return moffat_psf(dy, dx, dz, s_xy, s_z, beta=1.0)
 
 
+def gaussian_halo_psf(dy, dx, dz, s_xy, s_z, halo_frac=0.15, halo_scale=3.0):
+    """
+    A narrow Gaussian CORE plus a wider Gaussian HALO, both unit-peak, so
+    the sum is still 1 at the centre.
+
+    Added because the single-shape candidates measurably cannot do both
+    ends at once on this data: fitted to real reference crops, a Gaussian
+    matches the core and falls to zero by +/-0.5 um lateral while the
+    data still carries 6-15% intensity out to +/-1 um, and a Lorentzian
+    tracks those tails but is too narrow in the core. Residual per voxel
+    is dominated by the bright core, so the Gaussian wins on score while
+    being visibly wrong exactly where a neighbouring emitter would leak
+    in -- which is the part of the shape that biases a fit.
+
+    Two extra parameters: what fraction of the peak lives in the halo,
+    and how much wider it is than the core.
+    """
+    core = gaussian_psf(dy, dx, dz, s_xy, s_z)
+    halo = gaussian_psf(dy, dx, dz, s_xy * halo_scale, s_z * halo_scale)
+    return (1.0 - halo_frac) * core + halo_frac * halo
+
+
 # name -> (callable, free shape parameter names, initial guess, bounds)
 FAMILIES = {
     'gaussian': (gaussian_psf, ('sigma_xy_um', 'sigma_z_um'),
@@ -95,6 +117,10 @@ FAMILIES = {
                (0.15, 0.40, 2.5), ((0.03, 1.5), (0.05, 3.0), (0.6, 12.0))),
     'lorentzian': (lorentzian_psf, ('sigma_xy_um', 'sigma_z_um'),
                    (0.15, 0.40), ((0.03, 1.5), (0.05, 3.0))),
+    'gaussian_halo': (gaussian_halo_psf,
+                      ('sigma_xy_um', 'sigma_z_um', 'halo_frac', 'halo_scale'),
+                      (0.13, 0.35, 0.15, 3.0),
+                      ((0.03, 1.5), (0.05, 3.0), (0.0, 0.6), (1.5, 8.0))),
 }
 
 
