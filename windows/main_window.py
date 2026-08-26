@@ -6970,8 +6970,14 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         def norm2d(img):
             img = np.asarray(img, dtype=float)
+            if not np.isfinite(img).any():
+                return np.zeros(img.shape)
             lo, hi = np.nanquantile(img, 0.3), np.nanquantile(img, 0.999)
-            return np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
+            out = np.clip((img - lo) / max(hi - lo, 1e-6), 0, 1)
+            # Depth this hybe's crop does not reach (see zx_in_shared_z)
+            # renders as dark rather than propagating NaN into
+            # cv2.warpAffine and the RGB compositing below.
+            return np.nan_to_num(out, nan=0.0)
 
         def rgb(ref_img, mov_img):
             h = min(ref_img.shape[0], mov_img.shape[0])
@@ -7005,6 +7011,46 @@ class MainWindow(QtWidgets.QMainWindow):
                 np.maximum(out, p[:h, :w, None] * color[None, None, :], out)
             return out
 
+        def z_offset(hybe):
+            """
+            shared_z - native_z for this hybe: the whole already-applied
+            correction (FOV + cross-modal + the CELL-level residual dz),
+            read straight off the two forms of the same fit rather than
+            recomputed. fiducial_trace holds the fit in the SHARED frame
+            (localization._localize_fiducial_hybe's sz = zf +
+            cell_z_offset); debug's fiducial_centroid holds the very same
+            fit as a plane index into that hybe's OWN crop.
+            """
+            fit_shared = fid.get(hybe)
+            centroid = (debug.get(hybe) or {}).get('fiducial_centroid')
+            if fit_shared is None or centroid is None:
+                return 0.0
+            return float(fit_shared[2]) - float(centroid[2])
+
+        def zx_in_shared_z(cubic, hybe, z0, z1):
+            """
+            ZX view whose ROW r is always shared-frame plane z0+r.
+
+            Each hybe's crop is cut in its OWN raw z frame -- the crop box
+            spans the full stack depth and is never z-shifted -- so a
+            window expressed in shared-frame planes has to be translated
+            by that hybe's own offset before it can index this cubic.
+            Slicing every cubic at the same raw [z0, z1) instead compared
+            two DIFFERENT physical depths: for a cell whose residual dz
+            was 21 planes, the moving hybe's fiducial fell clean outside a
+            +/-15 window, so the tile showed an empty or clipped ZX while
+            the printed d=(...) correctly said the drift was ~0.
+            Rows outside this hybe's crop stay NaN (norm2d ignores them).
+            """
+            off = int(round(z_offset(hybe)))
+            n0, n1 = z0 - off, z1 - off                  # same window, native frame
+            c0, c1 = max(0, n0), min(cubic.shape[2], n1)
+            out = np.full((z1 - z0, cubic.shape[1]), np.nan)
+            if c1 > c0:
+                block = np.nanmax(cubic[:, :, c0:c1], axis=0).T
+                out[c0 - n0:c0 - n0 + block.shape[0], :] = block
+            return out
+
         Z_PAD = 15   # same z display window the fit-status grids use
         fid = allele.fiducial_trace or {}
         ref_fit = fid.get(reference_hybe)
@@ -7012,14 +7058,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if ref_fit is None or ref_cubic is None:
             return [], None
         ref_cubic = np.asarray(ref_cubic, dtype=float)
-        # ONE absolute z-window (the reference fit's) applied to BOTH
-        # sides of every pair: windowing each hybe around its OWN fit
-        # would silently re-center the depth axis and hide the very dz
-        # drift the ZX row exists to show.
-        z0 = max(0, int(round(ref_fit[2])) - Z_PAD)
-        z1 = min(ref_cubic.shape[2], int(round(ref_fit[2])) + Z_PAD + 1)
+        # ONE absolute z-window, in the SHARED frame, applied to every
+        # hybe: windowing each hybe around its OWN fit would silently
+        # re-center the depth axis and hide the very dz drift the ZX row
+        # exists to show, but the window must still name the same
+        # PHYSICAL depth in every tile -- hence zx_in_shared_z, which
+        # translates it into each hybe's own raw frame.
+        z0 = int(round(ref_fit[2])) - Z_PAD
+        z1 = int(round(ref_fit[2])) + Z_PAD + 1
         ref_yx = norm2d(np.nanmax(ref_cubic, axis=2))
-        ref_zx = norm2d(np.nanmax(ref_cubic[:, :, z0:z1], axis=0).T)
+        ref_zx = norm2d(zx_in_shared_z(ref_cubic, reference_hybe, z0, z1))
         entries = []
         # The total overlay reuses the per-tile normalized planes verbatim
         # -- same normalization, same z-window, same shift -- so the two
@@ -7034,9 +7082,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if fit is None or cubic is None:
                 continue
             cubic = np.asarray(cubic, dtype=float)
-            mz1 = min(cubic.shape[2], z1)
             mov_yx = norm2d(np.nanmax(cubic, axis=2))
-            mov_zx = norm2d(np.nanmax(cubic[:, :, z0:mz1], axis=0).T)
+            mov_zx = norm2d(zx_in_shared_z(cubic, hybe, z0, z1))
+            # Both rows now live in the shared frame, so this shared-frame
+            # dz is the right amount to shift the ZX tile by (it never was
+            # against a raw-frame image).
             dy, dx, dz = fit[0] - ref_fit[0], fit[1] - ref_fit[1], fit[2] - ref_fit[2]
             yx_after_img = shifted(mov_yx, dx, dy)
             zx_after_img = shifted(mov_zx, dx, dz)
