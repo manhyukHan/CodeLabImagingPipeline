@@ -118,11 +118,17 @@ FIDUCIAL_GATES = {
 }
 READOUT_GATES = {
     'reject_at_bound': True,
-    # None = ANY parameter at a bound is fatal. Safe here because the
-    # readout's sigma is FIXED from the calibrated PSF and so cannot be at
-    # a bound at all; anything that rails is a position or a background,
-    # and both matter.
-    'at_bound_fatal': None,
+    # POSITION only, matching the filter that was actually swept:
+    # gate_sweep_v2.py:159 is `any(s in ('x', 'y', 'z') for s in
+    # f.at_bound)`, and that is the filter behind 295/311 pairs at
+    # 0.218 um. (The tuple there is a membership SET over parameter names
+    # -- fit3d_um.py:245 -- not a coordinate order, so ('x','y','z') and
+    # ('y','x','z') are the same test.)
+    #
+    # This read None (= any parameter fatal) and would have rejected on a
+    # railed background offset, which the measurement never did. It bites
+    # only on the no-PSF fallback, where sigma is free and can rail too.
+    'at_bound_fatal': ('y', 'x', 'z'),
     'min_occupancy': 0.40,
     'max_uncert_xy_nm': None,
     'max_uncert_z_nm': None,
@@ -183,6 +189,11 @@ READOUT_PEAK_BOUND_Z_UM = 2.0
 # not a measurement and its centroid is what the round is for.
 FIDUCIAL_MAX_SIGMA_XY_UM = 3.00
 FIDUCIAL_MAX_SIGMA_Z_UM = 6.00
+# Same ceilings for the readout's FREE-sigma fallback. Only reached when no
+# plausible calibrated PSF is installed; with one, sigma is fixed and these
+# are unused.
+READOUT_MAX_SIGMA_XY_UM = 3.00
+READOUT_MAX_SIGMA_Z_UM = 6.00
 
 # A LOWER bound at the optical limit, not at the fitter's default 0.02 um.
 # 20 nm is a quarter of the smallest width this microscope can produce, so
@@ -237,8 +248,21 @@ class V2Params(object):
             doc = LIB.read(label)
         got = LIB.shape_tuple(doc) if doc else None
         if got:
-            fam, shape = got
-            label = doc.get('installed_from') or doc.get('label') or label
+            # REFUSE a degenerate shape rather than fixing every readout to
+            # it. Score cannot arbitrate this -- a 39 nm core scored rss/vox
+            # 2986 against 2931 for a 312 nm one on the same real data -- so
+            # psf.plausible() checks the physics instead: nothing on a
+            # declared bound, nothing below the optical limit. A calibrated
+            # PSF that is physically impossible is worse than no calibration,
+            # because free sigma can still recover while a fixed wrong shape
+            # cannot. Falling back to free sigma is the safe direction.
+            from codelab_pipeline.localization import psf as P
+            ok, why = P.plausible(got[0], doc.get('params') or {})
+            if ok:
+                fam, shape = got
+                label = doc.get('installed_from') or doc.get('label') or label
+            else:
+                label = f'{label} [REJECTED: {"; ".join(why)}]'
         return cls(voxel_um=voxel, psf_family=fam, psf_shape=shape,
                    psf_label=label)
 
@@ -347,10 +371,18 @@ def fit_readout(cube, z_centre, p):
         return None
     sy, sx, sz = _seed(cube, z_centre, p.voxel_um)
     if not p.has_psf:
+        # The FREE-sigma fallback must carry the validated ceilings too.
+        # Passing neither leaves fit3d_um's own defaults (0.520 / 1.000 um)
+        # in force -- a readout-sized ceiling that the measured ladder
+        # never used, and tight enough that a slightly broad spot rails
+        # instead of fitting. Every v2 number was taken at 3.0 / 6.0.
         return U.fit_gaussian_3d_um(
             cube, sy, sx, sz, voxel_um=p.voxel_um,
             peak_bound_um=READOUT_PEAK_BOUND_UM,
             peak_bound_z_um=READOUT_PEAK_BOUND_Z_UM,
+            min_sigma_um=FIDUCIAL_MIN_SIGMA_UM,
+            max_sigma_xy_um=READOUT_MAX_SIGMA_XY_UM,
+            max_sigma_z_um=READOUT_MAX_SIGMA_Z_UM,
             fit_radius_um=READOUT_FIT_RADIUS_UM,
             background='linear', apply_gates=False)
     return M.fit_gaussian_3d_mle(
@@ -457,15 +489,22 @@ def gate(fit, cube, gates, voxel_um=DEFAULT_VOXEL_UM):
             return False, 'occupancy undefined (no signal above background)'
         if occ < thr:
             return False, f'occupancy {occ:.2f} < {thr:.2f}'
+    # 2000x, not 1000x. FitUm.ci_*_um are HALF-widths, and the sweep that
+    # produced the recorded thresholds converted with
+    # `2000 * max(f.ci_y_um, f.ci_x_um)` (gate_sweep_v2.py:157-158) -- i.e.
+    # the FULL 95% interval in nanometres. Using the half-width here would
+    # compare against a threshold calibrated on twice the quantity, and
+    # every uncertainty gate would be exactly 2x looser than the number it
+    # was set from. Latent today only because these default to None.
     lim = gates.get('max_uncert_xy_nm')
     if lim is not None:
-        ci = 1000.0 * max(getattr(fit, 'ci_y_um', 0.0) or 0.0,
+        ci = 2000.0 * max(getattr(fit, 'ci_y_um', 0.0) or 0.0,
                           getattr(fit, 'ci_x_um', 0.0) or 0.0)
         if not np.isfinite(ci) or ci > lim:
             return False, f'lateral uncertainty {ci:.0f} nm > {lim:.0f} nm'
     lim = gates.get('max_uncert_z_nm')
     if lim is not None:
-        ci = 1000.0 * (getattr(fit, 'ci_z_um', 0.0) or 0.0)
+        ci = 2000.0 * (getattr(fit, 'ci_z_um', 0.0) or 0.0)
         if not np.isfinite(ci) or ci > lim:
             return False, f'axial uncertainty {ci:.0f} nm > {lim:.0f} nm'
     return True, None
@@ -527,6 +566,20 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     p = params or V2Params()
     if not append:
         allele.fiducial_trace, allele.polymer, allele.rejected_hybes = {}, {}, {}
+    else:
+        # MERGE, but a hybe that IS being re-derived must lose its stale
+        # entries first -- otherwise a round that traced last pass and is
+        # rejected this pass keeps its old polymer entry and the allele
+        # reports a position no current fit stands behind. v1 does the same
+        # (localization.py: rejected_hybes.pop / polymer.pop per hybe).
+        # fiducial_trace is deliberately NOT popped for the reference: its
+        # baseline is a physical fact about the reference stack that new
+        # hybes landing on disk do not change.
+        for h in hybes:
+            allele.rejected_hybes.pop(h, None)
+            allele.polymer.pop(h, None)
+            if h != reference_hybe:
+                allele.fiducial_trace.pop(h, None)
     debug = {} if collect_debug else None
     # (y, x). NOT (x, y). allele.coordinate is rasterized order (y, x, z)
     # per models/allele.py, and spot_mapper.reference_to_raw unpacks
@@ -555,7 +608,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         sy, sx = spot_mapper.raw_to_reference(
             (yf + ymin, xf + xmin), hybe, fov_matrices, modality=modality,
             cell=cell, resolver=resolver)
-        sz = zf if cell is None else zf + L.cell_z_offset(cell, hybe, mod, resolver)
+        # UNCONDITIONAL, unlike v1's `if cell is not None` guard. With a
+        # resolver, cell_z_offset returns resolver.z_to_shared(...) which
+        # carries the FOV-level CROSS-MODAL z drift -- and its own
+        # docstring says that drift "is FOV-bounded and therefore applies
+        # to unassigned spots too". v1's guard skips the resolver entirely
+        # for a cell-less allele and silently drops that correction. The
+        # function already returns 0.0 for the genuinely-nothing-known
+        # case (cell None, no resolver), so calling it always is both safe
+        # and more correct.
+        sz = zf + L.cell_z_offset(cell, hybe, mod, resolver)
         return float(sy), float(sx), float(sz)
 
     # -- phase 1: cut every fiducial crop, then place the boxes ---------
@@ -572,8 +634,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             continue
         fid_cubes[hybe] = cube
         fid_origin[hybe] = (ymin, xmin)
-        z_offsets[hybe] = (0.0 if cell is None
-                           else float(L.cell_z_offset(cell, hybe, mod, resolver)))
+        z_offsets[hybe] = float(L.cell_z_offset(cell, hybe, mod, resolver))
     zexp = consensus_native_z(fid_cubes, z_offsets)
 
     # -- phase 2: fit the fiducials at their own expected depth ---------
@@ -612,13 +673,39 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         fid_local[hybe] = (f.y, f.x, f.z)
         if debug is not None:
             debug[hybe]['fiducial_centroid'] = (f.x, f.y, f.z)
-    if ref_note and debug is not None:
-        debug.setdefault(reference_hybe, {})['reference_warning'] = ref_note
+    if ref_note:
+        # On the ALLELE, not only in debug. debug is None in every batch
+        # run (collect_debug=False), so a reference that only just scraped
+        # through would have been invisible exactly when it matters most --
+        # a whole FOV traced against a doubtful frame, with nothing saying
+        # so. The frame cancels out of pair distances, but it still bounds
+        # precision and the operator deserves to know.
+        allele.reference_warning = ref_note
+        if debug is not None:
+            debug.setdefault(reference_hybe, {})['reference_warning'] = ref_note
 
     baseline = allele.fiducial_trace.get(reference_hybe)
 
     # -- phase 3: the drift gate, then the readouts ---------------------
     for hybe in hybes:
+        # PREVIEW FIRST, VERDICT SECOND. A rejected round still has to show
+        # its crop: View Crop exists to let a person see WHY a round was
+        # rejected, and a grid that silently omits the failures shows only
+        # the rounds that already worked. Only the fitted-position marker
+        # depends on the gate. Costs one crop read per rejected hybe and
+        # only when debug is being collected, i.e. never in a batch run.
+        if debug is not None and hybe not in (debug or {}):
+            debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
+                                    'readout_cubic': None, 'readout_centroids': None})
+        if debug is not None and debug[hybe].get('readout_cubic') is None:
+            ch0 = hybe_readout_channels.get(hybe)
+            if ch0 is not None:
+                try:
+                    c0, _y0, _x0 = _cut(hybe, ch0)
+                    if c0 is not None and c0.size:
+                        debug[hybe]['readout_cubic'] = c0
+                except (OSError, ValueError):
+                    pass
         if hybe in allele.rejected_hybes:
             continue
         fid = allele.fiducial_trace.get(hybe)

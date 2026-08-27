@@ -611,7 +611,10 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     when the crop only ever had one real accepted component.
 
     mixture_centroids: () normally; when the mixture path found more than
-    one accepted component, a tuple of (x, y, z, amplitude) in that SAME
+    one accepted component, a tuple of (Y, X, z, amplitude) -- Y FIRST,
+    built from new_coordinate at line 761, which is adj_coordinate-shaped
+    and therefore yx (legacy/migrate_store_to_yx.py). This said
+    "(x, y, z, amplitude)" until 2026-08-27 and was stale -- in that SAME
     real coordinate frame, representative (brightest) first, then every
     other accepted component -- this is the ASpot.mixture_centroids-
     shaped value a caller should persist onto spot itself (see

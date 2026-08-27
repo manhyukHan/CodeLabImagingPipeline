@@ -5444,7 +5444,8 @@ class MainWindow(QtWidgets.QMainWindow):
         spot, never spawned as separate ASpot records -- per explicit
         request: spot.adj_coordinate/raw_coordinate become the BRIGHTEST
         accepted component's position, and spot.mixture_centroids records
-        every accepted component's own (x, y, z, amplitude), representative
+        every accepted component's own (Y, X, z, amplitude) -- Y FIRST, as
+        adj_coordinate is; said "(x, y, z, ...)" until 2026-08-27 -- representative
         first, for later reference/display (canvas/spot_fit_status.py
         draws the representative yellow, the rest blue). Cleared back to
         () on a spot whose crop only ever had one component this run.

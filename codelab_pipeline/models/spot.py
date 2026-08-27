@@ -39,7 +39,9 @@ class ASpot():
        re-accessed by locality later without inverting any matrix.
      size: float
      brightness: float
-     mixture_centroids: tuple of (x, y, z, amplitude) -- set only when this
+     mixture_centroids: tuple of (Y, X, z, amplitude) -- Y FIRST, matching
+      adj_coordinate and the rest of the store (legacy/migrate_store_to_yx.py);
+      said "(x, y, z, amplitude)" until 2026-08-27. Set only when this
        spot's own Z was refined via the multi-Gaussian mixture path (see
        localization.refine_spot_z) and the crop held more than one real
        component. Holds EVERY accepted component's own real/shared-frame

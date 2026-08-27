@@ -108,22 +108,33 @@ def main():
           V2.gate(None, cube, p.readout_gates)[0] is False
           and 'fit failed' in V2.gate(None, cube, p.readout_gates)[1])
 
-    class _AtBound(object):
-        # ON the emitter (the crop's peak is at 8, 8, 30), so the ONLY
-        # thing wrong with it is the bound. A stub sitting in background
-        # would fail the occupancy gate instead and the at_bound test
-        # would pass for the wrong reason.
-        at_bound = ('sigma_z_um',)
-        y = x = 8.0
-        z = 30.0
-        ci_y_um = ci_x_um = ci_z_um = 0.001
-        amplitude = 100.0
-    ok2, why2 = V2.gate(_AtBound(), cube, p.readout_gates, VOXEL)
-    check('an at-bound fit is rejected BEFORE any other gate is consulted',
-          ok2 is False and 'at bound' in why2, str(why2))
-    ok3, _ = V2.gate(_AtBound(), cube, dict(p.readout_gates,
-                                            reject_at_bound=False), VOXEL)
-    check('and the at_bound filter can be turned off deliberately', ok3 is True)
+    # Parameter names as fit3d_um.py:245 emits them. ON the emitter (the
+    # crop's peak is at 8, 8, 30), so the ONLY thing wrong is the bound --
+    # a stub in background would fail the occupancy gate instead and the
+    # at_bound test would pass for the wrong reason.
+    def _railed(*names):
+        class _R(object):
+            at_bound = names
+            y = x = 8.0
+            z = 30.0
+            ci_y_um = ci_x_um = ci_z_um = 0.001
+            amplitude = 100.0
+        return _R()
+
+    for label, g in (('fiducial', p.fiducial_gates), ('readout', p.readout_gates)):
+        ok2, why2 = V2.gate(_railed('z'), cube, g, VOXEL)
+        check(f'{label}: a railed POSITION is rejected before any other gate',
+              ok2 is False and 'at bound' in why2, str(why2))
+        # sigma at a bound is NOT fatal for either channel: the swept filter
+        # was `any(s in ('x','y','z') ...)` (gate_sweep_v2.py:159), and a
+        # fiducial's sigma pins to whatever ceiling exists while its
+        # centroid stays on the emitter.
+        ok3, why3 = V2.gate(_railed('sigma_y', 'sigma_x', 'offset'), cube, g, VOXEL)
+        check(f'{label}: a railed SIGMA or OFFSET is not, on its own, fatal',
+              ok3 is True, str(why3))
+    ok4, _ = V2.gate(_railed('z'), cube,
+                     dict(p.readout_gates, reject_at_bound=False), VOXEL)
+    check('and the at_bound filter can be turned off deliberately', ok4 is True)
 
     tight = dict(p.readout_gates, max_uncert_xy_nm=0.001)
     check('the lateral uncertainty gate is applied in NANOMETRES',
