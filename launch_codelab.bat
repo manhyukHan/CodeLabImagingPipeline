@@ -47,7 +47,10 @@ rem down to :plain and the wrong interpreter. CODELAB_PYTHON above is
 rem still the reliable knob; this just makes the common layout work
 rem without one.
 set "CONDA="
-for /f "delims=" %%C in ('where conda 2^>nul') do if not defined CONDA set "CONDA=%%C"
+rem via :try_conda like every other candidate, so a conda that is ON PATH
+rem but broken cannot win either -- a stale PATH entry outlives an
+rem uninstall exactly the way a stale file does.
+for /f "delims=" %%C in ('where conda 2^>nul') do if not defined CONDA call :try_conda "%%C"
 if not defined CONDA call :try_conda "%USERPROFILE%\miniforge3\Scripts\conda.exe"
 if not defined CONDA call :try_conda "%USERPROFILE%\miniconda3\Scripts\conda.exe"
 if not defined CONDA call :try_conda "%USERPROFILE%\anaconda3\Scripts\conda.exe"
@@ -144,7 +147,23 @@ pause
 goto :end
 
 :try_conda
-if exist %1 set "CONDA=%~1"
+rem Accept a candidate only if it actually RUNS. "if exist" alone was not
+rem enough: uninstalling Anaconda left a husk behind -- Scripts\conda.exe
+rem still on disk, but conda-script.py deleted, so it exits 105 on every
+rem invocation. The probe stopped at that dead file and never looked at
+rem the working conda further down the list. Worse than not finding one:
+rem `%CONDA% env list` then returns nothing, the launcher concludes the
+rem project env does not exist, and offers to re-create an env that is
+rem sitting there in perfect health.
+rem
+rem Files left behind by an uninstaller are normal (anything loaded at the
+rem time cannot be deleted), so this state is not exotic and the probe has
+rem to survive it. --version is the cheapest call that proves conda works,
+rem and it runs at most once per candidate before the first success.
+if not exist %1 goto :eof
+%1 --version >nul 2>&1
+if errorlevel 1 goto :eof
+set "CONDA=%~1"
 goto :eof
 
 :end
