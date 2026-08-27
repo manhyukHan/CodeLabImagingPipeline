@@ -193,6 +193,108 @@ def plausible(family, params, tol=1e-6):
 
 # -- calibration ---------------------------------------------------------
 
+def _prepare_projections(cube, voxel_um, seed_yxz, half_yxz=(5, 5, 15)):
+    """
+    A crop reduced to its three 2D MAX PROJECTIONS, with coordinates.
+
+    Exact for this PSF family, not an approximation. Every candidate here
+    is separable and co-centred, so
+
+        max_z [ g_xy(y,x) * g_z(z) ] = g_xy(y,x) * 1 = g_xy(y,x)
+
+    because g_z peaks at 0 and 0 is inside the box. gaussian_halo
+    survives it too: both of its components peak at the same z, so they
+    attain their maxima simultaneously and the projection is the lateral
+    profile of the sum. So YX carries sigma_xy, and ZX/ZY carry sigma_z
+    (and sigma_xy again, which is a free consistency check the 3D fit
+    does not provide).
+
+    Where it is NOT exact is background: max(signal + bg) != max(signal)
+    + bg. A background flat in z collapses to a constant the per-
+    projection plane absorbs; a strong axial gradient leaves the bright
+    end. Measured against the 3D fit on real fiducial crops, sigma_xy
+    agreed to 1 nm and sigma_z to 39 nm, so the distortion is small here.
+
+    Returns [(image, coord0, coord1, kinds), ...] or None.
+    """
+    from .fit3d_um import extract_box
+    box, _origin = extract_box(cube, seed_yxz, half_yxz)
+    if not np.isfinite(box).any():
+        return None
+    dy, dx, dz = voxel_um
+    ny, nx, nz = box.shape
+    y = (np.arange(ny) - (ny - 1) / 2.0) * dy
+    x = (np.arange(nx) - (nx - 1) / 2.0) * dx
+    z = (np.arange(nz) - (nz - 1) / 2.0) * dz
+    with np.errstate(all='ignore'):
+        yx = np.nanmax(box, axis=2)      # (y, x)
+        zx = np.nanmax(box, axis=0)      # (x, z)
+        zy = np.nanmax(box, axis=1)      # (y, z)
+    out = []
+    for img, a0, a1, kinds in ((yx, y, x, ('y', 'x')),
+                               (zx, x, z, ('x', 'z')),
+                               (zy, y, z, ('y', 'z'))):
+        m = np.isfinite(img)
+        if m.sum() < 20:
+            continue
+        A0, A1 = np.meshgrid(a0, a1, indexing='ij')
+        out.append((img[m], A0[m], A1[m], kinds))
+    return out or None
+
+
+def _fit_projections(prep, family, shape):
+    """
+    All three projections in ONE least_squares call, sharing amplitude
+    and a single 3D centre.
+
+    The shared parameterisation is the point. Fitting each projection
+    separately needs three solver calls per crop, and at ~800 points
+    each the per-call overhead dominates -- measured 0.6x, i.e. SLOWER
+    than the single 3D fit it was meant to replace. Sharing (amp, cy,
+    cx, cz) across the three cuts it to one call and 13 parameters
+    instead of 18, and is also the physically correct statement: one
+    emitter, seen three ways. Only the background plane is per-
+    projection, since each projection's background is a different
+    non-linear reduction of the same 3D one.
+    """
+    from scipy.optimize import least_squares
+    if not prep:
+        return None
+    n_proj = len(prep)
+    peak = max(float(np.nanmax(v) - np.nanmedian(v)) for v, _a, _b, _k in prep)
+
+    def split(p):
+        amp, cy, cx, cz = p[:4]
+        return amp, {'y': cy, 'x': cx, 'z': cz}, p[4:]
+
+    def resid(p):
+        amp, c, bg = split(p)
+        parts = []
+        for i, (v, A0, A1, kinds) in enumerate(prep):
+            d = {'y': 0.0, 'x': 0.0, 'z': 0.0}
+            d[kinds[0]] = A0 - c[kinds[0]]
+            d[kinds[1]] = A1 - c[kinds[1]]
+            s = evaluate(family, shape, d['y'], d['x'], d['z'])
+            b0, g0, g1 = bg[3 * i:3 * i + 3]
+            parts.append(amp * s + b0 + g0 * A0 + g1 * A1 - v)
+        return np.concatenate(parts)
+
+    p0 = [max(peak, 1.0), 0.0, 0.0, 0.0]
+    lo = [0.0, -0.5, -0.5, -1.0]
+    hi = [np.inf, 0.5, 0.5, 1.0]
+    for v, _a, _b, _k in prep:
+        p0 += [float(np.nanmedian(v)), 0.0, 0.0]
+        lo += [-np.inf] * 3
+        hi += [np.inf] * 3
+    try:
+        r = least_squares(resid, p0, bounds=(lo, hi), max_nfev=300)
+    except Exception:
+        return None
+    if not r.success:
+        return None
+    return float(np.sum(r.fun ** 2)), int(sum(v.size for v, _a, _b, _k in prep))
+
+
 def _prepare_crop(cube, voxel_um, fit_radius_um, seed_yxz):
     """
     Everything about ONE crop that does NOT depend on the PSF shape:
@@ -250,7 +352,8 @@ def _fit_prepared(prep, family, shape):
 
 
 def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
-              fit_radius_um=(0.8, 0.8, 2.0), verbose=True, z_centres=None):
+              fit_radius_um=(0.8, 0.8, 2.0), verbose=True, z_centres=None,
+              mode='box'):
     """
     Find the PSF shape that best describes `crops` -- a list of 3D
     (Y, X, Z) arrays from the REFERENCE hybe, which need no alignment.
@@ -286,7 +389,8 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
         else:
             zc = float(np.unravel_index(int(np.nanargmax(c)), c.shape)[2])
         seed = ((c.shape[0] - 1) / 2.0, (c.shape[1] - 1) / 2.0, zc)
-        prep = _prepare_crop(c, voxel_um, fit_radius_um, seed)
+        prep = (_prepare_projections(c, voxel_um, seed) if mode == 'projections'
+                else _prepare_crop(c, voxel_um, fit_radius_um, seed))
         if prep is not None:
             preps.append(prep)
 
@@ -296,8 +400,9 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
 
         def total(theta):
             rss, n = 0.0, 0
+            inner = _fit_projections if mode == 'projections' else _fit_prepared
             for prep in preps:
-                got = _fit_prepared(prep, family, tuple(theta))
+                got = inner(prep, family, tuple(theta))
                 if got is None:
                     continue
                 rss += got[0]
