@@ -37,6 +37,15 @@ if defined CODELAB_PYTHON (
 )
 
 rem -- locate a conda: PATH first, then the usual install roots --
+rem
+rem The non-system-drive roots are not decoration. This machine ran C: out
+rem of space, so the conda install itself was moved to D: -- and a conda
+rem that is not on PATH (installing without "Add to PATH" is the default
+rem and the recommended choice) is then invisible to every %USERPROFILE%
+rem and %ProgramData% probe below, which sends the launcher all the way
+rem down to :plain and the wrong interpreter. CODELAB_PYTHON above is
+rem still the reliable knob; this just makes the common layout work
+rem without one.
 set "CONDA="
 for /f "delims=" %%C in ('where conda 2^>nul') do if not defined CONDA set "CONDA=%%C"
 if not defined CONDA call :try_conda "%USERPROFILE%\miniforge3\Scripts\conda.exe"
@@ -45,6 +54,15 @@ if not defined CONDA call :try_conda "%USERPROFILE%\anaconda3\Scripts\conda.exe"
 if not defined CONDA call :try_conda "%ProgramData%\miniforge3\Scripts\conda.exe"
 if not defined CONDA call :try_conda "%ProgramData%\miniconda3\Scripts\conda.exe"
 if not defined CONDA call :try_conda "%ProgramData%\Anaconda3\Scripts\conda.exe"
+rem Installs moved off the system drive. D: first because that is where
+rem this machine's env and package dirs already live (see .condarc).
+for %%D in (D E) do (
+    if not defined CONDA call :try_conda "%%D:\miniforge3\Scripts\conda.exe"
+    if not defined CONDA call :try_conda "%%D:\miniconda3\Scripts\conda.exe"
+    if not defined CONDA call :try_conda "%%D:\anaconda3\Scripts\conda.exe"
+    if not defined CONDA call :try_conda "%%D:\Anaconda3\Scripts\conda.exe"
+    if not defined CONDA call :try_conda "%%D:\conda\Scripts\conda.exe"
+)
 if not defined CONDA goto :plain
 
 rem -- Ask CONDA whether the env exists, never the filesystem: envs_dirs can
