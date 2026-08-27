@@ -8,5 +8,12 @@ __pycache__/
 # from the store, and a full harvest is hundreds of MB of PNG.
 notes/chromatin_tracing_optimization/
 
-# Launcher logs (launch_codelab.vbs writes one per launch beside the app)
+# The log folder itself is tracked (via .gitkeep) so a fresh checkout has
+# it; everything written INTO it -- launcher logs, saved session logs -- is
+# not. Order matters: the un-ignore must follow the ignore.
+log/*
+!log/.gitkeep
+
+# Launcher logs from before they moved into log/, plus any that land beside
+# the app when the project folder is read-only and the launcher falls back.
 codelab_launch_*.log

@@ -13,9 +13,30 @@ window) and can be re-opened any time with the main window's 'Show Log'
 corner button; closing it merely hides it. Quitting the app is the MAIN
 window's close button, which asks first -- see MainWindow.closeEvent.
 """
+import os
 import time
 
 from PyQt5 import QtGui, QtWidgets
+
+# Both things that write a log write it here: this window's Save button and
+# launch_codelab.vbs. The folder is committed (log/.gitkeep) with its
+# contents gitignored, so it exists in a fresh checkout and nothing in it
+# is ever committed by accident.
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log')
+
+
+def default_log_dir():
+    """The log folder, creating it if needed; falls back to the cwd.
+
+    A save dialog that cannot open where it was told to is worse than one
+    that opens somewhere plausible, so an unwritable install path degrades
+    rather than raising in a button handler.
+    """
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        return LOG_DIR
+    except OSError:
+        return os.getcwd()
 
 
 class LogWindow(QtWidgets.QMainWindow):
@@ -61,7 +82,10 @@ class LogWindow(QtWidgets.QMainWindow):
     def _save_log(self):
         # The suggested name reuses the line-stamp date format but with
         # dashes for the time -- colons are illegal in Windows filenames.
-        suggested = time.strftime('codelab_log_%Y-%m-%d-%H-%M-%S.txt')
+        # Suggested as a FULL path so the dialog opens in the log folder;
+        # a bare name would open wherever the process happens to be.
+        suggested = os.path.join(default_log_dir(),
+                                 time.strftime('codelab_log_%Y-%m-%d-%H-%M-%S.txt'))
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Save Log', suggested, 'Text files (*.txt);;All files (*)')
         if not path:

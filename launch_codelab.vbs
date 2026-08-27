@@ -30,12 +30,19 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 
 here = fso.GetParentFolderName(WScript.ScriptFullName)
 
-' Logs live BESIDE the app, not in %TEMP% -- a log you have to go hunting
-' for is one nobody reads. Falls back to %TEMP% when the project folder
-' is not writable (an install under a protected path, or a read-only
-' share), because failing to launch over a log file would be absurd.
-tempDir = here
-If Not FolderIsWritable(here) Then
+' Logs live in log\ BESIDE the app, not in %TEMP% -- a log you have to go
+' hunting for is one nobody reads, but one log per launch dropped in the
+' project root buries the actual project. The folder is committed (git
+' tracks log\.gitkeep and ignores everything else in it) so it is normally
+' already there; creating it is only for a fresh checkout that lost it.
+'
+' Falls back to %TEMP% when that folder cannot be made or written (an
+' install under a protected path, or a read-only share), because failing
+' to launch over a log file would be absurd.
+tempDir = here & "\log"
+If Not EnsureFolder(tempDir) Then
+    tempDir = shell.ExpandEnvironmentStrings("%TEMP%")
+ElseIf Not FolderIsWritable(tempDir) Then
     tempDir = shell.ExpandEnvironmentStrings("%TEMP%")
 End If
 
@@ -51,6 +58,21 @@ logPath = ClaimLogPath(tempDir)
 ' enough to still have yesterday's failure to look at, without letting
 ' them accumulate in the project folder for ever.
 PruneOldLogs tempDir, 7
+
+Function EnsureFolder(folder)
+    ' True if the folder exists afterwards. Two launches racing here both
+    ' try to create it and one loses -- that loser's CreateFolder raises,
+    ' so the existence re-check after the error is what decides, not the
+    ' error itself.
+    On Error Resume Next
+    If fso.FolderExists(folder) Then
+        EnsureFolder = True
+        Exit Function
+    End If
+    fso.CreateFolder folder
+    Err.Clear
+    EnsureFolder = fso.FolderExists(folder)
+End Function
 
 Function FolderIsWritable(folder)
     ' The probe name must be unique per launch too. A fixed one was itself

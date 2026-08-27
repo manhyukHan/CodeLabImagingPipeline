@@ -1,0 +1,4 @@
+Keeps the log folder in the repository while its contents stay ignored
+(see .gitignore). Both writers -- launch_codelab.vbs and the Log window's
+Save button -- create it if missing, so this file is not load-bearing; it
+just means a fresh checkout already has the folder the app expects.
