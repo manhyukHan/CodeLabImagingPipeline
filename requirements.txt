@@ -46,5 +46,13 @@ ipywidgets
 # ingestion worker ceiling (it falls back to a Win32/POSIX call without it).
 psutil
 
+# Lets parallel.py pin a worker's BLAS to one thread even when numpy is
+# already imported, which the environment variables alone cannot do -- by
+# then they have missed their chance. Without it, N worker processes each
+# size their BLAS pool from the whole machine: on a 32-core box that is 32
+# processes asking for 64 threads apiece. It is also what lets the tests
+# ASSERT the pinning rather than assume it. Falls back to env-only.
+threadpoolctl
+
 # The GUI itself.
 PyQt5
