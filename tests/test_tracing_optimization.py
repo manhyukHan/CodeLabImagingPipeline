@@ -285,6 +285,36 @@ def main():
     check('the axial position bound is separate from the lateral one',
           'peak_bound_z_um' in U.fit_gaussian_3d_um.__code__.co_varnames)
 
+    # -- 7. splitting the families across processes changes nothing ----
+    #
+    # tools/psf_survey.py fits one family per worker and recombines with
+    # psf.select_best. That is only legitimate if the families really are
+    # independent -- if calibrate's per-family fit depended on the others
+    # having been fitted first, the parallel answer would differ from the
+    # serial one and nothing in the output would say so. Asserted rather
+    # than assumed, because the failure is silent.
+    fams = ['gaussian', 'lorentzian']
+    crops = [pillar(seed=s)[0] for s in (11, 12, 13)]
+
+    together = P.calibrate(crops, voxel_um=VOXEL, families=fams, verbose=False)
+    apart = {}
+    for f in fams:
+        apart[f] = P.calibrate(crops, voxel_um=VOXEL, families=[f],
+                               verbose=False)[f]
+    P.select_best(apart, verbose=False)
+
+    same_scores = all(abs(together[f]['score'] - apart[f]['score']) < 1e-9
+                      for f in fams)
+    check('a family fitted alone scores exactly as it does alongside others',
+          same_scores,
+          '  '.join(f'{f}: {together[f]["score"]:.6f} vs {apart[f]["score"]:.6f}'
+                    for f in fams))
+    check('recombining separately-fitted families picks the same winner',
+          together['best'] == apart['best'],
+          f'{together["best"]} vs {apart["best"]}')
+    check('select_best marks plausibility on the recombined result',
+          all('plausible' in apart[f] for f in fams))
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:

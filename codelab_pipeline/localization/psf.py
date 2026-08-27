@@ -430,13 +430,29 @@ def calibrate(crops, voxel_um=DEFAULT_VOXEL_UM, families=None,
             pretty = '  '.join(f'{k}={v:.4f}' for k, v in params.items())
             print(f'   {family:<11} rss/voxel {res.fun:10.2f}   {pretty}', flush=True)
 
-    # Score alone must not choose: a degenerate shape can score as well as
-    # a sane one (measured: rss/vox 2986 vs 2931 for a 39 nm core against
-    # a 312 nm one). Prefer the best-scoring PLAUSIBLE candidate, and only
-    # fall back to the best overall when every candidate is implausible --
-    # which is itself the signal that this data cannot constrain a PSF and
-    # needs more crops, flagged rather than hidden.
+    return select_best(results, verbose=verbose)
+
+
+def select_best(results, verbose=True):
+    """Mark plausibility and pick the winner, in place.
+
+    Split out of `calibrate` so that a driver which fits the families in
+    SEPARATE PROCESSES -- the obvious way to parallelise this, since the
+    families are independent -- can recombine the parts through exactly
+    this code rather than its own copy of it. Two implementations of
+    "which PSF do we believe" would eventually disagree, and the one that
+    disagreed silently would be the one in the tool.
+
+    Score alone must not choose: a degenerate shape can score as well as
+    a sane one (measured: rss/vox 2986 vs 2931 for a 39 nm core against a
+    312 nm one). Prefer the best-scoring PLAUSIBLE candidate, and fall
+    back to the best overall only when every candidate is implausible --
+    which is itself the signal that this data cannot constrain a PSF and
+    needs more crops, flagged rather than hidden.
+    """
     for family in list(results):
+        if not isinstance(results[family], dict) or 'params' not in results[family]:
+            continue
         ok, why = plausible(family, results[family]['params'])
         results[family]['plausible'] = ok
         results[family]['warnings'] = why
