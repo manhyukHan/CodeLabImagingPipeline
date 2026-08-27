@@ -7,3 +7,6 @@ __pycache__/
 # Rendered inspection output from tools/fit_testbox.py -- regenerable
 # from the store, and a full harvest is hundreds of MB of PNG.
 notes/chromatin_tracing_optimization/
+
+# Launcher logs (launch_codelab.vbs writes one per launch beside the app)
+codelab_launch_*.log

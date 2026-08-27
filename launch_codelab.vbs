@@ -24,12 +24,109 @@
 
 Option Explicit
 
-Dim shell, fso, here, logPath, cmd, rc
+Dim shell, fso, here, tempDir, logPath, cmd, rc
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
 here = fso.GetParentFolderName(WScript.ScriptFullName)
-logPath = shell.ExpandEnvironmentStrings("%TEMP%") & "\codelab_launch.log"
+
+' Logs live BESIDE the app, not in %TEMP% -- a log you have to go hunting
+' for is one nobody reads. Falls back to %TEMP% when the project folder
+' is not writable (an install under a protected path, or a read-only
+' share), because failing to launch over a log file would be absurd.
+tempDir = here
+If Not FolderIsWritable(here) Then
+    tempDir = shell.ExpandEnvironmentStrings("%TEMP%")
+End If
+
+' ONE LOG PER LAUNCH. A fixed name was wrong as soon as two copies of the
+' app run at once -- nothing stops that, since each double-click starts an
+' independent wscript. Both redirected into the same file with ">", so the
+' second launch truncated the first's log while it was still being written,
+' the two then interleaved, and a failure dialog could show the OTHER
+' instance's output. Stamping the name keeps each launch's log its own.
+logPath = ClaimLogPath(tempDir)
+
+' Nothing else cleans these up, so sweep launch logs older than a week --
+' enough to still have yesterday's failure to look at, without letting
+' them accumulate in the project folder for ever.
+PruneOldLogs tempDir, 7
+
+Function FolderIsWritable(folder)
+    ' The probe name must be unique per launch too. A fixed one was itself
+    ' a collision: two launches starting together would each create and
+    ' then DELETE the same probe, so one could delete the other's file
+    ' mid-check and wrongly conclude the folder was read-only, sending its
+    ' log somewhere the failure dialog did not expect. GetTempName is
+    ' exactly what it is for.
+    On Error Resume Next
+    Dim probe, f
+    probe = folder & "\" & fso.GetTempName()
+    Set f = fso.CreateTextFile(probe, False)
+    If Err.Number <> 0 Then
+        FolderIsWritable = False
+        Err.Clear
+        Exit Function
+    End If
+    f.Close
+    fso.DeleteFile probe, True
+    FolderIsWritable = (Err.Number = 0)
+    Err.Clear
+End Function
+
+Function ClaimLogPath(folder)
+    ' CLAIMS the name by creating the file, rather than picking a name and
+    ' hoping. A timestamp alone collides when two launches land in the same
+    ' second, and adding Rnd() does not close it: Randomize seeds from the
+    ' system timer, whose resolution is coarser than the gap between two
+    ' processes started together, so both can draw the SAME number.
+    '
+    ' CreateTextFile(path, False) fails if the file already exists, so
+    ' whichever launch creates it first owns that name and the other moves
+    ' on. The redirect below then truncates the empty file we just made,
+    ' which is what it would have done anyway.
+    On Error Resume Next
+    Dim n, base, candidate, i, f
+    Randomize
+    n = Now()
+    base = folder & "\codelab_launch_" & _
+           Year(n) & Pad2(Month(n)) & Pad2(Day(n)) & "_" & _
+           Pad2(Hour(n)) & Pad2(Minute(n)) & Pad2(Second(n))
+    For i = 0 To 999
+        candidate = base
+        If i > 0 Then candidate = candidate & "_" & CStr(i)
+        candidate = candidate & ".log"
+        Err.Clear
+        Set f = fso.CreateTextFile(candidate, False)
+        If Err.Number = 0 Then
+            f.Close
+            ClaimLogPath = candidate
+            Err.Clear
+            Exit Function
+        End If
+    Next
+    ' 1000 collisions in one second is not a real scenario; if it somehow
+    ' happens, a random name is still better than failing to launch.
+    ClaimLogPath = base & "_" & CStr(Int(Rnd() * 1000000)) & ".log"
+    Err.Clear
+End Function
+
+Function Pad2(v)
+    Pad2 = Right("0" & CStr(v), 2)
+End Function
+
+Sub PruneOldLogs(folder, maxAgeDays)
+    On Error Resume Next          ' housekeeping must never block a launch
+    Dim f, file
+    Set f = fso.GetFolder(folder)
+    For Each file In f.Files
+        If LCase(Left(file.Name, 16)) = "codelab_launch_2" Then
+            If DateDiff("d", file.DateLastModified, Now()) > maxAgeDays Then
+                file.Delete True
+            End If
+        End If
+    Next
+End Sub
 
 ' Quiet mode: no prompts, no pause -- see the note above.
 shell.Environment("PROCESS")("CODELAB_LAUNCH_QUIET") = "1"
