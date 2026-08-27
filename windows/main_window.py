@@ -40,6 +40,7 @@ from codelab_pipeline.alignment.convention import as_cv2
 from codelab_pipeline.segmentation import segment
 from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
+from codelab_pipeline.localization import tracing_v2
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
 from codelab_pipeline.models.spot_container import DiffUndo, SpotContainer
@@ -801,7 +802,7 @@ class ChromatinTracingWorker(QtCore.QThread):
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
                 max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None, append=False,
-                ready_hybes_by_fov=None):
+                ready_hybes_by_fov=None, engine=None, v2_params=None):
         super().__init__()
         # append=True: per-(allele, hybe) delta (per explicit decision) --
         # each allele is fitted only for checked hybes not yet in its
@@ -816,6 +817,10 @@ class ChromatinTracingWorker(QtCore.QThread):
         # landed for this FOV yet must not be attempted -- it stays
         # missing for the next append pass rather than failing this one.
         self.append = append
+        # Which engine, resolved ONCE on the GUI thread and carried here.
+        # v1 stays the default and the reference implementation.
+        self.engine = engine
+        self.v2_params = v2_params
         self.n_failed = 0
         self.ready_hybes_by_fov = ready_hybes_by_fov or {}
         self.resolver_by_fov = resolver_by_fov or {}
@@ -886,9 +891,11 @@ class ChromatinTracingWorker(QtCore.QThread):
                         # retries it -- failure is retry-able state, not a
                         # poisoned run.
                         try:
-                            localization.build_chromatin_trace_allele(
+                            tracing_v2.trace_allele(
+                                self.engine,
                                 allele, fit_hybes, self.reference_hybe, self.hybe_fiducial_channels,
                                 self.hybe_readout_channels, storage_path, fov, self.modality, cell, fov_matrices,
+                                v2_params=self.v2_params,
                                 max_fiducial_drift=self.max_fiducial_drift,
                                 max_fiducial_drift_z=self.max_fiducial_drift_z,
                                 spad=self.spad, z_window=self.z_window,
@@ -6871,6 +6878,10 @@ class MainWindow(QtWidgets.QMainWindow):
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
         resolver = self._frame_resolver(None, fov)
+        # Resolved on the GUI thread, once, and passed in: V2Params reads
+        # the installed PSF off disk, and the worker must touch neither
+        # widgets nor anything it did not receive.
+        v2_params = self._chromatin_v2_params(full_params, storage_path)
 
         # Background thread that owns its OWN process pool: the per-hybe
         # fits (and their stack reads) happen in the children, so h5py's
@@ -6898,9 +6909,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pool = None
             try:
-                _, debug = localization.build_chromatin_trace_allele(
+                _, debug = tracing_v2.trace_allele(
+                    full_params.get('engine'),
                     allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
-                    storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=full_params['max_fiducial_drift'],
+                    storage_path, fov, modality, cell, fov_matrices,
+                    v2_params=v2_params,
+                    max_fiducial_drift=full_params['max_fiducial_drift'],
                     max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
                     spad=full_params['spad'], z_window=full_params['z_window'],
                     fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
@@ -6956,6 +6970,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chromatin_preview_worker.finished_ok.connect(_done)
         self._chromatin_preview_worker.failed.connect(_fail)
         self._chromatin_preview_worker.start()
+
+    def _chromatin_v2_params(self, full_params, storage_path):
+        """V2Params for this run, or None when v1 is selected.
+
+        INSTALLS the chosen library entry into the store first, so the run
+        reads a copy that lives with its own data. A store found months
+        later then says which PSF produced its traces without depending on
+        the library still holding that entry -- and the config records the
+        label, so the choice is visible in the experiment description too.
+        """
+        from codelab_pipeline.localization import psf_library as LIB
+        if not tracing_v2.is_v2(full_params.get('engine')):
+            return None
+        label = full_params.get('readout_psf')
+        if label and LIB.read(label) is not None:
+            installed = LIB.install(label, storage_path)
+            if installed:
+                self.log(f'PSF {label!r} installed into {installed}')
+        p = tracing_v2.V2Params.from_panel(full_params, storage_path)
+        if not p.has_psf:
+            # Not fatal -- v2 falls back to fitting sigma per spot -- but
+            # it silently gives up both the accuracy and the 37% speed the
+            # fixed shape buys, so it must not pass unremarked.
+            self.log('WARNING: v2 selected but no usable readout PSF is '
+                     'installed; readout sigma will be fitted per spot.')
+        else:
+            self.log(f'Tracing engine: {p.describe()}')
+        return p
 
     def _fit_readout_psf(self):
         """
@@ -7390,7 +7432,10 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
                                                          z_boundary_trim=full_params['z_boundary_trim'],
                                                          append=(mode == 'append'),
-                                                         ready_hybes_by_fov=ready_hybes_by_fov)
+                                                         ready_hybes_by_fov=ready_hybes_by_fov,
+                                                         engine=full_params.get('engine'),
+                                                         v2_params=self._chromatin_v2_params(
+                                                             full_params, storage_path))
         self._chromatin_worker.progress.connect(self._on_chromatin_fit_progress)
         self._chromatin_worker.fov_done.connect(self._on_chromatin_fit_fov_done)
         self._chromatin_worker.finished_ok.connect(self._on_chromatin_fit_finished)
