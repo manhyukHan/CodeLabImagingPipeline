@@ -951,8 +951,13 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     applies, just expressed in the shared frame instead of raw pixels.
 
     Returns (candidates, cubic_or_None, crop_local_xyz_list) -- candidates
-    is a list of (x, y, z, amplitude) in the shared frame, already delta-
-    corrected (empty if none accepted); cubic/crop_local_xyz_list are for
+    is a list of (Y, X, z, amplitude) in the shared frame, already delta-
+    corrected (empty if none accepted). Y FIRST: this said "(x, y, z,
+    amplitude)" until 2026-08-27 and was stale -- it predates
+    legacy/migrate_store_to_yx.py, which swapped the whole store to yx
+    order, polymer entries included. The code below has always appended
+    (sy + dy, sx + dx, ...). A reimplementation trusted the docstring over
+    the code and mirrored every traced position; cubic/crop_local_xyz_list are for
     display only, same "always returned, caller discards if unused"
     convention as _localize_fiducial_hybe above -- crop_local_xyz_list is
     in the SAME order as candidates (never includes a rejected component).

@@ -672,7 +672,17 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         sy, sx, sz = _to_shared(hybe, r.y, r.x, r.z, ymin, xmin)
         # the same fiducial(ref) - fiducial(round) correction v1 applies,
         # in the shared frame
-        allele.polymer[hybe] = [(float(sx + dx), float(sy + dy), float(sz + dz),
+        # (y, x, z, amplitude) -- y FIRST, matching v1's actual code at
+        # localization.py:995 and the whole store's yx convention (see
+        # legacy/migrate_store_to_yx.py, which exists purely to enforce it
+        # and swaps polymer entries along with coordinate/fiducial_trace).
+        #
+        # v1's DOCSTRING for _localize_readout_hybe says "(x, y, z,
+        # amplitude)" and is stale -- it predates that migration. Writing
+        # this tuple x-first, as the docstring implies, mirrors every
+        # traced position relative to v1 while remaining a perfectly
+        # well-formed 4-tuple that nothing downstream can detect.
+        allele.polymer[hybe] = [(float(sy + dy), float(sx + dx), float(sz + dz),
                                  float(r.amplitude))]
         if debug is not None:
             debug[hybe]['readout_centroids'] = [(r.x, r.y, r.z)]
