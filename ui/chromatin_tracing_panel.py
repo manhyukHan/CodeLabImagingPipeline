@@ -573,6 +573,42 @@ class ChromatinTracingPanelUI(object):
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
 
+    def apply_engine_visibility(self):
+        """Disable the controls the SELECTED engine does not read.
+
+        v2 ignores the whole per-channel fit grid plus the two mixture-era
+        cross-mode rows: trace_allele drops z_window, z_boundary_trim,
+        fiducial_params and readout_params, and v2 uses hard-coded
+        micrometre bounds instead. Left enabled, those fields state things
+        that are not true -- "Peak bound 2.0 px" while v2 uses 1.04 um
+        (~5 px), "Max uncertainty 2.0 px" while v2's uncertainty gates are
+        OFF, "Min peak/background 1.2" which v2 does not implement at all
+        -- and tuning any of them produces a byte-identical result.
+
+        Greying them is the honest minimum. It is NOT the whole fix: v2's
+        real gate (occupancy, per channel) still has no widget, so the
+        panel under v2 shows fewer knobs than the engine actually has.
+        """
+        v2 = str(self.EngineComboBox.currentText()).strip().lower().startswith('v2')
+        for boxes in (self.FiducialSpinBoxes, self.ReadoutSpinBoxes):
+            for w in boxes.values():
+                w.setEnabled(not v2)
+        for w in (self.ZWindowSpinBox, self.ZBoundaryTrimSpinBox):
+            w.setEnabled(not v2)
+        for w in (self.VoxelXYSpinBox, self.VoxelZSpinBox,
+                  self.ReadoutPsfComboBox, self.FitReadoutPsfPushButton):
+            w.setEnabled(v2)
+        tip = ('' if not v2 else
+               'Ignored by v2: it fits in micrometres with its own bounds '
+               '(position 1.04 um lateral / 2.0 um axial) and gates on '
+               'occupancy, not on these ratios.')
+        for boxes in (self.FiducialSpinBoxes, self.ReadoutSpinBoxes):
+            for w in boxes.values():
+                w.setToolTip(tip)
+        self.ZWindowSpinBox.setToolTip(tip)
+        self.ZBoundaryTrimSpinBox.setToolTip(tip)
+        return v2
+
     def refresh_psf_entries(self, select=None):
         """Repopulate the PSF combo from the library on disk.
 
@@ -612,6 +648,9 @@ class ChromatinTracingPanelUI(object):
 
     def reset_defaults(self):
         self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
+        # Resetting the engine changes which controls are live; without
+        # this the grid could come back greyed under a v1 selection.
+        self.apply_engine_visibility()
         self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
         self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])
         self.refresh_psf_entries(select=DEFAULT_READOUT_PSF)

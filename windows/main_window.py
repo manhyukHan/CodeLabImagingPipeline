@@ -1480,9 +1480,15 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
         chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
+        # The engine combo was connected to NOTHING, so selecting v2 left
+        # every control it ignores enabled and labelled in pixels. Every
+        # other tracing widget above is connected; this one was not.
+        chp.EngineComboBox.currentIndexChanged.connect(
+            lambda _: chp.apply_engine_visibility())
         # Populate from the library at startup. Done here rather than in
         # setupUi so the panel stays importable without touching the disk.
         chp.refresh_psf_entries()
+        chp.apply_engine_visibility()
 
         self.ui.actionLoad_Config.triggered.connect(self._load_config_dialog)
         self.ui.actionSave_Config.triggered.connect(self._save_config_dialog)
@@ -6882,7 +6888,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Resolved on the GUI thread, once, and passed in: V2Params reads
         # the installed PSF off disk, and the worker must touch neither
         # widgets nor anything it did not receive.
-        v2_params = self._chromatin_v2_params(full_params, storage_path)
+        v2_params = self._chromatin_v2_params(full_params, storage_path,
+                                              install=False)
 
         # Background thread that owns its OWN process pool: the per-hybe
         # fits (and their stack reads) happen in the children, so h5py's
@@ -6972,7 +6979,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chromatin_preview_worker.failed.connect(_fail)
         self._chromatin_preview_worker.start()
 
-    def _chromatin_v2_params(self, full_params, storage_path):
+    def _chromatin_v2_params(self, full_params, storage_path, install=True):
         """V2Params for this run, or None when v1 is selected.
 
         INSTALLS the chosen library entry into the store first, so the run
@@ -6985,19 +6992,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if not tracing_v2.is_v2(full_params.get('engine')):
             return None
         label = full_params.get('readout_psf')
-        if label and LIB.read(label) is not None:
+        # install=False for PREVIEW. View Crop is documented as in-memory
+        # only, and installing would rewrite <project>/analysis/psf.json --
+        # so previewing with PSF B after a run with PSF A would leave the
+        # store claiming B produced traces it did not. The installed copy
+        # is the store's record of what made its data; only the action
+        # that WRITES data may change it.
+        if install and label and LIB.read(label) is not None:
             installed = LIB.install(label, storage_path)
             if installed:
                 self.log(f'PSF {label!r} installed into {installed}')
         p = tracing_v2.V2Params.from_panel(full_params, storage_path)
+        # ALWAYS log the resolved configuration, both branches. describe()
+        # now carries the voxel size and the reason a PSF was refused, so
+        # one line reconstructs the run -- including a run that silently
+        # became a free-sigma run.
+        self.log(f'Tracing engine: {p.describe()}')
         if not p.has_psf:
-            # Not fatal -- v2 falls back to fitting sigma per spot -- but
-            # it silently gives up both the accuracy and the 37% speed the
-            # fixed shape buys, so it must not pass unremarked.
-            self.log('WARNING: v2 selected but no usable readout PSF is '
-                     'installed; readout sigma will be fitted per spot.')
-        else:
-            self.log(f'Tracing engine: {p.describe()}')
+            self.log('WARNING: readout sigma will be fitted per spot, which '
+                     'gives up both the accuracy and the ~37% speed the fixed '
+                     'calibrated shape buys.')
         return p
 
     def _fit_readout_psf(self):

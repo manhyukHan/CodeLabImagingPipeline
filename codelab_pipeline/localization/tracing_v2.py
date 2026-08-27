@@ -267,8 +267,20 @@ class V2Params(object):
                    psf_label=label)
 
     def describe(self):
+        """One line that reconstructs the run.
+
+        BOTH branches name the voxel size and whatever is known about the
+        PSF. The fallback branch used to say only "no calibrated PSF
+        installed" -- which is wrong when one IS installed and was
+        REJECTED, discards the reason plausible() computed, and omits the
+        voxel size entirely. A run that silently becomes a different run
+        (readout sigma free instead of fixed) has to leave a record saying
+        which run it became.
+        """
         if not self.has_psf:
-            return 'v2, readout sigma FREE (no calibrated PSF installed)'
+            why = f' ({self.psf_label})' if self.psf_label else ''
+            return (f'v2, readout sigma FREE -- no usable calibrated PSF{why}; '
+                    f'voxel {self.voxel_um}')
         sxy = self.psf_shape[0] * 1000.0
         return (f'v2, readout PSF {self.psf_label!r} ({self.psf_family}, '
                 f'sigma_xy {sxy:.0f} nm), voxel {self.voxel_um}')
