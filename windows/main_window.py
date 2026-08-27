@@ -7161,7 +7161,11 @@ class MainWindow(QtWidgets.QMainWindow):
             cell = (self._find_cell_by_id(fov, allele.cell)
                     if getattr(allele, 'cell', -1) != -1 else None)
             resolver = self._frame_resolver(cell, fov)
-            shared_xy = (float(allele.coordinate[1]), float(allele.coordinate[0]))
+            # (y, x), matching v1 and spot_mapper's own unpacking. See the
+            # note in tracing_v2.build_chromatin_trace_allele -- the same
+            # transpose was written here and cuts crops at the mirrored
+            # location, which a PSF calibration would then bake in.
+            shared_xy = (float(allele.coordinate[0]), float(allele.coordinate[1]))
             try:
                 # EXACTLY the path a traced round takes, so the crops the
                 # PSF is fitted on are the crops it will be applied to.

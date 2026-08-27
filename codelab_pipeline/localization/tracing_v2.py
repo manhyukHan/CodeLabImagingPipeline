@@ -97,12 +97,32 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 # is how the v1 gates became wrong in the first place.
 FIDUCIAL_GATES = {
     'reject_at_bound': True,
+    # POSITION only. A fiducial's sigma has no value to converge to -- a
+    # single-crop fit walks it to whatever ceiling exists, measured
+    # directly: every one of 14 consecutive HoxA rounds came back at
+    # exactly 600 nm, the ceiling, while occupancy stayed 0.44-0.69, i.e.
+    # the centroid was ON the object the whole time. (The survey got
+    # stable widths only because psf.calibrate fits ONE shared shape
+    # across many crops with per-crop nuisances; alone, there is nothing
+    # to pin it.) Rejecting those fits discards a usable centroid over an
+    # undefined width -- and the centroid is the only thing the fiducial
+    # is for.
+    #
+    # Position at a bound is different and stays fatal: it means the fit
+    # could not reach the emitter, so the value IS the bound and the drift
+    # correction built from it is fiction.
+    'at_bound_fatal': ('y', 'x', 'z'),
     'min_occupancy': 0.25,      # looser: an extended object spreads its peak
     'max_uncert_xy_nm': None,
     'max_uncert_z_nm': None,
 }
 READOUT_GATES = {
     'reject_at_bound': True,
+    # None = ANY parameter at a bound is fatal. Safe here because the
+    # readout's sigma is FIXED from the calibrated PSF and so cannot be at
+    # a bound at all; anything that rails is a position or a background,
+    # and both matter.
+    'at_bound_fatal': None,
     'min_occupancy': 0.40,
     'max_uncert_xy_nm': None,
     'max_uncert_z_nm': None,
@@ -116,7 +136,19 @@ READOUT_GATES = {
 # sigma parameters describing background. That single change moved
 # occupancy 0.373 -> 0.806.
 FIDUCIAL_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
-READOUT_FIT_RADIUS_UM = (0.8, 0.8, 2.0)
+# THE SAME domain for both channels, because that is what was measured.
+# tools/fiducial_match.py, tools/v2_variants.py and tools/gate_sweep_v2.py
+# all use (1.0, 1.0, 3.0) for readouts as well as fiducials, so every
+# quoted readout number -- occupancy 0.561 -> 0.677, the at_bound filter's
+# 295/311 pairs at 0.218 um -- is a measurement at this radius.
+#
+# It briefly read (0.8, 0.8, 2.0) here, which is psf.calibrate's default
+# CALIBRATION window (psf.py:355), not a tracing domain: 1029 voxels
+# instead of 2511, 41% of the data every readout number was measured on,
+# while still fitting the same 8-11 parameters. It also broke the position
+# bounds, which are 1.04 um lateral and 2.0 um axial and must sit INSIDE
+# the domain -- at an axial radius of 2.0 um the bound equalled the domain.
+READOUT_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
 
 # Loose, and SEPARATE laterally and axially. Tight bounds put 75-100% of
 # fits on a constraint, which is why every dz in a fiducial overlay used
@@ -130,8 +162,37 @@ READOUT_PEAK_BOUND_Z_UM = 2.0
 # The fiducial's sigma is FREE and must be allowed to be large: measured
 # 257-574 nm depending on the fit window, against v1's 520 nm default
 # ceiling. A fiducial fitted against a readout-sized bound rails.
-FIDUCIAL_MAX_SIGMA_XY_UM = 1.20
-FIDUCIAL_MAX_SIGMA_Z_UM = 3.00
+# THE VALUES EVERY v2 MEASUREMENT WAS TAKEN WITH. tools/fiducial_match.py
+# used max_sigma_xy_um=3.0 / max_sigma_z_um=6.0, and so did the variants
+# ladder and the gate sweep -- so "at-bound fell to 2-13%" was measured
+# with sigma effectively UNBOUNDED, where at_bound almost always meant a
+# POSITION had railed.
+#
+# Tightening this is tempting and was tried twice here (1.20, then 0.60 on
+# the argument that a Gaussian as wide as its own fit window is
+# indistinguishable from the background beside it). The argument is sound
+# in principle and wrong in practice: sigma simply pins to whatever
+# ceiling exists -- 14 consecutive HoxA rounds returned exactly 600 nm --
+# because a single-crop fiducial fit has no width to converge to at all.
+# Moving the ceiling only moves the number, and quietly replaces a
+# validated configuration with an untested one.
+#
+# So the ceiling stays where every measurement was taken, and sigma being
+# at a bound is handled where it belongs: it is not fatal for a fiducial
+# (see FIDUCIAL_GATES 'at_bound_fatal'), because the fiducial's width is
+# not a measurement and its centroid is what the round is for.
+FIDUCIAL_MAX_SIGMA_XY_UM = 3.00
+FIDUCIAL_MAX_SIGMA_Z_UM = 6.00
+
+# A LOWER bound at the optical limit, not at the fitter's default 0.02 um.
+# 20 nm is a quarter of the smallest width this microscope can produce, so
+# it is not a bound the truth can sit near -- it is only reachable by the
+# fit collapsing onto a single bright voxel, which is precisely what a
+# noisy box invites. Measured on HoxA before this was set: 33 of 45 hybes
+# in one allele rejected as `at bound (sigma_y, sigma_x, offset)`, the
+# signature of exactly that collapse. 70 nm is psf.plausible's own lateral
+# floor, from the diffraction limit.
+FIDUCIAL_MIN_SIGMA_UM = 0.070
 
 
 class V2Params(object):
@@ -263,6 +324,7 @@ def fit_fiducial(cube, z_centre, p):
         cube, sy, sx, sz, voxel_um=p.voxel_um,
         peak_bound_um=FIDUCIAL_PEAK_BOUND_UM,
         peak_bound_z_um=FIDUCIAL_PEAK_BOUND_Z_UM,
+        min_sigma_um=FIDUCIAL_MIN_SIGMA_UM,
         max_sigma_xy_um=FIDUCIAL_MAX_SIGMA_XY_UM,
         max_sigma_z_um=FIDUCIAL_MAX_SIGMA_Z_UM,
         fit_radius_um=FIDUCIAL_FIT_RADIUS_UM,
@@ -313,19 +375,61 @@ def occupancy(cube, fit, voxel_um=DEFAULT_VOXEL_UM):
     """
     if fit is None or cube is None:
         return float('nan')
-    finite = np.isfinite(cube)
-    if not finite.any():
+    if not np.isfinite(cube).any():
         return float('nan')
-    bg = float(np.median(cube[finite]))
+    # A LOCAL PLANE, evaluated separately at the argmax and at the fitted
+    # centroid -- NOT one scalar median for the whole crop.
+    #
+    # This is the definition tools/fit_quality.py used to produce every
+    # occupancy number on record (0.354 -> 0.838 fiducial, 0.561 -> 0.677
+    # readout), so the 0.25 / 0.40 thresholds are calibrated against it and
+    # only against it. A global median measures something else: over a
+    # pillar with a real intensity gradient it sits far below the local
+    # level near the emitter and far above it in a dim corner, so the ratio
+    # is inflated where the gradient is positive and depressed where it is
+    # negative. Gating a differently-defined quantity with an inherited
+    # threshold is how the v1 gates went wrong in the first place.
+    bg = _local_background_plane(cube, voxel_um)
     iy, ix, iz = np.unravel_index(int(np.nanargmax(cube)), cube.shape)
-    peak = float(cube[iy, ix, iz]) - bg
-    if peak <= 0:
+    fy = int(np.clip(round(fit.y), 0, cube.shape[0] - 1))
+    fx = int(np.clip(round(fit.x), 0, cube.shape[1] - 1))
+    fz = int(np.clip(round(fit.z), 0, cube.shape[2] - 1))
+    denom = float(cube[iy, ix, iz]) - float(bg[iy, ix, iz])
+    if not np.isfinite(denom) or denom <= 0:
         return float('nan')
-    fy = int(round(np.clip(fit.y, 0, cube.shape[0] - 1)))
-    fx = int(round(np.clip(fit.x, 0, cube.shape[1] - 1)))
-    fz = int(round(np.clip(fit.z, 0, cube.shape[2] - 1)))
-    here = float(cube[fy, fx, fz]) - bg
-    return here / peak
+    return (float(cube[fy, fx, fz]) - float(bg[fy, fx, fz])) / denom
+
+
+def _local_background_plane(cube, voxel_um=DEFAULT_VOXEL_UM,
+                            radius_um=(1.0, 1.0, 3.0)):
+    """b0 + by*y + bx*x + bz*z fitted to the SHELL around the argmax.
+
+    The shell is inside the fit radius but outside a core region, so the
+    emitter cannot lift its own background and then be measured against
+    it. Falls back to the global median only when the shell is too small
+    to constrain a plane -- which is the degenerate case, not the normal
+    one. Ported verbatim from tools/fit_quality.local_background so the
+    gate and the measurement cannot drift apart.
+    """
+    dy, dx, dz = voxel_um
+    iy, ix, iz = np.unravel_index(int(np.nanargmax(cube)), cube.shape)
+    Y, X, Z = np.indices(cube.shape)
+    Y, X, Z = Y * dy, X * dx, Z * dz
+    cy, cx, cz = iy * dy, ix * dx, iz * dz
+    ry, rx, rz = radius_um
+    inside = ((np.abs(Y - cy) <= ry) & (np.abs(X - cx) <= rx)
+              & (np.abs(Z - cz) <= rz))
+    core = ((np.abs(Y - cy) <= 0.45) & (np.abs(X - cx) <= 0.45)
+            & (np.abs(Z - cz) <= 1.2))
+    shell = inside & ~core & np.isfinite(cube)
+    if shell.sum() < 50:
+        return np.full(cube.shape, float(np.nanmedian(cube)))
+    A = np.column_stack([np.ones(int(shell.sum())), Y[shell], X[shell], Z[shell]])
+    try:
+        c, *_ = np.linalg.lstsq(A, cube[shell], rcond=None)
+    except Exception:
+        return np.full(cube.shape, float(np.nanmedian(cube)))
+    return c[0] + c[1] * Y + c[2] * X + c[3] * Z
 
 
 def gate(fit, cube, gates, voxel_um=DEFAULT_VOXEL_UM):
@@ -337,10 +441,15 @@ def gate(fit, cube, gates, voxel_um=DEFAULT_VOXEL_UM):
     """
     if fit is None:
         return False, 'fit failed'
-    if gates.get('reject_at_bound', True) and getattr(fit, 'at_bound', None):
-        names = ', '.join(fit.at_bound) if not isinstance(fit.at_bound, str) \
-            else fit.at_bound
-        return False, f'at bound ({names})'
+    railed = getattr(fit, 'at_bound', None) or ()
+    if isinstance(railed, str):
+        railed = (railed,)
+    if gates.get('reject_at_bound', True) and railed:
+        fatal = gates.get('at_bound_fatal')       # None = every parameter
+        hit = tuple(railed) if fatal is None else tuple(
+            n for n in railed if n in fatal)
+        if hit:
+            return False, f'at bound ({", ".join(hit)})'
     occ = occupancy(cube, fit, voxel_um)
     thr = gates.get('min_occupancy')
     if thr is not None:
@@ -419,7 +528,18 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     if not append:
         allele.fiducial_trace, allele.polymer, allele.rejected_hybes = {}, {}, {}
     debug = {} if collect_debug else None
-    shared_xy = (float(allele.coordinate[1]), float(allele.coordinate[0]))
+    # (y, x). NOT (x, y). allele.coordinate is rasterized order (y, x, z)
+    # per models/allele.py, and spot_mapper.reference_to_raw unpacks
+    # `y, x = coordinate`. v1 passes (coordinate[0], coordinate[1]) at
+    # localization.py:1173 and this must match it exactly.
+    #
+    # It did not. Transposing these cuts every crop at the MIRRORED image
+    # location -- a spot at y=300, x=700 was fitted at y=700, x=300 -- and
+    # the failure is silent, because a crop taken anywhere still contains
+    # pixels and still fits something. It surfaced only as symptoms that
+    # each looked like a different problem: readouts "failing", occupancy
+    # below threshold, fiducial drift exceeding its gate.
+    shared_xy = (float(allele.coordinate[0]), float(allele.coordinate[1]))
     mod = modality if modality is not None else getattr(cell, 'reference_modality', None)
 
     def _cut(hybe, channel):
@@ -457,7 +577,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     zexp = consensus_native_z(fid_cubes, z_offsets)
 
     # -- phase 2: fit the fiducials at their own expected depth ---------
-    fid_local = {}
+    fid_local, ref_note = {}, None
     for hybe, cube in fid_cubes.items():
         if debug is not None:
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
@@ -466,6 +586,23 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         z0 = zexp.get(hybe, cube.shape[2] / 2.0)
         f = fit_fiducial(cube, z0, p)
         ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
+        # THE REFERENCE IS NOT AN ORDINARY HYBE. Every delta is measured
+        # against it, so gating it out does not reject one round -- it
+        # rejects the ALLELE, and it does so while reporting one bland
+        # 'reference hybe fiducial not found' per round, which hides the
+        # single real cause behind N identical symptoms. Measured before
+        # this exemption: 2 of 4 HoxA alleles lost all 45 rounds apiece
+        # to a gate applied to one fit.
+        #
+        # So the reference is accepted whenever it FITTED AT ALL. A
+        # mediocre baseline still defines a usable frame -- and it is a
+        # frame, not a measurement: it cancels out of every pair distance
+        # (delta(a) - delta(b) = fid(b) - fid(a)), so its quality bounds
+        # precision rather than biasing the result. Its gate verdict is
+        # kept and reported instead of discarded.
+        if hybe == reference_hybe and not ok and f is not None:
+            ref_note = why
+            ok = True
         if not ok:
             allele.rejected_hybes[hybe] = f'fiducial {why}'
             continue
@@ -475,6 +612,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         fid_local[hybe] = (f.y, f.x, f.z)
         if debug is not None:
             debug[hybe]['fiducial_centroid'] = (f.x, f.y, f.z)
+    if ref_note and debug is not None:
+        debug.setdefault(reference_hybe, {})['reference_warning'] = ref_note
 
     baseline = allele.fiducial_trace.get(reference_hybe)
 
