@@ -211,7 +211,12 @@ class ChromatinTracingPanelUI(object):
         paramsOuter.addLayout(engineForm)
 
         self.EngineComboBox = QtWidgets.QComboBox()
-        self.EngineComboBox.addItems([ENGINE_V1, ENGINE_V2])
+        # itemData, not display text. The config round-trips on this, so
+        # renaming a label ("v2" -> "v2 (calibrated PSF)") must not turn
+        # every saved v2 config into a v1 run silently carrying v2 numbers.
+        self.EngineComboBox.addItem(ENGINE_V1, 'v1')
+        self.EngineComboBox.addItem(ENGINE_V2, 'v2')
+        self.EngineComboBox.setProperty('config_uses_item_data', True)
         self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
         self.EngineComboBox.setToolTip(
             'v1 is the direct port of ChrTracer3 FitPsf3D and is kept as the\n'
@@ -263,8 +268,11 @@ class ChromatinTracingPanelUI(object):
         psfRow.addWidget(self.FitReadoutPsfPushButton)
         engineForm.addRow('Readout PSF (v2):', psfRow)
 
-        # -- cross-mode: one shared value, used identically by both
-        # fiducial and readout fitting --
+        # -- cross-mode: shared by BOTH engines, so it sits OUTSIDE the
+        # stack. v2 really does read all four: spad reaches
+        # crop_for_localization, and both drift gates are applied in
+        # tracing_v2.build_chromatin_trace_allele. z_window and
+        # z_boundary_trim are v1-only and move onto the v1 page below.
         crossForm = QtWidgets.QFormLayout()
         paramsOuter.addLayout(crossForm)
 
@@ -272,17 +280,6 @@ class ChromatinTracingPanelUI(object):
         self.SpadSpinBox.setRange(1, 100)
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])
         crossForm.addRow('Crop half-width (px):', self.SpadSpinBox)
-
-        self.ZWindowSpinBox = QtWidgets.QSpinBox()
-        self.ZWindowSpinBox.setRange(1, 200)
-        self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
-        crossForm.addRow('Z search window (+/-px, mixture mode only):', self.ZWindowSpinBox)
-
-        self.ZBoundaryTrimSpinBox = QtWidgets.QSpinBox()
-        self.ZBoundaryTrimSpinBox.setRange(0, 100)
-        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
-        self.ZBoundaryTrimSpinBox.setSuffix(' planes')
-        crossForm.addRow('Z boundary trim (each end):', self.ZBoundaryTrimSpinBox)
 
         self.MaxFiducialDriftSpinBox = double_spin(CROSS_MODE_DEFAULTS['max_fiducial_drift'], 0.5, 100.0)
         # The rejection gate, per explicit request: a hybe whose own
@@ -304,6 +301,31 @@ class ChromatinTracingPanelUI(object):
         # characteristics worth tuning separately. min_sep/multi_mode are
         # readout-only (no mixture mode for fiducial, per explicit
         # request) -- the fiducial column simply has no cell at those rows.
+        # -- the stack: one page per engine ------------------------------
+        #
+        # Greying v1's rows under v2 was honest but useless -- it hid the
+        # wrong parameters without showing the right ones, and v2's actual
+        # gate (occupancy) had no widget at all. Each engine now shows its
+        # OWN parameters, in its own units.
+        self.FitParamsStackedWidget = QtWidgets.QStackedWidget()
+
+        v1Page = QtWidgets.QWidget()
+        v1Outer = QtWidgets.QVBoxLayout(v1Page)
+        v1Outer.setContentsMargins(0, 0, 0, 0)
+        v1Form = QtWidgets.QFormLayout()
+        v1Outer.addLayout(v1Form)
+
+        self.ZWindowSpinBox = QtWidgets.QSpinBox()
+        self.ZWindowSpinBox.setRange(1, 200)
+        self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
+        v1Form.addRow('Z search window (+/-px, mixture mode only):', self.ZWindowSpinBox)
+
+        self.ZBoundaryTrimSpinBox = QtWidgets.QSpinBox()
+        self.ZBoundaryTrimSpinBox.setRange(0, 100)
+        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
+        self.ZBoundaryTrimSpinBox.setSuffix(' planes')
+        v1Form.addRow('Z boundary trim (each end):', self.ZBoundaryTrimSpinBox)
+
         grid = QtWidgets.QGridLayout()
         grid.addWidget(QtWidgets.QLabel('Fiducial'), 0, 1)
         grid.addWidget(QtWidgets.QLabel('Readout'), 0, 2)
@@ -331,7 +353,10 @@ class ChromatinTracingPanelUI(object):
             grid.addWidget(QtWidgets.QLabel(label), row, 0)
             add_widget(row, 'readout', self.ReadoutSpinBoxes, attr, key, kind, minv, maxv, 2)
             row += 1
-        paramsOuter.addLayout(grid)
+        v1Outer.addLayout(grid)
+        self.FitParamsStackedWidget.addWidget(v1Page)          # index 0 = v1
+        self.FitParamsStackedWidget.addWidget(self._build_v2_page(double_spin))
+        paramsOuter.addWidget(self.FitParamsStackedWidget)
 
         self.ResetDefaultsPushButton = QtWidgets.QPushButton('Reset to Defaults')
         self.ResetDefaultsPushButton.clicked.connect(self.reset_defaults)
@@ -507,8 +532,15 @@ class ChromatinTracingPanelUI(object):
         self.SpotListWidget.clear()
         for global_index, d in indexed:
             cell_tag = 'unassigned' if d['cell'] == -1 else f"cell {d['cell']}"
-            x, y, z = d['adj_coordinate']
-            item = QtWidgets.QListWidgetItem(f'Spot {global_index} | {cell_tag} | ({x:.1f}, {y:.1f}, {z:.1f})')
+            # adj_coordinate is (y, x, z) -- rasterized order, models/spot.py:31.
+            # Unpacking it as x, y, z printed the two transposed, so a spot at
+            # y=300, x=700 read as "(700.0, 300.0, ...)" and anyone matching a
+            # listed spot against a coordinate seen elsewhere got the mirror.
+            # Display-only, unlike the two transposes found in the fit path,
+            # but the same mistake and worth not leaving in place.
+            y, x, z = d['adj_coordinate']
+            item = QtWidgets.QListWidgetItem(
+                f'Spot {global_index} | {cell_tag} | y={y:.1f}, x={x:.1f}, z={z:.1f}')
             item.setData(QtCore.Qt.UserRole, d)
             self.SpotListWidget.addItem(item)
 
@@ -564,7 +596,10 @@ class ChromatinTracingPanelUI(object):
                 'max_fiducial_drift': self.MaxFiducialDriftSpinBox.value(),
                 'max_fiducial_drift_z': self.MaxFiducialDriftZSpinBox.value(),
                 'z_boundary_trim': self.ZBoundaryTrimSpinBox.value(),
-                'engine': self.EngineComboBox.currentText(),
+                'engine': (self.EngineComboBox.currentData()
+                           or self.EngineComboBox.currentText()),
+                'engine_label': self.EngineComboBox.currentText(),
+                'v2': self.v2_params(),
                 'voxel_um': (self.VoxelXYSpinBox.value(),
                              self.VoxelXYSpinBox.value(),
                              self.VoxelZSpinBox.value()),
@@ -573,41 +608,197 @@ class ChromatinTracingPanelUI(object):
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
 
-    def apply_engine_visibility(self):
-        """Disable the controls the SELECTED engine does not read.
+    def _build_v2_page(self, double_spin):
+        """v2's own parameters, in v2's own units.
 
-        v2 ignores the whole per-channel fit grid plus the two mixture-era
-        cross-mode rows: trace_allele drops z_window, z_boundary_trim,
-        fiducial_params and readout_params, and v2 uses hard-coded
-        micrometre bounds instead. Left enabled, those fields state things
-        that are not true -- "Peak bound 2.0 px" while v2 uses 1.04 um
-        (~5 px), "Max uncertainty 2.0 px" while v2's uncertainty gates are
-        OFF, "Min peak/background 1.2" which v2 does not implement at all
-        -- and tuning any of them produces a byte-identical result.
+        EVERY DEFAULT IS READ FROM THE ENGINE, never typed here. The values
+        in tracing_v2 are measurements -- occupancy 0.25/0.40, the 1.0/3.0
+        um fit domain the whole 43-68% result was taken at -- and a literal
+        retyped in the UI that drifts by one digit would replace the
+        validated configuration with a plausible-looking different one,
+        silently. Importing the constants makes that impossible rather
+        than unlikely, which is the same reason DEFAULT_PARAMS exists for
+        the v1 page.
 
-        Greying them is the honest minimum. It is NOT the whole fix: v2's
-        real gate (occupancy, per channel) still has no widget, so the
-        panel under v2 shows fewer knobs than the engine actually has.
+        The page separates TUNABLE gates from MEASURED constants. The
+        constants are shown read-only rather than hidden: a person needs
+        to know the fit domain is 1.0 um to understand why a 1.04 um
+        position bound can rail, and hiding it is how the v1 gates ended
+        up inherited without provenance.
         """
-        v2 = str(self.EngineComboBox.currentText()).strip().lower().startswith('v2')
-        for boxes in (self.FiducialSpinBoxes, self.ReadoutSpinBoxes):
-            for w in boxes.values():
-                w.setEnabled(not v2)
-        for w in (self.ZWindowSpinBox, self.ZBoundaryTrimSpinBox):
-            w.setEnabled(not v2)
-        for w in (self.VoxelXYSpinBox, self.VoxelZSpinBox,
-                  self.ReadoutPsfComboBox, self.FitReadoutPsfPushButton):
-            w.setEnabled(v2)
-        tip = ('' if not v2 else
-               'Ignored by v2: it fits in micrometres with its own bounds '
-               '(position 1.04 um lateral / 2.0 um axial) and gates on '
-               'occupancy, not on these ratios.')
-        for boxes in (self.FiducialSpinBoxes, self.ReadoutSpinBoxes):
-            for w in boxes.values():
-                w.setToolTip(tip)
-        self.ZWindowSpinBox.setToolTip(tip)
-        self.ZBoundaryTrimSpinBox.setToolTip(tip)
+        from codelab_pipeline.localization import tracing_v2 as V2
+
+        page = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self.V2EngineStatusLabel = QtWidgets.QLabel('')
+        self.V2EngineStatusLabel.setWordWrap(True)
+        self.V2EngineStatusLabel.setStyleSheet('color: #555;')
+        outer.addWidget(self.V2EngineStatusLabel)
+
+        grid = QtWidgets.QGridLayout()
+        grid.addWidget(QtWidgets.QLabel('Fiducial'), 0, 1)
+        grid.addWidget(QtWidgets.QLabel('Readout'), 0, 2)
+        self.V2FiducialBoxes, self.V2ReadoutBoxes = {}, {}
+
+        def occ_box(default):
+            w = double_spin(default, -0.5, 1.0, step=0.05, decimals=2)
+            w.setToolTip(
+                'Intensity at the fitted centroid over intensity at the argmax,\n'
+                'both above a LOCAL PLANE background. 1.0 = the fit is on the\n'
+                'emitter, <= 0 = it is in background.\n\n'
+                'The tunable gate, and the best-behaved: it degrades smoothly\n'
+                'instead of falling off a cliff. Measured v1 -> v2: 0.354 ->\n'
+                '0.838 fiducial, 0.561 -> 0.677 readout. The fiducial default\n'
+                'is looser on purpose -- an extended object spreads its peak.')
+            return w
+
+        def ci_box(default_nm):
+            w = QtWidgets.QDoubleSpinBox()
+            w.setDecimals(0)
+            w.setRange(0.0, 2000.0)
+            # step 1.0 at 0 decimals matters: test_config_roundtrip nudges
+            # each spinbox by one singleStep, and a 0.1 step at 0 decimals
+            # is a silent no-op that would exercise nothing while passing.
+            w.setSingleStep(1.0)
+            w.setValue(0.0 if default_nm is None else float(default_nm))
+            w.setSpecialValueText('off (measured default)')
+            w.setToolTip(
+                'FULL 95% confidence interval in nanometres; 0 = gate off.\n\n'
+                'Off by default deliberately. At v1\'s own coverage these reach\n'
+                '61-79 nm against v1\'s 183 nm, but those thresholds were derived\n'
+                'on ONE dataset, and a silently inherited constant is how the v1\n'
+                'gates became wrong in the first place.\n\n'
+                'FULL width, not half: the sweep that produced those numbers used\n'
+                '2000 * max(ci_y_um, ci_x_um).')
+            return w
+
+        rows = [
+            ('Min occupancy (fit on emitter; 1.0 = perfect):',
+             'min_occupancy', occ_box, 'MinOccupancy'),
+            ('Max lateral uncertainty (full 95% CI, nm; 0 = off):',
+             'max_uncert_xy_nm', ci_box, 'MaxUncertXY'),
+            ('Max axial uncertainty (full 95% CI, nm; 0 = off):',
+             'max_uncert_z_nm', ci_box, 'MaxUncertZ'),
+        ]
+        for r, (label, key, factory, attr) in enumerate(rows, start=1):
+            grid.addWidget(QtWidgets.QLabel(label), r, 0)
+            for col, (name, gates, boxes) in enumerate(
+                    (('Fiducial', V2.FIDUCIAL_GATES, self.V2FiducialBoxes),
+                     ('Readout', V2.READOUT_GATES, self.V2ReadoutBoxes)), start=1):
+                w = factory(gates[key])
+                setattr(self, f'V2{name}{attr}SpinBox', w)
+                boxes[key] = w
+                grid.addWidget(w, r, col)
+        outer.addLayout(grid)
+
+        qcRow = QtWidgets.QFormLayout()
+        self.V2QcShiftCheckBox = QtWidgets.QCheckBox()
+        self.V2QcShiftCheckBox.setChecked(bool(V2.V2Params().qc_shift))
+        self.V2QcShiftCheckBox.setToolTip(
+            'An independent estimate of each hybe\'s drift by image registration.\n'
+            'QC ONLY -- it never changes a stored position.\n\n'
+            'Measured 14.8% WORSE than the fit on the median of 305 replicate\n'
+            'pairs, and closer on only 37% of them, so it is not the estimator.\n'
+            'It is here because it has the better tail (p90 1.858 vs 1.945) and\n'
+            'is independent: two estimates of one displacement that disagree is\n'
+            'a strong outlier signal. Costs roughly 20 s per 48 alleles.')
+        qcRow.addRow('Cross-check drift by image registration (QC only):',
+                     self.V2QcShiftCheckBox)
+        outer.addLayout(qcRow)
+
+        # -- measured, not tunable ---------------------------------------
+        frozen = QtWidgets.QGroupBox('Measured constants (not tunable)')
+        fl = QtWidgets.QFormLayout(frozen)
+
+        def frozen_row(label, text, tip):
+            w = QtWidgets.QLabel(text)
+            w.setStyleSheet('color: #555;')
+            w.setToolTip(tip)
+            fl.addRow(label, w)
+
+        fr, rr = V2.FIDUCIAL_FIT_RADIUS_UM, V2.READOUT_FIT_RADIUS_UM
+        frozen_row('Fit domain (half-extent, um):',
+                   f'fiducial {fr[0]:g}, {fr[1]:g}, {fr[2]:g}   '
+                   f'readout {rr[0]:g}, {rr[1]:g}, {rr[2]:g}',
+                   'A BOX, not a pillar: occupancy 0.373 -> 0.806 and\n'
+                   'blank-region fits 31% -> 4%. The SAME domain for both\n'
+                   'channels because that is what was measured. It briefly read\n'
+                   '(0.8, 0.8, 2.0) -- 1029 voxels instead of 2511, 41% of the\n'
+                   'data every readout number was taken on.')
+        frozen_row('Position bound, lateral / axial (um):',
+                   f'{V2.FIDUCIAL_PEAK_BOUND_UM:g} (~5 px)  /  '
+                   f'{V2.FIDUCIAL_PEAK_BOUND_Z_UM:g} (~10 planes)',
+                   'Loose and SEPARATE. Tight bounds put 75-100% of fits on a\n'
+                   'constraint -- which is why every dz in a fiducial overlay\n'
+                   'used to print as a whole number.\n\n'
+                   'Note the lateral bound (1.04 um) slightly exceeds the lateral\n'
+                   'fit domain (1.0 um). Both are the measured values; a lateral\n'
+                   'rail is fatal, so such fits are rejected rather than trusted.')
+        frozen_row('Sigma bounds (um):',
+                   f'min {V2.FIDUCIAL_MIN_SIGMA_UM:g}   '
+                   f'max xy {V2.FIDUCIAL_MAX_SIGMA_XY_UM:g} / z '
+                   f'{V2.FIDUCIAL_MAX_SIGMA_Z_UM:g}   '
+                   '(readout sigma is FIXED by the calibrated PSF)',
+                   'The ceilings every v2 measurement was taken with. Tightening\n'
+                   'was tried twice (1.20, then 0.60) and only moved the number:\n'
+                   'a single-crop fiducial fit pins sigma to whatever ceiling\n'
+                   'exists -- 14 consecutive HoxA rounds returned exactly 600 nm.\n'
+                   'The floor is psf.plausible\'s own diffraction limit, 70 nm.')
+        frozen_row('At-bound rejection:',
+                   'on -- fatal on position (y, x, z) only',
+                   'Free, with no threshold to choose: 295/311 pairs at 0.218 um\n'
+                   'against 311 at 0.294 ungated -- 95% of pairs kept for a 26%\n'
+                   'better median.\n\n'
+                   'Sigma railing is NOT fatal for a fiducial: its width has no\n'
+                   'value to converge to, while its centroid stays on the emitter\n'
+                   '(occupancy 0.44-0.69 on exactly those railed fits).')
+        frozen_row('v1 gates v2 does not implement:',
+                   'min peak/background, min amplitude/peak',
+                   'min_hb_ratio is untunable -- 311 pairs at 1.0, 40 at 1.2,\n'
+                   '~10 by 1.6, so a 0.1 change swings coverage by an order of\n'
+                   'magnitude. min_ah_ratio is dominated by occupancy, which\n'
+                   'measures the same intent properly.')
+        outer.addWidget(frozen)
+        return page
+
+    def v2_params(self):
+        """The v2 page's tunable values, shaped for V2Params.
+
+        0 in a CI box means "off" -- the widget's special value -- and must
+        become None, not 0.0. A 0 nm threshold would reject every fit ever
+        made, which is the opposite of off and would look like the engine
+        had broken.
+        """
+        def read(boxes):
+            out = {}
+            for key, w in boxes.items():
+                v = w.value()
+                out[key] = None if (key.endswith('_nm') and v <= 0) else v
+            return out
+        return {'fiducial': read(self.V2FiducialBoxes),
+                'readout': read(self.V2ReadoutBoxes),
+                'qc_shift': self.V2QcShiftCheckBox.isChecked()}
+
+    def apply_engine_visibility(self):
+        """Show the SELECTED engine's parameters.
+
+        A page swap, not a grey-out. Each engine's widgets keep their own
+        values while hidden, so switching v1 -> v2 -> v1 restores exactly
+        what was there: a pixel peak-bound and a micrometre one are not
+        the same number, and carrying values across would be a unit bug
+        waiting to happen.
+        """
+        v2 = self.selected_engine_is_v2()
+        self.FitParamsStackedWidget.setCurrentIndex(1 if v2 else 0)
         return v2
+
+    def selected_engine_is_v2(self):
+        """Match tracing_v2.is_v2 -- prefix, and on itemData when present."""
+        data = self.EngineComboBox.currentData()
+        name = data if data else self.EngineComboBox.currentText()
+        return str(name or '').strip().lower().startswith('v2')
 
     def refresh_psf_entries(self, select=None):
         """Repopulate the PSF combo from the library on disk.
@@ -648,8 +839,15 @@ class ChromatinTracingPanelUI(object):
 
     def reset_defaults(self):
         self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
-        # Resetting the engine changes which controls are live; without
-        # this the grid could come back greyed under a v1 selection.
+        # BOTH pages reset, from the engine's own constants -- Reset means
+        # "the documented configuration", and the hidden page is part of it.
+        from codelab_pipeline.localization import tracing_v2 as V2
+        for gates, boxes in ((V2.FIDUCIAL_GATES, self.V2FiducialBoxes),
+                             (V2.READOUT_GATES, self.V2ReadoutBoxes)):
+            for key, w in boxes.items():
+                v = gates[key]
+                w.setValue(0.0 if v is None else float(v))
+        self.V2QcShiftCheckBox.setChecked(bool(V2.V2Params().qc_shift))
         self.apply_engine_visibility()
         self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
         self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])

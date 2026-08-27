@@ -241,6 +241,12 @@ class V2Params(object):
         """
         from codelab_pipeline.localization import psf_library as LIB
         voxel = params.get('voxel_um', DEFAULT_VOXEL_UM)
+        # The panel's v2 page, when it is there. Absent (a config written
+        # before the page existed, or a caller that is not the panel) means
+        # the MEASURED defaults stand -- V2Params merges over
+        # FIDUCIAL_GATES / READOUT_GATES rather than replacing them, so a
+        # missing key can never silently disable a gate.
+        v2 = params.get('v2') or {}
         fam = shape = None
         label = params.get('readout_psf', '')
         doc = LIB.installed(storage_path) if storage_path else None
@@ -264,7 +270,10 @@ class V2Params(object):
             else:
                 label = f'{label} [REJECTED: {"; ".join(why)}]'
         return cls(voxel_um=voxel, psf_family=fam, psf_shape=shape,
-                   psf_label=label)
+                   psf_label=label,
+                   fiducial_gates=v2.get('fiducial'),
+                   readout_gates=v2.get('readout'),
+                   qc_shift=v2.get('qc_shift', True))
 
     def describe(self):
         """One line that reconstructs the run.

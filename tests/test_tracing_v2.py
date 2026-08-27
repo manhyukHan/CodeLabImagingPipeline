@@ -163,8 +163,20 @@ def main():
               f'fixed ({r_psf.y:.2f},{r_psf.z:.2f})')
         check('describe() names the PSF actually in use',
               'universal-default' in p_psf.describe(), p_psf.describe())
-    check('describe() says so when there is no PSF',
-          'no calibrated PSF' in p_free.describe(), p_free.describe())
+    # Assert what the line must CARRY, not how it is worded. describe() is
+    # the one record of what a run actually was, so the requirements are
+    # that a free-sigma fallback is identifiable and the voxel size is
+    # present in BOTH branches -- the earlier version omitted the voxel
+    # size here, so a fallback run left no record of its configuration.
+    free = p_free.describe()
+    check('describe() names the free-sigma fallback when there is no PSF',
+          'FREE' in free, free)
+    check('and carries the voxel size in that branch too',
+          '0.208' in free and '0.2' in free, free)
+    rejected = V2.V2Params(voxel_um=VOXEL,
+                           psf_label='some-entry [REJECTED: sigma below limit]')
+    check('a REJECTED psf is reported as rejected, not as absent',
+          'REJECTED' in rejected.describe(), rejected.describe())
 
     # from_panel must prefer the INSTALLED copy over the library, or a run
     # would silently follow the library when it moved on.

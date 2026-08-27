@@ -7008,6 +7008,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # one line reconstructs the run -- including a run that silently
         # became a free-sigma run.
         self.log(f'Tracing engine: {p.describe()}')
+        # Also on the panel. A run that silently became a free-sigma run
+        # should say so where the person is looking, not only in the log.
+        label = getattr(self.ui.ChromatinTracingPanel, 'V2EngineStatusLabel', None)
+        if label is not None:
+            label.setText(p.describe())
         if not p.has_psf:
             self.log('WARNING: readout sigma will be fitted per spot, which '
                      'gives up both the accuracy and the ~37% speed the fixed '
@@ -10787,6 +10792,19 @@ One PNG PER MODALITY: each modality has its own reference and its
             # holding a copy of the numbers would be a second source of
             # truth that could silently disagree with the store.
             'engine': ('ChromatinTracingPanel', 'EngineComboBox'),
+            # v2's own tunables. Separate keys from v1's, never shared: a
+            # pixel peak-bound and a micrometre one are different numbers
+            # for the same idea, and one key holding both is a unit bug
+            # waiting to be loaded. An old config lacking these simply
+            # leaves the measured defaults in place -- _apply_config_params
+            # only touches keys the file actually carries.
+            'v2_fiducial_min_occupancy': ('ChromatinTracingPanel', 'V2FiducialMinOccupancySpinBox'),
+            'v2_readout_min_occupancy': ('ChromatinTracingPanel', 'V2ReadoutMinOccupancySpinBox'),
+            'v2_fiducial_max_uncert_xy_nm': ('ChromatinTracingPanel', 'V2FiducialMaxUncertXYSpinBox'),
+            'v2_readout_max_uncert_xy_nm': ('ChromatinTracingPanel', 'V2ReadoutMaxUncertXYSpinBox'),
+            'v2_fiducial_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2FiducialMaxUncertZSpinBox'),
+            'v2_readout_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2ReadoutMaxUncertZSpinBox'),
+            'v2_qc_shift': ('ChromatinTracingPanel', 'V2QcShiftCheckBox'),
             'voxel_xy_um': ('ChromatinTracingPanel', 'VoxelXYSpinBox'),
             'voxel_z_um': ('ChromatinTracingPanel', 'VoxelZSpinBox'),
             'readout_psf': ('ChromatinTracingPanel', 'ReadoutPsfComboBox'),
