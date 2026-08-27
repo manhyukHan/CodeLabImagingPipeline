@@ -1,0 +1,43 @@
+{
+ "candidates": {},
+ "converged": {
+  "converged": true,
+  "delta_nm": 4.0,
+  "family_stable": true,
+  "n_crops": [
+   80,
+   110
+  ],
+  "sigma_xy_nm": [
+   115.1,
+   119.2
+  ]
+ },
+ "family": "gaussian_halo",
+ "kind": "readout",
+ "label": "CrossMod-Hyb_002-ch555-20260827",
+ "notes": "converged",
+ "params": {
+  "halo_frac": 0.15888053771030064,
+  "halo_scale": 2.675019882677015,
+  "sigma_xy_um": 0.11917359951515169,
+  "sigma_z_um": 0.4471835404194253
+ },
+ "source": {
+  "channel": 555,
+  "experiment": "CrossMod",
+  "n_crops": 110,
+  "reference_hybe": "Hyb_002",
+  "scope_mb": 18.5,
+  "survey": [
+   "psf_survey.json",
+   "psf_survey_4families_n40.json"
+  ]
+ },
+ "voxel_um": [
+  0.208,
+  0.208,
+  0.2
+ ],
+ "written": "2026-08-27T20:15:36"
+}

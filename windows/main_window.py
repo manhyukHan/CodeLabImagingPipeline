@@ -1472,6 +1472,10 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.BuildAllelesPushButton.clicked.connect(self._build_chromatin_alleles_from_selection)
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
         chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
+        chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
+        # Populate from the library at startup. Done here rather than in
+        # setupUi so the panel stays importable without touching the disk.
+        chp.refresh_psf_entries()
 
         self.ui.actionLoad_Config.triggered.connect(self._load_config_dialog)
         self.ui.actionSave_Config.triggered.connect(self._save_config_dialog)
@@ -6953,6 +6957,199 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chromatin_preview_worker.failed.connect(_fail)
         self._chromatin_preview_worker.start()
 
+    def _fit_readout_psf(self):
+        """
+        Calibrate a readout PSF from THIS experiment's reference-hybe spots
+        and add it to the library as a NEW entry.
+
+        Never overwrites: every calibration is kept, labelled by experiment
+        and date, so the library is a history rather than a current value.
+        That is the point of it -- the readout PSF is close to universal
+        (4 experiments over 64x in genomic scope agreed to within 28 nm),
+        so each calibration is another data point about the microscope, and
+        throwing the old one away loses the only evidence that the shared
+        default is justified.
+
+        The reference hybe is the right source: many independent point-like
+        emitters in ONE optical configuration, and being the reference it
+        needs no alignment first, so nothing about the calibration depends
+        on the alignment being right.
+        """
+        from codelab_pipeline.localization import psf as P
+        from codelab_pipeline.localization import psf_library as LIB
+
+        chp = self.ui.ChromatinTracingPanel
+        # The SAME resolver Build Alleles / View Crop / Fit All FOVs use, so
+        # a calibration can never disagree with the run about which hybe is
+        # the reference or which channel is the readout.
+        context = self._chromatin_tracing_context()
+        if context is None:
+            return
+        (_hybes, _fid_ch, readout_channels, modality, storage_path,
+         reference_hybe) = context
+
+        fov = chp.AlleleFovSpinBox.value()
+        alleles = list(self.chromatin_alleles.get((storage_path, fov), []))
+        if len(alleles) < 8:
+            QtWidgets.QMessageBox.warning(
+                self, 'Fit Readout PSF',
+                f'Only {len(alleles)} allele(s) built for FOV{fov:03d}. '
+                f'Calibration needs crops to fit -- build them in section 2 '
+                f'first.\n\nAt least 8, and more is better: the fit is known '
+                f'to be badly constrained at 40 crops, where the winning '
+                f'family flipped and sigma moved ~40 nm when the crops were '
+                f'merely reselected.')
+            return
+
+        vx, vz = chp.VoxelXYSpinBox.value(), chp.VoxelZSpinBox.value()
+        voxel = (vx, vx, vz)
+        readout_channel = readout_channels.get(reference_hybe)
+        chp.FitReadoutPsfPushButton.setEnabled(False)
+        chp.StatusLabel.setText(f'Cutting {reference_hybe} readout crops from '
+                                f'{len(alleles)} alleles...')
+        self.log(f'PSF calibration started: {reference_hybe} ch{readout_channel} '
+                 f'readout, FOV{fov:03d}, {len(alleles)} alleles, voxel {voxel}')
+        try:
+            crops = self._reference_readout_crops(
+                alleles, reference_hybe, readout_channel, modality,
+                storage_path, fov, chp.SpadSpinBox.value())
+        except Exception as e:
+            chp.FitReadoutPsfPushButton.setEnabled(True)
+            chp.StatusLabel.setText(f'PSF calibration failed -- {e}')
+            self.log(f'PSF calibration could not cut crops: {e}')
+            return
+
+        def _compute():
+            if len(crops) < 8:
+                raise RuntimeError(f'only {len(crops)} usable crops')
+            # Two families only. moffat models atmospheric seeing, which a
+            # microscope does not have; a Lorentzian has no diffraction
+            # basis and an undefined variance. Measured over 4 experiments
+            # x 2 channels, each won 0 of 8 and both were the slowest jobs.
+            res = P.calibrate(crops, voxel_um=voxel,
+                              families=['gaussian', 'gaussian_halo'],
+                              verbose=False)
+            # Convergence evidence, not just a number: re-fit on HALF the
+            # crops and report how far sigma moved. A calibration still
+            # drifting at its largest crop count is a waypoint.
+            half = P.calibrate(crops[:max(8, len(crops) // 2)], voxel_um=voxel,
+                               families=[res['best']], verbose=False)
+            best, params = res['best'], res[res['best']]['params']
+            d_nm = abs(1000 * (params['sigma_xy_um']
+                               - half[best]['params']['sigma_xy_um']))
+            return res, best, params, d_nm, len(crops)
+
+        def _done(result):
+            res, best, params, d_nm, n = result
+            chp.FitReadoutPsfPushButton.setEnabled(True)
+            conv = {'n_crops': [max(8, n // 2), n],
+                    'delta_nm': round(float(d_nm), 1),
+                    'converged': bool(d_nm <= 15.0)}
+            label = self._unique_psf_label(
+                LIB.default_label(self._psf_experiment_name(storage_path),
+                                  reference_hybe, readout_channel))
+            LIB.write(label, best, params, voxel,
+                      source={'storage_path': storage_path,
+                              'reference_hybe': reference_hybe,
+                              'modality': modality, 'n_crops': n,
+                              'fitted_in': 'app'},
+                      converged=conv,
+                      notes=('converged' if conv['converged'] else
+                             f'NOT converged: sigma moved {d_nm:.1f} nm '
+                             f'when the crop count was halved'),
+                      scores={f: res[f] for f in res
+                              if isinstance(res.get(f), dict) and 'params' in res[f]})
+            chp.refresh_psf_entries(select=label)
+            msg = (f'{label}: {best}  sigma_xy '
+                   f'{1000 * params["sigma_xy_um"]:.0f} nm  from {n} crops  '
+                   + ('converged' if conv['converged']
+                      else f'NOT CONVERGED (moved {d_nm:.1f} nm)'))
+            chp.StatusLabel.setText(msg)
+            self.log(f'PSF calibration finished -- {msg}')
+            if not conv['converged']:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Fit Readout PSF',
+                    f'{msg}\n\nThe shape was still moving when the crop count '
+                    f'was halved, so this calibration has not converged. It '
+                    f'has been saved and is marked as such, but prefer a '
+                    f'converged entry (or add more alleles and re-fit).')
+
+        def _fail(message):
+            chp.FitReadoutPsfPushButton.setEnabled(True)
+            chp.StatusLabel.setText(f'PSF calibration failed -- {message}')
+            self.log(f'PSF calibration failed: {message}')
+
+        self._psf_worker = FnWorker(_compute)
+        self._psf_worker.finished_ok.connect(_done)
+        self._psf_worker.failed.connect(_fail)
+        self._psf_worker.start()
+
+    @staticmethod
+    def _psf_experiment_name(storage_path):
+        """A short name for the experiment, for labelling a PSF entry.
+
+        The project folder, not the modality folder: a PSF describes the
+        optical configuration, which both modalities of one experiment
+        share. <root>/DNA -> the name of <root>.
+        """
+        parent = os.path.dirname(os.path.normpath(storage_path or ''))
+        return os.path.basename(parent) or 'experiment'
+
+    def _reference_readout_crops(self, alleles, reference_hybe, readout_channel,
+                                 modality, storage_path, fov, spad):
+        """
+        Readout crops from the reference hybe, one per allele, brightest
+        first.
+
+        The reference hybe needs no alignment, so nothing about the
+        calibration depends on the alignment being right -- which is why
+        it, and not a traced round, is the source.
+
+        Brightest first because calibration wants the cleanest emitters
+        available, not a random sample; `contrast` is peak-above-median so
+        a bright background does not read as a bright spot.
+        """
+        from codelab_pipeline.localization import spot_mapper
+        if readout_channel is None:
+            raise RuntimeError(f'{reference_hybe} has no readout channel '
+                               f'(its only channel is the fiducial one)')
+        fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
+        scored = []
+        for allele in alleles:
+            cell = (self._find_cell_by_id(fov, allele.cell)
+                    if getattr(allele, 'cell', -1) != -1 else None)
+            resolver = self._frame_resolver(cell, fov)
+            shared_xy = (float(allele.coordinate[1]), float(allele.coordinate[0]))
+            try:
+                # EXACTLY the path a traced round takes, so the crops the
+                # PSF is fitted on are the crops it will be applied to.
+                raw_y, raw_x = spot_mapper.reference_to_raw(
+                    shared_xy, reference_hybe, fov_matrices, modality=modality,
+                    cell=cell, resolver=resolver)
+                cube, _origin = spot_mapper.crop_for_localization(
+                    storage_path, fov, reference_hybe, readout_channel,
+                    (raw_y, raw_x), pad=spad, use_stack=True)
+            except Exception:
+                continue
+            if cube is None or cube.size == 0 or not np.isfinite(cube).any():
+                continue
+            contrast = float(np.nanmax(cube) - np.nanmedian(cube))
+            if contrast > 0:
+                scored.append((contrast, np.asarray(cube, dtype=float)))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [c for _s, c in scored]
+
+    def _unique_psf_label(self, label):
+        """Never clobber an earlier calibration: same day, add a suffix."""
+        from codelab_pipeline.localization import psf_library as LIB
+        if LIB.read(label) is None:
+            return label
+        for i in range(2, 100):
+            cand = f'{label}-{i}'
+            if LIB.read(cand) is None:
+                return cand
+        return f'{label}-{int(time.time())}'
+
     @staticmethod
     def _build_fiducial_overlay_entries(allele, reference_hybe, debug):
         """
@@ -10518,6 +10715,17 @@ One PNG PER MODALITY: each modality has its own reference and its
         },
         'chromatin_tracing': {
             'reference_hybe': ('ChromatinTracingPanel', 'ReferenceHybeComboBox'),
+            # Which engine ran, what a voxel measures, and WHICH readout PSF
+            # was used. The PSF entry is stored as its library label rather
+            # than as its parameters: the parameters are copied into the
+            # store at run time (<project>/analysis/psf.json), so the config
+            # records the CHOICE while the store records the VALUE. A config
+            # holding a copy of the numbers would be a second source of
+            # truth that could silently disagree with the store.
+            'engine': ('ChromatinTracingPanel', 'EngineComboBox'),
+            'voxel_xy_um': ('ChromatinTracingPanel', 'VoxelXYSpinBox'),
+            'voxel_z_um': ('ChromatinTracingPanel', 'VoxelZSpinBox'),
+            'readout_psf': ('ChromatinTracingPanel', 'ReadoutPsfComboBox'),
             'spad': ('ChromatinTracingPanel', 'SpadSpinBox'),
             'z_window': ('ChromatinTracingPanel', 'ZWindowSpinBox'),
             'z_boundary_trim': ('ChromatinTracingPanel', 'ZBoundaryTrimSpinBox'),
@@ -10538,9 +10746,22 @@ One PNG PER MODALITY: each modality has its own reference and its
         },
     }
 
+    # A combo whose DISPLAY text is decorated cannot round-trip through
+    # the config on its text -- the decoration would be written to the
+    # file and would stop matching as soon as it changed. Such a combo
+    # sets this property and round-trips its itemData instead. Opt-in, so
+    # every existing combo keeps saving exactly what it saved before.
+    _CONFIG_DATA_PROPERTY = 'config_uses_item_data'
+
+    @staticmethod
+    def _combo_uses_data(w):
+        return bool(w.property(MainWindow._CONFIG_DATA_PROPERTY))
+
     @staticmethod
     def _widget_value(w):
         if isinstance(w, QtWidgets.QComboBox):
+            if MainWindow._combo_uses_data(w):
+                return str(w.currentData() or w.currentText())
             return w.currentText()
         if isinstance(w, QtWidgets.QLineEdit):
             return w.text()
@@ -10554,6 +10775,16 @@ One PNG PER MODALITY: each modality has its own reference and its
         item reports False so _apply_config_params can retry it after the
         combos it depends on have fired their repopulation signals."""
         if isinstance(w, QtWidgets.QComboBox):
+            if MainWindow._combo_uses_data(w):
+                # Walk the items comparing DATA. QComboBox.findData matches
+                # non-QVariant Python payloads by object IDENTITY, not by
+                # value, so it silently misses every string that is not the
+                # very object stored -- the bug that broke the hybe combo.
+                for i in range(w.count()):
+                    if w.itemData(i) == value:
+                        w.setCurrentIndex(i)
+                        return True
+                return False
             w.setCurrentText(value)
             return w.currentText() == value
         if isinstance(w, QtWidgets.QLineEdit):

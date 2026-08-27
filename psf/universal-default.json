@@ -1,0 +1,32 @@
+{
+ "candidates": {},
+ "converged": {
+  "converged": true,
+  "sigma_xy_spread_nm": 28.2
+ },
+ "family": "gaussian_halo",
+ "kind": "readout",
+ "label": "universal-default",
+ "notes": "Mean over converged experiments only. The spread between them is the number that justifies a shared default: it is smaller than the ~40 nm one experiment moves when its own crops are reselected, so between-experiment variation is below within-experiment measurement noise. Override per experiment whenever a local calibration converges.",
+ "params": {
+  "halo_frac": 0.18019240741964682,
+  "halo_scale": 2.5597354682460147,
+  "sigma_xy_um": 0.13745373113223333,
+  "sigma_z_um": 0.46949118150640373
+ },
+ "source": {
+  "derivation": "mean of converged per-experiment readout calibrations",
+  "experiments": [
+   "CrossMod",
+   "HoxA",
+   "MP58"
+  ],
+  "n_experiments": 3
+ },
+ "voxel_um": [
+  0.208,
+  0.208,
+  0.2
+ ],
+ "written": "2026-08-27T20:15:36"
+}

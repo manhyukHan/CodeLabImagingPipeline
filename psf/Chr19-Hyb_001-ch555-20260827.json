@@ -1,0 +1,41 @@
+{
+ "candidates": {},
+ "converged": {
+  "converged": false,
+  "delta_nm": 34.7,
+  "family_stable": true,
+  "n_crops": [
+   110,
+   160
+  ],
+  "sigma_xy_nm": [
+   241.6,
+   206.9
+  ]
+ },
+ "family": "gaussian",
+ "kind": "readout",
+ "label": "Chr19-Hyb_001-ch555-20260827",
+ "notes": "NOT converged: sigma moved 34.7 nm from n=110 to n=160",
+ "params": {
+  "sigma_xy_um": 0.20689867882174398,
+  "sigma_z_um": 0.7250463360268613
+ },
+ "source": {
+  "channel": 555,
+  "experiment": "Chr19",
+  "n_crops": 160,
+  "reference_hybe": "Hyb_001",
+  "scope_mb": 18.5,
+  "survey": [
+   "psf_survey.json",
+   "psf_survey_4families_n40.json"
+  ]
+ },
+ "voxel_um": [
+  0.208,
+  0.208,
+  0.2
+ ],
+ "written": "2026-08-27T20:15:36"
+}

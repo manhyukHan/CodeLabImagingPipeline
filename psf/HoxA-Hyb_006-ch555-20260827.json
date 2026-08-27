@@ -1,0 +1,43 @@
+{
+ "candidates": {},
+ "converged": {
+  "converged": true,
+  "delta_nm": 0.1,
+  "family_stable": true,
+  "n_crops": [
+   80,
+   110
+  ],
+  "sigma_xy_nm": [
+   147.3,
+   147.4
+  ]
+ },
+ "family": "gaussian_halo",
+ "kind": "readout",
+ "label": "HoxA-Hyb_006-ch555-20260827",
+ "notes": "converged",
+ "params": {
+  "halo_frac": 0.19189672745001302,
+  "halo_scale": 2.700927659211675,
+  "sigma_xy_um": 0.1474072775853154,
+  "sigma_z_um": 0.4834598332049934
+ },
+ "source": {
+  "channel": 555,
+  "experiment": "HoxA",
+  "n_crops": 110,
+  "reference_hybe": "Hyb_006",
+  "scope_mb": 0.29,
+  "survey": [
+   "psf_survey.json",
+   "psf_survey_4families_n40.json"
+  ]
+ },
+ "voxel_um": [
+  0.208,
+  0.208,
+  0.2
+ ],
+ "written": "2026-08-27T20:15:36"
+}

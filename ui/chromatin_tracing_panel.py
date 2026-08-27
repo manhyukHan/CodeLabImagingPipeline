@@ -31,11 +31,33 @@ from PyQt5 import QtWidgets, QtCore
 # bottom of its cell can have its real peak outside a seed-centered window,
 # while a stack's outermost planes are out-of-focus junk regardless of where
 # the allele sits. Display crops stay full-depth; only the fit domain shrinks.
+# The two engines. v1 stays the reference implementation -- it is a direct
+# port of ChrTracer3's FitPsf3D and must remain runnable so any v2 claim
+# can be checked against it rather than asserted.
+ENGINE_V1 = 'v1 (ChrTracer3 port)'
+ENGINE_V2 = 'v2'
+
+# Voxel size, in micrometres. An INPUT with a default, not a constant:
+# v2 reasons in physical length, and a lateral pixel (0.208 um) and an
+# axial plane (0.2 um) are different lengths that happen to be close on
+# this microscope. Anything that assumes a fixed ratio between them is
+# wrong somewhere else.
+VOXEL_DEFAULTS = {'voxel_xy_um': 0.208, 'voxel_z_um': 0.2}
+
+# 'universal-default' is the mean of the converged per-experiment readout
+# calibrations in <repo>/psf. Justified because the between-experiment
+# spread (28 nm over 4 experiments spanning 64x in genomic scope) is
+# SMALLER than the ~40 nm a single experiment moves when its own
+# calibration crops are reselected.
+DEFAULT_READOUT_PSF = 'universal-default'
+
 CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0,
                        'max_fiducial_drift_z': 10.0, 'z_boundary_trim': 10}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
-DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS,
+DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
+                  'engine': ENGINE_V1,
+                  'readout_psf': DEFAULT_READOUT_PSF,
                   'fiducial': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2},
                   'readout': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2, **READOUT_ONLY_FIT_DEFAULTS}}
 
@@ -176,6 +198,70 @@ class ChromatinTracingPanelUI(object):
             sb.setSingleStep(step)
             sb.setValue(default)
             return sb
+
+        # -- engine, voxel size, and the readout PSF --
+        #
+        # Voxel size is an INPUT, not a constant. v2 works in micrometres
+        # throughout, so a lateral pixel and an axial plane are separate
+        # physical lengths instead of being silently equated: v1 wrote its
+        # axial gate as 2x the lateral one in pixels, assuming a plane is
+        # twice a pixel, when here a plane is 0.2 um against a pixel's
+        # 0.208 -- they differ by 4%, not 2x.
+        engineForm = QtWidgets.QFormLayout()
+        paramsOuter.addLayout(engineForm)
+
+        self.EngineComboBox = QtWidgets.QComboBox()
+        self.EngineComboBox.addItems([ENGINE_V1, ENGINE_V2])
+        self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
+        self.EngineComboBox.setToolTip(
+            'v1 is the direct port of ChrTracer3 FitPsf3D and is kept as the\n'
+            'reference implementation. v2 fits in micrometres with a boxed\n'
+            'fit domain, a linear background, and a calibrated readout PSF.')
+        engineForm.addRow('Fit engine:', self.EngineComboBox)
+
+        voxelRow = QtWidgets.QHBoxLayout()
+        self.VoxelXYSpinBox = double_spin(DEFAULT_PARAMS['voxel_xy_um'],
+                                          0.01, 2.0, step=0.001, decimals=4)
+        self.VoxelXYSpinBox.setSuffix(' um/px')
+        self.VoxelZSpinBox = double_spin(DEFAULT_PARAMS['voxel_z_um'],
+                                         0.01, 5.0, step=0.001, decimals=4)
+        self.VoxelZSpinBox.setSuffix(' um/plane')
+        voxelRow.addWidget(QtWidgets.QLabel('lateral'))
+        voxelRow.addWidget(self.VoxelXYSpinBox)
+        voxelRow.addWidget(QtWidgets.QLabel('axial'))
+        voxelRow.addWidget(self.VoxelZSpinBox)
+        engineForm.addRow('Voxel size (v2):', voxelRow)
+
+        # The readout PSF is CHOSEN, not derived here. Entries come from
+        # the tracked library in <repo>/psf, which accumulates every
+        # calibration ever run -- so a new experiment can start from the
+        # universal default (4 experiments over 64x in genomic scope agreed
+        # to within 28 nm) and only re-fit if it has reason to.
+        #
+        # There is deliberately no fiducial entry: a Gaussian fitted to a
+        # fiducial returns the FIT WINDOW rather than a width (sigma ~
+        # r^0.5, no plateau), so a stored fiducial PSF would be a number
+        # that does not exist.
+        psfRow = QtWidgets.QHBoxLayout()
+        self.ReadoutPsfComboBox = QtWidgets.QComboBox()
+        self.ReadoutPsfComboBox.setMinimumWidth(240)
+        # Round-trip through the config on itemData (the stable label), not
+        # on the decorated display text. See MainWindow._widget_value.
+        self.ReadoutPsfComboBox.setProperty('config_uses_item_data', True)
+        self.ReadoutPsfComboBox.setToolTip(
+            'Readout PSF shape, from the tracked library in <repo>/psf.\n'
+            'The chosen entry is COPIED into this experiment at\n'
+            '<project>/analysis/psf.json when tracing runs, so a store\n'
+            'stays reproducible after the library moves on.')
+        psfRow.addWidget(self.ReadoutPsfComboBox, 1)
+        self.FitReadoutPsfPushButton = QtWidgets.QPushButton('Fit Readout PSF...')
+        self.FitReadoutPsfPushButton.setToolTip(
+            'Calibrate a readout PSF from this experiment\'s own reference-hybe\n'
+            'spots and add it to the library as a new entry. Never overwrites\n'
+            'an existing one -- every calibration is kept, so the library is a\n'
+            'history rather than a current value.')
+        psfRow.addWidget(self.FitReadoutPsfPushButton)
+        engineForm.addRow('Readout PSF (v2):', psfRow)
 
         # -- cross-mode: one shared value, used identically by both
         # fiducial and readout fitting --
@@ -478,10 +564,57 @@ class ChromatinTracingPanelUI(object):
                 'max_fiducial_drift': self.MaxFiducialDriftSpinBox.value(),
                 'max_fiducial_drift_z': self.MaxFiducialDriftZSpinBox.value(),
                 'z_boundary_trim': self.ZBoundaryTrimSpinBox.value(),
+                'engine': self.EngineComboBox.currentText(),
+                'voxel_um': (self.VoxelXYSpinBox.value(),
+                             self.VoxelXYSpinBox.value(),
+                             self.VoxelZSpinBox.value()),
+                'readout_psf': self.ReadoutPsfComboBox.currentData()
+                               or self.ReadoutPsfComboBox.currentText(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
 
+    def refresh_psf_entries(self, select=None):
+        """Repopulate the PSF combo from the library on disk.
+
+        The label is carried as itemData, not just as display text: the
+        text shows provenance (sigma, source, whether it converged) and is
+        meant to change as the library grows, while the label is what the
+        config stores and must stay exactly what was written.
+        """
+        from codelab_pipeline.localization import psf_library as LIB
+        want = select or (self.ReadoutPsfComboBox.currentData()
+                          or DEFAULT_READOUT_PSF)
+        self.ReadoutPsfComboBox.blockSignals(True)
+        self.ReadoutPsfComboBox.clear()
+        for e in LIB.list_entries():
+            p = e.get('params', {})
+            sxy = p.get('sigma_xy_um')
+            conv = (e.get('converged') or {})
+            mark = '' if conv.get('converged', True) else '  [not converged]'
+            bits = [e['label']]
+            if sxy:
+                bits.append(f'{1000 * sxy:.0f} nm')
+            bits.append(str(e.get('family', '')))
+            self.ReadoutPsfComboBox.addItem('  --  '.join(bits) + mark,
+                                            e['label'])
+        # Matching on DATA, never on display text: findData compares
+        # non-QVariant payloads by object identity in PyQt5, so this walks
+        # the items instead (the same bug that broke the hybe combo).
+        idx = -1
+        for i in range(self.ReadoutPsfComboBox.count()):
+            if self.ReadoutPsfComboBox.itemData(i) == want:
+                idx = i
+                break
+        if idx >= 0:
+            self.ReadoutPsfComboBox.setCurrentIndex(idx)
+        self.ReadoutPsfComboBox.blockSignals(False)
+        return self.ReadoutPsfComboBox.count()
+
     def reset_defaults(self):
+        self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
+        self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
+        self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])
+        self.refresh_psf_entries(select=DEFAULT_READOUT_PSF)
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])
         self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
         self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
