@@ -96,10 +96,23 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 #   min_ah_ratio    dominated by occupancy, which measures the same intent
 #                   properly.
 #
-# The uncertainty gates default OFF rather than to an inherited number.
-# At v1's own coverage they reach 61-79 nm against v1's 183 nm, but those
-# thresholds were derived on ONE dataset and a silently inherited constant
-# is how the v1 gates became wrong in the first place.
+# The uncertainty gates default OFF, with ONE exception: the readout's
+# axial gate, set to 150 nm by explicit decision (2026-08-29) after
+# inspecting real tiles with both CIs printed on them. The measured
+# ladder behind it (127 MP58 FOV1 alleles, post hoc on one permissive
+# pass; same-locus repeat distance):
+#
+#     z-uncert gate   pairs   med nm   p90 nm   readouts kept
+#     off               443      194     1605      69%
+#     <= 500            413      180     1297      64%
+#     <= 300            363      159      811      57%
+#     <= 150            269      149      675      44%
+#
+# 150 trades ~40% of pairs for a 2.4x better p90 -- precision over
+# coverage, deliberately. The knee is near 300 if coverage matters more.
+# Derived on ONE dataset; the panel knob (0 = off) is the escape hatch,
+# and the tiles print the very number the gate tests, so re-deriving it
+# on another experiment is a matter of reading its own grid.
 FIDUCIAL_GATES = {
     # OFF for the fiducial. at_bound belongs to the READOUT, where the 295/311
     # measurement was actually made; on the fiducial it is a blunt proxy for
@@ -177,7 +190,7 @@ READOUT_GATES = {
     'at_bound_fatal': ('y', 'x'),
     'min_occupancy': 0.40,
     'max_uncert_xy_nm': None,
-    'max_uncert_z_nm': None,
+    'max_uncert_z_nm': 150.0,     # see the ladder above
 }
 
 # -- fit domains ----------------------------------------------------------
@@ -224,6 +237,14 @@ READOUT_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
 # crops in those same hybes are clean, bright and obviously fittable.
 FIDUCIAL_PEAK_BOUND_UM = 1.456       # 7 px
 FIDUCIAL_PEAK_BOUND_Z_UM = 3.0       # 15 planes
+# BOTH ENGINES ANCHOR THESE BOUNDS AT THE SEED (fit3d_um.py builds lb/ub
+# from y0/x0/z0; fit3d_mle.py identically), not at the crop centre. That
+# is what closed the railed-by-drift failure: while the seed was trapped
+# within +/-5 px of the crop centre, the bound was effectively anchored
+# to the alignment prior, and crop-placement error (drift) turned into
+# at-bound verdicts on clean spots. With the crop-spanning seed, the
+# bound travels to wherever the centroid found the emitter -- railing
+# fell 4.4% -> 1.4% of readouts from the seed change alone.
 READOUT_PEAK_BOUND_UM = 1.04         # 5 px
 # 14 planes, up from 10. Neutralising the z at_bound gate (see
 # READOUT_GATES) removes the REJECTION but not the truncation: a fit that

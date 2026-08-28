@@ -73,7 +73,7 @@
     v2_fiducial_max_uncert_xy_nm="0.0"
     v2_readout_max_uncert_xy_nm="0.0"
     v2_fiducial_max_uncert_z_nm="0.0"
-    v2_readout_max_uncert_z_nm="0.0"
+    v2_readout_max_uncert_z_nm="150.0"
     v2_qc_shift="1"
     readout_psf="universal-default"
     spad="8"
