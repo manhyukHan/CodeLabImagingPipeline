@@ -92,10 +92,51 @@ def write_manifest(dp, modalities, layout_paths=None, dax_directories=None):
                                'dax_directory': (dax_directories or {}).get(name, '')}
                         for name in modalities}}
     os.makedirs(dp, exist_ok=True)
-    tmp = manifest_path(dp) + '.part'
+    target = manifest_path(dp)
+
+    # WRITE ONLY IF IT WOULD CHANGE.
+    #
+    # Every session rewrites this at startup from its config, so the
+    # content is almost always byte-identical to what is already there.
+    # Two sessions on one project -- which the launcher explicitly
+    # supports, it makes one log per launch precisely because two copies
+    # can run at once -- then race on os.replace, and on Windows the loser
+    # gets PermissionError/WinError 5 replacing a file the other has open.
+    # Observed repeatedly on the real NAS store.
+    #
+    # The manifest survived (atomic replace: the old file stays whole), but
+    # the exception escaped into a session that had done nothing wrong.
+    # Skipping the no-op write removes the race in the case that causes it,
+    # and removes pointless NAS churn at every startup as a side effect.
+    try:
+        with open(target, 'r') as f:
+            if json.load(f) == m:
+                _MANIFEST_CACHE.pop(dp, None)
+                return m
+    except (OSError, ValueError):
+        pass    # missing, unreadable or malformed -- write it
+
+    tmp = target + '.part'
     with open(tmp, 'w') as f:
         json.dump(m, f, indent=2)
-    os.replace(tmp, manifest_path(dp))
+    try:
+        os.replace(tmp, target)
+    except OSError:
+        # Another session replaced it first. That is only tolerable if the
+        # file now says what we were going to say -- otherwise the caller
+        # must hear about it, because a manifest that disagrees with the
+        # session's own configuration is not a cosmetic problem.
+        try:
+            with open(target, 'r') as f:
+                same = json.load(f) == m
+        except (OSError, ValueError):
+            same = False
+        try:
+            os.remove(tmp)      # never leave a .part behind
+        except OSError:
+            pass
+        if not same:
+            raise
     _MANIFEST_CACHE.pop(dp, None)
     return m
 

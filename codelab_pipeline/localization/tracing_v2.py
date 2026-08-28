@@ -562,8 +562,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                  storage_path, fov, modality, cell, fov_matrices,
                                  params=None, max_fiducial_drift=5.0,
                                  max_fiducial_drift_z=10.0, spad=8,
-                                 collect_debug=False, resolver=None,
-                                 append=False):
+                                 collect_debug=False, resolver=None):
     """
     v2's counterpart to localization.build_chromatin_trace_allele, filling
     the same three fields on `allele` and returning the same
@@ -585,22 +584,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     from codelab_pipeline.localization import localization as L
 
     p = params or V2Params()
-    if not append:
-        allele.fiducial_trace, allele.polymer, allele.rejected_hybes = {}, {}, {}
-    else:
-        # MERGE, but a hybe that IS being re-derived must lose its stale
-        # entries first -- otherwise a round that traced last pass and is
-        # rejected this pass keeps its old polymer entry and the allele
-        # reports a position no current fit stands behind. v1 does the same
-        # (localization.py: rejected_hybes.pop / polymer.pop per hybe).
-        # fiducial_trace is deliberately NOT popped for the reference: its
-        # baseline is a physical fact about the reference stack that new
-        # hybes landing on disk do not change.
-        for h in hybes:
-            allele.rejected_hybes.pop(h, None)
-            allele.polymer.pop(h, None)
-            if h != reference_hybe:
-                allele.fiducial_trace.pop(h, None)
+    # ALWAYS a full re-derivation. v2 has no merge mode, deliberately.
+    #
+    # It briefly had one, mirroring v1's, and it is now unreachable: an
+    # allele only reaches this function because append-mode membership
+    # said it has no committed trace, so there is nothing to merge into.
+    # Leaving the branch in place would advertise a mode nothing selects
+    # and invite a future caller to switch it on, which is exactly how the
+    # per-hybe append rule survived long enough to mix two engines'
+    # estimates inside one polymer.
+    allele.fiducial_trace, allele.polymer, allele.rejected_hybes = {}, {}, {}
     debug = {} if collect_debug else None
     # (y, x). NOT (x, y). allele.coordinate is rasterized order (y, x, z)
     # per models/allele.py, and spot_mapper.reference_to_raw unpacks
@@ -797,6 +790,69 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     return allele, debug
 
 
+def allele_task(payload):
+    """Run ONE allele end to end in a child process.
+
+    THE UNIT OF PARALLELISM FOR v2, and it has to be the allele rather
+    than the hybe. consensus_native_z needs EVERY hybe's fiducial argmax,
+    mapped into the shared frame, before ANY fit can be seeded -- a
+    barrier that v1 does not have, because v1 fits each hybe independently
+    end to end.
+
+    Splitting across that barrier per hybe would mean either shipping the
+    crops back to the parent and out again (~12 MB per allele each way) or
+    reading every crop from the NAS twice. Keeping the whole allele in one
+    child keeps the barrier inside one process, and the only thing that
+    crosses a process boundary is the finished trace.
+
+    The median itself is not the cost: 0.09 s, measured, against 106 s for
+    the fit-based placement it replaced. What it forces is that all the
+    crop reads complete before any fitting starts.
+
+    Returns plain dicts, not the AnAllele: the parent owns the object the
+    rest of the app holds references to, and merging three dicts into it
+    is unambiguous where returning a rebuilt object would quietly replace
+    identity.
+    """
+    (meta, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov, modality,
+     cell, fov_matrices, params, max_drift, max_drift_z, spad, resolver) = payload
+    from codelab_pipeline.models.allele import AnAllele
+    allele = AnAllele()
+    allele.set_metadata(**meta)
+    # The child bypasses trace_allele, so it stamps its own provenance --
+    # otherwise every parallel v2 run would produce unstamped traces while
+    # the serial path stamped them, which is worse than not stamping at all.
+    import time as _time
+    allele.provenance = {
+        'engine': 'v2', 'engine_label': 'v2',
+        'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'voxel_um': list(params.voxel_um) if params else None,
+        'psf': (params.psf_label or None) if params else None,
+        'psf_family': params.psf_family if params else None,
+    }
+    build_chromatin_trace_allele(
+        allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,
+        modality, cell, fov_matrices, params=params,
+        max_fiducial_drift=max_drift, max_fiducial_drift_z=max_drift_z,
+        spad=spad, collect_debug=False, resolver=resolver)
+    return (int(meta['id']), allele.fiducial_trace, allele.polymer,
+            allele.rejected_hybes, getattr(allele, 'reference_warning', None),
+            dict(getattr(allele, 'provenance', {}) or {}))
+
+
+def apply_allele_result(allele, result):
+    """Merge a child's result into the parent's own AnAllele, in place."""
+    _aid, fiducial_trace, polymer, rejected, warning, provenance = result
+    allele.fiducial_trace = fiducial_trace
+    allele.polymer = polymer
+    allele.rejected_hybes = rejected
+    if warning:
+        allele.reference_warning = warning
+    if provenance:
+        allele.provenance = provenance
+    return allele
+
+
 def is_v2(engine):
     """True for the v2 engine name, whatever decoration the combo carries.
 
@@ -813,20 +869,46 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
                  fov_matrices, v2_params=None, max_fiducial_drift=5.0,
                  max_fiducial_drift_z=10.0, spad=8, z_window=15,
                  fiducial_params=None, readout_params=None, collect_debug=False,
-                 resolver=None, z_boundary_trim=0, executor=None, append=False):
+                 resolver=None, z_boundary_trim=0, executor=None):
     """
     Route one allele to the chosen engine. The ONE place the choice is
     made, so the preview and the batch run cannot diverge -- they took
     different code paths to the same v1 call before, and a switch added to
     only one of them would be invisible until the two disagreed.
 
-    v1 keeps every argument it had. The ones v2 has no use for are dropped
+    NEITHER engine is offered an `append` mode here. Which alleles run is
+    decided by membership before the worker starts, so an allele arriving
+    here never has a committed trace to merge into. v1 still HAS the
+    parameter for direct callers (it is the reference implementation and
+    stays unchanged); the dispatcher simply never asks for it.
+
+    v1 keeps every other argument it had. The ones v2 has no use for are dropped
     rather than accepted and ignored: z_window is a mixture-mode seed
     search (v2 fits one emitter), z_boundary_trim shaves the pillar ends
     (v2 fits a box placed at the consensus depth, so the ends are already
     out of the domain), and the per-channel *_params carry v1's gate
     constants, which do not transfer to a local background.
     """
+    # STAMP HOW THIS TRACE WAS MADE, whichever engine runs. Free-form on
+    # purpose: each engine records its own inputs, so a future engine adds
+    # its hyperparameters here without anything else changing. The base is
+    # only what is true of every engine.
+    if allele is not None and hasattr(allele, 'provenance'):
+        import time as _time
+        stamp = {'engine': 'v2' if is_v2(engine) else 'v1',
+                 'engine_label': str(engine or ''),
+                 'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S')}
+        if is_v2(engine) and v2_params is not None:
+            stamp.update({
+                'voxel_um': list(v2_params.voxel_um),
+                'psf': v2_params.psf_label or None,
+                'psf_family': v2_params.psf_family,
+                'fiducial_gates': {k: v for k, v in v2_params.fiducial_gates.items()
+                                   if not isinstance(v, tuple)},
+                'readout_gates': {k: v for k, v in v2_params.readout_gates.items()
+                                  if not isinstance(v, tuple)},
+            })
+        allele.provenance = stamp
     if not is_v2(engine):
         from codelab_pipeline.localization import localization as L
         return L.build_chromatin_trace_allele(
@@ -837,13 +919,13 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
             z_window=z_window, fiducial_params=fiducial_params,
             readout_params=readout_params, collect_debug=collect_debug,
             resolver=resolver, z_boundary_trim=z_boundary_trim,
-            executor=executor, append=append)
+            executor=executor)
     return build_chromatin_trace_allele(
         allele, hybes, reference_hybe, hybe_fiducial_channels,
         hybe_readout_channels, storage_path, fov, modality, cell, fov_matrices,
         params=v2_params, max_fiducial_drift=max_fiducial_drift,
         max_fiducial_drift_z=max_fiducial_drift_z, spad=spad,
-        collect_debug=collect_debug, resolver=resolver, append=append)
+        collect_debug=collect_debug, resolver=resolver)
 
 
 def _slab(cube, zc, half):

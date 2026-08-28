@@ -237,7 +237,10 @@ def main():
 
     def _spy(traced):
         def record(engine, allele, hybes, *a, **k):
-            traced.append((allele.id, tuple(hybes), k.get('append')))
+            # 'append' in k, not k.get('append'): the parameter is GONE, so
+            # the property worth pinning is that the worker never passes it
+            # -- a default of False would be indistinguishable from absence.
+            traced.append((allele.id, tuple(hybes), 'append' in k))
             return allele, None
         return record
 
@@ -255,18 +258,22 @@ def main():
     check('the worker no longer takes ready_hybes_by_fov -- readiness is a '
           'FOV-level decision made on the GUI thread',
           'ready_hybes_by_fov' not in sig.parameters, str(list(sig.parameters)))
+    # No append flag either. A flag stored but never consulted is an
+    # invitation to branch on it again, which is how the per-hybe rule
+    # survived long enough to mix two engines inside one polymer.
+    check('and takes no append flag at all -- it has no append concept',
+          'append' not in sig.parameters, str(list(sig.parameters)))
 
     ctw = ChromatinTracingWorker([(dna_sp, 9, [a1, a2])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
                                  {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
-                                 workers=1, append=True)
+                                 workers=1)
     traced = []
     with mock.patch.object(tracing_v2, 'trace_allele', side_effect=_spy(traced)):
         ctw.run()
     check('every allele handed to the worker is fitted for EVERY checked hybe',
           traced == [(1, ('H1', 'H2', 'H3'), False),
                      (2, ('H1', 'H2', 'H3'), False)], str(traced))
-    check('and always with append=False -- a selected allele has no committed '
-          'trace to merge into, so a full re-derivation is correct',
+    check('and the worker never passes an append kwarg -- there is none to pass',
           all(entry[2] is False for entry in traced), str(traced))
 
     # An allele with NOTHING traced gets the full hybe list too -- there is
@@ -275,7 +282,7 @@ def main():
                                polymer={}, rejected_hybes={}, fiducial_trace={})
     ctw2 = ChromatinTracingWorker([(dna_sp, 9, [a3])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
                                   {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
-                                  workers=1, append=True)
+                                  workers=1)
     traced.clear()
     with mock.patch.object(tracing_v2, 'trace_allele', side_effect=_spy(traced)):
         ctw2.run()
@@ -286,8 +293,21 @@ def main():
     src = _inspect.getsource(ChromatinTracingWorker.run)
     check('the worker body contains no per-hybe append filter at all',
           'not in traced' not in src and 'set(allele.polymer' not in src
-          and 'ready_hybes_by_fov' not in src,
+          and 'ready_hybes_by_fov' not in src and 'self.append' not in src,
           'a hybe-narrowing expression survives in ChromatinTracingWorker.run')
+
+    # And the v2 engine offers no merge mode to switch back on.
+    v2_sig = _inspect.signature(tracing_v2.build_chromatin_trace_allele)
+    check('tracing_v2 has no append parameter -- no merge branch to revive',
+          'append' not in v2_sig.parameters, str(list(v2_sig.parameters)))
+    check('and neither does the dispatcher',
+          'append' not in _inspect.signature(tracing_v2.trace_allele).parameters,
+          str(list(_inspect.signature(tracing_v2.trace_allele).parameters)))
+    # v1 KEEPS its own append: it is the reference implementation, stays
+    # unchanged, and section 6 above still exercises both of its modes.
+    check('v1 still has its append parameter (reference implementation, untouched)',
+          'append' in _inspect.signature(
+              localization.build_chromatin_trace_allele).parameters)
 
     # -- 7b. the membership rule itself --------------------------------------
     from codelab_pipeline.models.allele import AnAllele

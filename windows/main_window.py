@@ -802,12 +802,14 @@ class ChromatinTracingWorker(QtCore.QThread):
     def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
-                max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None, append=False,
+                max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None,
                 engine=None, v2_params=None):
         super().__init__()
-        # THE WORKER DOES NO APPEND FILTERING. It fits every allele it is
-        # given, for every checked hybe. `append` is carried only so the
-        # progress text can name the mode.
+        # THE WORKER HAS NO APPEND CONCEPT AT ALL. It fits every allele it
+        # is given, for every checked hybe. It used to take an `append`
+        # flag; nothing read it after the filtering went, and a flag that
+        # is stored but never consulted is an invitation to branch on it
+        # again.
         #
         # It used to filter per (allele, hybe) -- fit the hybes not yet in
         # an allele's polymer or rejected_hybes -- and that is exactly what
@@ -824,7 +826,6 @@ class ChromatinTracingWorker(QtCore.QThread):
         # never be committed and then never revisited. A parameter the
         # worker no longer reads would imply a filter that no longer
         # exists.
-        self.append = append
         # Which engine, resolved ONCE on the GUI thread and carried here.
         # v1 stays the default and the reference implementation.
         self.engine = engine
@@ -849,6 +850,56 @@ class ChromatinTracingWorker(QtCore.QThread):
         self.z_window = z_window
         self.fiducial_params = fiducial_params
         self.readout_params = readout_params
+
+    def _run_fov_alleles_parallel(self, executor, storage_path, fov, alleles,
+                                  fov_matrices, done, total):
+        """One FOV's alleles, one child process each. Returns the new `done`.
+
+        Results are merged back into the PARENT's own AnAllele objects, so
+        everything downstream -- fov_done, the permanent-tier promotion,
+        the listview -- keeps working on the objects it already holds. The
+        alternative, returning rebuilt alleles, would silently swap
+        identity underneath the containers.
+
+        A child that raises loses ONE allele, exactly as the serial path
+        does: failure is retry-able state, and the next append pass picks
+        it up because the allele never reached the permanent tier.
+        """
+        futures = {}
+        for allele in alleles:
+            cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
+            payload = (allele.save(), self.hybes, self.reference_hybe,
+                       self.hybe_fiducial_channels, self.hybe_readout_channels,
+                       storage_path, fov, self.modality, cell, fov_matrices,
+                       self.v2_params, self.max_fiducial_drift,
+                       self.max_fiducial_drift_z, self.spad,
+                       self.resolver_by_fov.get(fov))
+            try:
+                futures[executor.submit(tracing_v2.allele_task, payload)] = allele
+            except Exception as e:
+                # Submission itself can fail (a dead pool, an unpicklable
+                # cell). Fall back to fitting this allele here rather than
+                # losing it.
+                self.n_failed += 1
+                done += 1
+                self.progress.emit(done, total,
+                                   f'FOV{fov:03d} allele {allele.id}: FAILED to '
+                                   f'dispatch -- {e}')
+        for future in as_completed(futures):
+            allele = futures[future]
+            try:
+                tracing_v2.apply_allele_result(allele, future.result())
+            except Exception as e:
+                self.n_failed += 1
+                done += 1
+                self.progress.emit(done, total,
+                                   f'FOV{fov:03d} allele {allele.id}: FAILED -- {e}')
+                continue
+            done += 1
+            self.progress.emit(done, total,
+                               f'FOV{fov:03d} allele {allele.id}: '
+                               f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
+        return done
 
     def run(self):
         try:
@@ -878,6 +929,18 @@ class ChromatinTracingWorker(QtCore.QThread):
             try:
                 for storage_path, fov, alleles in self.jobs:
                     fov_matrices = self.fov_matrices_by_fov.get(fov, {})
+                    # v2 parallelises across ALLELES, not hybes. Its
+                    # consensus-depth step needs every fiducial crop of an
+                    # allele before any of its fits can be seeded, so the
+                    # per-hybe fan-out v1 uses has nothing to fan: keeping a
+                    # whole allele in one child keeps that barrier inside
+                    # one process and ships only the finished trace back.
+                    if executor is not None and tracing_v2.is_v2(self.engine):
+                        done = self._run_fov_alleles_parallel(
+                            executor, storage_path, fov, alleles, fov_matrices,
+                            done, total)
+                        self.fov_done.emit(storage_path, fov, alleles)
+                        continue
                     for allele in alleles:
                         # EVERY checked hybe, always. Which ALLELES run was
                         # already decided by membership on the GUI thread;
@@ -902,14 +965,7 @@ class ChromatinTracingWorker(QtCore.QThread):
                                 spad=self.spad, z_window=self.z_window,
                                 fiducial_params=self.fiducial_params, readout_params=self.readout_params,
                                 resolver=self.resolver_by_fov.get(fov),
-                                z_boundary_trim=self.z_boundary_trim, executor=executor,
-                                # append=False ALWAYS. An allele reaching
-                                # this loop has no committed trace to merge
-                                # into -- append mode filtered those out --
-                                # so a full re-derivation is correct, and
-                                # merging would only preserve stale entries
-                                # from a run that was never saved.
-                                append=False)
+                                z_boundary_trim=self.z_boundary_trim, executor=executor)
                         except Exception as e:
                             self.n_failed += 1
                             done += 1
@@ -7699,7 +7755,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          resolver_by_fov=resolver_by_fov,
                                                          max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
                                                          z_boundary_trim=full_params['z_boundary_trim'],
-                                                         append=(mode == 'append'),
                                                          engine=full_params.get('engine'),
                                                          v2_params=self._chromatin_v2_params(
                                                              full_params, storage_path))

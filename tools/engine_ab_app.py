@@ -162,8 +162,7 @@ def _prepare(mw, exp, fovs, n_alleles):
             lst.item(i).setSelected(True)
         if n:
             mw._build_chromatin_alleles_from_selection()
-        got = mw.chromatin_alleles.get((sp, fov), [])
-        built += len(got)
+        built += mw.chromatin_alleles.count((sp, fov))
     return wanted, ref_item, built
 
 
@@ -172,7 +171,7 @@ def _score(mw, exp, fovs, pairs):
     dy, dx, dz = VOXEL
     out, rejected, traced = {}, 0, 0
     for fov in fovs:
-        for allele in mw.chromatin_alleles.get((sp, fov), []):
+        for allele in mw.chromatin_alleles.of_fov((sp, fov)):
             poly = {}
             for h, comps in (allele.polymer or {}).items():
                 if comps:

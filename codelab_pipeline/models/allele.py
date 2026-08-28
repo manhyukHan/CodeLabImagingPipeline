@@ -62,6 +62,19 @@ class AnAllele():
         self.anchor_uid = 0
         self.anchor_hybe = ''
         self.anchor_channel = 0
+        # HOW this allele's trace was produced. A FREE-FORM dict, on
+        # purpose: the engine that fills it decides what belongs in it, so
+        # v1, v2 and whatever comes next can each record their own inputs
+        # without this class growing a field per engine. Empty means "no
+        # trace, or a trace made before provenance was recorded".
+        #
+        # It exists because nothing on disk said which engine produced a
+        # polymer. v1 and v2 differ by 43-68% in localization error, so a
+        # store mixing them is mixing two accuracy regimes with no way to
+        # tell which alleles are which, or to re-fit only the old ones.
+        # File mtime cannot answer it either: an append run rewrites the
+        # whole FOV capsule, so every allele in it looks equally fresh.
+        self.provenance = {}
         self.coordinate = (0.0, 0.0, 0.0)
         self.raw_coordinate = (0.0, 0.0, 0.0)
         self.fiducial_trace = {}
@@ -78,6 +91,8 @@ class AnAllele():
         if 'anchor_uid' in kwargs: self.anchor_uid = int(kwargs['anchor_uid'])
         if 'anchor_hybe' in kwargs: self.anchor_hybe = str(kwargs['anchor_hybe'])
         if 'anchor_channel' in kwargs: self.anchor_channel = int(kwargs['anchor_channel'])
+        if 'provenance' in kwargs:
+            self.provenance = dict(kwargs['provenance'] or {})
         if 'coordinate' in kwargs: self.coordinate = tuple(kwargs['coordinate'])
         if 'raw_coordinate' in kwargs: self.raw_coordinate = tuple(kwargs['raw_coordinate'])
         if 'fiducial_trace' in kwargs:
@@ -113,6 +128,7 @@ class AnAllele():
                            for k, v in self.polymer.items()},
                 'rejected_hybes': dict(self.rejected_hybes),
                 'final_polymer': np.array(self.final_polymer),
+                'provenance': dict(self.provenance or {}),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at}
 
