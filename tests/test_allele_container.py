@@ -32,7 +32,7 @@ def make(aid, uid=0, traced=False):
                    anchor_hybe='Hyb_016', anchor_channel=555,
                    coordinate=(100.0, 200.0, 0.0), raw_coordinate=(100.0, 200.0, 0.0))
     if traced:
-        a.polymer = {'Hyb_020': [(1.0, 2.0, 3.0, 500.0)]}
+        a.polymer_adj = {'Hyb_020': [(1.0, 2.0, 3.0, 500.0)]}
     return a
 
 
@@ -66,9 +66,9 @@ def main():
     check('sync_from copies every allele', perm.count(KEY) == 3)
     # the tracing worker mutates AnAllele IN PLACE; shared objects would
     # make every fit silently write into the permanent tier
-    t.by_id(KEY, 1).polymer = {'Hyb_030': [(9.0, 9.0, 9.0, 1.0)]}
+    t.by_id(KEY, 1).polymer_adj = {'Hyb_030': [(9.0, 9.0, 9.0, 1.0)]}
     check('mutating transient does NOT reach permanent',
-          not perm.by_id(KEY, 1).polymer, str(perm.by_id(KEY, 1).polymer))
+          not perm.by_id(KEY, 1).polymer_adj, str(perm.by_id(KEY, 1).polymer_adj))
     perm.by_id(KEY, 2).rejected_hybes = {'Hyb_040': 'nope'}
     check('and mutating permanent does not reach transient',
           not t.by_id(KEY, 2).rejected_hybes)
@@ -80,7 +80,7 @@ def main():
     check('has() is true for a saved-but-untraced allele', p2.has(KEY, 1))
     check('has_traced() is FALSE for it -- append must still fit it',
           not p2.has_traced(KEY, 1))
-    check('has_traced() is true once it carries a polymer', p2.has_traced(KEY, 2))
+    check('has_traced() is true once it carries a polymer_adj', p2.has_traced(KEY, 2))
     check('both are false for an allele that was never saved',
           not p2.has(KEY, 99) and not p2.has_traced(KEY, 99))
 

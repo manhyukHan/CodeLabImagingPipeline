@@ -16,7 +16,7 @@ ONE FAMILY AT A TIME, ALWAYS
 ----------------------------
 Comparing sigma across experiments while letting each pick its own
 best-scoring family is not a comparison. It produced a spurious
-"fiducial follows N^(1/3) polymer scaling" here: HoxA contributed its
+"fiducial follows N^(1/3) polymer_adj scaling" here: HoxA contributed its
 gaussian_halo core (194 nm) while the others contributed their gaussian
 (332-399 nm), and HoxA's own gaussian is 273 nm. With one family
 throughout the exponent fell from +0.30 to +0.16 and the interpretation

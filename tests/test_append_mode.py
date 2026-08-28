@@ -24,7 +24,7 @@ Append-mode (per-(FOV, hybe) delta, manual trigger) functional check:
    This section asserted the opposite until 2026-08-28. The old rule --
    append fits the hybes not yet traced on an allele -- is what allowed an
    allele half-traced by one engine to be finished by another, leaving one
-   polymer built from two estimators with nothing on disk recording it.
+   polymer_adj built from two estimators with nothing on disk recording it.
    Section 6 stays: the ENGINE still supports merge, only the caller
    stopped asking for it.
 """
@@ -209,23 +209,23 @@ def main():
 
     # -- 6. build_chromatin_trace_allele append semantics ---------------------
     allele = types.SimpleNamespace(coordinate=(5.0, 6.0, 7.0),
-                                   fiducial_trace={'R': (1, 2, 3), 'A': (1, 2, 3)},
-                                   polymer={'A': ['kept']}, rejected_hybes={'B': 'why'})
+                                   fiducial_trace_adj={'R': (1, 2, 3), 'A': (1, 2, 3)},
+                                   polymer_adj={'A': ['kept']}, rejected_hybes={'B': 'why'})
     localization.build_chromatin_trace_allele(allele, [], 'R', {}, {}, '/nowhere', 1, 'DNA', None, {},
                                               append=True)
     check('append=True with no hybes leaves everything untouched',
-          allele.polymer == {'A': ['kept']} and allele.rejected_hybes == {'B': 'why'}
-          and allele.fiducial_trace.get('R') == (1, 2, 3))
+          allele.polymer_adj == {'A': ['kept']} and allele.rejected_hybes == {'B': 'why'}
+          and allele.fiducial_trace_adj.get('R') == (1, 2, 3))
     localization.build_chromatin_trace_allele(allele, [], 'R', {}, {}, '/nowhere', 1, 'DNA', None, {})
     check('default (overwrite) still resets the three dicts',
-          allele.polymer == {} and allele.rejected_hybes == {} and allele.fiducial_trace == {})
+          allele.polymer_adj == {} and allele.rejected_hybes == {} and allele.fiducial_trace_adj == {})
 
     # -- 7. ChromatinTracingWorker: append is a MEMBERSHIP question ----------
     #
     # This section used to assert the opposite, and the behaviour it
     # defended is the one that had to go: append filtered HYBES per allele,
     # so an allele half-traced by one engine could have the rest of its
-    # hybes filled in by another, leaving ONE polymer built from two
+    # hybes filled in by another, leaving ONE polymer_adj built from two
     # estimators with nothing on disk saying so.
     #
     # Which ALLELES run is now decided before the worker starts, by
@@ -247,9 +247,9 @@ def main():
     # a1 is partly traced, a2 is fully traced -- under the OLD rule a1
     # would have been fitted for H3 only and a2 skipped entirely.
     a1 = types.SimpleNamespace(id=1, cell=-1, coordinate=(0, 0, 0),
-                               polymer={'H1': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace={})
+                               polymer_adj={'H1': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace_adj={})
     a2 = types.SimpleNamespace(id=2, cell=-1, coordinate=(0, 0, 0),
-                               polymer={'H1': 1, 'H3': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace={})
+                               polymer_adj={'H1': 1, 'H3': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace_adj={})
     # The worker no longer ACCEPTS ready_hybes_by_fov. A parameter it does
     # not read would imply a per-hybe filter that no longer exists, so its
     # absence is asserted rather than assumed.
@@ -260,7 +260,7 @@ def main():
           'ready_hybes_by_fov' not in sig.parameters, str(list(sig.parameters)))
     # No append flag either. A flag stored but never consulted is an
     # invitation to branch on it again, which is how the per-hybe rule
-    # survived long enough to mix two engines inside one polymer.
+    # survived long enough to mix two engines inside one polymer_adj.
     check('and takes no append flag at all -- it has no append concept',
           'append' not in sig.parameters, str(list(sig.parameters)))
 
@@ -279,7 +279,7 @@ def main():
     # An allele with NOTHING traced gets the full hybe list too -- there is
     # no path left by which the worker fits a subset.
     a3 = types.SimpleNamespace(id=3, cell=-1, coordinate=(0, 0, 0),
-                               polymer={}, rejected_hybes={}, fiducial_trace={})
+                               polymer_adj={}, rejected_hybes={}, fiducial_trace_adj={})
     ctw2 = ChromatinTracingWorker([(dna_sp, 9, [a3])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
                                   {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
                                   workers=1)
@@ -292,7 +292,7 @@ def main():
     import inspect as _inspect
     src = _inspect.getsource(ChromatinTracingWorker.run)
     check('the worker body contains no per-hybe append filter at all',
-          'not in traced' not in src and 'set(allele.polymer' not in src
+          'not in traced' not in src and 'set(allele.polymer' not in src   # PREFIX: also catches _adj/_raw
           and 'ready_hybes_by_fov' not in src and 'self.append' not in src,
           'a hybe-narrowing expression survives in ChromatinTracingWorker.run')
 
@@ -320,7 +320,7 @@ def main():
                        anchor_channel=555, coordinate=(0.0, 0.0, 0.0),
                        raw_coordinate=(0.0, 0.0, 0.0))
         if traced_flag:
-            a.polymer = {'H1': [(1.0, 2.0, 3.0, 9.0)]}
+            a.polymer_adj = {'H1': [(1.0, 2.0, 3.0, 9.0)]}
         perm.add(key, a)
     check('a committed allele WITH a trace is skipped by append',
           perm.has_traced(key, 1))

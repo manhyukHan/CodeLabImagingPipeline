@@ -244,8 +244,21 @@ def pack_alleles(grp, dicts):
                              ('ry', 'f8'), ('rx', 'f8'), ('rz', 'f8'), ('linked', 'u1')])
     strs = {k: [] for k in ('anchor_hybe', 'linked_at')}
     prov = []
+    # tr_*/pl_* KEEP THEIR MEANING: in every file ever written they held
+    # the shared-frame values, which is exactly what _adj now names. So
+    # old stores stay readable with no translation, and the hybe-native
+    # values get NEW columns (trr_*/plr_*) whose absence means "written
+    # before raw was recorded", not "empty".
+    #
+    # The raw columns carry their OWN allele/hybe index rather than
+    # riding on the adj rows. Parity between the two dicts is not
+    # guaranteed -- v1 fills adj and no raw at all -- and an index that
+    # silently assumes it would mis-assign every hybe the moment one
+    # engine wrote a different set.
     tr = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
+    trr = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
     pl = {'allele': [], 'hybe': [], 'vals': []}
+    plr = {'allele': [], 'hybe': [], 'vals': []}
     rj = {'allele': [], 'hybe': [], 'reason': []}
     fp, fp_off = [], [0]
     for i, d in enumerate(dicts):
@@ -255,14 +268,17 @@ def pack_alleles(grp, dicts):
         for k in strs:
             strs[k].append(_s(d.get(k)))
         prov.append(json.dumps(d.get('provenance') or {}, sort_keys=True))
-        for hybe, v in (d.get('fiducial_trace') or {}).items():
-            tr['allele'].append(i); tr['hybe'].append(_s(hybe))
-            tr['isnone'].append(v is None)
-            tr['vals'].append(np.zeros(4) if v is None else np.asarray(v, dtype=np.float64))
-        for hybe, cands in (d.get('polymer') or {}).items():
-            for cand in cands:
-                pl['allele'].append(i); pl['hybe'].append(_s(hybe))
-                pl['vals'].append(np.asarray(cand, dtype=np.float64))
+        for col, key in ((tr, 'fiducial_trace_adj'), (trr, 'fiducial_trace_raw')):
+            for hybe, v in (d.get(key) or {}).items():
+                col['allele'].append(i); col['hybe'].append(_s(hybe))
+                col['isnone'].append(v is None)
+                col['vals'].append(np.zeros(4) if v is None
+                                   else np.asarray(v, dtype=np.float64))
+        for col, key in ((pl, 'polymer_adj'), (plr, 'polymer_raw')):
+            for hybe, cands in (d.get(key) or {}).items():
+                for cand in cands:
+                    col['allele'].append(i); col['hybe'].append(_s(hybe))
+                    col['vals'].append(np.asarray(cand, dtype=np.float64))
         for hybe, reason in (d.get('rejected_hybes') or {}).items():
             rj['allele'].append(i); rj['hybe'].append(_s(hybe)); rj['reason'].append(_s(reason))
         f = np.asarray(d.get('final_polymer', np.empty((0, 3))), dtype=np.float64).reshape(-1, 3)
@@ -271,13 +287,17 @@ def pack_alleles(grp, dicts):
     for k, v in strs.items():
         _write(grp, k, np.asarray(v, dtype=_STR))
     grp.create_dataset('provenance', data=np.asarray(prov, dtype=object), dtype=_JSON)
-    _write(grp, 'tr_allele', np.asarray(tr['allele'], dtype=np.int32))
-    _write(grp, 'tr_hybe', np.asarray(tr['hybe'], dtype=_STR))
-    _write(grp, 'tr_isnone', np.asarray(tr['isnone'], dtype=np.uint8))
-    _write(grp, 'tr_vals', np.asarray(tr['vals']).reshape(-1, 4) if tr['vals'] else np.empty((0, 4)))
-    _write(grp, 'pl_allele', np.asarray(pl['allele'], dtype=np.int32))
-    _write(grp, 'pl_hybe', np.asarray(pl['hybe'], dtype=_STR))
-    _write(grp, 'pl_vals', np.asarray(pl['vals']).reshape(-1, 4) if pl['vals'] else np.empty((0, 4)))
+    for pre, col in (('tr', tr), ('trr', trr)):
+        _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
+        _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
+        _write(grp, pre + '_isnone', np.asarray(col['isnone'], dtype=np.uint8))
+        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, 4)
+               if col['vals'] else np.empty((0, 4)))
+    for pre, col in (('pl', pl), ('plr', plr)):
+        _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
+        _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
+        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, 4)
+               if col['vals'] else np.empty((0, 4)))
     _write(grp, 'rj_allele', np.asarray(rj['allele'], dtype=np.int32))
     _write(grp, 'rj_hybe', np.asarray(rj['hybe'], dtype=_STR))
     _write(grp, 'rj_reason', np.asarray(rj['reason'], dtype='S256'))
@@ -305,7 +325,8 @@ def unpack_alleles(grp):
             'anchor_channel': int(tab['anchor_channel'][i]),
             'coordinate': (float(tab['y'][i]), float(tab['x'][i]), float(tab['z'][i])),
             'raw_coordinate': (float(tab['ry'][i]), float(tab['rx'][i]), float(tab['rz'][i])),
-            'fiducial_trace': {}, 'polymer': {}, 'rejected_hybes': {},
+            'fiducial_trace_adj': {}, 'fiducial_trace_raw': {},
+            'polymer_adj': {}, 'polymer_raw': {}, 'rejected_hybes': {},
             # empty comes back shape-(0,) exactly as AnAllele.save()
             # produces it (np.array([]) of an empty polymer)
             'final_polymer': (fp[fpo[i]:fpo[i + 1]] if fpo[i + 1] > fpo[i]
@@ -313,12 +334,23 @@ def unpack_alleles(grp):
             'provenance': (json.loads(prov[i]) if prov[i] else {}),
             'linked': bool(tab['linked'][i]),
             'linked_at': la if la else None})
-    vals, tr_hybe, tr_none = grp['tr_vals'][()], grp['tr_hybe'][()], grp['tr_isnone'][()]
-    for j, ai in enumerate(grp['tr_allele'][()]):
-        out[ai]['fiducial_trace'][_rd(tr_hybe[j])] = None if tr_none[j] else tuple(vals[j])
-    pvals, pl_hybe = grp['pl_vals'][()], grp['pl_hybe'][()]
-    for j, ai in enumerate(grp['pl_allele'][()]):
-        out[ai]['polymer'].setdefault(_rd(pl_hybe[j]), []).append(tuple(pvals[j]))
+    # trr_*/plr_* ABSENT means the file predates the raw fields, exactly
+    # as a missing provenance column does -- an honest empty, not an error.
+    for pre, key in (('tr', 'fiducial_trace_adj'), ('trr', 'fiducial_trace_raw')):
+        if pre + '_allele' not in grp:
+            continue
+        vals = grp[pre + '_vals'][()]
+        hybe = grp[pre + '_hybe'][()]
+        none = grp[pre + '_isnone'][()]
+        for j, ai in enumerate(grp[pre + '_allele'][()]):
+            out[ai][key][_rd(hybe[j])] = None if none[j] else tuple(vals[j])
+    for pre, key in (('pl', 'polymer_adj'), ('plr', 'polymer_raw')):
+        if pre + '_allele' not in grp:
+            continue
+        vals = grp[pre + '_vals'][()]
+        hybe = grp[pre + '_hybe'][()]
+        for j, ai in enumerate(grp[pre + '_allele'][()]):
+            out[ai][key].setdefault(_rd(hybe[j]), []).append(tuple(vals[j]))
     rj_hybe, rj_reason = grp['rj_hybe'][()], grp['rj_reason'][()]
     for j, ai in enumerate(grp['rj_allele'][()]):
         out[ai]['rejected_hybes'][_rd(rj_hybe[j])] = _rd(rj_reason[j])

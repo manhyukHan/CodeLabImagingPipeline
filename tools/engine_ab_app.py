@@ -173,7 +173,7 @@ def _score(mw, exp, fovs, pairs):
     for fov in fovs:
         for allele in mw.chromatin_alleles.of_fov((sp, fov)):
             poly = {}
-            for h, comps in (allele.polymer or {}).items():
+            for h, comps in (allele.polymer_adj or {}).items():
                 if comps:
                     best = max(comps, key=lambda c: c[3])
                     poly[h] = (float(best[0]), float(best[1]), float(best[2]))

@@ -78,8 +78,8 @@ def cell_dict(cid, fov):
 def allele_dict(aid, fov):
     return {'id': aid, 'fov': fov, 'cell': 1, 'anchor_uid': 7, 'anchor_channel': 1,
             'anchor_hybe': 'H1', 'coordinate': (1., 2., 3.), 'raw_coordinate': (1., 2., 3.),
-            'fiducial_trace': {'H2': np.array([1., 2., 3., 4.])},
-            'polymer': {'H2': [np.array([1., 2., 3., 4.])]},
+            'fiducial_trace_adj': {'H2': np.array([1., 2., 3., 4.])},
+            'polymer_adj': {'H2': [np.array([1., 2., 3., 4.])]},
             'rejected_hybes': {'H3': 'drift'},
             'final_polymer': np.array([[1., 2., 3.]]),
             'linked': False, 'linked_at': None}

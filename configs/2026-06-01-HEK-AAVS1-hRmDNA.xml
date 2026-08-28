@@ -1,0 +1,77 @@
+<settings
+  project_root="G:\Seonghyeok\2026-06-01-HEK-AAVS1-hRmDNA"
+  fov_list="1,2"
+  celltype_names="">
+  <modality
+    name="DNA" />
+  <cell_segmentation
+    reference_hybe=""
+    channel=""
+    method="Cellpose"
+    diameter="40"
+    min_size="1000"
+    max_size="10000"
+    classical_algorithm="Otsu"
+    classical_absolute_cutoff="1000.0"
+    classical_min_distance="7"
+    classical_min_size="500"
+    classical_max_size="10000"
+    append_mode="0"
+    projection="MIP (stored)"
+    z_plane="0"
+    z_start="0"
+    z_end="0" />
+  <fov_alignment
+    channel_type="fiducial"
+    border_trim="0"
+    max_shift="0" />
+  <cross_modal_alignment
+    channel_type="readout"
+    border_trim="0"
+    max_shift="0" />
+  <cell_alignment
+    channel_type="fiducial"
+    pad="10"
+    max_z_shift="15"
+    overlay_autosave_threshold_px="0" />
+  <spot_localization
+    hybe=""
+    channel=""
+    threshold_percent="50"
+    threshold_absolute=""
+    min_distance="3"
+    pad="10"
+    append_mode="0" />
+  <celltype
+    barcode_hybe=""
+    barcode_channel=""
+    method="Vote (200-sample)"
+    fov_ranges=""
+    calibration_fov=""
+    scale="1.0"
+    lower_bound_mode="Quantile"
+    lower_bound_value="0.3"
+    upper_bound_mode="Quantile"
+    upper_bound_value="0.999"
+    include_transient="1" />
+  <chromatin_tracing
+    reference_hybe=""
+    spad="8"
+    z_window="15"
+    z_boundary_trim="10"
+    max_fiducial_drift="5.0"
+    max_fiducial_drift_z="10.0"
+    fiducial_peak_bound="2.0"
+    readout_peak_bound="2.0"
+    fiducial_max_sigma="2.5"
+    readout_max_sigma="2.5"
+    fiducial_max_uncert="2.0"
+    readout_max_uncert="2.0"
+    fiducial_min_hb_ratio="1.2"
+    readout_min_hb_ratio="1.2"
+    fiducial_min_ah_ratio="0.25"
+    readout_min_ah_ratio="0.25"
+    readout_min_sep="3.0"
+    multi_component_fit="0"
+    hybes="" />
+</settings>

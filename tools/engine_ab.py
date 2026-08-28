@@ -90,7 +90,7 @@ def _one(item, st):
 
     out = {'i': i, 'fov': fov, 'cell': d['cell'], 'uid': d.get('uid', 0)}
     for engine, key in ((None, 'v1'), ('v2', 'v2')):
-        # A FRESH allele per arm: tracing fills fiducial_trace/polymer/
+        # A FRESH allele per arm: tracing fills fiducial_trace_adj/polymer_adj/
         # rejected_hybes in place, so reusing one would let the first arm
         # decide what the second even attempts.
         allele = AnAllele()
@@ -106,11 +106,11 @@ def _one(item, st):
                         v2_params=st['v2p'], spad=8, resolver=resolver)
         # keep only the brightest component per hybe; v1 can return several
         poly = {}
-        for h, comps in (allele.polymer or {}).items():
+        for h, comps in (allele.polymer_adj or {}).items():
             if comps:
                 best = max(comps, key=lambda c: c[3])
                 poly[h] = (float(best[0]), float(best[1]), float(best[2]))
-        out[key] = {'polymer': poly,
+        out[key] = {'polymer_adj': poly,
                     'n_rejected': len(allele.rejected_hybes or {}),
                     'seconds': time.perf_counter() - t0}
     return out
@@ -121,12 +121,12 @@ def _pairs(results, pairs, key):
     dy, dx, dz = VOXEL
     out, either = {}, 0
     for r in results:
-        poly = r[key]['polymer']
+        poly = r[key]['polymer_adj']
         for a, b, _rid in pairs:
             either += 1
             if a not in poly or b not in poly:
                 continue
-            # polymer entries are (x, y, z) in the shared frame
+            # polymer_adj entries are (x, y, z) in the shared frame
             pa, pb = np.array(poly[a]), np.array(poly[b])
             d = (pa - pb) * np.array([dx, dy, dz])
             out[(r['i'], a, b)] = (float(np.linalg.norm(d)),

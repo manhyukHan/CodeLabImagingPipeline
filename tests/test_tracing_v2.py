@@ -56,8 +56,8 @@ def main():
     check('v1 routes to localization.build_chromatin_trace_allele',
           got == 'V1' and m.call_count == 1)
     with mock.patch.object(L, 'build_chromatin_trace_allele') as m2:
-        allele = mock.Mock(coordinate=(0., 0., 0.), fiducial_trace={},
-                           polymer={}, rejected_hybes={})
+        allele = mock.Mock(coordinate=(0., 0., 0.), fiducial_trace_adj={},
+                           polymer_adj={}, rejected_hybes={})
         V2.trace_allele('v2', allele, [], 'R', {}, {}, '/nowhere', 1, 'DNA',
                         None, {})
     check('v2 does NOT call the v1 path', m2.call_count == 0)

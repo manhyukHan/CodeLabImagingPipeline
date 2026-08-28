@@ -812,9 +812,9 @@ class ChromatinTracingWorker(QtCore.QThread):
         # again.
         #
         # It used to filter per (allele, hybe) -- fit the hybes not yet in
-        # an allele's polymer or rejected_hybes -- and that is exactly what
+        # an allele's polymer_adj or rejected_hybes -- and that is exactly what
         # let an allele half-traced by one engine be finished by another,
-        # producing one polymer built from two estimators with nothing on
+        # producing one polymer_adj built from two estimators with nothing on
         # disk recording it. Which ALLELES run is now decided before the
         # worker starts, by AlleleContainer.has_traced against the
         # permanent tier (_run_chromatin_tracing_fit_all).
@@ -898,7 +898,7 @@ class ChromatinTracingWorker(QtCore.QThread):
             done += 1
             self.progress.emit(done, total,
                                f'FOV{fov:03d} allele {allele.id}: '
-                               f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
+                               f'{len(allele.polymer_adj)}/{len(self.hybes)} hybe(s) traced')
         return done
 
     def run(self):
@@ -950,7 +950,7 @@ class ChromatinTracingWorker(QtCore.QThread):
                         cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
                         # Per-allele guard: one bad allele (a corrupt crop,
                         # a degenerate fit) must not abort the remaining
-                        # ~hundreds. A failed allele's polymer/rejected_hybes
+                        # ~hundreds. A failed allele's polymer_adj/rejected_hybes
                         # are left untouched, so the next APPEND pass simply
                         # retries it -- failure is retry-able state, not a
                         # poisoned run.
@@ -974,7 +974,7 @@ class ChromatinTracingWorker(QtCore.QThread):
                             continue
                         done += 1
                         self.progress.emit(done, total, f'FOV{fov:03d} allele {allele.id}: '
-                                           f'{len(allele.polymer)}/{len(self.hybes)} hybe(s) traced')
+                                           f'{len(allele.polymer_adj)}/{len(self.hybes)} hybe(s) traced')
                     results[(storage_path, fov)] = alleles
                     self.fov_done.emit(storage_path, fov, alleles)
             finally:
@@ -1262,7 +1262,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Alleles used to be a single plain dict that Build REPLACED
         # wholesale, which made APPEND a per-hybe question ("which hybes
         # are not yet traced on this allele") and let one allele end up
-        # with a polymer built by two different engines. Membership -- is
+        # with a polymer_adj built by two different engines. Membership -- is
         # this allele committed yet -- is the question that actually
         # matches what a person means by append.
         self.chromatin_alleles = AlleleContainer()
@@ -7051,7 +7051,7 @@ class MainWindow(QtWidgets.QMainWindow):
                          f"anchor={a.anchor_hybe}/{a.anchor_channel} @ "
                          f"y={a.coordinate[0]:.1f}, x={a.coordinate[1]:.1f}, "
                          f"z={a.coordinate[2]:.1f} "
-                         f"[{len(a.polymer)} hybe(s) traced]"))
+                         f"[{len(a.polymer_adj)} hybe(s) traced]"))
         chp.populate_allele_list(rows)
         n_saved = self.chromatin_alleles_permanent.count(key)
         chp.AlleleCountLabel.setText(
@@ -7230,7 +7230,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chromatin_fiducial_total_overlay_displayer.show()
             self.chromatin_fiducial_total_overlay_displayer.raise_()
             self._refresh_chromatin_allele_lists(storage_path, fov)
-            chp.StatusLabel.setText(f'Allele {allele.id}: {len(allele.polymer)}/{len(hybes)} hybe(s) traced '
+            chp.StatusLabel.setText(f'Allele {allele.id}: {len(allele.polymer_adj)}/{len(hybes)} hybe(s) traced '
                                     f'({len(allele.rejected_hybes)} rejected).')
 
         def _fail(message):
@@ -7510,10 +7510,10 @@ class MainWindow(QtWidgets.QMainWindow):
         hybe's -- BEFORE as the trace actually cut them (centers already
         carry the modality/cell-residual correction via reference_to_raw)
         and AFTER with the moving crop shifted by the GAUSSIAN-CENTROID
-        drift (allele.fiducial_trace[h] - fiducial_trace[reference]) --
+        drift (allele.fiducial_trace_adj[h] - fiducial_trace_adj[reference]) --
         fiducial alignment is centroid matching, never image matching, so
         the applied shift IS the fit result. A hybe whose Gaussian fit
-        failed (fiducial_trace None / missing) is omitted, per explicit
+        failed (fiducial_trace_adj None / missing) is omitted, per explicit
         spec; so is the whole overlay when the reference itself has no
         fit, since every drift is measured against it.
         """
@@ -7565,7 +7565,7 @@ class MainWindow(QtWidgets.QMainWindow):
             shared_z - native_z for this hybe: the whole already-applied
             correction (FOV + cross-modal + the CELL-level residual dz),
             read straight off the two forms of the same fit rather than
-            recomputed. fiducial_trace holds the fit in the SHARED frame
+            recomputed. fiducial_trace_adj holds the fit in the SHARED frame
             (localization._localize_fiducial_hybe's sz = zf +
             cell_z_offset); debug's fiducial_centroid holds the very same
             fit as a plane index into that hybe's OWN crop.
@@ -7601,7 +7601,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return out
 
         Z_PAD = 15   # same z display window the fit-status grids use
-        fid = allele.fiducial_trace or {}
+        fid = allele.fiducial_trace_adj or {}
         ref_fit = fid.get(reference_hybe)
         ref_cubic = (debug.get(reference_hybe) or {}).get('fiducial_cubic')
         if ref_fit is None or ref_cubic is None:
@@ -7789,7 +7789,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
 
         # Overwrite re-traces every allele x hybe; Append fits only
-        # per-(allele, hybe) entries not yet in polymer/rejected_hybes,
+        # per-(allele, hybe) entries not yet in polymer_adj/rejected_hybes,
         # restricted to hybes whose stacks are really on disk for each
         # FOV (per explicit decision -- re-runnable as ingestion
         # advances, each pass filling the newly possible delta).
@@ -7803,10 +7803,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # staged but not yet COMMITTED WITH A TRACE. It used to ask
             # which HYBES were missing from an allele, which is what let a
             # half-traced allele be finished by a different engine and end
-            # up with one polymer built by two estimators.
+            # up with one polymer_adj built by two estimators.
             #
             # has_traced, not has: Add -> Save stages an allele with an
-            # empty polymer, and if mere presence counted as committed that
+            # empty polymer_adj, and if mere presence counted as committed that
             # allele could never be reached by append -- only by a full
             # Overwrite.
             filtered, already = [], 0

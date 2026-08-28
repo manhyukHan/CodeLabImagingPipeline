@@ -4,7 +4,7 @@ in every tile.
 
 Each hybe's tracing crop is cut in that hybe's OWN raw z frame -- the
 crop box spans the full stack depth and is never z-shifted -- while the
-fit stored in allele.fiducial_trace is in the SHARED frame (native z plus
+fit stored in allele.fiducial_trace_adj is in the SHARED frame (native z plus
 the FOV, cross-modal and CELL-level residual dz). The overlay builder
 took its z-window from the shared-frame reference fit and then sliced
 every raw cubic at those same indices, so the two sides of a tile showed
@@ -73,7 +73,7 @@ def build(cell_dz, drift):
     planes of genuine leftover shared-frame drift.
     """
     mov_native = REF_NATIVE - cell_dz + drift
-    allele = types.SimpleNamespace(fiducial_trace={
+    allele = types.SimpleNamespace(fiducial_trace_adj={
         # shared frame: native + that hybe's own offset
         'R': (10.0, 10.0, REF_NATIVE, 500.0),
         'M': (10.0, 10.0, mov_native + cell_dz, 500.0)})

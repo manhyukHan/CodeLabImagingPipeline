@@ -1,7 +1,7 @@
 <settings
   project_root="G:\Seonghyeok\2025-11-30-MP58"
   fov_list="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
-  celltype_names="">
+  celltype_names="8B1,4A3,WT">
   <modality
     name="DNA" />
   <modality
@@ -24,10 +24,11 @@
     z_start="0"
     z_end="109" />
   <fov_alignment
-    reference_hybe="Hyb_101 (RNA)"
     channel_type="fiducial"
     border_trim="0"
-    max_shift="0" />
+    max_shift="0"
+    reference_hybe_DNA="Hyb_016"
+    reference_hybe_RNA="Hyb_101" />
   <cross_modal_alignment
     channel_type="fiducial"
     border_trim="0"
@@ -38,7 +39,7 @@
     channel_type="fiducial"
     pad="10"
     max_z_shift="55"
-    overlay_autosave_threshold_px="0"
+    overlay_autosave_threshold_px="5"
     reference_hybe_DNA="Hyb_015"
     reference_hybe_RNA="Hyb_101" />
   <spot_localization
@@ -62,20 +63,20 @@
     upper_bound_value="0.999"
     include_transient="1" />
   <chromatin_tracing
-    reference_hybe="Hyb_015 (DNA)"
+    reference_hybe="Hyb_031 (DNA)"
     spad="8"
     z_window="15"
-    z_boundary_trim="10"
-    max_fiducial_drift="5.0"
-    max_fiducial_drift_z="10.0"
-    fiducial_peak_bound="2.0"
-    readout_peak_bound="2.0"
-    fiducial_max_sigma="2.5"
-    readout_max_sigma="2.5"
-    fiducial_max_uncert="2.0"
-    readout_max_uncert="2.0"
+    z_boundary_trim="2"
+    max_fiducial_drift="15.0"
+    max_fiducial_drift_z="33.0"
+    fiducial_peak_bound="10.0"
+    readout_peak_bound="6.0"
+    fiducial_max_sigma="5.0"
+    readout_max_sigma="3.0"
+    fiducial_max_uncert="10.0"
+    readout_max_uncert="2.5"
     fiducial_min_hb_ratio="1.2"
-    readout_min_hb_ratio="1.2"
+    readout_min_hb_ratio="1.05"
     fiducial_min_ah_ratio="0.25"
     readout_min_ah_ratio="0.25"
     readout_min_sep="3.0"

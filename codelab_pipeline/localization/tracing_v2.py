@@ -592,8 +592,10 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     # Leaving the branch in place would advertise a mode nothing selects
     # and invite a future caller to switch it on, which is exactly how the
     # per-hybe append rule survived long enough to mix two engines'
-    # estimates inside one polymer.
-    allele.fiducial_trace, allele.polymer, allele.rejected_hybes = {}, {}, {}
+    # estimates inside one polymer_adj.
+    allele.fiducial_trace_adj, allele.polymer_adj = {}, {}
+    allele.fiducial_trace_raw, allele.polymer_raw = {}, {}
+    allele.rejected_hybes = {}
     debug = {} if collect_debug else None
     # (y, x). NOT (x, y). allele.coordinate is rasterized order (y, x, z)
     # per models/allele.py, and spot_mapper.reference_to_raw unpacks
@@ -693,8 +695,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             allele.rejected_hybes[hybe] = f'fiducial {why}'
             continue
         ymin, xmin = fid_origin[hybe]
-        allele.fiducial_trace[hybe] = _to_shared(hybe, f.y, f.x, f.z, ymin, xmin) \
+        allele.fiducial_trace_adj[hybe] = _to_shared(hybe, f.y, f.x, f.z, ymin, xmin) \
             + (float(f.amplitude),)
+        # The SAME fit, before any matrix: crop-local plus the crop's own
+        # origin. ymin/xmin are the actual origin, clamp included, so this
+        # indexes that hybe's full frame directly and the image can be
+        # re-reached without inverting anything.
+        allele.fiducial_trace_raw[hybe] = (float(f.y + ymin), float(f.x + xmin),
+                                           float(f.z), float(f.amplitude))
         fid_local[hybe] = (f.y, f.x, f.z)
         if debug is not None:
             debug[hybe]['fiducial_centroid'] = (f.x, f.y, f.z)
@@ -717,7 +725,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         if debug is not None:
             debug.setdefault(reference_hybe, {})['reference_warning'] = ref_note
 
-    baseline = allele.fiducial_trace.get(reference_hybe)
+    baseline = allele.fiducial_trace_adj.get(reference_hybe)
 
     # -- phase 3: the drift gate, then the readouts ---------------------
     for hybe in hybes:
@@ -749,7 +757,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                     pass
         if hybe in allele.rejected_hybes:
             continue
-        fid = allele.fiducial_trace.get(hybe)
+        fid = allele.fiducial_trace_adj.get(hybe)
         if baseline is None:
             allele.rejected_hybes[hybe] = 'reference hybe fiducial not found'
             continue
@@ -810,15 +818,21 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # (y, x, z, amplitude) -- y FIRST, matching v1's actual code at
         # localization.py:995 and the whole store's yx convention (see
         # legacy/migrate_store_to_yx.py, which exists purely to enforce it
-        # and swaps polymer entries along with coordinate/fiducial_trace).
+        # and swaps polymer_adj entries along with coordinate/fiducial_trace_adj).
         #
         # v1's DOCSTRING for _localize_readout_hybe says "(x, y, z,
         # amplitude)" and is stale -- it predates that migration. Writing
         # this tuple x-first, as the docstring implies, mirrors every
         # traced position relative to v1 while remaining a perfectly
         # well-formed 4-tuple that nothing downstream can detect.
-        allele.polymer[hybe] = [(float(sy + dy), float(sx + dx), float(sz + dz),
-                                 float(r.amplitude))]
+        allele.polymer_adj[hybe] = [(float(sy + dy), float(sx + dx), float(sz + dz),
+                                     float(r.amplitude))]
+        # Raw carries NO correction of any kind -- neither the alignment
+        # nor the fiducial drift. adj - raw for a READOUT is therefore
+        # alignment PLUS fiducial correction, one term more than the same
+        # difference on a fiducial. See AnAllele's docstring.
+        allele.polymer_raw[hybe] = [(float(r.y + ymin), float(r.x + xmin),
+                                     float(r.z), float(r.amplitude))]
         if debug is not None:
             debug[hybe]['readout_centroids'] = [(r.x, r.y, r.z)]
     return allele, debug
@@ -869,7 +883,8 @@ def allele_task(payload):
         modality, cell, fov_matrices, params=params,
         max_fiducial_drift=max_drift, max_fiducial_drift_z=max_drift_z,
         spad=spad, collect_debug=False, resolver=resolver)
-    return (int(meta['id']), allele.fiducial_trace, allele.polymer,
+    return (int(meta['id']), allele.fiducial_trace_adj, allele.polymer_adj,
+            allele.fiducial_trace_raw, allele.polymer_raw,
             allele.rejected_hybes, getattr(allele, 'reference_warning', None),
             dict(getattr(allele, 'provenance', {}) or {}))
 
@@ -900,16 +915,20 @@ def allele_task_with_debug(payload):
         modality, cell, fov_matrices, params=params,
         max_fiducial_drift=max_drift, max_fiducial_drift_z=max_drift_z,
         spad=spad, collect_debug=True, resolver=resolver)
-    return ((int(meta['id']), allele.fiducial_trace, allele.polymer,
+    return ((int(meta['id']), allele.fiducial_trace_adj, allele.polymer_adj,
+             allele.fiducial_trace_raw, allele.polymer_raw,
              allele.rejected_hybes, getattr(allele, 'reference_warning', None),
              dict(allele.provenance or {})), debug)
 
 
 def apply_allele_result(allele, result):
     """Merge a child's result into the parent's own AnAllele, in place."""
-    _aid, fiducial_trace, polymer, rejected, warning, provenance = result
-    allele.fiducial_trace = fiducial_trace
-    allele.polymer = polymer
+    (_aid, fiducial_trace_adj, polymer_adj, fiducial_trace_raw, polymer_raw,
+     rejected, warning, provenance) = result
+    allele.fiducial_trace_adj = fiducial_trace_adj
+    allele.polymer_adj = polymer_adj
+    allele.fiducial_trace_raw = fiducial_trace_raw
+    allele.polymer_raw = polymer_raw
     allele.rejected_hybes = rejected
     if warning:
         allele.reference_warning = warning

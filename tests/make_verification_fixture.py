@@ -26,7 +26,7 @@ Layers armed afterwards (verified inventory printed at the end):
     (inheriting celltype), background spots, and mixture_centroids
     carriers.
   - chromatin-tracing alleles anchored on real assigned DNA spots, with
-    fiducial_trace / polymer (incl. a sister-chromatid candidate pair) /
+    fiducial_trace_adj / polymer_adj (incl. a sister-chromatid candidate pair) /
     rejected_hybes / final_polymer.
 """
 import os
@@ -68,7 +68,7 @@ def build_alleles(w, fov, dna_hybes):
     for aid, s in enumerate(anchors, start=1):
         a = AnAllele()
         ax, ay, az = s.adj_coordinate
-        fiducial, polymer, rejected = {}, {}, {}
+        fiducial, polymer_adj, rejected = {}, {}, {}
         for j, h in enumerate(dna_hybes):
             if j == len(dna_hybes) - 1 and aid == 1:
                 rejected[h] = 'fiducial drift above bound (fixture)'
@@ -80,13 +80,13 @@ def build_alleles(w, fov, dna_hybes):
             if j == 1:                              # sister-chromatid pair
                 cands.append((cands[0][0] + 2.1, cands[0][1] - 1.7,
                               cands[0][2] + 0.5, float(rng.uniform(500, 2500))))
-            polymer[h] = cands
+            polymer_adj[h] = cands
         a.set_metadata(id=aid, fov=fov, cell=int(s.cell), anchor_hybe=s.hybe,
                        anchor_channel=int(s.channel),
                        adj_coordinate=tuple(map(float, s.adj_coordinate)),
                        raw_coordinate=tuple(map(float, s.raw_coordinate)))
-        a.fiducial_trace, a.polymer, a.rejected_hybes = fiducial, polymer, rejected
-        a.final_polymer = np.array([max(v, key=lambda t: t[3])[:3] for v in polymer.values()])
+        a.fiducial_trace_adj, a.polymer_adj, a.rejected_hybes = fiducial, polymer_adj, rejected
+        a.final_polymer = np.array([max(v, key=lambda t: t[3])[:3] for v in polymer_adj.values()])
         alleles.append(a)
     return alleles
 

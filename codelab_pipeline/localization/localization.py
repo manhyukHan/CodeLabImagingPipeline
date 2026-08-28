@@ -958,7 +958,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     corrected (empty if none accepted). Y FIRST: this said "(x, y, z,
     amplitude)" until 2026-08-27 and was stale -- it predates
     legacy/migrate_store_to_yx.py, which swapped the whole store to yx
-    order, polymer entries included. The code below has always appended
+    order, polymer_adj entries included. The code below has always appended
     (sy + dy, sx + dx, ...). A reimplementation trusted the docstring over
     the code and mirrored every traced position; cubic/crop_local_xyz_list are for
     display only, same "always returned, caller discards if unused"
@@ -1083,7 +1083,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                                  collect_debug=False, resolver=None, z_boundary_trim=0, executor=None,
                                  append=False):
     """
-    Fills in allele.fiducial_trace/polymer/rejected_hybes for every hybe in
+    Fills in allele.fiducial_trace_adj/polymer_adj/rejected_hybes for every hybe in
     `hybes` (folder names) -- full replace by default, same "re-run
     overwrites" convention as _replace_cell_spots/_replace_fov_unassigned_
     spots elsewhere in this app.
@@ -1092,9 +1092,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
     Fit All FOVs Append option): the three dicts are NOT reset, only the
     requested `hybes` are (re)fitted and merged in, and the reference
     hybe's fiducial baseline is REUSED from the allele's stored
-    fiducial_trace when present (a fiducial baseline is a physical fact
+    fiducial_trace_adj when present (a fiducial baseline is a physical fact
     about the reference stack -- new hybes landing on disk do not change
-    it; AnAllele.save round-trips fiducial_trace, so the baseline
+    it; AnAllele.save round-trips fiducial_trace_adj, so the baseline
     survives sessions). When the stored baseline is missing and
     reference_hybe is not among `hybes`, its fiducial alone is fitted as
     an extra so phase 2's delta gate has a real baseline rather than
@@ -1103,9 +1103,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
     Two phases:
 
     1. Fiducial-only fit for every hybe (_localize_fiducial_hybe) ->
-       allele.fiducial_trace[hybe].
-    2. baseline = allele.fiducial_trace[reference_hybe]; for every other
-       hybe, delta = baseline - fiducial_trace[hybe] (shared frame); reject
+       allele.fiducial_trace_adj[hybe].
+    2. baseline = allele.fiducial_trace_adj[reference_hybe]; for every other
+       hybe, delta = baseline - fiducial_trace_adj[hybe] (shared frame); reject
        (allele.rejected_hybes[hybe] = reason, no readout fit attempted) when
        either fiducial is missing, or the XY magnitude of delta exceeds
        max_fiducial_drift -- per explicit request, evaluated in the shared
@@ -1116,7 +1116,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
        alignment / the mixture-sibling QC gates each bound XY and Z
        separately, never combined) -- otherwise fits the readout channel
        (_localize_readout_hybe) and stores its delta-corrected candidates
-       in allele.polymer[hybe].
+       in allele.polymer_adj[hybe].
 
     hybe_fiducial_channels/hybe_readout_channels: {hybe: channel(int)} --
     one entry per hybe each, independently resolved from that hybe's own
@@ -1167,9 +1167,19 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
 
     Mutates allele in place either way.
     """
+    # v1 FILLS _adj ONLY -- it has no raw counterpart to write, and this
+    # module is the frozen reference implementation, so it does not grow
+    # one. But it must still CLEAR raw, and per-hybe in append mode:
+    # re-tracing a v2 allele with v1 would otherwise leave v2's
+    # fiducial_trace_raw/polymer_raw sitting beside v1's freshly written
+    # _adj, silently pairing a raw from one engine with an adj from
+    # another. An empty raw honestly says "this engine did not record
+    # one"; a stale one is a lie that nothing downstream could detect.
     if not append:
-        allele.fiducial_trace = {}
-        allele.polymer = {}
+        allele.fiducial_trace_adj = {}
+        allele.polymer_adj = {}
+        allele.fiducial_trace_raw = {}
+        allele.polymer_raw = {}
         allele.rejected_hybes = {}
     else:
         # merge mode: keep what earlier passes established; a hybe in
@@ -1177,7 +1187,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
         # overwritten), only hybes OUTSIDE the request are left alone.
         for hybe in hybes:
             allele.rejected_hybes.pop(hybe, None)
-            allele.polymer.pop(hybe, None)
+            allele.polymer_adj.pop(hybe, None)
+            allele.polymer_raw.pop(hybe, None)
+            allele.fiducial_trace_raw.pop(hybe, None)
     shared_xy = (allele.coordinate[0], allele.coordinate[1])
     debug = {} if collect_debug else None
 
@@ -1197,11 +1209,11 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                            'readout_cubic': None, 'readout_centroids': None}
         fid_channel = hybe_fiducial_channels.get(hybe)
         if fid_channel is None:
-            allele.fiducial_trace[hybe] = None
+            allele.fiducial_trace_adj[hybe] = None
             allele.rejected_hybes[hybe] = 'no fiducial channel configured'
             continue
         fid_todo.append((hybe, fid_channel))
-    if append and reference_hybe not in hybes and allele.fiducial_trace.get(reference_hybe) is None:
+    if append and reference_hybe not in hybes and allele.fiducial_trace_adj.get(reference_hybe) is None:
         # the delta gate below needs the reference baseline; in append
         # mode it normally comes stored from the earlier pass, but a
         # first-ever append (or a legacy allele saved without it) must
@@ -1214,7 +1226,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             fid_todo.append((reference_hybe, ref_channel))
 
     def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid):
-        allele.fiducial_trace[hybe] = fid_result
+        allele.fiducial_trace_adj[hybe] = fid_result
         if debug is not None:
             debug[hybe]['fiducial_cubic'] = fid_cubic
             debug[hybe]['fiducial_centroid'] = fid_centroid
@@ -1233,7 +1245,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                 resolver=resolver, **fiducial_kwargs)
             _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid)
 
-    baseline = allele.fiducial_trace.get(reference_hybe)
+    baseline = allele.fiducial_trace_adj.get(reference_hybe)
     # -- phase 2a: the drift gate. Cheap arithmetic, stays serial; produces
     # per hybe (reject_reason, delta, readout_channel) so the fits below can
     # run detached from the gating.
@@ -1243,7 +1255,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
         # channel configured'); otherwise derive it from this hybe's own
         # fiducial vs. the reference's.
         reject_reason = allele.rejected_hybes.get(hybe)
-        fid = allele.fiducial_trace.get(hybe)
+        fid = allele.fiducial_trace_adj.get(hybe)
         delta = (0.0, 0.0, 0.0)
         if reject_reason is None:
             if baseline is None:
@@ -1315,7 +1327,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.rejected_hybes[hybe] = reject_reason
             continue
         if candidates:
-            allele.polymer[hybe] = candidates
+            allele.polymer_adj[hybe] = candidates
         else:
             allele.rejected_hybes[hybe] = 'no readout peak accepted'
     return (allele, debug) if collect_debug else allele

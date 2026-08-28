@@ -128,7 +128,7 @@ def populate_allele_tree(tree, allele_dicts):
     tree.clear()
     for a in allele_dicts:
         cell_label = 'unassigned' if a.get('cell', -1) == -1 else f"cell {a.get('cell')}"
-        n_traced = len(a.get('polymer', {}))
+        n_traced = len(a.get('polymer_adj', {}))
         _add_lazy_top(tree, f"Allele {a.get('id')} ({cell_label}, {n_traced} hybe(s) traced)", a)
 
 
@@ -202,7 +202,7 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     FOV alone -- a cell IS FOV-scoped), Spots (scoped by FOV + hybe +
     channel, since a real spot always belongs to exactly one of each),
     and Alleles (scoped by FOV alone, same as Cells -- an allele's own
-    polymer dict already spans every traced hybe internally, no further
+    polymer_adj dict already spans every traced hybe internally, no further
     sub-scoping needed). Each panel's own combo selection re-reads and
     re-populates that panel's own tree live; the top-level Refresh button
     additionally re-reads storage_path's own FOV list from scratch and

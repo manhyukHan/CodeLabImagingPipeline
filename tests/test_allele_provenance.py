@@ -38,7 +38,7 @@ def make(aid=1, provenance=None):
     a.set_metadata(id=aid, fov=1, cell=7, anchor_uid=aid, anchor_hybe='Hyb_016',
                    anchor_channel=555, coordinate=(100.0, 200.0, 30.0),
                    raw_coordinate=(101.0, 201.0, 31.0))
-    a.polymer = {'Hyb_020': [(1.0, 2.0, 3.0, 500.0)]}
+    a.polymer_adj = {'Hyb_020': [(1.0, 2.0, 3.0, 500.0)]}
     if provenance is not None:
         a.provenance = provenance
     return a
@@ -108,8 +108,8 @@ def main():
           'good, they just do not know how they were made',
           old[0]['provenance'] == {}, repr(old[0]['provenance']))
     check('its real data is untouched',
-          old[0]['polymer']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)],
-          str(old[0]['polymer']))
+          old[0]['polymer_adj']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)],
+          str(old[0]['polymer_adj']))
 
     print('\nthe engines stamp it')
     from codelab_pipeline.localization import tracing_v2 as V2

@@ -18,7 +18,7 @@ that only the Fit All run ever wrote. Two consequences, both real:
     app lost every allele that had not just been fitted;
   * APPEND meant "hybes not yet traced on this allele", which is a
     per-hybe rule. An allele half-traced by one engine could be finished
-    by another, leaving one polymer built from two estimators with nothing
+    by another, leaving one polymer_adj built from two estimators with nothing
     on disk saying so.
 
 With two tiers, append becomes a MEMBERSHIP question -- trace the alleles
@@ -85,14 +85,14 @@ class AlleleContainer:
         """Present AND carrying at least one traced hybe.
 
         The membership test append uses. Presence alone would be wrong:
-        Build -> Save stages an allele with an empty polymer, and if that
+        Build -> Save stages an allele with an empty polymer_adj, and if that
         counted as committed the allele could never be fitted by append --
         only a full Overwrite would ever reach it. Requiring a non-empty
-        polymer makes "saved but not yet traced" a recoverable state
+        polymer_adj makes "saved but not yet traced" a recoverable state
         instead of a trap.
         """
         a = self.by_id(key, allele_id)
-        return bool(a is not None and getattr(a, 'polymer', None))
+        return bool(a is not None and getattr(a, 'polymer_adj', None))
 
     def remove(self, key, allele_ids):
         """Drop alleles from THIS tier only.
