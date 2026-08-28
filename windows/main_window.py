@@ -7111,6 +7111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cell = self._find_cell_by_id(fov, allele.cell) if allele.cell != -1 else None
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
 
+        chp._voxel_um = self._voxel_um()
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
         resolver = self._frame_resolver(None, fov)
@@ -7207,6 +7208,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._chromatin_preview_worker.finished_ok.connect(_done)
         self._chromatin_preview_worker.failed.connect(_fail)
         self._chromatin_preview_worker.start()
+
+    def _voxel_um(self):
+        """(dy, dx, dz) in micrometres, from the Ingestion panel.
+
+        ONE pair of widgets for the whole app. Anything that needs
+        physical length asks here rather than carrying its own copy --
+        two copies would eventually disagree, and a voxel size that
+        disagrees with the data is not detectable from the numbers it
+        produces.
+        """
+        ip = self.ui.IngestionPanel
+        xy = float(ip.VoxelXYSpinBox.value())
+        return (xy, xy, float(ip.VoxelZSpinBox.value()))
 
     def _chromatin_v2_params(self, full_params, storage_path, install=True):
         """V2Params for this run, or None when v1 is selected.
@@ -7684,6 +7698,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "add them per FOV first.")
             return
 
+        chp._voxel_um = self._voxel_um()
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
 
@@ -11038,6 +11053,14 @@ One PNG PER MODALITY: each modality has its own reference and its
     # per-modality reference_hybe_{name} (a dict of dynamic combos) and
     # chromatin_tracing's checked-hybe list.
     _CONFIG_PARAM_MAP = {
+        # Experiment-level, not step-level: the voxel size is a property of
+        # the microscope and every analysis step that reasons in physical
+        # length reads the SAME pair. It sat in chromatin_tracing while v2
+        # was the only consumer, which made it look like a tracing setting.
+        'acquisition': {
+            'voxel_xy_um': ('IngestionPanel', 'VoxelXYSpinBox'),
+            'voxel_z_um': ('IngestionPanel', 'VoxelZSpinBox'),
+        },
         'cell_segmentation': {
             'reference_hybe': ('CellSegmentPanel', 'ReferenceHybeComboBox'),
             'channel': ('CellSegmentPanel', 'ChannelComboBox'),
@@ -11120,8 +11143,6 @@ One PNG PER MODALITY: each modality has its own reference and its
             'v2_fiducial_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2FiducialMaxUncertZSpinBox'),
             'v2_readout_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2ReadoutMaxUncertZSpinBox'),
             'v2_qc_shift': ('ChromatinTracingPanel', 'V2QcShiftCheckBox'),
-            'voxel_xy_um': ('ChromatinTracingPanel', 'VoxelXYSpinBox'),
-            'voxel_z_um': ('ChromatinTracingPanel', 'VoxelZSpinBox'),
             'readout_psf': ('ChromatinTracingPanel', 'ReadoutPsfComboBox'),
             'spad': ('ChromatinTracingPanel', 'SpadSpinBox'),
             'z_window': ('ChromatinTracingPanel', 'ZWindowSpinBox'),

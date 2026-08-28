@@ -5,6 +5,11 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 
 from codelab_pipeline.io import preprocess
 
+# The microscope's voxel size, in micrometres. Experiment-level, so it
+# lives here rather than on whichever analysis panel happened to need it
+# first. Defaults are this lab's own; every store should set its own.
+VOXEL_DEFAULTS = {'voxel_xy_um': 0.208, 'voxel_z_um': 0.2}
+
 
 # {(dax_directory, folder): bool} -- session cache of "does this hybe
 # folder hold real .dax data". Raw acquisition data essentially never
@@ -132,6 +137,39 @@ class IngestionPanelUI(object):
         self.FovListLineEdit = QtWidgets.QLineEdit()
         self.FovListLineEdit.setPlaceholderText('e.g. 1,2,3 or 1-10,15,20-25 or 1 2 3 (comma and/or space separated)')
         form.addRow('FOV list (all modalities):', self.FovListLineEdit)
+
+        # VOXEL SIZE IS A PROPERTY OF THE MICROSCOPE, not of one analysis
+        # step. It lived on the chromatin-tracing panel because v2 was the
+        # first thing to need it, which made it look like a tracing
+        # setting; it is entered once here instead, travels in the config,
+        # and every consumer reads it from one place.
+        #
+        # Lateral and axial are SEPARATE inputs and neither is derived from
+        # the other. On this microscope a pixel is 0.208 um and a plane
+        # 0.2 um -- close enough that assuming a ratio looks harmless, and
+        # v1's axial gate did exactly that (2x the lateral, in pixels) and
+        # was wrong by construction.
+        voxelRow = QtWidgets.QWidget()
+        voxelLayout = QtWidgets.QHBoxLayout(voxelRow)
+        voxelLayout.setContentsMargins(0, 0, 0, 0)
+        self.VoxelXYSpinBox = QtWidgets.QDoubleSpinBox()
+        self.VoxelXYSpinBox.setDecimals(4)
+        self.VoxelXYSpinBox.setRange(0.0001, 10.0)
+        self.VoxelXYSpinBox.setSingleStep(0.001)
+        self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
+        self.VoxelXYSpinBox.setSuffix(' um/px')
+        self.VoxelZSpinBox = QtWidgets.QDoubleSpinBox()
+        self.VoxelZSpinBox.setDecimals(4)
+        self.VoxelZSpinBox.setRange(0.0001, 20.0)
+        self.VoxelZSpinBox.setSingleStep(0.001)
+        self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])
+        self.VoxelZSpinBox.setSuffix(' um/plane')
+        voxelLayout.addWidget(QtWidgets.QLabel('lateral'))
+        voxelLayout.addWidget(self.VoxelXYSpinBox)
+        voxelLayout.addWidget(QtWidgets.QLabel('axial'))
+        voxelLayout.addWidget(self.VoxelZSpinBox)
+        voxelLayout.addStretch(1)
+        form.addRow('Voxel size:', voxelRow)
 
         self.ParseLayoutPushButton = QtWidgets.QPushButton('Parse Layouts (all modalities)')
         layout.addWidget(self.ParseLayoutPushButton)

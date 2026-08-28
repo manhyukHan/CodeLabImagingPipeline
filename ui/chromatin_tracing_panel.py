@@ -240,6 +240,13 @@ class ChromatinTracingPanelUI(object):
         engineForm = QtWidgets.QFormLayout()
         paramsOuter.addLayout(engineForm)
 
+        # Filled by MainWindow from the Ingestion panel before params()
+        # is read. A default here only covers a panel constructed alone,
+        # as the tests do.
+        self._voxel_um = (VOXEL_DEFAULTS['voxel_xy_um'],
+                          VOXEL_DEFAULTS['voxel_xy_um'],
+                          VOXEL_DEFAULTS['voxel_z_um'])
+
         self.EngineComboBox = QtWidgets.QComboBox()
         # itemData, not display text. The config round-trips on this, so
         # renaming a label ("v2" -> "v2 (calibrated PSF)") must not turn
@@ -253,19 +260,6 @@ class ChromatinTracingPanelUI(object):
             'reference implementation. v2 fits in micrometres with a boxed\n'
             'fit domain, a linear background, and a calibrated readout PSF.')
         engineForm.addRow('Fit engine:', self.EngineComboBox)
-
-        voxelRow = QtWidgets.QHBoxLayout()
-        self.VoxelXYSpinBox = double_spin(DEFAULT_PARAMS['voxel_xy_um'],
-                                          0.01, 2.0, step=0.001, decimals=4)
-        self.VoxelXYSpinBox.setSuffix(' um/px')
-        self.VoxelZSpinBox = double_spin(DEFAULT_PARAMS['voxel_z_um'],
-                                         0.01, 5.0, step=0.001, decimals=4)
-        self.VoxelZSpinBox.setSuffix(' um/plane')
-        voxelRow.addWidget(QtWidgets.QLabel('lateral'))
-        voxelRow.addWidget(self.VoxelXYSpinBox)
-        voxelRow.addWidget(QtWidgets.QLabel('axial'))
-        voxelRow.addWidget(self.VoxelZSpinBox)
-        engineForm.addRow('Voxel size (v2):', voxelRow)
 
         # The readout PSF is CHOSEN, not derived here. Entries come from
         # the tracked library in <repo>/psf, which accumulates every
@@ -647,9 +641,10 @@ class ChromatinTracingPanelUI(object):
                            or self.EngineComboBox.currentText()),
                 'engine_label': self.EngineComboBox.currentText(),
                 'v2': self.v2_params(),
-                'voxel_um': (self.VoxelXYSpinBox.value(),
-                             self.VoxelXYSpinBox.value(),
-                             self.VoxelZSpinBox.value()),
+                # NOT read here any more: voxel size is experiment-level
+                # and lives on the Ingestion panel. MainWindow injects it,
+                # so there is exactly one widget pair for it in the app.
+                'voxel_um': self._voxel_um,
                 'readout_psf': self.ReadoutPsfComboBox.currentData()
                                or self.ReadoutPsfComboBox.currentText(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
@@ -896,8 +891,6 @@ class ChromatinTracingPanelUI(object):
                 w.setValue(0.0 if v is None else float(v))
         self.V2QcShiftCheckBox.setChecked(bool(V2.V2Params().qc_shift))
         self.apply_engine_visibility()
-        self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
-        self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])
         self.refresh_psf_entries(select=DEFAULT_READOUT_PSF)
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])
         self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
