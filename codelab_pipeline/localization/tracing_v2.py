@@ -88,7 +88,14 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 Z_PLACEMENT = 'consensus'
 
 # Retry a gate-failed fiducial fit once from the argmax seed. See the
-# fallback site in the trace loop for the basin story and the numbers.
+# fallback site in the trace loop for the basin story and the accuracy
+# numbers. TIME cost, measured on MP58 FOV1 (127 alleles x 73 hybes,
+# 32-worker pool): 97.5 -> 113.9 s wall, +16.8%. The delta closes
+# arithmetically as pure retries -- ~12.4 gate-failed fiducials per
+# allele x ~0.33 s per fit x 32 workers -- so the fallback costs exactly
+# what it fits and nothing else. For scale, allele-level parallelism
+# itself is ~19x on this machine (36.4 min serial -> 1.9 min), so the
+# retry costs about 16 s per FOV against the 34 min the pool saves.
 FIDUCIAL_SEED_FALLBACK = True
 
 # -- gates, per channel, in NANOMETRES ------------------------------------
