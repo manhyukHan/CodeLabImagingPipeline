@@ -58,28 +58,65 @@ def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
     return fig
 
 
-def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1):
-    """Per-FOV ensembles + their pairwise SCC matrix -- QC view 2."""
-    res = ens.fov_consistency(dmaps, fovs, mask, min_n=min_n)
-    k = len(res['fovs'])
-    fig, axes = plt.subplots(1, k + 1, figsize=(3.4 * (k + 1), 3.8),
+def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None):
+    """FOV-level QC: per-FOV ensembles, SCC matrix, and the MSD TEST.
+
+    group_masks decomposes the whole view -- celltype-decompose means
+    THREE FOV matrices, not one, per the flag principle: flags multiply
+    figures. One ROW per group: its per-FOV maps, its SCC matrix, and
+    the in-FOV vs cross-FOV allele-map MSD distributions with the Welch
+    verdict. The MSD test is the quantitative instrument: SCC compares
+    two grainy ensembles (one number per FOV pair) while the MSD
+    histogram carries thousands of allele pairs per class -- p-values
+    are ranking scores (pairs share alleles; see fov_msd_test).
+    """
+    groups = [('all', mask)] if not group_masks else list(group_masks.items())
+    all_fovs = sorted(set(int(f) for f in np.asarray(fovs)))
+    k = len(all_fovs)
+    ncols = k + 2
+    fig, axes = plt.subplots(len(groups), ncols,
+                             figsize=(3.1 * ncols, 3.5 * len(groups)),
                              squeeze=False)
-    for ax, f in zip(axes[0], res['fovs']):
-        _dmap_ax(ax, res['maps'][f], f'FOV{f:03d}')
-    ax = axes[0][-1]
-    im = ax.imshow(res['scc'], cmap='viridis', vmin=0, vmax=1)
-    ax.set_xticks(range(k))
-    ax.set_yticks(range(k))
-    ax.set_xticklabels([str(f) for f in res['fovs']], fontsize=8)
-    ax.set_yticklabels([str(f) for f in res['fovs']], fontsize=8)
-    for i in range(k):
-        for j in range(k):
-            ax.text(j, i, f'{res["scc"][i, j]:.2f}', ha='center',
-                    va='center', fontsize=7,
-                    color='white' if res['scc'][i, j] < 0.6 else 'black')
-    ax.set_title('pairwise SCC', fontsize=9)
-    fig.colorbar(im, ax=ax, shrink=0.8)
-    fig.suptitle('FOV-level consistency', fontsize=11)
+    for row, (name, gmask) in enumerate(groups):
+        res = ens.fov_consistency(dmaps, fovs, gmask, min_n=min_n)
+        for col, f in enumerate(all_fovs):
+            ax = axes[row][col]
+            if f in res['maps']:
+                _dmap_ax(ax, res['maps'][f], f'{name}  FOV{f:03d}')
+            else:
+                ax.set_axis_off()
+        ax = axes[row][k]
+        kk = len(res['fovs'])
+        im = ax.imshow(res['scc'], cmap='viridis', vmin=0, vmax=1)
+        ax.set_xticks(range(kk))
+        ax.set_yticks(range(kk))
+        ax.set_xticklabels([str(f) for f in res['fovs']], fontsize=7)
+        ax.set_yticklabels([str(f) for f in res['fovs']], fontsize=7)
+        for i in range(kk):
+            for j in range(kk):
+                ax.text(j, i, f'{res["scc"][i, j]:.2f}', ha='center',
+                        va='center', fontsize=6,
+                        color='white' if res['scc'][i, j] < 0.6 else 'black')
+        ax.set_title(f'{name}: SCC', fontsize=9)
+
+        ax = axes[row][k + 1]
+        t = ens.fov_msd_test(dmaps, fovs, gmask)
+        if len(t['msd_in']) and len(t['msd_cross']):
+            edges = np.histogram_bin_edges(
+                np.concatenate([t['msd_in'], t['msd_cross']]), bins=40)
+            ax.hist(t['msd_cross'], bins=edges, density=True, alpha=0.5,
+                    color='0.6', label=f"cross-FOV (n={len(t['msd_cross'])})")
+            ax.hist(t['msd_in'], bins=edges, density=True, alpha=0.6,
+                    color='crimson', label=f"in-FOV (n={len(t['msd_in'])})")
+            ax.legend(fontsize=7)
+            per = '  '.join(f"F{d['fov']}:{d['signed_neglog10p']:+.1f}"
+                            for d in t['per_fov'])
+            ax.set_title(f"{name}: MSD  -log10 p = {t['neglog10p']:.1f}\n"
+                         f'per-FOV signed (+ = deviant)  {per}', fontsize=8)
+        else:
+            ax.set_title(f'{name}: too few pairs', fontsize=9)
+        ax.set_xlabel('pairwise map MSD (um^2)', fontsize=8)
+    fig.suptitle('FOV-level consistency', fontsize=12)
     return fig
 
 
@@ -100,6 +137,61 @@ def fig_allele_difference(dmaps, fovs, cells, mask=None):
     ax.legend(fontsize=8)
     ax.set_title(f'allele differences -- {res["n_multi_allelic"]} '
                  f'multi-allelic cells', fontsize=10)
+    return fig
+
+
+def fig_polymer_qc(table, dmaps, thresholds, qc_result=None):
+    """The polymeric-QC view: every gated quantity as a histogram with
+    its threshold drawn ON the distribution it was derived from, plus
+    efficacy per bin and completeness per allele -- the tracked, visible
+    QC stage the gate builder sits behind.
+    """
+    fig, axes = plt.subplots(1, 5, figsize=(21, 3.6))
+    amp = table['amp']
+    finite_amp = amp[np.isfinite(amp)]
+    ax = axes[0]
+    if len(finite_amp):
+        ax.hist(finite_amp, bins=60, color='0.5')
+    ax.axvline(thresholds['min_brightness'], color='crimson', ls='--')
+    ax.axvline(thresholds['max_brightness'], color='crimson', ls='--')
+    ax.set_title('bin amplitude + brightness gates', fontsize=9)
+    ax = axes[1]
+    if len(dmaps):
+        nb = np.concatenate([np.diagonal(d, 1) for d in dmaps])
+        nb = nb[np.isfinite(nb)]
+        if len(nb):
+            ax.hist(nb, bins=60, color='0.5')
+    ax.axvline(thresholds['max_jump_um'], color='crimson', ls='--')
+    ax.set_title('neighbor distance (um) + max jump', fontsize=9)
+    ax = axes[2]
+    if len(dmaps):
+        med = np.nanmedian(dmaps, axis=1)
+        med = med[np.isfinite(med)]
+        if len(med):
+            ax.hist(med, bins=60, color='0.5')
+    ax.axvline(thresholds['max_dist_um'], color='crimson', ls='--')
+    ax.set_title('per-bin median distance (um) + max', fontsize=9)
+    ax = axes[3]
+    from codelab_pipeline.analysis import polymer as _P
+    pos = qc_result['pos_um'] if qc_result is not None else table['pos_um']
+    eff = _P.efficacy(pos)
+    ax.bar(np.arange(len(eff)), eff, color='steelblue')
+    ax.set_ylim(0, 1)
+    ax.set_title('efficacy per bin (after QC)' if qc_result is not None
+                 else 'efficacy per bin', fontsize=9)
+    ax = axes[4]
+    comp = _P.completeness(pos)
+    if len(comp):
+        ax.hist(comp, bins=min(40, max(5, int(comp.max()) + 1)),
+                color='steelblue')
+    ax.set_title('completeness per allele', fontsize=9)
+    if qc_result is not None:
+        kept = int(qc_result['kept'].sum())
+        fig.suptitle(f'polymer QC -- {kept}/{len(table["amp"])} alleles kept, '
+                     f'{int(qc_result["bads"].sum())} bins removed',
+                     fontsize=11)
+    else:
+        fig.suptitle('polymer QC (preview -- not applied)', fontsize=11)
     return fig
 
 

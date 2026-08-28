@@ -1558,6 +1558,12 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.FitAllFovsPushButton.clicked.connect(
             lambda _checked=False: self._run_chromatin_tracing_fit_all())
         chp.FitThisFovPushButton.clicked.connect(self._run_chromatin_tracing_fit_this_fov)
+
+        # The Analysis tab: a thin shell over codelab_pipeline/analysis --
+        # ALL of its logic lives in windows/analysis_wiring.py + the
+        # headless toolbox, deliberately outside this class.
+        from windows.analysis_wiring import AnalysisWiring
+        self.analysis = AnalysisWiring(self)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
         # The engine combo was connected to NOTHING, so selecting v2 left
         # every control it ignores enabled and labelled in pixels. Every
@@ -2217,6 +2223,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # cleared drops out, so nothing downstream keeps offering hybes
         # from a layout that is no longer configured.
         self.hybe_records_by_modality = parsed
+        # the Analysis tab's source list follows the parsed layouts
+        if hasattr(self, 'analysis'):
+            self.analysis.populate_sources()
 
         if root:
             dp = os.path.abspath(root)

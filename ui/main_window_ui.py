@@ -6,6 +6,7 @@ from ui.cell_segment_panel import CellSegmentPanelUI
 from ui.spot_localization_panel import SpotLocalizationPanelUI
 from ui.celltype_determination_panel import CelltypeDeterminationPanelUI
 from ui.chromatin_tracing_panel import ChromatinTracingPanelUI
+from ui.analysis_panel import AnalysisPanelUI
 
 
 class MainWindowUI(object):
@@ -59,6 +60,11 @@ class MainWindowUI(object):
         self.ChromatinTracingPanel = ChromatinTracingPanelUI()
         self.ChromatinTracingPanel.setupUi(self.ChromatinTracingPanelWidget)
         self.tabWidget.addTab(self._scrollable(self.ChromatinTracingPanelWidget), 'Chromatin Tracing')
+
+        self.AnalysisPanelWidget = QtWidgets.QWidget()
+        self.AnalysisPanel = AnalysisPanelUI()
+        self.AnalysisPanel.setupUi(self.AnalysisPanelWidget)
+        self.tabWidget.addTab(self._scrollable(self.AnalysisPanelWidget), 'Analysis')
 
         # The combined log window replaced every panel's own log box -- this
         # corner button (visible from every tab) re-opens it after the user

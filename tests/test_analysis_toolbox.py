@@ -109,6 +109,37 @@ s_diff = ensemble.scc(base, far, h=0)
 check('similar maps score high, unrelated low',
       s_same > 0.8 and s_diff < 0.5, f'{s_same:.2f} vs {s_diff:.2f}')
 
+print('\nFOV MSD test')
+rng_f = np.random.default_rng(3)
+n_per, nb = 40, 10
+base_map = np.abs(rng_f.normal(3, 1, (nb, nb)))
+base_map = (base_map + base_map.T) / 2
+
+
+def fov_stack(offset, n):
+    out = np.repeat(base_map[None], n, 0) + rng_f.normal(0, 0.15, (n, nb, nb))
+    return out + offset
+
+
+homog = np.concatenate([fov_stack(0, n_per) for _ in range(3)])
+fov_ids = np.repeat([1, 2, 3], n_per)
+r_h = ensemble.fov_msd_test(homog, fov_ids, seed=0)
+check('homogeneous FOVs: in-FOV and cross-FOV MSD agree (p not small)',
+      r_h['p'] > 0.001, f"p={r_h['p']:.3g}")
+deviant = np.concatenate([fov_stack(0, n_per), fov_stack(0, n_per),
+                          fov_stack(1.5, n_per)])
+r_d = ensemble.fov_msd_test(deviant, fov_ids, seed=0)
+worst = max(r_d['per_fov'], key=lambda d: d['signed_neglog10p'])
+check('a deviant FOV separates in-FOV from cross-FOV MSD',
+      r_d['p'] < 1e-6, f"p={r_d['p']:.3g}")
+scores = {d['fov']: d['signed_neglog10p'] for d in r_d['per_fov']}
+check('and the SIGNED per-FOV verdict NAMES the deviant FOV alone',
+      worst['fov'] == 3 and scores[3] > 3
+      and scores[1] < scores[3] and scores[2] < scores[3],
+      str({k: round(v, 1) for k, v in scores.items()}))
+r_e = ensemble.fov_msd_test(homog[:2], fov_ids[:2])
+check('too few alleles reports NaN, not a crash', np.isnan(r_e['p']))
+
 print('\nallele differences (only differences exist, not indices)')
 fovs = np.array([1, 1, 1, 2])
 cells = np.array([5, 5, 7, -1])
@@ -161,6 +192,43 @@ d = cond.to_dict()
 cond2 = gate.Condition.from_dict(d)
 check('a gate round-trips through plain data',
       cond2.to_dict() == d and list(cond2.mask(pop)) == list(cond.mask(pop)))
+
+print('\nOR composition and allele-level presence')
+from codelab_pipeline.analysis import population as popmod   # noqa: E402
+FakePop.allele_mask_from_cells = popmod.Population.allele_mask_from_cells
+pop.alleles = {'fov': np.array([1, 1, 2]), 'cell': np.array([1, 1, 1]),
+               'n_traced': np.array([50, 40, 30]),
+               'bin_hybes': ['A', 'B', 'C'],
+               'pos_um': np.array([
+                   [[1., 1, 1], [2, 2, 2], [np.nan] * 3],   # has A, B
+                   [[np.nan] * 3, [2, 2, 2], [3, 3, 3]],    # missing A
+                   [[1., 1, 1], [np.nan] * 3, [3, 3, 3]]])}  # has A
+am = gate.BarcodePresence(['A']).allele_mask(pop)
+check('presence gate is ALLELE-level (heterogeneous modification)',
+      list(am) == [True, False, True])
+check('its cell-level projection: cell holds >= 1 qualifying allele',
+      list(gate.BarcodePresence(['A']).mask(pop)) == [True, False, True, False])
+check('absent=True inverts per allele',
+      list(gate.BarcodePresence(['A'], absent=True).allele_mask(pop))
+      == [False, True, False])
+orc = gate.Condition(clauses=[[gate.CelltypeIn(['WT'])],
+                              [gate.CelltypeIn(['KI'])]])
+check('clauses OR together: (WT) OR (KI)',
+      list(orc.mask(pop)) == [True, True, True, False])
+check('the report marks clause boundaries',
+      any(r == '-- OR --' for r, _n in orc.report(pop)))
+mixed = gate.Condition(clauses=[
+    [gate.CelltypeIn(['WT']), gate.BarcodePresence(['A'])]])
+check('allele_mask: cell predicates project, presence applies per allele',
+      list(mixed.allele_mask(pop)) == [True, False, True])
+mixed2 = gate.Condition(clauses=[
+    [gate.CelltypeIn(['WT']), gate.BarcodePresence(['A'])],
+    [gate.BarcodePresence(['C'])]])
+check('OR at the allele level too: ... OR presence(C)',
+      list(mixed2.allele_mask(pop)) == [True, True, True])
+d_or = mixed2.to_dict()
+check('OR-composed gates round-trip through plain data',
+      gate.Condition.from_dict(d_or).to_dict() == d_or)
 
 print('\nexpression normalization')
 t = pop.expression

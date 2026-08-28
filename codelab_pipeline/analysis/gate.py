@@ -203,32 +203,133 @@ class AlleleCount(Predicate):
         return ok
 
 
-class Condition:
-    """Ordered AND of predicates -> one boolean cell mask."""
+@_register
+class BarcodePresence(Predicate):
+    """ALLELE-LEVEL, per explicit decision: the genetic modification can
+    be heterogeneous, so presence/absence of a barcode distinguishes the
+    modified from the unmodified HOMOLOG within one cell -- a cell-level
+    verdict would erase exactly that distinction.
 
-    def __init__(self, predicates=()):
-        self.predicates = list(predicates)
+    hybes: bins that must ALL be present (finite traced position) in the
+    allele; absent=True inverts (all must be MISSING). allele_mask() is
+    the primary product; the cell-level mask() says "the cell holds at
+    least one qualifying allele", so cell gating still composes.
+    """
+    kind = 'barcode_presence'
+    level = 'allele'
+
+    def __init__(self, hybes, absent=False):
+        self.hybes = list(hybes)
+        self.absent = bool(absent)
+
+    def _params(self):
+        return {'hybes': self.hybes, 'absent': self.absent}
+
+    def allele_mask(self, pop):
+        al = pop.alleles
+        if al is None:
+            raise ValueError('population carries no alleles')
+        bins = list(al['bin_hybes'])
+        idxs = []
+        for h in self.hybes:
+            if h not in bins:
+                raise ValueError(f'{h!r} is not a genomic bin '
+                                 f'(bins: {bins[:5]}...)')
+            idxs.append(bins.index(h))
+        present = np.isfinite(al['pos_um'][:, idxs, 0])
+        return (~present).all(1) if self.absent else present.all(1)
 
     def mask(self, pop):
-        m = np.ones(len(pop.cells), dtype=bool)
-        for p in self.predicates:
-            m &= np.asarray(p.mask(pop), bool)
-        return m
+        amask = self.allele_mask(pop)
+        al = pop.alleles
+        keep = pd.DataFrame({'fov': al['fov'][amask],
+                             'cell': al['cell'][amask]})
+        keep = keep[keep['cell'] >= 0].drop_duplicates()
+        idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
+        got = pd.Series(True, index=pd.MultiIndex.from_frame(keep))
+        return got.reindex(idx, fill_value=False).to_numpy()
+
+
+class Condition:
+    """OR of AND-clauses over predicates -> boolean masks.
+
+    Condition([p1, p2]) is one AND clause (the common case);
+    Condition(clauses=[[p1, p2], [p3]]) is (p1 AND p2) OR (p3) -- the
+    composition the founding spec names: additive within a category AND
+    across categories, with OR between clause groups.
+
+    Two mask levels, per explicit decision. mask() gates CELLS.
+    allele_mask() gates ALLELES: cell-level predicates project through
+    the cell (an allele survives iff its cell does), allele-level
+    predicates (BarcodePresence) apply directly -- so a heterozygous
+    cell can pass while only its modified allele feeds the map.
+    """
+
+    def __init__(self, predicates=(), clauses=None):
+        if clauses is not None:
+            self.clauses = [list(c) for c in clauses]
+        else:
+            self.clauses = [list(predicates)] if predicates else []
+
+    @property
+    def predicates(self):
+        """Flat view over all clauses -- for reporting and GUI listing."""
+        return [p for c in self.clauses for p in c]
+
+    def mask(self, pop):
+        if not self.clauses:
+            return np.ones(len(pop.cells), dtype=bool)
+        out = np.zeros(len(pop.cells), dtype=bool)
+        for clause in self.clauses:
+            m = np.ones(len(pop.cells), dtype=bool)
+            for p in clause:
+                m &= np.asarray(p.mask(pop), bool)
+            out |= m
+        return out
+
+    def allele_mask(self, pop):
+        """Allele-level gate: OR over clauses of (cell-projection AND
+        the clause's own allele-level predicates)."""
+        al = pop.alleles
+        if al is None:
+            raise ValueError('population carries no alleles')
+        n_al = len(al['cell'])
+        if not self.clauses:
+            return np.ones(n_al, dtype=bool)
+        out = np.zeros(n_al, dtype=bool)
+        for clause in self.clauses:
+            cm = np.ones(len(pop.cells), dtype=bool)
+            am = np.ones(n_al, dtype=bool)
+            for p in clause:
+                if getattr(p, 'level', 'cell') == 'allele':
+                    am &= np.asarray(p.allele_mask(pop), bool)
+                else:
+                    cm &= np.asarray(p.mask(pop), bool)
+            out |= am & pop.allele_mask_from_cells(cm)
+        return out
 
     def report(self, pop):
-        """[(repr, n_surviving_after)] -- the CellClassifier summary line,
-        as data. The sequential counts show which predicate narrowed."""
+        """[(repr, n_after)] per clause sequentially, clause boundaries
+        marked with ('-- OR --', running total)."""
         out = []
-        m = np.ones(len(pop.cells), dtype=bool)
-        for p in self.predicates:
-            m &= np.asarray(p.mask(pop), bool)
-            out.append((repr(p), int(m.sum())))
+        total = np.zeros(len(pop.cells), dtype=bool)
+        for ci, clause in enumerate(self.clauses):
+            if ci:
+                out.append(('-- OR --', int(total.sum())))
+            m = np.ones(len(pop.cells), dtype=bool)
+            for p in clause:
+                m &= np.asarray(p.mask(pop), bool)
+                out.append((repr(p), int(m.sum())))
+            total |= m
         return out
 
     def to_dict(self):
-        return {'predicates': [p.to_dict() for p in self.predicates]}
+        return {'clauses': [[p.to_dict() for p in c] for c in self.clauses]}
 
     @staticmethod
     def from_dict(d):
+        if 'clauses' in d:
+            return Condition(clauses=[[Predicate.from_dict(x) for x in c]
+                                      for c in d['clauses']])
         return Condition([Predicate.from_dict(x)
                           for x in d.get('predicates', [])])
