@@ -88,8 +88,18 @@ def main():
           f'readout {p.readout_gates["min_occupancy"]}')
     check('the fiducial gate is the looser of the two (extended object)',
           p.fiducial_gates['min_occupancy'] < p.readout_gates['min_occupancy'])
-    check('both reject at_bound unconditionally by default',
-          p.fiducial_gates['reject_at_bound'] and p.readout_gates['reject_at_bound'])
+    # at_bound is a READOUT gate. It was on for both until it was measured
+    # on the fiducial side: over 9007 permissively-fitted readouts (MP58
+    # FOV1, 127 alleles), a readout z-uncert <= 600 nm gate reached 375
+    # pairs at p90 735 nm where fiducial at_bound reached 378 at 794 --
+    # same coverage, better tail, and tunable. Of the 798 readouts the
+    # fiducial gate removed, only 20% were the ones a readout gate would
+    # remove; the rest were not the damaging ones.
+    check('at_bound rejects on the READOUT, whose measurement it is',
+          p.readout_gates['reject_at_bound'] is True)
+    check('and NOT on the fiducial, where it measured worse than a '
+          'readout uncertainty gate at matched coverage',
+          p.fiducial_gates['reject_at_bound'] is False)
     check('neither inherits v1 min_hb_ratio / min_ah_ratio',
           'min_hb_ratio' not in p.readout_gates
           and 'min_ah_ratio' not in p.readout_gates)
@@ -121,10 +131,19 @@ def main():
             amplitude = 100.0
         return _R()
 
-    for label, g in (('fiducial', p.fiducial_gates), ('readout', p.readout_gates)):
-        ok2, why2 = V2.gate(_railed('z'), cube, g, VOXEL)
-        check(f'{label}: a railed POSITION is rejected before any other gate',
-              ok2 is False and 'at bound' in why2, str(why2))
+    ok2, why2 = V2.gate(_railed('z'), cube, p.readout_gates, VOXEL)
+    check('readout: a railed POSITION is rejected before any other gate',
+          ok2 is False and 'at bound' in why2, str(why2))
+    ok2f, why2f = V2.gate(_railed('z'), cube, p.fiducial_gates, VOXEL)
+    check('fiducial: a railed POSITION is NOT rejected -- it passes to the '
+          'readout gates, which measure round quality better',
+          ok2f is True, str(why2f))
+    # Switched back on, the fiducial must still reject POSITION and only
+    # position -- the key survives the default change for exactly this.
+    on = dict(p.fiducial_gates, reject_at_bound=True)
+    check('fiducial: with the filter switched back on, position IS fatal',
+          V2.gate(_railed('z'), cube, on, VOXEL)[0] is False)
+    for label, g in (('fiducial', on), ('readout', p.readout_gates)):
         # sigma at a bound is NOT fatal for either channel: the swept filter
         # was `any(s in ('x','y','z') ...)` (gate_sweep_v2.py:159), and a
         # fiducial's sigma pins to whatever ceiling exists while its

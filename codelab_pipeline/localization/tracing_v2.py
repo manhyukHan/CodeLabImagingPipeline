@@ -76,12 +76,17 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 # so none of the v1 constants transfer (tools/gate_sweep_v2.py). What is
 # on by default is only what was measured to be free:
 #
-#   at_bound        295/311 pairs at 0.218 um against 311 at 0.294
-#                   ungated -- keeps 95% of pairs, improves the median
-#                   26%, and has NO THRESHOLD TO CHOOSE. A parameter that
-#                   stopped on its constraint is the bound you supplied,
-#                   not a measurement, and its Jacobian CI (which assumes
-#                   an interior optimum) does not describe it either.
+#   at_bound        READOUT ONLY. 295/311 pairs at 0.218 um against 311
+#                   at 0.294 ungated -- keeps 95% of pairs, improves the
+#                   median 26%, and has NO THRESHOLD TO CHOOSE. A
+#                   parameter that stopped on its constraint is the bound
+#                   you supplied, not a measurement, and its Jacobian CI
+#                   (which assumes an interior optimum) does not describe
+#                   it either. That measurement is a readout one --
+#                   gate_sweep_v2.score filters ra/rb and never ga/gb --
+#                   and on the FIDUCIAL the same gate measured WORSE than
+#                   a readout uncertainty gate at matched coverage. See
+#                   FIDUCIAL_GATES.
 #   occupancy       the tunable one, and the best-behaved: it degrades
 #                   smoothly instead of falling off a cliff.
 #
@@ -96,7 +101,35 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 # thresholds were derived on ONE dataset and a silently inherited constant
 # is how the v1 gates became wrong in the first place.
 FIDUCIAL_GATES = {
-    'reject_at_bound': True,
+    # OFF for the fiducial. at_bound belongs to the READOUT, where the 295/311
+    # measurement was actually made; on the fiducial it is a blunt proxy for
+    # round quality that the readout's own gates measure better and tunably.
+    #
+    # Measured post-hoc over 9007 permissively-fitted readouts, MP58 FOV1,
+    # 127 alleles (one fitting pass, gates applied afterwards):
+    #
+    #     configuration                        pairs  med nm  p90 nm
+    #     readout gates only                     384     168     900
+    #     + fiducial at_bound FATAL              378     165     794
+    #     + readout z-uncert <= 600 nm           375     164     735
+    #     + readout xy-uncert <= 200 nm          377     164     797
+    #     + readout z-uncert <= 500 nm           365     161     622
+    #
+    # At matched coverage the readout axial-uncertainty gate beats this one:
+    # 3 fewer pairs (0.8%) for a 7.4% better p90, and it has a knob.
+    #
+    # WHY the swap works, and why it is not the same set: hybes whose
+    # fiducial railed do have worse readouts -- z-uncert median 299 nm
+    # against 171, xy 92 against 53, occupancy 0.5 against 0.7 -- so a
+    # railed fiducial really does mark a poor round. But of the 798
+    # readouts this gate removed, only 159 (20%) are also removed by
+    # z-uncert <= 600. It was discarding 639 readouts that were not the
+    # damaging ones.
+    #
+    # Position-at-bound is still recorded and still shown on the fiducial
+    # grid beside occupancy and both CIs; it is a diagnostic here, not a
+    # verdict.
+    'reject_at_bound': False,
     # POSITION only. A fiducial's sigma has no value to converge to -- a
     # single-crop fit walks it to whatever ceiling exists, measured
     # directly: every one of 14 consecutive HoxA rounds came back at
@@ -108,33 +141,8 @@ FIDUCIAL_GATES = {
     # undefined width -- and the centroid is the only thing the fiducial
     # is for.
     #
-    # Position at a bound is different and stays fatal: it means the fit
-    # could not reach the emitter, so the value IS the bound and the drift
-    # correction built from it is fiction.
-    #
-    # THAT WAS REASONING, NOT MEASUREMENT, until 2026-08-28. The famous
-    # 295/311 pairs @ 0.218 um result is a READOUT number --
-    # gate_sweep_v2.score applies its `keep` to ra/rb only and never to
-    # ga/gb -- so nothing on record had ever tested the fiducial side.
-    # Measured now, through the app, 127 alleles of MP58 FOV1 at the 7 px
-    # / 15 plane bound:
-    #
-    #                        FATAL   IGNORED
-    #     pairs scored         364       368   +1.1%
-    #     traced readouts     5015      5064   +1.0%
-    #     fiducial at-bound    659         0
-    #     median 3D (nm)       164       166   +0.9%
-    #     p90 3D (nm)          771       850   +10.3% WORSE
-    #
-    # Ignoring it recovers 659 rejected hybes and converts only 49 of them
-    # into accepted readouts -- a 7% yield, i.e. those hybes were failing
-    # for other reasons anyway -- while the handful of extra pairs land in
-    # the tail. So it costs ~1% of the data and buys a 10% better p90.
-    #
-    # It is cheap ONLY because the bound is now 7 px. At the old 5 px it
-    # cost 33 of 73 hybes on one real allele. The gate was never the
-    # problem; the leash was. Tighten the bound again and this becomes
-    # expensive again.
+    # Kept for when reject_at_bound is switched back on: if it is, only
+    # POSITION should be fatal, never sigma.
     'at_bound_fatal': ('y', 'x', 'z'),
     'min_occupancy': 0.25,      # looser: an extended object spreads its peak
     'max_uncert_xy_nm': None,
@@ -720,7 +728,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'fiducial_occupancy': float('nan'),
                                     'readout_occupancy': float('nan'),
                                     'fiducial_uncert_nm': (float('nan'), float('nan')),
-                                    'readout_uncert_nm': (float('nan'), float('nan'))})
+                                    'readout_uncert_nm': (float('nan'), float('nan')),
+                                    'fiducial_at_bound': (),
+                                    'readout_at_bound': ()})
             debug[hybe]['fiducial_cubic'] = cube
         z0 = zexp.get(hybe, cube.shape[2] / 2.0)
         f = fit_fiducial(cube, z0, p)
@@ -734,6 +744,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         if debug is not None:
             debug[hybe]['fiducial_occupancy'] = occupancy(cube, f, p.voxel_um)
             debug[hybe]['fiducial_uncert_nm'] = uncertainty_nm(f)
+            debug[hybe]['fiducial_at_bound'] = tuple(
+                getattr(f, 'at_bound', None) or ())
         # THE REFERENCE IS NOT AN ORDINARY HYBE. Every delta is measured
         # against it, so gating it out does not reject one round -- it
         # rejects the ALLELE, and it does so while reporting one bland
@@ -801,7 +813,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'fiducial_occupancy': float('nan'),
                                     'readout_occupancy': float('nan'),
                                     'fiducial_uncert_nm': (float('nan'), float('nan')),
-                                    'readout_uncert_nm': (float('nan'), float('nan'))})
+                                    'readout_uncert_nm': (float('nan'), float('nan')),
+                                    'fiducial_at_bound': (),
+                                    'readout_at_bound': ()})
         if debug is not None and debug[hybe].get('readout_cubic') is None:
             ch0 = hybe_readout_channels.get(hybe)
             if ch0 is not None:
@@ -872,6 +886,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         if debug is not None:
             debug[hybe]['readout_occupancy'] = occupancy(cube, r, p.voxel_um)
             debug[hybe]['readout_uncert_nm'] = uncertainty_nm(r)
+            debug[hybe]['readout_at_bound'] = tuple(
+                getattr(r, 'at_bound', None) or ())
         if not ok:
             allele.rejected_hybes[hybe] = f'readout {why}'
             continue
