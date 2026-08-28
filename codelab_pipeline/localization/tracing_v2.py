@@ -657,11 +657,21 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     for hybe, cube in fid_cubes.items():
         if debug is not None:
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
-                                    'readout_cubic': None, 'readout_centroids': None})
+                                    'readout_cubic': None, 'readout_centroids': None,
+                                    'fiducial_occupancy': float('nan'),
+                                    'readout_occupancy': float('nan')})
             debug[hybe]['fiducial_cubic'] = cube
         z0 = zexp.get(hybe, cube.shape[2] / 2.0)
         f = fit_fiducial(cube, z0, p)
         ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
+        # Recorded BEFORE the reject below, on purpose: the occupancy that
+        # FAILED is the one worth seeing when deciding where the threshold
+        # belongs, and a rejected hybe still draws a tile. gate() computes
+        # this internally but does not return it; recomputing here keeps
+        # gate()'s signature (and its many callers) untouched, and costs
+        # nothing in a batch run, where debug is None.
+        if debug is not None:
+            debug[hybe]['fiducial_occupancy'] = occupancy(cube, f, p.voxel_um)
         # THE REFERENCE IS NOT AN ORDINARY HYBE. Every delta is measured
         # against it, so gating it out does not reject one round -- it
         # rejects the ALLELE, and it does so while reporting one bland
@@ -719,7 +729,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # only when debug is being collected, i.e. never in a batch run.
         if debug is not None and hybe not in (debug or {}):
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
-                                    'readout_cubic': None, 'readout_centroids': None})
+                                    'readout_cubic': None, 'readout_centroids': None,
+                                    'fiducial_occupancy': float('nan'),
+                                    'readout_occupancy': float('nan')})
         if debug is not None and debug[hybe].get('readout_cubic') is None:
             ch0 = hybe_readout_channels.get(hybe)
             if ch0 is not None:
@@ -785,6 +797,10 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug[hybe]['readout_cubic'] = cube
         r = fit_readout(cube, zexp.get(hybe, cube.shape[2] / 2.0), p)
         ok, why = gate(r, cube, p.readout_gates, p.voxel_um)
+        # Same as the fiducial: before the reject, so a gated-out readout
+        # still reports the number it was gated on.
+        if debug is not None:
+            debug[hybe]['readout_occupancy'] = occupancy(cube, r, p.voxel_um)
         if not ok:
             allele.rejected_hybes[hybe] = f'readout {why}'
             continue

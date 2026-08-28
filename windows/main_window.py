@@ -7186,13 +7186,27 @@ class MainWindow(QtWidgets.QMainWindow):
         def _done(debug):
             chp.ViewCropPushButton.setEnabled(True)
             fid_results, readout_results = [], []
+            def _titled(hybe, occ):
+                """'Hyb_050\\nocc 0.87' -- the gated quantity, on its own line.
+
+                Occupancy is what both grids' gates actually reject on, so
+                reading a tile and reading the number that condemned it
+                should not need two windows. 'n/a' where the fit failed
+                outright, since occupancy is undefined without a centroid.
+                """
+                if occ is None or not np.isfinite(occ):
+                    return f'{hybe}\nocc n/a'
+                return f'{hybe}\nocc {occ:.2f}'
+
             for hybe in hybes:
                 d = debug.get(hybe, {})
                 if d.get('fiducial_cubic') is not None:
                     centroid = [d['fiducial_centroid']] if d['fiducial_centroid'] is not None else None
-                    fid_results.append((d['fiducial_cubic'], centroid, hybe))
+                    fid_results.append((d['fiducial_cubic'], centroid,
+                                        _titled(hybe, d.get('fiducial_occupancy'))))
                 if d.get('readout_cubic') is not None:
-                    readout_results.append((d['readout_cubic'], d['readout_centroids'], hybe))
+                    readout_results.append((d['readout_cubic'], d['readout_centroids'],
+                                            _titled(hybe, d.get('readout_occupancy'))))
 
             allele_label = f'FOV{fov:03d}_allele{allele.id}'
             # allele figures default into figures/{modality}/alleles/fov###/,
@@ -7666,7 +7680,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             # exact ambiguity behind three real transposition
                             # bugs in this code. The numbers stay bare so the
                             # label is still machine-parseable.
-                            f'{hybe}  d(y,x,z)=({dy:+.2f},{dx:+.2f},{dz:+.2f})'))
+                            # Hybe on its own line: show_overlay_grid appends
+                            # '\nbefore' to this, so a one-line title put the
+                            # name, the drift and the column label on two
+                            # cramped lines over a 320 px tile.
+                            f'{hybe}\nd(y,x,z)=({dy:+.2f},{dx:+.2f},{dz:+.2f})'))
             yx_before.append(mov_yx)
             yx_after.append(yx_after_img)
             zx_before.append(mov_zx)
