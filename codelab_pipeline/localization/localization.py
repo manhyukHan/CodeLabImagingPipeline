@@ -891,9 +891,9 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, fiducial_channel,
                                                                  (raw_y, raw_x), pad=spad, use_stack=True)
     except OSError:
-        return None, None, None
+        return None, None, None, None
     if cubic.size == 0:
-        return None, None, None
+        return None, None, None, None
     x0, y0 = raw_x - xmin, raw_y - ymin
 
     # BOUNDARY trim, not a center window: the fit runs on the stack minus its
@@ -914,7 +914,7 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
                                     min_hb_ratio=min_hb_ratio, min_ah_ratio=min_ah_ratio, max_uncert=max_uncert)
     result = engine.raw_components(fit_cubic, (y0, x0, z0), n_max=1)[0][0]
     if result is None:
-        return None, cubic, None
+        return None, cubic, None, None
     amp, xf, yf, zf = result[:4]
     zf = zf + z_off   # back to the full stack's own absolute plane index
     raw_fx, raw_fy = xf + xmin, yf + ymin
@@ -925,7 +925,13 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
         Hz = alignment.entry_dz(cell.matrices.get((hybe, m)))
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
     shared_result = (float(sy), float(sx), float(sz), float(amp))
-    return shared_result, cubic, (xf, yf, zf)
+    # The SAME fit in this hybe's own untransformed frame. raw_fy/raw_fx
+    # are already the crop origin plus the crop-local fit, clamp included,
+    # so this indexes the full frame directly. Recording it changes no
+    # fitted number -- it is bookkeeping, not algorithm, which is why the
+    # reference implementation can carry it without ceasing to be one.
+    raw_result = (float(raw_fy), float(raw_fx), float(zf), float(amp))
+    return shared_result, cubic, (xf, yf, zf), raw_result
 
 
 def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
@@ -970,9 +976,9 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
         cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, readout_channel,
                                                                  (raw_y, raw_x), pad=spad, use_stack=True)
     except OSError:
-        return [], None, []
+        return [], None, [], []
     if cubic.size == 0:
-        return [], None, []
+        return [], None, [], []
     x0, y0 = raw_x - xmin, raw_y - ymin
     # Same boundary trim as _localize_fiducial_hybe (see the comment there):
     # fit on the stack minus its outermost planes, display the full crop,
@@ -991,7 +997,7 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
     dy, dx, dz = delta   # (y, x, z), rasterized order
     m = modality if modality is not None else (cell.reference_modality if cell is not None else None)
     Hz = alignment.entry_dz(cell.matrices.get((hybe, m))) if cell is not None else 0.0
-    candidates, crop_local = [], []
+    candidates, crop_local, raw_candidates = [], [], []
     for r in results:
         if r is None:
             continue
@@ -1001,8 +1007,14 @@ def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, 
         sy, sx = spot_mapper.raw_to_reference((raw_ry, raw_rx), hybe, fov_matrices, modality=modality, cell=cell, resolver=resolver)
         sz = zf + cell_z_offset(cell, hybe, m, resolver)
         candidates.append((float(sy + dy), float(sx + dx), float(sz + dz), float(amp)))
+        # SAME ORDER as `candidates`, one raw per accepted component, and
+        # carrying NO correction at all -- neither the alignment nor the
+        # `delta` fiducial drift added above. That is the documented
+        # asymmetry: adj-raw is one term larger for a readout than for a
+        # fiducial. See AnAllele.
+        raw_candidates.append((float(raw_ry), float(raw_rx), float(zf), float(amp)))
         crop_local.append((xf, yf, zf))
-    return candidates, cubic, crop_local
+    return candidates, cubic, crop_local, raw_candidates
 
 
 # Fiducial-fit and readout-fit params are independently configurable (see
@@ -1052,21 +1064,23 @@ def _init_tracing_worker():
 def _fiducial_task(payload):
     (shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
      kwargs, resolver, want_debug) = payload
-    result, cubic, centroid = _localize_fiducial_hybe(
+    result, cubic, centroid, raw_result = _localize_fiducial_hybe(
         shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
         resolver=resolver, **kwargs)
     # cubic is display-only (~100+ KB per hybe); never ship it back for a
-    # batch run that would discard it.
-    return hybe, result, (cubic if want_debug else None), centroid
+    # batch run that would discard it. The raw tuple is 4 floats and must
+    # travel, or every parallel run silently loses the raw frame.
+    return hybe, result, (cubic if want_debug else None), centroid, raw_result
 
 
 def _readout_task(payload):
     (shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
      delta, kwargs, resolver, want_debug) = payload
-    candidates, cubic, crop_local = _localize_readout_hybe(
+    candidates, cubic, crop_local, raw_candidates = _localize_readout_hybe(
         shared_xy, hybe, channel, storage_path, fov, modality, cell, fov_matrices,
         delta, resolver=resolver, **kwargs)
-    return hybe, candidates, (cubic if want_debug else None), crop_local
+    return (hybe, candidates, (cubic if want_debug else None), crop_local,
+            raw_candidates)
 
 
 def max_tracing_workers(hard_ceiling=32):
@@ -1167,14 +1181,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
 
     Mutates allele in place either way.
     """
-    # v1 FILLS _adj ONLY -- it has no raw counterpart to write, and this
-    # module is the frozen reference implementation, so it does not grow
-    # one. But it must still CLEAR raw, and per-hybe in append mode:
-    # re-tracing a v2 allele with v1 would otherwise leave v2's
-    # fiducial_trace_raw/polymer_raw sitting beside v1's freshly written
-    # _adj, silently pairing a raw from one engine with an adj from
-    # another. An empty raw honestly says "this engine did not record
-    # one"; a stale one is a lie that nothing downstream could detect.
+    # raw/adj is a property of AnAllele, not of whichever engine filled
+    # it, so v1 maintains both exactly as v2 does -- no engine-shaped hole
+    # in the container's contract. Recording the raw frame changes no
+    # fitted number (it is the same fit, expressed before the matrix), so
+    # this module remains the reference implementation every v2 claim was
+    # measured against.
+    #
+    # Clearing raw alongside adj, per-hybe in append mode too, is what
+    # keeps the pair honest: a hybe whose adj is re-derived must not keep
+    # a raw from the previous run.
     if not append:
         allele.fiducial_trace_adj = {}
         allele.polymer_adj = {}
@@ -1210,6 +1226,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
         fid_channel = hybe_fiducial_channels.get(hybe)
         if fid_channel is None:
             allele.fiducial_trace_adj[hybe] = None
+            allele.fiducial_trace_raw[hybe] = None
             allele.rejected_hybes[hybe] = 'no fiducial channel configured'
             continue
         fid_todo.append((hybe, fid_channel))
@@ -1225,8 +1242,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                                          'readout_cubic': None, 'readout_centroids': None}
             fid_todo.append((reference_hybe, ref_channel))
 
-    def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid):
+    def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid, fid_raw=None):
         allele.fiducial_trace_adj[hybe] = fid_result
+        allele.fiducial_trace_raw[hybe] = fid_raw
         if debug is not None:
             debug[hybe]['fiducial_cubic'] = fid_cubic
             debug[hybe]['fiducial_centroid'] = fid_centroid
@@ -1240,10 +1258,10 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             _store_fiducial(*future.result())
     else:
         for hybe, ch in fid_todo:
-            fid_result, fid_cubic, fid_centroid = _localize_fiducial_hybe(
+            fid_result, fid_cubic, fid_centroid, fid_raw = _localize_fiducial_hybe(
                 shared_xy, hybe, ch, storage_path, fov, modality, cell, fov_matrices,
                 resolver=resolver, **fiducial_kwargs)
-            _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid)
+            _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid, fid_raw)
 
     baseline = allele.fiducial_trace_adj.get(reference_hybe)
     # -- phase 2a: the drift gate. Cheap arithmetic, stays serial; produces
@@ -1303,14 +1321,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                                     debug is not None))
                    for hybe in ro_todo]
         for future in as_completed(futures):
-            hybe, candidates, cubic, crop_local = future.result()
-            ro_results[hybe] = (candidates, cubic, crop_local)
+            hybe, candidates, cubic, crop_local, raw_cands = future.result()
+            ro_results[hybe] = (candidates, cubic, crop_local, raw_cands)
     else:
         for hybe in ro_todo:
-            candidates, cubic, crop_local = _localize_readout_hybe(
+            candidates, cubic, crop_local, raw_cands = _localize_readout_hybe(
                 shared_xy, hybe, gate[hybe][2], storage_path, fov, modality, cell, fov_matrices,
                 gate[hybe][1], resolver=resolver, **readout_kwargs)
-            ro_results[hybe] = (candidates, cubic, crop_local)
+            ro_results[hybe] = (candidates, cubic, crop_local, raw_cands)
 
     # -- phase 2c: bookkeeping, in the caller's own hybe order --
     for hybe in hybes:
@@ -1319,7 +1337,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             if readout_channel is None or (reject_reason is not None and debug is None):
                 allele.rejected_hybes[hybe] = reject_reason
             continue
-        candidates, readout_cubic, readout_centroids = ro_results[hybe]
+        candidates, readout_cubic, readout_centroids, raw_cands = ro_results[hybe]
         if debug is not None:
             debug[hybe]['readout_cubic'] = readout_cubic
             debug[hybe]['readout_centroids'] = readout_centroids or None
@@ -1328,6 +1346,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             continue
         if candidates:
             allele.polymer_adj[hybe] = candidates
+            allele.polymer_raw[hybe] = raw_cands
         else:
             allele.rejected_hybes[hybe] = 'no readout peak accepted'
     return (allele, debug) if collect_debug else allele
