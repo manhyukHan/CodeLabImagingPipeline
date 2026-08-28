@@ -93,6 +93,11 @@ class Population:
         tables; either may be omitted and the matching predicates then
         refuse with an actionable error rather than a KeyError.
         """
+        fovs = [int(f) for f in fovs]
+        if len(set(fovs)) != len(fovs):
+            # a duplicated FOV silently duplicates every (fov, cell) key
+            # and every downstream join then fabricates signal
+            raise ValueError(f'duplicate FOVs in {fovs}')
         if hybes is None and records is not None:
             hybes = P.bin_hybes(records)
         items = [(storage_path, int(f), hybes, sources, spot_sources,

@@ -31,32 +31,33 @@ def pair_distances(pop, source_a, source_b):
     distance across cells is not a cellular quantity). When the two
     sources are identical, self-pairs and double counting are excluded
     (i < j).
+
+    VECTORIZED as one within-cell cross join (merge on (fov, cell)) plus
+    column arithmetic. The per-cell Python loop this replaces measured
+    8.7 s at the design point (12,000 cells, ~772k pairs); cells can be
+    tens of thousands, so per-cell Python is banned from every gate
+    path.
     """
-    a = _spots_of(pop, source_a)
-    b = _spots_of(pop, source_b)
+    cols = ['fov', 'cell', 'celltype', 'y_um', 'x_um', 'z_um']
+    a = _spots_of(pop, source_a)[cols]
+    a = a[a['cell'] >= 0].reset_index(drop=True)
     same = tuple(source_a) == tuple(source_b)
-    out = []
-    bg = {k: v for k, v in b.groupby(['fov', 'cell'])}
-    for key, ga in a.groupby(['fov', 'cell']):
-        fov, cell = key
-        if cell < 0:
-            continue
-        gb = bg.get(key)
-        if gb is None:
-            continue
-        pa = ga[['y_um', 'x_um', 'z_um']].to_numpy(float)
-        pb = gb[['y_um', 'x_um', 'z_um']].to_numpy(float)
-        d = np.sqrt(((pa[:, None, :] - pb[None, :, :]) ** 2).sum(-1))
-        if same:
-            iu = np.triu_indices(len(pa), k=1)
-            vals = d[iu]
-        else:
-            vals = d.ravel()
-        ct = str(ga['celltype'].iloc[0])
-        for v in vals:
-            out.append({'fov': int(fov), 'cell': int(cell),
-                        'celltype': ct, 'd_um': float(v)})
-    return pd.DataFrame(out, columns=['fov', 'cell', 'celltype', 'd_um'])
+    b = a if same else _spots_of(pop, source_b)[cols]
+    if not same:
+        b = b[b['cell'] >= 0].reset_index(drop=True)
+    a = a.assign(_ia=np.arange(len(a)))
+    b = b.assign(_ib=np.arange(len(b)))
+    m = a.merge(b.drop(columns=['celltype']), on=['fov', 'cell'],
+                suffixes=('', '_b'))
+    if same:
+        m = m[m['_ia'] < m['_ib']]
+    d = np.sqrt((m['y_um'].to_numpy() - m['y_um_b'].to_numpy()) ** 2
+                + (m['x_um'].to_numpy() - m['x_um_b'].to_numpy()) ** 2
+                + (m['z_um'].to_numpy() - m['z_um_b'].to_numpy()) ** 2)
+    return pd.DataFrame({'fov': m['fov'].to_numpy(),
+                         'cell': m['cell'].to_numpy(),
+                         'celltype': m['celltype'].to_numpy(),
+                         'd_um': d})
 
 
 def pair_distance_per_cell(pop, source_a, source_b, collapse='median'):
@@ -83,10 +84,14 @@ def distance_histogram(pop, source_a, source_b, mask=None, bins=100,
     """
     pairs = pair_distances(pop, source_a, source_b)
     if mask is not None:
+        # an inner merge, not a Python membership loop: it is a real
+        # semi-join at any scale, and on ZERO pairs it stays a 0-row
+        # frame WITH its columns -- the list-comprehension form fed
+        # pandas an empty list, which selects COLUMNS, and the next
+        # access raised KeyError instead of returning an empty histogram.
         keep = pop.cells.loc[np.asarray(mask, bool), ['fov', 'cell']]
-        keys = set(map(tuple, keep.itertuples(index=False)))
-        pairs = pairs[[(f, c) in keys for f, c in
-                       zip(pairs['fov'], pairs['cell'])]]
+        pairs = pairs.merge(keep.drop_duplicates(), on=['fov', 'cell'],
+                            how='inner')
     def hist(vals):
         return np.histogram(vals, bins=bins, range=range_um)
     if not per_celltype:

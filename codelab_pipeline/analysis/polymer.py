@@ -165,8 +165,20 @@ def polymer_distmaps(pos_um):
     NaN positions propagate to NaN rows/columns, exactly the ORCA kappa
     behaviour. Vectorized over alleles; ~25 MB for 127 alleles x 90 bins.
     """
-    diff = pos_um[:, :, None, :] - pos_um[:, None, :, :]
-    return np.sqrt((diff ** 2).sum(-1))
+    pos = np.asarray(pos_um, np.float32)
+    n_a, n_b = pos.shape[0], pos.shape[1]
+    out = np.empty((n_a, n_b, n_b), np.float32)
+    # float32 and CHUNKED: cells run to tens of thousands, so alleles do
+    # too. At 24k alleles x 62 bins the float64 all-at-once broadcast
+    # peaked at ~1.1 GB of scratch for a 738 MB result; float32 halves
+    # both and um distances do not need 15 significant digits. Measured:
+    # 5.3 s / 738 MB -> chunked float32 keeps peak scratch ~50 MB.
+    step = max(1, int(2e7 // max(n_b * n_b * 3, 1)))
+    for i0 in range(0, n_a, step):
+        blk = pos[i0:i0 + step]
+        diff = blk[:, :, None, :] - blk[:, None, :, :]
+        out[i0:i0 + step] = np.sqrt((diff ** 2).sum(-1))
+    return out
 
 
 # -- ORCA QC ---------------------------------------------------------------
@@ -213,6 +225,14 @@ def apply_qc(table, dmaps, thresholds, min_traced=2):
     pos = table['pos_um'].copy()
     amp = table['amp'].copy()
     n_a, n_b = amp.shape
+    if n_a == 0:
+        # zero alleles is a legitimate gate outcome, not an error: the
+        # jump gate's diagonal stack collapses to 1-D on empty input and
+        # crashed here (IndexError) before this guard.
+        return {'pos_um': pos, 'amp': amp,
+                'bads': np.zeros((0, n_b), bool), 'kept': np.zeros(0, bool),
+                'index': np.zeros(0, np.int64),
+                'dmaps': np.empty((0, n_b, n_b), np.float32)}
     bads = np.zeros((n_a, n_b), dtype=bool)
     bads |= np.isfinite(amp) & (amp > thresholds['max_brightness'])
     bads |= np.isfinite(amp) & (amp < thresholds['min_brightness'])

@@ -97,18 +97,36 @@ def predicted_P(q, b, tau, n_nodes=25):
     return (q[:, :, None] * _sigmoid(b[None, None, :] + u[:, None, None])).sum(0)
 
 
-def cooccurrence_z(X, P):
-    """Pairwise co-detection beyond the null: (Z, p_one, ratio, obs, exp).
+def cooccurrence_z(X, q, b, tau):
+    """Pairwise co-detection beyond the quality null: (Z, p_one, ratio,
+    obs, exp).
 
-    C = X^T X observed; E = sum_i P_ij P_ik; V = sum_i q(1-q) with
-    q = P_ij P_ik. Z (m, m) with NaN diagonal; p_one = one-sided
-    enrichment; ratio = (C+eps)/(E+eps).
+    THE EXPECTATION IS EXACT, not a product of posterior means. Under
+    the model X_ij and X_ik are conditionally independent given u_i, so
+
+        p_i(j,k) = E[X_ij X_ik | X_i] = sum_n q_ni s_j(u_n) s_k(u_n)
+
+    -- the posterior expectation OF THE PRODUCT. The first version used
+    E[s_j|X] * E[s_k|X]; both sigmoids increase in the shared u, so that
+    understates every pair expectation and review confirmed a positive
+    z bias on EVERY pair. Closed form over the GHQ nodes:
+
+        E_jk      = sum_n W_n s_nj s_nk          with W = q.sum(cells)
+        sum_i p^2 = sum_(n,l) M_nl (s_nj s_lj)(s_nk s_lk),  M = q q^T
+        V_jk      = E_jk - sum_i p^2             (Bernoulli variance)
+
+    q: (n_nodes, n_cells) from posterior_u; b, tau from the fit.
     """
     X = np.asarray(X, float)
     C = X.T @ X
-    E = P.T @ P
-    q = P[:, :, None] * P[:, None, :]
-    V = (q * (1 - q)).sum(0)
+    nodes, _w = np.polynomial.hermite_e.hermegauss(q.shape[0])
+    S = _sigmoid(b[None, :] + (nodes * tau)[:, None])       # (K, m)
+    W = q.sum(1)                                            # (K,)
+    E = S.T @ (W[:, None] * S)
+    M = q @ q.T                                             # (K, K)
+    B = (S[:, None, :] * S[None, :, :]).reshape(-1, S.shape[1])
+    sum_p2 = B.T @ (M.reshape(-1, 1) * B)
+    V = E - sum_p2
     with np.errstate(all='ignore'):
         Z = (C - E) / np.sqrt(np.maximum(V, 1e-12))
         ratio = (C + 1e-9) / (E + 1e-9)
@@ -117,35 +135,71 @@ def cooccurrence_z(X, P):
     return Z, stats.norm.sf(Z), ratio, C, E
 
 
-def count_stratified_null_z(X, n_samples=2000, seed=0):
-    """The COUNT null: co-detection z against within-k-stratum shuffles.
+def count_stratified_null_z(X, n_samples=200, seed=0, max_alleles=4000,
+                            burn_factor=5, thin_factor=1):
+    """The COUNT null: co-detection z against MARGIN-PRESERVING shuffles.
 
-    Every allele keeps its detected count k; within each k-stratum the
-    column patterns are resampled by permuting each row independently
-    (a random k-subset of bins, uniform). Answers: is the observed
-    co-detection explained by count heterogeneity alone? Returns
-    (Z (m, m) NaN diagonal, p_one).
+    Curveball trades: two random rows exchange a random reassignment of
+    the bins in their symmetric difference, preserving EVERY row sum
+    (each allele keeps its k) and EVERY column sum (each bin keeps its
+    efficacy) exactly. The first version resampled uniform k-subsets per
+    row, destroying the column margins -- with real per-bin efficacy
+    spread (a first-class QC output of this very package) that null
+    called every high-efficacy pair astronomically significant and
+    buried real co-detection among low-efficacy bins; confirmed by
+    review before any caller shipped.
+
+    Alleles are subsampled to max_alleles (recorded in the returned
+    info) -- the trade chain is O(rows) per sweep and QC power does not
+    need 10^5 rows. Returns (Z (m, m) NaN diagonal, p_one, info).
     """
     X = np.asarray(X, np.uint8)
-    n, m = X.shape
     rng = np.random.default_rng(seed)
-    C_obs = (X.astype(float).T @ X.astype(float))
-    ks = X.sum(1)
-    sims = np.zeros((int(n_samples), m, m))
-    for s in range(int(n_samples)):
-        Xs = np.zeros_like(X)
-        for i in range(n):
-            k = ks[i]
-            if k:
-                Xs[i, rng.choice(m, int(k), replace=False)] = 1
-        Xf = Xs.astype(float)
-        sims[s] = Xf.T @ Xf
-    E = sims.mean(0)
-    V = sims.var(0)
+    n_all = len(X)
+    if n_all > int(max_alleles):
+        X = X[rng.choice(n_all, int(max_alleles), replace=False)]
+    n, m = X.shape
+    C_obs = X.astype(float).T @ X.astype(float)
+    rows = [set(np.flatnonzero(r)) for r in X]
+
+    def trade(times):
+        for _ in range(times):
+            i, j = rng.integers(0, n, 2)
+            if i == j:
+                continue
+            ri, rj = rows[i], rows[j]
+            only_i = ri - rj
+            only_j = rj - ri
+            if not only_i or not only_j:
+                continue
+            pool = list(only_i | only_j)
+            rng.shuffle(pool)
+            take = set(pool[:len(only_i)])
+            shared = ri & rj
+            rows[i] = shared | take
+            rows[j] = shared | (set(pool) - take)
+
+    def snapshot():
+        Xs = np.zeros((n, m))
+        for i, r in enumerate(rows):
+            Xs[i, list(r)] = 1.0
+        return Xs.T @ Xs
+
+    trade(int(burn_factor) * n)
+    s1 = np.zeros((m, m))
+    s2 = np.zeros((m, m))
+    for _ in range(int(n_samples)):
+        trade(int(thin_factor) * n)
+        C = snapshot()
+        s1 += C
+        s2 += C * C
+    E = s1 / n_samples
+    V = s2 / n_samples - E ** 2
     with np.errstate(all='ignore'):
         Z = (C_obs - E) / np.sqrt(np.maximum(V, 1e-12))
     np.fill_diagonal(Z, np.nan)
-    return Z, stats.norm.sf(Z)
+    return Z, stats.norm.sf(Z), {'n_used': n, 'n_total': n_all,
+                                 'n_samples': int(n_samples)}
 
 
 def bh_fdr(pvals):

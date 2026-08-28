@@ -23,6 +23,8 @@ with a FrameResolver (the app) can pass it for exact projection in every
 case. Alignment offsets are a few px against ~50 px cell masks, so the
 fallback is a small, FLAGGED approximation, never a silent one.
 """
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -69,8 +71,14 @@ def fov_expression_table(storage_path, fov, sources, mask_intensity=False,
         homeless[src] = n_homeless
         mip = None
         if mask_intensity:
-            mip = analysis_store.read_hybe_mip(storage_path, fov, hybe,
-                                              int(channel))
+            # The MIP must come from the SOURCE's modality tree -- a bare
+            # (storage_path, hybe) read would resolve an RNA source
+            # against the DNA tree whenever the population was built from
+            # the DNA storage_path (the bridge hybe exists in both).
+            mip_sp = os.path.join(os.path.dirname(
+                os.path.normpath(storage_path)), modality)
+            mip = analysis_store.read_hybe_mip(mip_sp, fov, hybe,
+                                               int(channel))
         for c in cells:
             cid = int(c['id'])
             b = np.array(by_cell.get(cid, []), float)
@@ -98,13 +106,19 @@ def _mask_median(cell, mip, hybe, modality, resolver):
     frame = 'native'
     if resolver is not None:
         try:
+            # transform(src, dst) ALREADY maps src-frame points into
+            # dst's frame (frames.py contract) -- the mask lives in the
+            # cell's reference frame, so H applies DIRECTLY. The first
+            # version inverted it, moving the mask by minus the
+            # alignment offset while labeling the result exact; caught
+            # by adversarial review with a stub resolver before any
+            # caller shipped.
             H, _dz, _missing = resolver.transform(
                 (cell.reference_hybe, cell.reference_modality),
                 (hybe, modality), cell=cell)
-            Hi = np.linalg.inv(H)
             ay, ax = cell.area
             pts = np.stack([ay, ax, np.ones(len(ay))])
-            moved = Hi @ pts
+            moved = H @ pts
             ys, xs = moved[0], moved[1]
         except Exception:
             ys = xs = None

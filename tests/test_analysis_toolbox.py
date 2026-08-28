@@ -59,7 +59,8 @@ p = np.full((1, 3, 3), np.nan)
 p[0, 0] = (0.0, 0.0, 0.0)
 p[0, 1] = (0.0, 0.208, 0.0)      # one PIXEL apart in x, already um-scaled
 d = polymer.polymer_distmaps(p)
-check('distances are euclidean um', abs(d[0, 0, 1] - 0.208) < 1e-9)
+check('distances are euclidean um (float32: memory is the design point)',
+      abs(float(d[0, 0, 1]) - 0.208) < 2e-6 and d.dtype == np.float32)
 check('NaN position poisons its row and column',
       np.isnan(d[0, 2]).all() and np.isnan(d[0, :, 2]).all())
 check('diagonal is zero where observed', d[0, 0, 0] == 0.0)
@@ -138,6 +139,8 @@ pop.alleles = {'fov': np.array([1, 1, 2]), 'cell': np.array([1, 1, 1]),
 
 m = gate.CelltypeIn(['WT']).mask(pop)
 check('celltype gate', list(m) == [True, False, True, False])
+# distance_histogram with a gate on ZERO pairs must return an empty
+# histogram, not KeyError (the pandas empty-list column-selection trap)
 m = gate.ExpressionRange(('RNA', 'Hyb_101', 555), 'n_spots', lo=5).mask(pop)
 check('expression range gate', list(m) == [True, False, True, False])
 m = gate.ExpressionRange(('RNA', 'Hyb_101', 555), 'brightness_median',
@@ -192,6 +195,17 @@ per_cell = distances.pair_distance_per_cell(pop, ('RNA', 'Hyb_101', 555),
                                             ('DNA', 'Hyb_016', 555))
 check('per-cell collapse is median', abs(per_cell.loc[(1, 1)]
       - np.median(pairs['d_um'])) < 1e-9)
+counts_h, _edges = distances.distance_histogram(
+    pop, ('RNA', 'Hyb_101', 555), ('DNA', 'Hyb_016', 555),
+    mask=np.array([False, False, False, False]))
+check('a gate leaving zero pairs yields an EMPTY histogram, not KeyError',
+      counts_h.sum() == 0)
+empty_tab = {'pos_um': np.empty((0, 5, 3)), 'amp': np.empty((0, 5))}
+empty_dm = polymer.polymer_distmaps(empty_tab['pos_um'])
+out0 = polymer.apply_qc(empty_tab, empty_dm,
+                        polymer.qc_thresholds(empty_tab, empty_dm))
+check('apply_qc on zero alleles returns empties, not IndexError',
+      len(out0['kept']) == 0 and out0['dmaps'].shape == (0, 5, 5))
 
 print('\ndetection nulls')
 rng = np.random.default_rng(7)
@@ -207,8 +221,8 @@ u_mean, _sd, q = detection.posterior_u(X_indep, fit['b'], fit['tau'], n_nodes=15
 check('posterior efficiency tracks the truth',
       np.corrcoef(u_mean, u)[0, 1] > 0.6,
       f'r={np.corrcoef(u_mean, u)[0, 1]:.2f}')
-Pn = detection.predicted_P(q, fit['b'], fit['tau'])
-Z, p1, ratio, C, Ex = detection.cooccurrence_z(X_indep, Pn)
+Z, p1, ratio, C, Ex = detection.cooccurrence_z(X_indep, q, fit['b'],
+                                               fit['tau'])
 off = Z[np.triu_indices(m_bins, 1)]
 check('independent bins: co-occurrence z is calibrated (|median| < 1)',
       abs(np.nanmedian(off)) < 1.0, f'{np.nanmedian(off):.2f}')
@@ -217,14 +231,29 @@ X_dep = X_indep.copy()
 X_dep[:, 5] = X_dep[:, 4]
 fit2 = detection.fit_quality_model(X_dep, n_nodes=15, maxiter=200)
 u2, _s2, q2 = detection.posterior_u(X_dep, fit2['b'], fit2['tau'], n_nodes=15)
-Z2, _p, _r, _c, _e = detection.cooccurrence_z(
-    X_dep, detection.predicted_P(q2, fit2['b'], fit2['tau']))
+Z2, _p, _r, _c, _e = detection.cooccurrence_z(X_dep, q2, fit2['b'],
+                                              fit2['tau'])
 others = Z2[np.triu_indices(m_bins, 1)]
 check('a duplicated bin pair stands out against the quality null',
       Z2[4, 5] > np.nanquantile(others, 0.99), f'z={Z2[4, 5]:.1f}')
-Zc, _pc = detection.count_stratified_null_z(X_dep, n_samples=200, seed=0)
-check('and against the count-stratified null too',
+Zc, _pc, info = detection.count_stratified_null_z(X_dep, n_samples=100,
+                                                  seed=0)
+check('and against the margin-preserving count null too',
       Zc[4, 5] > 3.0, f'z={Zc[4, 5]:.1f}')
+# THE FIXED DEFECT, pinned: strongly heterogeneous per-bin efficacy on
+# INDEPENDENT data. The uniform-subset null ignored column margins and
+# called every high-efficacy pair significant; the curveball null
+# preserves both margins and must stay calibrated here.
+b_het = np.linspace(-2.5, 2.5, m_bins)
+X_het = (rng.random((n, m_bins))
+         < 1 / (1 + np.exp(-(b_het[None, :] + u[:, None])))).astype(np.uint8)
+Zh, _ph, _ih = detection.count_stratified_null_z(X_het, n_samples=100,
+                                                 seed=1)
+off_h = Zh[np.triu_indices(m_bins, 1)]
+check('heterogeneous-efficacy independent data stays CALIBRATED under '
+      'the margin-preserving null',
+      abs(np.nanmedian(off_h)) < 1.0 and np.nanmax(np.abs(off_h)) < 6.0,
+      f'median {np.nanmedian(off_h):.2f}, max |z| {np.nanmax(np.abs(off_h)):.1f}')
 q_bh = detection.bh_fdr(np.array([0.001, 0.02, 0.5, np.nan]))
 check('bh_fdr is monotone and NaN-transparent',
       q_bh[0] <= q_bh[1] <= q_bh[2] and np.isnan(q_bh[3]))
