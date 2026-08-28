@@ -46,8 +46,8 @@
     reference_hybe_DNA="Hyb_015"
     reference_hybe_RNA="Hyb_101" />
   <spot_localization
-    hybe="Hyb_015 (DNA)"
-    channel="635"
+    hybe="Hyb_016 (DNA)"
+    channel="555"
     threshold_percent="50"
     threshold_absolute=""
     min_distance="3"
