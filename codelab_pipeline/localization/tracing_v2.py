@@ -87,6 +87,10 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 # piece of the same proposal that survives on physical grounds.
 Z_PLACEMENT = 'consensus'
 
+# Retry a gate-failed fiducial fit once from the argmax seed. See the
+# fallback site in the trace loop for the basin story and the numbers.
+FIDUCIAL_SEED_FALLBACK = True
+
 # -- gates, per channel, in NANOMETRES ------------------------------------
 #
 # Nanometres and not pixels, with lateral and axial INDEPENDENT. v1 wrote
@@ -548,8 +552,22 @@ def fit_fiducial(cube, z_centre, p):
     """
     if cube is None or not np.isfinite(cube).any():
         return None
-    sy, sx, sz = _seed(cube, z_centre, p.voxel_um,
-                       _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
+    seed = _seed(cube, z_centre, p.voxel_um,
+                 _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
+    return fit_fiducial_from(cube, seed, p)
+
+
+def fit_fiducial_from(cube, seed, p):
+    """fit_fiducial's core with the SEED chosen by the caller.
+
+    Exists for the second-start fallback: on faint extended fiducials the
+    fit landscape has two basins (emitter vs background-soak) and the
+    seed decides which one least squares falls into, so a failed
+    centroid-seeded fit is retried from the argmax.
+    """
+    if cube is None or not np.isfinite(cube).any():
+        return None
+    sy, sx, sz = seed
     return U.fit_gaussian_3d_um(
         cube, sy, sx, sz, voxel_um=p.voxel_um,
         peak_bound_um=FIDUCIAL_PEAK_BOUND_UM,
@@ -877,6 +895,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'readout_uncert_nm': (float('nan'), float('nan')),
                                     'fiducial_at_bound': (),
                                     'readout_at_bound': (),
+                                    'fiducial_rejected_centroid': None,
+                                    'readout_rejected_centroids': None,
                                     'fiducial_seed': None,
                                     'readout_seed': None,
                                     'readout_zexp': float('nan')})
@@ -888,6 +908,29 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                 _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
         f = fit_fiducial(cube, z0, p)
         ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
+        if not ok and FIDUCIAL_SEED_FALLBACK:
+            # SECOND START FROM THE ARGMAX, only when the first fit failed
+            # its gate. Faint extended fiducials (contrast ~1.5x, which
+            # per-tile display normalization renders indistinguishable
+            # from a bright one) give the enlarged fit domain TWO basins:
+            # the emitter, and a background-soak solution with a huge free
+            # sigma. The centroid seed sometimes starts in the soak basin;
+            # the brightest voxel is in the emitter basin by construction.
+            #
+            # Measured on the five reported allele-15 failures, same
+            # bytes: centroid-seeded occupancy -0.36..0.22, argmax-seeded
+            # 0.37..0.75 -- all five recover at the 0.25 gate. Passing
+            # hybes never pay (no retry), and greedy-seed identity risk is
+            # bounded: this fires only where the alternative was LOSING
+            # the hybe, and the drift gate against the reference still
+            # applies to whatever the retry returns.
+            ay, ax, az = np.unravel_index(int(np.nanargmax(cube)), cube.shape)
+            f2 = fit_fiducial_from(cube, (float(ay), float(ax), float(az)), p)
+            ok2, why2 = gate(f2, cube, p.fiducial_gates, p.voxel_um)
+            if ok2:
+                f, ok, why = f2, ok2, why2
+                if debug is not None:
+                    debug[hybe]['fiducial_seed_fallback'] = True
         # Recorded BEFORE the reject below, on purpose: the occupancy that
         # FAILED is the one worth seeing when deciding where the threshold
         # belongs, and a rejected hybe still draws a tile. gate() computes
@@ -917,6 +960,11 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             ref_note = why
             ok = True
         if not ok:
+            # The fit EXISTS; the gate refused it. Its position is what the
+            # blue circle draws -- yellow = traced, blue = fitted but
+            # gated, no circle = no fit at all.
+            if debug is not None and f is not None:
+                debug[hybe]['fiducial_rejected_centroid'] = (f.x, f.y, f.z)
             allele.rejected_hybes[hybe] = f'fiducial {why}'
             continue
         ymin, xmin = fid_origin[hybe]
@@ -969,6 +1017,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'readout_uncert_nm': (float('nan'), float('nan')),
                                     'fiducial_at_bound': (),
                                     'readout_at_bound': (),
+                                    'fiducial_rejected_centroid': None,
+                                    'readout_rejected_centroids': None,
                                     'fiducial_seed': None,
                                     'readout_seed': None,
                                     'readout_zexp': float('nan')})
@@ -1059,6 +1109,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug[hybe]['readout_at_bound'] = tuple(
                 getattr(r, 'at_bound', None) or ())
         if not ok:
+            if debug is not None and r is not None:
+                debug[hybe]['readout_rejected_centroids'] = [(r.x, r.y, r.z)]
             allele.rejected_hybes[hybe] = f'readout {why}'
             continue
         sy, sx, sz = _to_shared(hybe, r.y, r.x, r.z, ymin, xmin)

@@ -4,7 +4,8 @@ from codelab_pipeline.io import preprocess
 
 
 def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, title='',
-                         marker_size=130, z_display_pad=15, title_fontsize=9):
+                         marker_size=130, z_display_pad=15, title_fontsize=9,
+                         rejected=None):
     """
     Renders one spot's fit-status: a YX max-projection (over Z) and an XZ
     max-projection (over Y -- X horizontal, Z vertical, same display
@@ -65,9 +66,24 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     centroids = None
     if centroid is not None:
         centroids = list(centroid) if isinstance(centroid, list) else [centroid]
+    # rejected: fits that EXIST but were gate-rejected, drawn blue -- the
+    # same colour as mixture-context components, and the same meaning: a
+    # fit that is not a traced position. Three states per tile: yellow =
+    # traced, blue = fitted but gated, no circle = no fit at all.
+    rejected_list = None
+    if rejected is not None:
+        rejected_list = list(rejected) if isinstance(rejected, list) else [rejected]
 
     depth = cubic.shape[2]
-    z_center = centroids[0][2] if centroids else float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+    if centroids:
+        z_center = centroids[0][2]
+    elif rejected_list:
+        # centre the depth window on the rejected fit, or a rejected tile
+        # shows a slab picked by the brightest voxel and the blue circle
+        # can fall outside its own display window
+        z_center = rejected_list[0][2]
+    else:
+        z_center = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
     zmin = max(0, int(round(z_center)) - z_display_pad)
     zmax = min(depth, int(round(z_center)) + z_display_pad + 1)
     xz = preprocess.normalize_to_uint8(cubic[:, :, zmin:zmax].max(axis=0).T, lb, ub)  # (z window, width)
@@ -85,5 +101,11 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         for i, (cx, cy, cz) in enumerate(centroids):
             color = 'yellow' if i == 0 else 'blue'
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none', edgecolors=color, linewidths=1.2)
+            ax_yx.scatter([cx], [cy], **marker_kwargs)
+            ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+    if rejected_list:
+        for cx, cy, cz in rejected_list:
+            marker_kwargs = dict(s=marker_size, marker='o', facecolors='none',
+                                 edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
             ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)

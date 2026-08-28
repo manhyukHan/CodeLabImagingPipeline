@@ -7241,17 +7241,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
             for hybe in hybes:
                 d = debug.get(hybe, {})
+                # Three marker states per tile: yellow = traced, blue =
+                # fitted but gate-rejected, no circle = no fit at all.
                 if d.get('fiducial_cubic') is not None:
                     centroid = [d['fiducial_centroid']] if d['fiducial_centroid'] is not None else None
+                    rej = d.get('fiducial_rejected_centroid')
                     fid_results.append((d['fiducial_cubic'], centroid,
                                         _titled(hybe, d.get('fiducial_occupancy'),
                                                 d.get('fiducial_uncert_nm'),
-                                                'fiducial')))
+                                                'fiducial'),
+                                        [rej] if rej is not None else None))
                 if d.get('readout_cubic') is not None:
                     readout_results.append((d['readout_cubic'], d['readout_centroids'],
                                             _titled(hybe, d.get('readout_occupancy'),
                                                     d.get('readout_uncert_nm'),
-                                                    'readout')))
+                                                    'readout'),
+                                            d.get('readout_rejected_centroids')))
 
             allele_label = f'FOV{fov:03d}_allele{allele.id}'
             # allele figures default into figures/{modality}/alleles/fov###/,

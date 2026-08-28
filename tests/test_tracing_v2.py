@@ -191,6 +191,29 @@ def main():
     check('own_native_z answers mid-stack for an all-NaN pillar, not a raise',
           V2.own_native_z(np.full((5, 5, 9), np.nan), VOXEL) == 4.0)
 
+    print('\nthe fiducial seed fallback')
+    # Faint extended fiducials (contrast ~1.5x -- per-tile display
+    # normalization hides this entirely) give the fit two basins, and the
+    # seed decides which one least squares lands in. Measured on the five
+    # reported allele-15 failures, same bytes: centroid-seeded occupancy
+    # -0.36..0.22, argmax-seeded 0.37..0.75 -- all five recover at the
+    # 0.25 gate. End-to-end at shipping gates: fiducials kept 7694 ->
+    # 8661, pairs 230 -> 243, p90 320 -> 387 nm (the recovered rounds are
+    # the faint ones; their pairs land in the tail).
+    check('the argmax retry is on by default',
+          V2.FIDUCIAL_SEED_FALLBACK is True)
+    fb_cube = np.random.default_rng(7).normal(100.0, 2.0, (17, 17, 40))
+    fb_cube[8, 8, 20] = 400.0
+    fb_cube[7:10, 7:10, 19:22] += 150.0
+    same_seed = (8.0, 8.0, 20.0)
+    fa1 = V2.fit_fiducial_from(fb_cube, same_seed, p)
+    check('fit_fiducial_from is fit_fiducial with the seed chosen by the '
+          'caller -- same seed, same fit',
+          fa1 is not None and abs(fa1.y - 8.0) < 1.0 and abs(fa1.x - 8.0) < 1.0,
+          None if fa1 is None else f'({fa1.y:.2f}, {fa1.x:.2f})')
+    check('an all-NaN cube returns None, not a raise',
+          V2.fit_fiducial_from(np.full((5, 5, 9), np.nan), same_seed, p) is None)
+
     print('\nthe readout PSF')
     p_free = V2.V2Params(voxel_um=VOXEL)
     check('no PSF means sigma is fitted per spot', not p_free.has_psf)

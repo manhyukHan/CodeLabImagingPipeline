@@ -54,7 +54,7 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
 
     def show_fit_status_grid(self, results, allele_label='', params=None, default_dir=''):
         """
-        results: list of (cubic, centroid, title) -- one entry per active
+        results: list of (cubic, centroid, title, rejected) -- one entry per active
         hybe, same shape/semantics Localize3DGridDisplayer.
         show_fit_status_grid already uses (cubic=None entries should
         already be filtered out by the caller; centroid=None still renders
@@ -81,13 +81,14 @@ class ChromatinTraceGridDisplayer(QtWidgets.QMainWindow):
         # and were getting clipped off the canvas at 0.97.
         outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
                                  left=0.03, right=0.98, top=0.90, bottom=0.03)
-        for i, (cubic, centroid, title) in enumerate(results):
+        for i, (cubic, centroid, title, rejected) in enumerate(results):
             row_pair, col = divmod(i, ncols)
             inner = outer[row_pair, col].subgridspec(2, 1, hspace=0.08)
             ax_yx = fig.add_subplot(inner[0])
             ax_xz = fig.add_subplot(inner[1], sharex=ax_yx)
             spot_fit_status.draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=centroid,
-                                                 title=title, title_fontsize=8)
+                                                 title=title, title_fontsize=8,
+                                                 rejected=rejected)
         width_px = max(self.canvas.minimumWidth(), ncols * col_px)
         height_px = max(self.canvas.minimumHeight(), nrows_pairs * pair_px)
         self._resize_canvas(width_px, height_px)
