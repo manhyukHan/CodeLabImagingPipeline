@@ -65,6 +65,28 @@ from codelab_pipeline.localization import fit3d_mle as M
 
 DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 
+# How each hybe's FIDUCIAL box is placed in depth. Proposed and A/B-tested
+# 2026-08-29, both arms through the engine at the shipping gates (fid occ
+# 0.25, readout occ 0.40, z-uncert 150, lateral at-bound fatal; MP58 FOV1,
+# 127 alleles):
+#
+#                     traced   fiducials   pairs   med nm   p90 nm
+#     consensus         3395        7694     230      129      320
+#     self              3111        7288     204      126      399
+#
+# 'self' (per-hybe pillar intensity centroid) was proposed to stop losing
+# fiducials to a mis-placed consensus box -- and measured, it keeps FEWER
+# fiducials: over ~110 planes the single-pillar centroid sometimes centres
+# the box on the wrong depth structure, that fit scores low occupancy, and
+# the hybe dies. The cross-hybe median pools ~70 hybes and is the more
+# robust estimator of the same quantity -- the identity-over-greed lesson
+# again, one axis down. Kept selectable for re-testing on other data.
+#
+# The READOUT box is unaffected by this switch: it sits at its own hybe's
+# fitted fiducial z in both modes (see the readout phase), which is the
+# piece of the same proposal that survives on physical grounds.
+Z_PLACEMENT = 'consensus'
+
 # -- gates, per channel, in NANOMETRES ------------------------------------
 #
 # Nanometres and not pixels, with lateral and axial INDEPENDENT. v1 wrote
@@ -396,6 +418,12 @@ def consensus_native_z(cubes_by_hybe, z_offsets):
     {hybe: expected native z} -- where this allele should sit, in depth,
     in EACH hybe's own stack.
 
+    Still the FIDUCIAL placement (Z_PLACEMENT = 'consensus'): the
+    per-hybe alternative (own_native_z) was proposed and A/B-tested at
+    the shipping gates and kept fewer fiducials and fewer pairs at a
+    worse p90 -- see the table at Z_PLACEMENT. The READOUT box no longer
+    uses this: it sits at its own hybe's fitted fiducial z.
+
     The alleles here have z = 0: they are detected on MIPs and never
     3D-refined, so there is no anchor depth to place a box with. It is
     derived instead, and the derivation must happen in the SHARED frame:
@@ -429,6 +457,41 @@ def consensus_native_z(cubes_by_hybe, z_offsets):
         return {}
     baseline = float(np.median(shared))
     return {h: baseline - float(o) for h, o in z_offsets.items()}
+
+
+def own_native_z(cube, voxel_um=DEFAULT_VOXEL_UM):
+    """This hybe's OWN depth: intensity-weighted z centroid of the pillar.
+
+    The proposed replacement for the cross-hybe consensus (2026-08-29):
+    the consensus is an external prior, and a hybe genuinely off the
+    median depth got its box mis-placed, railing innocently. MEASURED at
+    the shipping gates it is NOT the default: the single-pillar centroid
+    is noisier than the pooled median and lost more fiducials than the
+    mis-placement did (see Z_PLACEMENT). Selectable for re-testing; also
+    the readout-phase fallback when a hybe has no fiducial fit.
+
+    The centroid, NOT the argmax: the argmax is one voxel and as noisy as
+    one voxel (consensus_native_z's own measurement), and NOT a pillar
+    fit: measured at 4.65 planes of placement error against 1.05 for the
+    fit-free routes -- a pillar fit is the degenerate fit this module
+    exists to avoid. The centroid is floor-clipped at the median so the
+    ~110 planes of out-of-focus background do not drag it to mid-stack.
+
+    Boundary needs no NaN padding: the fit DOMAIN (fit_radius_um around
+    the seed) clips at the stack edge by construction, and display crops
+    stay full-depth.
+    """
+    ny, nx, nz = cube.shape
+    if not np.isfinite(cube).any():
+        # nanargmax on an all-NaN cube raises; mid-stack is the only
+        # honest answer when the pillar holds nothing.
+        return (nz - 1) / 2.0
+    got = U.intensity_centroid(
+        cube, ((ny - 1) / 2.0, (nx - 1) / 2.0, (nz - 1) / 2.0),
+        (max(1, ny // 2 - 1), max(1, nx // 2 - 1), nz), voxel_um)
+    if got is not None:
+        return float(got[2])
+    return float(np.unravel_index(int(np.nanargmax(cube)), cube.shape)[2])
 
 
 # -- fitting --------------------------------------------------------------
@@ -791,7 +854,15 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         fid_cubes[hybe] = cube
         fid_origin[hybe] = (ymin, xmin)
         z_offsets[hybe] = float(L.cell_z_offset(cell, hybe, mod, resolver))
-    zexp = consensus_native_z(fid_cubes, z_offsets)
+    # Each hybe's box at its OWN depth -- no cross-hybe consensus, no
+    # external prior for the placement. z_offsets stay: the drift gate and
+    # the shared-frame conversion still need raw->shared per hybe.
+    # Z_PLACEMENT is module state so the two schemes stay A/B-able; the
+    # consensus is the measured reference this change is judged against.
+    if Z_PLACEMENT == 'consensus':
+        zexp = consensus_native_z(fid_cubes, z_offsets)
+    else:
+        zexp = {h: own_native_z(c, p.voxel_um) for h, c in fid_cubes.items()}
 
     # -- phase 2: fit the fiducials at their own expected depth ---------
     fid_local, ref_note = {}, None
@@ -964,7 +1035,15 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             continue
         if debug is not None:
             debug[hybe]['readout_cubic'] = cube
-        z_r = zexp.get(hybe, cube.shape[2] / 2.0)
+        # The readout box sits at this hybe's OWN fiducial depth. The
+        # fiducial images the whole traced region and the readout is one
+        # locus inside it, so the region's fitted z is the right prior --
+        # and it carries this hybe's own drift, unlike the old cross-hybe
+        # consensus. With the z bound (2.8 um) anchored at the seed inside
+        # this box, the readout's axial reach is now measured FROM ITS OWN
+        # FIDUCIAL, which is the physically meaningful anchor.
+        z_r = (float(fid_local[hybe][2]) if hybe in fid_local
+               else own_native_z(cube, p.voxel_um))
         if debug is not None:
             debug[hybe]['readout_zexp'] = float(z_r)
             debug[hybe]['readout_seed'] = _seed(
@@ -1012,7 +1091,10 @@ def allele_task(payload):
     """Run ONE allele end to end in a child process.
 
     THE UNIT OF PARALLELISM FOR v2, and it has to be the allele rather
-    than the hybe. consensus_native_z needs EVERY hybe's fiducial argmax,
+    than the hybe. (Historically because consensus_native_z needed every
+    hybe's fiducial argmax; placement now self-centres per hybe, but the
+    drift gate still measures every hybe against the reference fiducial,
+    so the allele remains the natural unit,
     mapped into the shared frame, before ANY fit can be seeded -- a
     barrier that v1 does not have, because v1 fits each hybe independently
     end to end.

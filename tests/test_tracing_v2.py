@@ -175,6 +175,22 @@ def main():
           V2.gate(f, cube, tightz, VOXEL)[0] is False
           and 'axial uncertainty' in V2.gate(f, cube, tightz, VOXEL)[1])
 
+    print('\nz placement')
+    # A/B-tested at the shipping gates (MP58 FOV1, 127 alleles): consensus
+    # 230 pairs @ 129/320 nm against self 204 @ 126/399, and self kept
+    # FEWER fiducials (7288 vs 7694) -- the single-pillar centroid is
+    # noisier than the pooled median. The switch stays for re-testing.
+    check('fiducial boxes are placed by the cross-hybe consensus by default',
+          V2.Z_PLACEMENT == 'consensus', V2.Z_PLACEMENT)
+    zc = np.zeros((17, 17, 110))
+    zc[8, 8, 80] = 900.0
+    zc[7:10, 7:10, 78:83] += 120.0
+    check('own_native_z finds an emitter far off the stack middle',
+          abs(V2.own_native_z(zc, VOXEL) - 80.0) <= 2.0,
+          f'{V2.own_native_z(zc, VOXEL):.1f}')
+    check('own_native_z answers mid-stack for an all-NaN pillar, not a raise',
+          V2.own_native_z(np.full((5, 5, 9), np.nan), VOXEL) == 4.0)
+
     print('\nthe readout PSF')
     p_free = V2.V2Params(voxel_um=VOXEL)
     check('no PSF means sigma is fitted per spot', not p_free.has_psf)
