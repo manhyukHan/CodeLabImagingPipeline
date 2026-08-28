@@ -16,8 +16,17 @@ Append-mode (per-(FOV, hybe) delta, manual trigger) functional check:
    cell.matrices; fully-aligned cells skipped.
 6. build_chromatin_trace_allele append: merge (no reset) vs default full
    replace; requested hybes' stale entries cleared for re-derive.
-7. ChromatinTracingWorker append: per-allele fit list excludes polymer +
-   rejected + not-ready hybes; up-to-date alleles skipped.
+7. ChromatinTracingWorker append: fits EVERY checked hybe for every allele
+   it is handed, always with append=False. Which ALLELES run is decided
+   upstream by membership (AlleleContainer.has_traced on the permanent
+   tier), not by which hybes an allele happens to be missing.
+
+   This section asserted the opposite until 2026-08-28. The old rule --
+   append fits the hybes not yet traced on an allele -- is what allowed an
+   allele half-traced by one engine to be finished by another, leaving one
+   polymer built from two estimators with nothing on disk recording it.
+   Section 6 stays: the ENGINE still supports merge, only the caller
+   stopped asking for it.
 """
 import json
 import os
@@ -211,34 +220,95 @@ def main():
     check('default (overwrite) still resets the three dicts',
           allele.polymer == {} and allele.rejected_hybes == {} and allele.fiducial_trace == {})
 
-    # -- 7. ChromatinTracingWorker append filter ------------------------------
+    # -- 7. ChromatinTracingWorker: append is a MEMBERSHIP question ----------
+    #
+    # This section used to assert the opposite, and the behaviour it
+    # defended is the one that had to go: append filtered HYBES per allele,
+    # so an allele half-traced by one engine could have the rest of its
+    # hybes filled in by another, leaving ONE polymer built from two
+    # estimators with nothing on disk saying so.
+    #
+    # Which ALLELES run is now decided before the worker starts, by
+    # AlleleContainer.has_traced on the permanent tier (see
+    # MainWindow._run_chromatin_tracing_fit_all). The worker's remaining
+    # job is simple and is what these checks pin: fit EVERY checked hybe,
+    # for every allele it is handed, with append=False.
+    from codelab_pipeline.localization import tracing_v2
+
+    def _spy(traced):
+        def record(engine, allele, hybes, *a, **k):
+            traced.append((allele.id, tuple(hybes), k.get('append')))
+            return allele, None
+        return record
+
+    # a1 is partly traced, a2 is fully traced -- under the OLD rule a1
+    # would have been fitted for H3 only and a2 skipped entirely.
     a1 = types.SimpleNamespace(id=1, cell=-1, coordinate=(0, 0, 0),
                                polymer={'H1': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace={})
     a2 = types.SimpleNamespace(id=2, cell=-1, coordinate=(0, 0, 0),
                                polymer={'H1': 1, 'H3': 1}, rejected_hybes={'H2': 'r'}, fiducial_trace={})
+    # The worker no longer ACCEPTS ready_hybes_by_fov. A parameter it does
+    # not read would imply a per-hybe filter that no longer exists, so its
+    # absence is asserted rather than assumed.
+    import inspect
+    sig = inspect.signature(ChromatinTracingWorker.__init__)
+    check('the worker no longer takes ready_hybes_by_fov -- readiness is a '
+          'FOV-level decision made on the GUI thread',
+          'ready_hybes_by_fov' not in sig.parameters, str(list(sig.parameters)))
+
     ctw = ChromatinTracingWorker([(dna_sp, 9, [a1, a2])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
                                  {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
-                                 workers=1, append=True, ready_hybes_by_fov={9: {'H1', 'H2', 'H3'}})
+                                 workers=1, append=True)
     traced = []
-    with mock.patch.object(localization, 'build_chromatin_trace_allele',
-                           side_effect=lambda allele, hybes, *a, **k: traced.append((allele.id, tuple(hybes),
-                                                                                    k.get('append')))):
+    with mock.patch.object(tracing_v2, 'trace_allele', side_effect=_spy(traced)):
         ctw.run()
-    check('append traces only missing hybes per allele; complete allele skipped',
-          traced == [(1, ('H3',), True)], str(traced))
+    check('every allele handed to the worker is fitted for EVERY checked hybe',
+          traced == [(1, ('H1', 'H2', 'H3'), False),
+                     (2, ('H1', 'H2', 'H3'), False)], str(traced))
+    check('and always with append=False -- a selected allele has no committed '
+          'trace to merge into, so a full re-derivation is correct',
+          all(entry[2] is False for entry in traced), str(traced))
 
-    # not-ready hybes excluded from the fit list
+    # An allele with NOTHING traced gets the full hybe list too -- there is
+    # no path left by which the worker fits a subset.
     a3 = types.SimpleNamespace(id=3, cell=-1, coordinate=(0, 0, 0),
                                polymer={}, rejected_hybes={}, fiducial_trace={})
     ctw2 = ChromatinTracingWorker([(dna_sp, 9, [a3])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
                                   {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
-                                  workers=1, append=True, ready_hybes_by_fov={9: {'H1'}})
+                                  workers=1, append=True)
     traced.clear()
-    with mock.patch.object(localization, 'build_chromatin_trace_allele',
-                           side_effect=lambda allele, hybes, *a, **k: traced.append((allele.id, tuple(hybes)))):
+    with mock.patch.object(tracing_v2, 'trace_allele', side_effect=_spy(traced)):
         ctw2.run()
-    check('mid-ingestion: only stack-ready hybes are attempted',
-          traced == [(3, ('H1',))], str(traced))
+    check('an untraced allele is also fitted for every checked hybe',
+          traced == [(3, ('H1', 'H2', 'H3'), False)], str(traced))
+    # The source itself: no surviving expression that narrows the hybe list.
+    import inspect as _inspect
+    src = _inspect.getsource(ChromatinTracingWorker.run)
+    check('the worker body contains no per-hybe append filter at all',
+          'not in traced' not in src and 'set(allele.polymer' not in src
+          and 'ready_hybes_by_fov' not in src,
+          'a hybe-narrowing expression survives in ChromatinTracingWorker.run')
+
+    # -- 7b. the membership rule itself --------------------------------------
+    from codelab_pipeline.models.allele import AnAllele
+    from codelab_pipeline.models.allele_container import AlleleContainer
+    key = (dna_sp, 9)
+    perm = AlleleContainer()
+    for aid, traced_flag in ((1, True), (2, False)):
+        a = AnAllele()
+        a.set_metadata(id=aid, fov=9, cell=-1, anchor_uid=aid, anchor_hybe='H1',
+                       anchor_channel=555, coordinate=(0.0, 0.0, 0.0),
+                       raw_coordinate=(0.0, 0.0, 0.0))
+        if traced_flag:
+            a.polymer = {'H1': [(1.0, 2.0, 3.0, 9.0)]}
+        perm.add(key, a)
+    check('a committed allele WITH a trace is skipped by append',
+          perm.has_traced(key, 1))
+    check('a committed allele with NO trace is still fitted by append -- '
+          'Add then Save must not become a trap',
+          not perm.has_traced(key, 2))
+    check('an allele that was never saved is fitted by append',
+          not perm.has_traced(key, 3))
 
     print(f"\n{'ALL GOOD' if not FAILS else f'{len(FAILS)} FAILED: {FAILS}'}")
     return 1 if FAILS else 0

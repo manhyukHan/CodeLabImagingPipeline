@@ -45,6 +45,7 @@ from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import ASpot
 from codelab_pipeline.models.spot_container import DiffUndo, SpotContainer
 from codelab_pipeline.models.allele import AnAllele
+from codelab_pipeline.models.allele_container import AlleleContainer
 from codelab_pipeline.models import celltype
 from skimage.feature import peak_local_max
 
@@ -802,27 +803,33 @@ class ChromatinTracingWorker(QtCore.QThread):
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
                 max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None, append=False,
-                ready_hybes_by_fov=None, engine=None, v2_params=None):
+                engine=None, v2_params=None):
         super().__init__()
-        # append=True: per-(allele, hybe) delta (per explicit decision) --
-        # each allele is fitted only for checked hybes not yet in its
-        # polymer or rejected_hybes (a rejection is a real fit-quality
-        # verdict, not missing work -- re-judging it every append pass
-        # would just repeat the same answer), via build_chromatin_trace_
-        # allele's own merge mode, which also reuses the stored reference
-        # fiducial baseline. Alleles with nothing missing are skipped.
-        # ready_hybes_by_fov ({fov: set(folders)}, append mode only,
-        # precomputed on the GUI thread from _ready_hybes): tracing reads
-        # RAW STACK crops, so mid-ingestion a hybe whose stack hasn't
-        # landed for this FOV yet must not be attempted -- it stays
-        # missing for the next append pass rather than failing this one.
+        # THE WORKER DOES NO APPEND FILTERING. It fits every allele it is
+        # given, for every checked hybe. `append` is carried only so the
+        # progress text can name the mode.
+        #
+        # It used to filter per (allele, hybe) -- fit the hybes not yet in
+        # an allele's polymer or rejected_hybes -- and that is exactly what
+        # let an allele half-traced by one engine be finished by another,
+        # producing one polymer built from two estimators with nothing on
+        # disk recording it. Which ALLELES run is now decided before the
+        # worker starts, by AlleleContainer.has_traced against the
+        # permanent tier (_run_chromatin_tracing_fit_all).
+        #
+        # `ready_hybes_by_fov` is gone from here for the same reason. Stack
+        # readiness still matters mid-ingestion, but it is now a FOV-level
+        # decision made on the GUI thread: a FOV whose checked hybes have
+        # not all landed is skipped WHOLE, so a partially-traced allele can
+        # never be committed and then never revisited. A parameter the
+        # worker no longer reads would imply a filter that no longer
+        # exists.
         self.append = append
         # Which engine, resolved ONCE on the GUI thread and carried here.
         # v1 stays the default and the reference implementation.
         self.engine = engine
         self.v2_params = v2_params
         self.n_failed = 0
-        self.ready_hybes_by_fov = ready_hybes_by_fov or {}
         self.resolver_by_fov = resolver_by_fov or {}
         self.z_boundary_trim = z_boundary_trim
         # None defers to localization.max_tracing_workers(); 1 forces the
@@ -872,17 +879,11 @@ class ChromatinTracingWorker(QtCore.QThread):
                 for storage_path, fov, alleles in self.jobs:
                     fov_matrices = self.fov_matrices_by_fov.get(fov, {})
                     for allele in alleles:
+                        # EVERY checked hybe, always. Which ALLELES run was
+                        # already decided by membership on the GUI thread;
+                        # the old per-hybe filter here is what allowed one
+                        # allele to be finished by a second engine.
                         fit_hybes = self.hybes
-                        if self.append:
-                            traced = set(allele.polymer or {}) | set(allele.rejected_hybes or {})
-                            ready = self.ready_hybes_by_fov.get(fov)
-                            fit_hybes = [h for h in self.hybes if h not in traced
-                                         and (ready is None or h in ready)]
-                            if not fit_hybes:
-                                done += 1
-                                self.progress.emit(done, total,
-                                                   f'FOV{fov:03d} allele {allele.id}: up to date -- skipped')
-                                continue
                         cell = self.cell_lookup(fov, allele.cell) if allele.cell != -1 else None
                         # Per-allele guard: one bad allele (a corrupt crop,
                         # a degenerate fit) must not abort the remaining
@@ -902,7 +903,13 @@ class ChromatinTracingWorker(QtCore.QThread):
                                 fiducial_params=self.fiducial_params, readout_params=self.readout_params,
                                 resolver=self.resolver_by_fov.get(fov),
                                 z_boundary_trim=self.z_boundary_trim, executor=executor,
-                                append=self.append)
+                                # append=False ALWAYS. An allele reaching
+                                # this loop has no committed trace to merge
+                                # into -- append mode filtered those out --
+                                # so a full re-derivation is correct, and
+                                # merging would only preserve stale entries
+                                # from a run that was never saved.
+                                append=False)
                         except Exception as e:
                             self.n_failed += 1
                             done += 1
@@ -1191,15 +1198,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._vlinks_refreshed_paths = set()  # storage_paths already reconciled from vlinks this session (see _refresh_params_from_vlinks)
         self._activated_fovs = set()  # FOVs _try_show_existing_cells has already staged into self.cell_container this session (see _activate_fov)
 
-        # (storage_path, fov) -> [AnAllele, ...] -- chromatin tracing's own
-        # session-transient allele list, built from whatever's currently
-        # selected in Spot Localization (see _build_chromatin_alleles_
-        # from_selection), same shape/rationale as the old unassigned pool
-        # above. Only Fit All FOVs persists these (mirror_write_fov_
-        # alleles) -- building/previewing stays in-memory only, same
-        # "explicit Save step" convention Spot Localization's own Save
-        # Current Spots already follows.
-        self.chromatin_alleles = {}
+        # TWO TIERS, exactly as cells and spots have: chromatin_alleles is
+        # transient (what the listview shows and Build/Remove touch) and
+        # chromatin_alleles_permanent mirrors what is on disk. Without
+        # saving, nothing changes data.
+        #
+        # Alleles used to be a single plain dict that Build REPLACED
+        # wholesale, which made APPEND a per-hybe question ("which hybes
+        # are not yet traced on this allele") and let one allele end up
+        # with a polymer built by two different engines. Membership -- is
+        # this allele committed yet -- is the question that actually
+        # matches what a person means by append.
+        self.chromatin_alleles = AlleleContainer()
+        self.chromatin_alleles_permanent = AlleleContainer()
+        # (storage_path, fov) staged from disk this session. The guard that
+        # stops a Save on an unstaged FOV wiping alleles.h5, which is a
+        # whole-FOV atomic replace.
+        self._allele_loaded_keys = set()
         self.chromatin_fiducial_grid_displayer = ChromatinTraceGridDisplayer('Fiducial')
         self.chromatin_readout_grid_displayer = ChromatinTraceGridDisplayer('Readout')
         self.chromatin_fiducial_overlay_displayer = ChromatinTraceGridDisplayer('Fiducial Overlay')
@@ -1477,8 +1492,12 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.AlleleHybeComboBox.currentIndexChanged.connect(lambda _: self._on_chromatin_allele_hybe_changed())
         chp.AlleleChannelComboBox.currentIndexChanged.connect(lambda _: self._refresh_chromatin_allele_spot_choices())
         chp.BuildAllelesPushButton.clicked.connect(self._build_chromatin_alleles_from_selection)
+        chp.RemoveAllelesPushButton.clicked.connect(self._remove_selected_alleles)
+        chp.SaveAllelesPushButton.clicked.connect(self._save_chromatin_alleles)
+        chp.RevertAllelesPushButton.clicked.connect(self._revert_chromatin_alleles)
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
         chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
+        chp.FitThisFovPushButton.clicked.connect(self._run_chromatin_tracing_fit_this_fov)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
         # The engine combo was connected to NOTHING, so selecting v2 left
         # every control it ignores enabled and labelled in pixels. Every
@@ -6780,12 +6799,19 @@ class MainWindow(QtWidgets.QMainWindow):
         Turns whatever's currently SELECTED in this panel's OWN spot list
         (Alleles section -- scoped by its own FOV/Hybe/Channel pickers,
         never Spot Localization's live session state, see class docstring
-        on ui/chromatin_tracing_panel.py) into this FOV's allele list --
-        full replace (same "re-run overwrites" convention as _replace_
-        cell_spots/_replace_fov_unassigned_spots elsewhere in this app),
-        never an incremental merge, so clicking this again after changing
-        the selection can't leave stale alleles from a previous click
-        mixed in. Builds directly from the persisted spot dicts (id/cell/
+        on ui/chromatin_tracing_panel.py) into this FOV's TRANSIENT allele
+        container -- an ADD, not a replace.
+
+        It was a full replace while alleles lived in one plain dict, which
+        made ids positional and safe to remint from 1 each time. With two
+        tiers that is wrong twice over: staged work from an earlier click
+        would vanish, and reminting would collide with the ids the
+        listview, the preview fit and the append membership test all key
+        on. Ids now come from next_id across BOTH tiers, and a spot whose
+        uid already anchors a staged allele is skipped rather than
+        duplicated. Remove Selected is how a mistake is undone.
+
+        Builds directly from the persisted spot dicts (id/cell/
         hybe/channel/coordinate/raw_coordinate) -- no live ASpot/ACell
         needed at build time; the owning cell is resolved later, lazily,
         wherever a real fit actually needs it (View Crop/Fit All FOVs).
@@ -6800,40 +6826,181 @@ class MainWindow(QtWidgets.QMainWindow):
         if not selected:
             QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Select at least one spot first.')
             return
-        alleles = []
-        for i, d in enumerate(selected, start=1):
+        key = (storage_path, int(fov))
+        self._stage_alleles(storage_path, fov)
+        seen = self.chromatin_alleles.anchor_uids(key)
+        added = skipped = 0
+        for d in selected:
+            uid = int(d.get('uid', 0) or 0)
+            # uid 0 is legacy data with no identity, so it can never dedup;
+            # a real uid already staged means this spot is already an allele.
+            if uid and uid in seen:
+                skipped += 1
+                continue
             allele = AnAllele()
-            allele.set_metadata(id=i, fov=fov, cell=d['cell'], anchor_uid=d.get('uid', 0),
-                                anchor_hybe=d['hybe'], anchor_channel=d['channel'],
-                                coordinate=d['adj_coordinate'], raw_coordinate=d['raw_coordinate'])
-            alleles.append(allele)
-        self.chromatin_alleles[(storage_path, fov)] = alleles
+            allele.set_metadata(
+                id=max(self.chromatin_alleles.next_id(key),
+                       self.chromatin_alleles_permanent.next_id(key)),
+                fov=fov, cell=d['cell'], anchor_uid=uid,
+                anchor_hybe=d['hybe'], anchor_channel=d['channel'],
+                coordinate=d['adj_coordinate'], raw_coordinate=d['raw_coordinate'])
+            self.chromatin_alleles.add(key, allele)
+            if uid:
+                seen.add(uid)
+            added += 1
         self._refresh_chromatin_allele_lists(storage_path, fov)
-        chp.StatusLabel.setText(f'Built {len(alleles)} allele(s) for FOV{fov:03d} from {len(selected)} selected spot(s).')
+        note = f' ({skipped} already staged)' if skipped else ''
+        chp.StatusLabel.setText(
+            f'Added {added} allele(s) to FOV{fov:03d} from {len(selected)} '
+            f'selected spot(s){note}. Not saved yet.')
+
+    def _save_chromatin_alleles(self):
+        """Promote this FOV's transient alleles to permanent and to disk.
+
+        write_fov_alleles is a WHOLE-FOV atomic replace, so saving a FOV
+        whose alleles were never staged would write an empty list over
+        real data. The staging guard is the same one _persist_fov_spots
+        uses, and it is the reason this refuses rather than warns.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
+                                          'Check at least one hybe (Hybes Involved) first.')
+            return
+        fov = chp.AlleleFovSpinBox.value()
+        key = (storage_path, int(fov))
+        if key not in self._allele_loaded_keys:
+            QtWidgets.QMessageBox.warning(
+                self, 'Save Alleles',
+                f'FOV{fov:03d} has not been loaded in this session, so what is '
+                f'on disk is unknown. Saving now would replace it with an empty '
+                f'list. Select the FOV first.')
+            return
+        staged = self.chromatin_alleles.count(key)
+        committed = self.chromatin_alleles_permanent.count(key)
+        if committed and staged < committed:
+            reply = QtWidgets.QMessageBox.question(
+                self, 'Save Alleles',
+                f'FOV{fov:03d} has {committed} saved allele(s) and {staged} staged. '
+                f'Saving REPLACES the FOV, so {committed - staged} will be deleted '
+                f'from disk. Continue?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        kept, removed = self.chromatin_alleles_permanent.sync_from(
+            self.chromatin_alleles, key)
+        # ALWAYS write from permanent, never from transient -- the same rule
+        # _save_cells follows, so what is on disk and what the permanent tier
+        # believes cannot drift.
+        analysis_store.mirror_write_fov_alleles(
+            self._all_analysis_storage_paths(), fov,
+            self.chromatin_alleles_permanent.of_fov(key))
+        self._refresh_chromatin_allele_lists(storage_path, fov)
+        msg = (f'Saved {kept} allele(s) for FOV{fov:03d}'
+               + (f'; {removed} deleted' if removed else '') + '.')
+        chp.StatusLabel.setText(msg)
+        self.log(f'{msg} -> ' + ', '.join(self._all_analysis_storage_paths()))
+
+    def _remove_selected_alleles(self):
+        """Drop selected alleles from the TRANSIENT tier only.
+
+        Disk is untouched until the next Save -- the same contract removing
+        a cell or a spot has. Save then replaces the FOV, which is what
+        makes the deletion real.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            return
+        fov = chp.AlleleFovSpinBox.value()
+        ids = chp.selected_allele_ids()
+        if not ids:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
+                                          'Select at least one allele first.')
+            return
+        dropped = self.chromatin_alleles.remove((storage_path, int(fov)), ids)
+        self._refresh_chromatin_allele_lists(storage_path, fov)
+        chp.StatusLabel.setText(
+            f'Removed {len(dropped)} allele(s) from FOV{fov:03d}. '
+            f'Save to apply this to the store.')
+
+    def _revert_chromatin_alleles(self):
+        """Discard staged edits: copy permanent back over transient."""
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            return
+        fov = chp.AlleleFovSpinBox.value()
+        key = (storage_path, int(fov))
+        self._stage_alleles(storage_path, fov)
+        kept, removed = self.chromatin_alleles.sync_from(
+            self.chromatin_alleles_permanent, key)
+        self._refresh_chromatin_allele_lists(storage_path, fov)
+        chp.StatusLabel.setText(
+            f'Reverted FOV{fov:03d} to {kept} saved allele(s)'
+            + (f'; {removed} staged allele(s) discarded' if removed else '') + '.')
+
+    def _stage_alleles(self, storage_path, fov):
+        """Read this FOV's saved alleles into BOTH tiers, once per session.
+
+        Two independent AnAllele objects per stored dict, never one shared
+        -- the tracing worker mutates alleles in place, so a shared object
+        would make every fit silently write into the permanent tier and
+        the append membership test would answer about data nobody saved.
+        Same shape as the spot staging in _activate_fov.
+        """
+        key = (storage_path, int(fov))
+        if key in self._allele_loaded_keys:
+            return
+        for d in analysis_store.read_fov_alleles(storage_path, fov) or []:
+            committed = AnAllele()
+            committed.set_metadata(**d)
+            staged = AnAllele()
+            staged.set_metadata(**d)
+            try:
+                self.chromatin_alleles_permanent.add(key, committed)
+                self.chromatin_alleles.add(key, staged)
+            except ValueError as e:
+                # A duplicate or zero id on disk is old data, not a reason
+                # to refuse the FOV. Renumber into BOTH tiers so the two
+                # stay in step, and say so.
+                new_id = max(self.chromatin_alleles.next_id(key),
+                             self.chromatin_alleles_permanent.next_id(key))
+                self.log(f'FOV{fov:03d}: allele id {getattr(committed, "id", 0)} '
+                         f'unusable ({e}); renumbered to {new_id}')
+                committed.id = staged.id = new_id
+                self.chromatin_alleles_permanent.add(key, committed)
+                self.chromatin_alleles.add(key, staged)
+        self._allele_loaded_keys.add(key)
 
     def _refresh_chromatin_allele_lists(self, storage_path, fov):
         chp = self.ui.ChromatinTracingPanel
-        alleles = self.chromatin_alleles.get((storage_path, fov))
-        if alleles is None:
-            # Stage persisted alleles once per (storage_path, fov) --
-            # vlinks is the authoritative container (rule 4), and cells/
-            # spots already stage this way at _activate_fov. Without this,
-            # a fresh session's tracing panel showed an empty list even
-            # though the store held real alleles, and only a re-Build
-            # could bring them back.
-            alleles = []
-            for d in analysis_store.read_fov_alleles(storage_path, fov) or []:
-                a = AnAllele()
-                a.set_metadata(**d)
-                alleles.append(a)
-            self.chromatin_alleles[(storage_path, fov)] = alleles
-        rows = [(a.id, f"Allele {a.id}: cell={'unassigned' if a.cell == -1 else a.cell} "
-                       f"anchor={a.anchor_hybe}/{a.anchor_channel} @ "
-                       f"({a.coordinate[0]:.1f}, {a.coordinate[1]:.1f}, {a.coordinate[2]:.1f}) "
-                       f"[{len(a.polymer)} hybe(s) traced]")
-                for a in alleles]
+        key = (storage_path, int(fov))
+        self._stage_alleles(storage_path, fov)
+        alleles = self.chromatin_alleles.of_fov(key)
+        rows = []
+        for a in alleles:
+            saved = self.chromatin_alleles_permanent.has(key, a.id)
+            traced = self.chromatin_alleles_permanent.has_traced(key, a.id)
+            # The marker distinguishes the three states append cares about:
+            # unsaved, saved-but-never-traced (which append WILL fit), and
+            # committed.
+            mark = 'unsaved' if not saved else ('saved, untraced' if not traced
+                                                else 'saved')
+            rows.append((a.id,
+                         f"Allele {a.id} [{mark}]: "
+                         f"cell={'unassigned' if a.cell == -1 else a.cell} "
+                         f"anchor={a.anchor_hybe}/{a.anchor_channel} @ "
+                         f"y={a.coordinate[0]:.1f}, x={a.coordinate[1]:.1f}, "
+                         f"z={a.coordinate[2]:.1f} "
+                         f"[{len(a.polymer)} hybe(s) traced]"))
         chp.populate_allele_list(rows)
-        chp.populate_preview_allele_choices(rows)
+        n_saved = self.chromatin_alleles_permanent.count(key)
+        chp.AlleleCountLabel.setText(
+            f'{len(rows)} allele(s) in this FOV -- {n_saved} saved, '
+            f'{max(len(rows) - n_saved, 0)} unsaved.')
 
     def _on_chromatin_allele_fov_changed(self):
         chp = self.ui.ChromatinTracingPanel
@@ -6841,7 +7008,6 @@ class MainWindow(QtWidgets.QMainWindow):
         _modality, storage_path = self._chromatin_storage_path_and_modality()
         if not storage_path:
             chp.populate_allele_list([])
-            chp.populate_preview_allele_choices([])
             return
         self._refresh_chromatin_allele_lists(storage_path, chp.AlleleFovSpinBox.value())
 
@@ -6860,12 +7026,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe = ctx
         fov = chp.AlleleFovSpinBox.value()
-        allele_id = chp.current_preview_allele_id()
+        # ONE selector: the allele listview. The preview combo used to be a
+        # second, independent one for the same job, which is the bug class
+        # this panel's docstring already records.
+        allele_id = chp.current_allele_id()
         if allele_id is None:
-            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Build alleles for this FOV first.')
+            n = len(chp.selected_allele_ids())
+            QtWidgets.QMessageBox.warning(
+                self, 'Chromatin Tracing',
+                'Select exactly one allele in the list to preview.'
+                if n else 'Add alleles for this FOV first, then select one.')
             return
-        alleles = self.chromatin_alleles.get((storage_path, fov), [])
-        allele = next((a for a in alleles if a.id == allele_id), None)
+        self._stage_alleles(storage_path, fov)
+        allele = self.chromatin_alleles.by_id((storage_path, int(fov)), allele_id)
         if allele is None:
             return
         # Alleles are built straight from persisted spot dicts (see
@@ -7051,7 +7224,7 @@ class MainWindow(QtWidgets.QMainWindow):
          reference_hybe) = context
 
         fov = chp.AlleleFovSpinBox.value()
-        alleles = list(self.chromatin_alleles.get((storage_path, fov), []))
+        alleles = list(self.chromatin_alleles.of_fov((storage_path, int(fov))))
         if len(alleles) < 8:
             QtWidgets.QMessageBox.warning(
                 self, 'Fit Readout PSF',
@@ -7385,7 +7558,17 @@ class MainWindow(QtWidgets.QMainWindow):
         allele.raw_coordinate = tuple(spot.raw_coordinate)
         return True
 
-    def _run_chromatin_tracing_fit_all(self):
+    def _run_chromatin_tracing_fit_this_fov(self):
+        """Fit only the FOV the Alleles section is showing.
+
+        Same machinery, same append semantics, one FOV -- so a person can
+        work FOV-wise while ingestion is still running, which is the whole
+        reason the readiness skip exists.
+        """
+        fov = self.ui.ChromatinTracingPanel.AlleleFovSpinBox.value()
+        return self._run_chromatin_tracing_fit_all(fov_subset=[fov])
+
+    def _run_chromatin_tracing_fit_all(self, fov_subset=None):
         """
         Batch-fits every FOV in the Ingestion tab's own FOV list that
         already has alleles built (Build/Refresh Alleles per FOV, or a
@@ -7401,10 +7584,25 @@ class MainWindow(QtWidgets.QMainWindow):
         hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe = ctx
         ip = self.ui.IngestionPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
+        if fov_subset is not None:
+            # The Ingestion list stays the authority on which FOVs are
+            # legitimate; a per-FOV run NARROWS that set, never bypasses it.
+            wanted = {int(f) for f in fov_subset}
+            fov_list = [f for f in fov_list if int(f) in wanted]
+            if not fov_list:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Fit This FOV',
+                    f'FOV{sorted(wanted)[0]:03d} is not in the Ingestion tab '
+                    f'FOV list, so it is not part of this experiment.')
+                return
 
         jobs, fov_matrices_by_fov, resolver_by_fov = [], {}, {}
         for fov in fov_list:
-            alleles = self.chromatin_alleles.get((storage_path, fov), [])
+            # Stage first. Reading without staging meant a FOV the user had
+            # never clicked contributed nothing, so the run silently fitted
+            # whatever subset happened to be in memory.
+            self._stage_alleles(storage_path, fov)
+            alleles = self.chromatin_alleles.of_fov((storage_path, int(fov)))
             if not alleles:
                 continue
             # Alleles are built from persisted spot dicts, not a live
@@ -7424,9 +7622,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # fov_matrices_by_fov: _frame_resolver reads Qt line edits.
             resolver_by_fov[fov] = self._frame_resolver(None, fov)
         if not jobs:
-            QtWidgets.QMessageBox.warning(self, 'Fit All FOVs',
-                                          "No alleles built yet for any FOV in the Ingestion tab's FOV list -- "
-                                          "use Build/Refresh Alleles per FOV first.")
+            QtWidgets.QMessageBox.warning(
+                self, 'Fit All FOVs',
+                "No alleles for any FOV in the Ingestion tab's FOV list -- "
+                "add them per FOV first.")
             return
 
         full_params = chp.params()
@@ -7437,13 +7636,58 @@ class MainWindow(QtWidgets.QMainWindow):
         # restricted to hybes whose stacks are really on disk for each
         # FOV (per explicit decision -- re-runnable as ingestion
         # advances, each pass filling the newly possible delta).
-        mode = self._confirm_batch_mode('Fit All FOVs', 'traced allele/hybe entries')
+        scope = ('Fit This FOV' if fov_subset is not None else 'Fit All FOVs')
+        mode = self._confirm_batch_mode(scope, 'alleles')
         if mode is None:
             return
         ready_hybes_by_fov = None
         if mode == 'append':
+            # APPEND IS NOW A MEMBERSHIP QUESTION: fit the alleles that are
+            # staged but not yet COMMITTED WITH A TRACE. It used to ask
+            # which HYBES were missing from an allele, which is what let a
+            # half-traced allele be finished by a different engine and end
+            # up with one polymer built by two estimators.
+            #
+            # has_traced, not has: Add -> Save stages an allele with an
+            # empty polymer, and if mere presence counted as committed that
+            # allele could never be reached by append -- only by a full
+            # Overwrite.
+            filtered, already = [], 0
+            for sp, fov, alleles in jobs:
+                todo = [a for a in alleles
+                        if not self.chromatin_alleles_permanent.has_traced(
+                            (sp, int(fov)), a.id)]
+                already += len(alleles) - len(todo)
+                if todo:
+                    filtered.append((sp, fov, todo))
+            jobs = filtered
+            # A FOV whose checked hybes are not all on disk yet is SKIPPED
+            # WHOLE in append mode, per explicit decision: tracing it now
+            # would commit a partially-traced allele that append would
+            # then never revisit. Working FOV-wise while ingestion runs is
+            # the point -- fully ingested FOVs proceed, the rest wait.
             ready_hybes_by_fov = {fov: self._ready_hybes(modality, fov)
                                   for _sp, fov, _al in jobs}
+            not_ready = [fov for _sp, fov, _al in jobs
+                         if not set(hybes) <= set(ready_hybes_by_fov.get(fov) or ())]
+            if not_ready:
+                jobs = [(sp, fov, al) for sp, fov, al in jobs if fov not in not_ready]
+                ready_hybes_by_fov = {f: r for f, r in ready_hybes_by_fov.items()
+                                      if f not in not_ready}
+                self.log('Fit All FOVs (append): skipped FOV '
+                         + ', '.join(f'{f:03d}' for f in sorted(not_ready))
+                         + ' -- not every checked hybe has landed on disk yet.')
+            if not jobs:
+                QtWidgets.QMessageBox.information(
+                    self, 'Fit All FOVs',
+                    f'Nothing to do: {already} allele(s) are already traced and '
+                    f'saved, and no FOV has all its checked hybes ready.'
+                    if not_ready else
+                    f'Nothing to do: all {already} staged allele(s) are already '
+                    f'traced and saved. Use Overwrite to re-fit them.')
+                return
+            self.log(f'Fit All FOVs (append): {sum(len(a) for _s, _f, a in jobs)} '
+                     f'allele(s) to fit, {already} already traced and saved.')
 
         chp.ProgressBar.setValue(0)
         chp.FitAllFovsPushButton.setEnabled(False)
@@ -7456,7 +7700,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                                          max_fiducial_drift_z=full_params['max_fiducial_drift_z'],
                                                          z_boundary_trim=full_params['z_boundary_trim'],
                                                          append=(mode == 'append'),
-                                                         ready_hybes_by_fov=ready_hybes_by_fov,
                                                          engine=full_params.get('engine'),
                                                          v2_params=self._chromatin_v2_params(
                                                              full_params, storage_path))
@@ -7477,12 +7720,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(msg)
 
     def _on_chromatin_fit_fov_done(self, storage_path, fov, alleles):
-        """Persist ONE finished FOV immediately (FOV-level capsule): a
-        crash/quit mid-run keeps every completed FOV durable, and an
-        append re-run then skips their traced entries. Runs on the GUI
-        thread (queued slot), so _all_analysis_storage_paths' widget reads
-        are safe here."""
-        analysis_store.mirror_write_fov_alleles(self._all_analysis_storage_paths(), fov, alleles)
+        """Promote ONE finished FOV into permanent, then write it.
+
+        Per-FOV rather than at the end so a crash mid-run keeps every
+        completed FOV durable -- the reason this exists at all.
+
+        PROMOTE PER ALLELE, THEN WRITE THE WHOLE PERMANENT TIER. Writing
+        `alleles` directly would be a whole-FOV replace fed a SUBSET: in
+        append mode this list is only the alleles that were traced, so
+        every previously committed allele in the FOV would be deleted from
+        the store, silently, with no error and no undo. write_fov_alleles
+        is atomic against truncation, not against being handed the wrong
+        content.
+        """
+        key = (storage_path, int(fov))
+        for allele in alleles:
+            # The worker mutated the TRANSIENT object in place, so the
+            # freshly fitted trace is already there; promote_one copies it
+            # across without disturbing the alleles this batch skipped.
+            self.chromatin_alleles_permanent.promote_one(
+                self.chromatin_alleles, key, allele.id)
+        analysis_store.mirror_write_fov_alleles(
+            self._all_analysis_storage_paths(), fov,
+            self.chromatin_alleles_permanent.of_fov(key))
         chp = self.ui.ChromatinTracingPanel
         if fov == chp.AlleleFovSpinBox.value():
             self._refresh_chromatin_allele_lists(storage_path, fov)

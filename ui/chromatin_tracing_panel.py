@@ -176,15 +176,45 @@ class ChromatinTracingPanelUI(object):
         self.SpotListWidget.setMaximumHeight(120)
         allelesLayout.addWidget(self.SpotListWidget)
 
-        self.BuildAllelesPushButton = QtWidgets.QPushButton('Build/Refresh Alleles from Selected Spots')
+        # ADD, not refresh: the transient container accumulates across
+        # clicks now, and Remove Selected is how a mistake is undone.
+        self.BuildAllelesPushButton = QtWidgets.QPushButton('Add Alleles from Selected Spots')
         allelesLayout.addWidget(self.BuildAllelesPushButton)
 
         self.AlleleCountLabel = QtWidgets.QLabel('0 allele(s) in this FOV.')
         allelesLayout.addWidget(self.AlleleCountLabel)
 
+        # Selectable and removable. This is the ONLY allele selector --
+        # it drives Remove, Save and the single-allele preview fit alike.
+        # A second, independent selector for the same job is the exact bug
+        # class this panel's own docstring already records (the Alleles
+        # section used to inherit Spot Localization's comboboxes).
         self.AlleleListWidget = QtWidgets.QListWidget()
-        self.AlleleListWidget.setMaximumHeight(120)
+        self.AlleleListWidget.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.AlleleListWidget.setMaximumHeight(140)
         allelesLayout.addWidget(self.AlleleListWidget)
+
+        # Transient/permanent controls, same shape as the cell panel's.
+        alleleButtonsRow = QtWidgets.QWidget()
+        alleleButtons = QtWidgets.QHBoxLayout(alleleButtonsRow)
+        alleleButtons.setContentsMargins(0, 0, 0, 0)
+        self.RemoveAllelesPushButton = QtWidgets.QPushButton('Remove Selected')
+        self.RemoveAllelesPushButton.setToolTip(
+            'Drops the selected alleles from this session only. '
+            'The store is untouched until you press Save.')
+        self.SaveAllelesPushButton = QtWidgets.QPushButton('Save')
+        self.SaveAllelesPushButton.setToolTip(
+            'Writes this FOV staged alleles to the store, REPLACING the FOV. '
+            'Alleles removed since the last save are deleted from disk.')
+        self.RevertAllelesPushButton = QtWidgets.QPushButton('Revert')
+        self.RevertAllelesPushButton.setToolTip(
+            'Discards staged edits and restores this FOV from the store.')
+        for b in (self.RemoveAllelesPushButton, self.SaveAllelesPushButton,
+                  self.RevertAllelesPushButton):
+            alleleButtons.addWidget(b)
+        alleleButtons.addStretch(1)
+        allelesLayout.addWidget(alleleButtonsRow)
         layout.addWidget(allelesGroup)
 
         # -- 3. fit parameters --
@@ -366,10 +396,13 @@ class ChromatinTracingPanelUI(object):
         # -- 4. preview one allele --
         previewGroup = QtWidgets.QGroupBox('4. Preview One Allele')
         previewLayout = QtWidgets.QVBoxLayout(previewGroup)
-        previewForm = QtWidgets.QFormLayout()
-        self.PreviewAlleleComboBox = QtWidgets.QComboBox()
-        previewForm.addRow('Allele:', self.PreviewAlleleComboBox)
-        previewLayout.addLayout(previewForm)
+        # NO allele picker here. The allele listview in section 2 is the
+        # single selector -- a second, independent one for the same job is
+        # exactly what this class's docstring records going wrong before,
+        # when the Alleles section silently inherited Spot Localization's
+        # comboboxes.
+        previewLayout.addWidget(QtWidgets.QLabel(
+            'Select ONE allele in the list above, then:'))
         self.ViewCropPushButton = QtWidgets.QPushButton('View Crop (fiducial + readout grids)')
         previewLayout.addWidget(self.ViewCropPushButton)
         layout.addWidget(previewGroup)
@@ -377,6 +410,12 @@ class ChromatinTracingPanelUI(object):
         # -- 5. fit all fovs --
         fitAllGroup = QtWidgets.QGroupBox('5. Fit All FOVs')
         fitAllLayout = QtWidgets.QVBoxLayout(fitAllGroup)
+        self.FitThisFovPushButton = QtWidgets.QPushButton('Fit This FOV')
+        self.FitThisFovPushButton.setToolTip(
+            'Traces only the FOV shown in the Alleles section. Same append '
+            'and overwrite semantics as Fit All FOVs -- useful while '
+            'ingestion is still running, since a FOV whose hybes have not '
+            'all landed is skipped in append mode.')
         self.FitAllFovsPushButton = QtWidgets.QPushButton('Fit All FOVs')
         fitAllLayout.addWidget(self.FitAllFovsPushButton)
         self.ProgressBar = QtWidgets.QProgressBar()
@@ -548,28 +587,36 @@ class ChromatinTracingPanelUI(object):
         return [item.data(QtCore.Qt.UserRole) for item in self.SpotListWidget.selectedItems()]
 
     def populate_allele_list(self, rows):
-        """rows: [(allele_id, label), ...] -- pure display, caller (MainWindow)
-        already resolved the label text from the real AnAllele objects."""
+        """rows: [(allele_id, label), ...] -- caller resolved the text.
+
+        The id is carried as itemData, not parsed back out of the label:
+        every consumer (Remove, the preview fit) keys on it, and a label
+        is display text that is meant to change. Selection is preserved
+        across a repopulate BY ID, so refreshing after a Build or a fit
+        does not silently move which allele is selected.
+        """
+        keep = set(self.selected_allele_ids())
+        self.AlleleListWidget.blockSignals(True)
         self.AlleleListWidget.clear()
-        for _, label in rows:
-            self.AlleleListWidget.addItem(label)
+        for allele_id, label in rows:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.UserRole, int(allele_id))
+            self.AlleleListWidget.addItem(item)
+            if int(allele_id) in keep:
+                item.setSelected(True)
+        self.AlleleListWidget.blockSignals(False)
         self.AlleleCountLabel.setText(f'{len(rows)} allele(s) in this FOV.')
 
-    def populate_preview_allele_choices(self, rows):
-        """rows: [(allele_id, label), ...]."""
-        current = self.PreviewAlleleComboBox.currentData()
-        self.PreviewAlleleComboBox.blockSignals(True)
-        self.PreviewAlleleComboBox.clear()
-        for allele_id, label in rows:
-            self.PreviewAlleleComboBox.addItem(label, allele_id)
-        if self.PreviewAlleleComboBox.count():
-            restore_index = next((i for i in range(self.PreviewAlleleComboBox.count())
-                                  if self.PreviewAlleleComboBox.itemData(i) == current), 0)
-            self.PreviewAlleleComboBox.setCurrentIndex(restore_index)
-        self.PreviewAlleleComboBox.blockSignals(False)
+    def selected_allele_ids(self):
+        """Ids of the selected rows, from itemData -- never from the text."""
+        return [int(i.data(QtCore.Qt.UserRole))
+                for i in self.AlleleListWidget.selectedItems()
+                if i.data(QtCore.Qt.UserRole) is not None]
 
-    def current_preview_allele_id(self):
-        return self.PreviewAlleleComboBox.currentData()
+    def current_allele_id(self):
+        """The one allele a single-allele action works on, or None."""
+        ids = self.selected_allele_ids()
+        return ids[0] if len(ids) == 1 else None
 
     # -- fit parameters --
 
