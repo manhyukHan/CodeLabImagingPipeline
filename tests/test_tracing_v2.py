@@ -131,9 +131,20 @@ def main():
             amplitude = 100.0
         return _R()
 
-    ok2, why2 = V2.gate(_railed('z'), cube, p.readout_gates, VOXEL)
-    check('readout: a railed POSITION is rejected before any other gate',
+    # LATERAL position only. The readout box is pre-placed at the
+    # fiducial-derived consensus depth, so a railed z measures how far
+    # this locus sits from the median fiducial plane -- allele geometry,
+    # not data quality (a real case railed on z while reporting CIs of
+    # xy 18 / z 57 nm). Measured at the 2.8 um bound: making z fatal
+    # keeps 438 pairs at p90 1553 against 443 at 1605 -- ~1-3%, which the
+    # z-uncertainty gate covers properly when wanted.
+    ok2, why2 = V2.gate(_railed('y'), cube, p.readout_gates, VOXEL)
+    check('readout: a railed LATERAL position is rejected before any other gate',
           ok2 is False and 'at bound' in why2, str(why2))
+    ok2z, why2z = V2.gate(_railed('z'), cube, p.readout_gates, VOXEL)
+    check('readout: a railed z alone is NOT fatal -- it reflects distance '
+          'from the consensus depth, not fit quality',
+          ok2z is True, str(why2z))
     ok2f, why2f = V2.gate(_railed('z'), cube, p.fiducial_gates, VOXEL)
     check('fiducial: a railed POSITION is NOT rejected -- it passes to the '
           'readout gates, which measure round quality better',

@@ -160,7 +160,21 @@ READOUT_GATES = {
     # This read None (= any parameter fatal) and would have rejected on a
     # railed background offset, which the measurement never did. It bites
     # only on the no-PSF fallback, where sigma is free and can rail too.
-    'at_bound_fatal': ('y', 'x', 'z'),
+    #
+    # 'z' IS DELIBERATELY ABSENT. The readout box is pre-placed at the
+    # fiducial-derived CONSENSUS depth -- that placement is what makes the
+    # fit fast and well-conditioned -- so the axial bound measures how far
+    # this hybe's locus sits from the median fiducial plane, which is a
+    # property of the allele's geometry, not of the readout's data
+    # quality. A hybe that genuinely sits off the consensus depth rails
+    # inevitably and innocently: Hyb_043 on FOV1 railed on z while
+    # reporting CIs of xy 18 nm and z 57 nm, i.e. an extremely well
+    # determined fit that merely stopped at its leash.
+    #
+    # Lateral is not analogous and stays fatal. The crop is centred by
+    # alignment, not by a consensus taken over other hybes, so a railed
+    # y or x really does mean the fit could not reach the emitter.
+    'at_bound_fatal': ('y', 'x'),
     'min_occupancy': 0.40,
     'max_uncert_xy_nm': None,
     'max_uncert_z_nm': None,
@@ -210,8 +224,19 @@ READOUT_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
 # crops in those same hybes are clean, bright and obviously fittable.
 FIDUCIAL_PEAK_BOUND_UM = 1.456       # 7 px
 FIDUCIAL_PEAK_BOUND_Z_UM = 3.0       # 15 planes
-READOUT_PEAK_BOUND_UM = 1.04
-READOUT_PEAK_BOUND_Z_UM = 2.0
+READOUT_PEAK_BOUND_UM = 1.04         # 5 px
+# 14 planes, up from 10. Neutralising the z at_bound gate (see
+# READOUT_GATES) removes the REJECTION but not the truncation: a fit that
+# stops on its axial leash still reports the leash as its z, and that
+# value would now flow into the polymer instead of being thrown away --
+# a visible rejection traded for an invisible error. Widening the bound
+# is what makes the neutralisation safe rather than merely quieter.
+#
+# 2.8 um sits INSIDE the unchanged 3.0 um axial fit radius, so the fit
+# DOMAIN -- the thing every recorded readout number was measured at
+# (1.0, 1.0, 3.0) -- is untouched; only how far the centre may travel
+# within it changes.
+READOUT_PEAK_BOUND_Z_UM = 2.8
 
 # The fiducial's sigma is FREE and must be allowed to be large: measured
 # 257-574 nm depending on the fit window, against v1's 520 nm default
@@ -387,18 +412,45 @@ def consensus_native_z(cubes_by_hybe, z_offsets):
 
 # -- fitting --------------------------------------------------------------
 
-def _seed(cube, z_centre, voxel_um, half=(5, 5, 10)):
+def _seed(cube, z_centre, voxel_um, z_half):
     """Intensity-weighted centroid, falling back to the crop centre.
 
     Both engines start here, per explicit request. It is worth more to v1
     (0.354 -> 0.597) than to v2 (0.799 -> 0.818), because v2's boxed
     domain has already removed most of what a bad seed used to chase.
+
+    THE LATERAL WINDOW SPANS THE CROP, less one voxel at each edge. It was
+    a fixed +/-5 px centred on the crop CENTRE, while the crop at pad=8 is
+    17x17: a spot more than 5 px off-centre fell entirely outside the
+    window, so the centroid stayed near the middle, the fit box got placed
+    around a point that was not the emitter, and the fit converged into
+    background. That is reported as low occupancy on a crop that plainly
+    holds one clean PSF -- the number looks like a bad spot when it is
+    really a mis-aimed search. The crop is already the statement of where
+    the emitter might be; the seed should search all of it.
+
+    One voxel is left at each edge deliberately. A centroid computed hard
+    against a boundary is one-sided, and a seed on the rim gives the fit
+    box nothing to work with on that side.
+
+    z_half is EXPLICIT and comes from the caller's own fit radius, so the
+    seed searches exactly as far as the fit can subsequently reach -- no
+    more (the crop spans the whole slab, and a centroid over ~110 planes
+    is dragged by out-of-focus content) and no less (a seed window
+    narrower than the fit domain hides emitters the fit could have found).
     """
-    cy = (cube.shape[0] - 1) / 2.0
-    cx = (cube.shape[1] - 1) / 2.0
-    zc = float(np.clip(z_centre, 0, cube.shape[2] - 1))
+    ny, nx, nz = cube.shape
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+    zc = float(np.clip(z_centre, 0, nz - 1))
+    half = (max(1, ny // 2 - 1), max(1, nx // 2 - 1), max(1, int(z_half)))
     got = U.intensity_centroid(cube, (cy, cx, zc), half, voxel_um)
     return got if got is not None else (cy, cx, zc)
+
+
+def _seed_z_half(fit_radius_um, voxel_um):
+    """Axial seed half-width in PLANES, from a fit radius in micrometres."""
+    return max(1, int(round(fit_radius_um[2] / float(voxel_um[2]))) - 1)
 
 
 def fit_fiducial(cube, z_centre, p):
@@ -412,7 +464,8 @@ def fit_fiducial(cube, z_centre, p):
     """
     if cube is None or not np.isfinite(cube).any():
         return None
-    sy, sx, sz = _seed(cube, z_centre, p.voxel_um)
+    sy, sx, sz = _seed(cube, z_centre, p.voxel_um,
+                       _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
     return U.fit_gaussian_3d_um(
         cube, sy, sx, sz, voxel_um=p.voxel_um,
         peak_bound_um=FIDUCIAL_PEAK_BOUND_UM,
@@ -438,7 +491,8 @@ def fit_readout(cube, z_centre, p):
     """
     if cube is None or not np.isfinite(cube).any():
         return None
-    sy, sx, sz = _seed(cube, z_centre, p.voxel_um)
+    sy, sx, sz = _seed(cube, z_centre, p.voxel_um,
+                       _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
     if not p.has_psf:
         # The FREE-sigma fallback must carry the validated ceilings too.
         # Passing neither leaves fit3d_um's own defaults (0.520 / 1.000 um)
@@ -730,9 +784,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'fiducial_uncert_nm': (float('nan'), float('nan')),
                                     'readout_uncert_nm': (float('nan'), float('nan')),
                                     'fiducial_at_bound': (),
-                                    'readout_at_bound': ()})
+                                    'readout_at_bound': (),
+                                    'fiducial_seed': None,
+                                    'readout_seed': None,
+                                    'readout_zexp': float('nan')})
             debug[hybe]['fiducial_cubic'] = cube
         z0 = zexp.get(hybe, cube.shape[2] / 2.0)
+        if debug is not None:
+            debug[hybe]['fiducial_seed'] = _seed(
+                cube, z0, p.voxel_um,
+                _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
         f = fit_fiducial(cube, z0, p)
         ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
         # Recorded BEFORE the reject below, on purpose: the occupancy that
@@ -815,7 +876,10 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'fiducial_uncert_nm': (float('nan'), float('nan')),
                                     'readout_uncert_nm': (float('nan'), float('nan')),
                                     'fiducial_at_bound': (),
-                                    'readout_at_bound': ()})
+                                    'readout_at_bound': (),
+                                    'fiducial_seed': None,
+                                    'readout_seed': None,
+                                    'readout_zexp': float('nan')})
         if debug is not None and debug[hybe].get('readout_cubic') is None:
             ch0 = hybe_readout_channels.get(hybe)
             if ch0 is not None:
@@ -879,7 +943,13 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             continue
         if debug is not None:
             debug[hybe]['readout_cubic'] = cube
-        r = fit_readout(cube, zexp.get(hybe, cube.shape[2] / 2.0), p)
+        z_r = zexp.get(hybe, cube.shape[2] / 2.0)
+        if debug is not None:
+            debug[hybe]['readout_zexp'] = float(z_r)
+            debug[hybe]['readout_seed'] = _seed(
+                cube, z_r, p.voxel_um,
+                _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
+        r = fit_readout(cube, z_r, p)
         ok, why = gate(r, cube, p.readout_gates, p.voxel_um)
         # Same as the fiducial: before the reject, so a gated-out readout
         # still reports the number it was gated on.
