@@ -1552,7 +1552,6 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.SaveAllelesPushButton.clicked.connect(self._save_chromatin_alleles)
         chp.RevertAllelesPushButton.clicked.connect(self._revert_chromatin_alleles)
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
-        chp.SaveTracedAllelePushButton.clicked.connect(self._save_traced_allele)
         chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
         chp.FitThisFovPushButton.clicked.connect(self._run_chromatin_tracing_fit_this_fov)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
@@ -6910,58 +6909,6 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.StatusLabel.setText(
             f'Added {added} allele(s) to FOV{fov:03d} from {len(selected)} '
             f'selected spot(s){note}. Not saved yet.')
-
-    def _save_traced_allele(self):
-        """Persist ONE allele -- the one View Crop just traced.
-
-        Promotes that allele alone into the permanent tier, then writes the
-        FOV from permanent. write_fov_alleles is a whole-FOV atomic
-        replace, so writing the single allele directly would delete every
-        other allele in the FOV; promoting one and writing all of them is
-        the same rule the batch path follows.
-        """
-        chp = self.ui.ChromatinTracingPanel
-        _modality, storage_path = self._chromatin_storage_path_and_modality()
-        if not storage_path:
-            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
-                                          'Check at least one hybe first.')
-            return
-        fov = chp.AlleleFovSpinBox.value()
-        key = (storage_path, int(fov))
-        allele_id = chp.current_allele_id()
-        if allele_id is None:
-            QtWidgets.QMessageBox.warning(
-                self, 'Save This Allele',
-                'Select exactly one allele in the list first.')
-            return
-        if key not in self._allele_loaded_keys:
-            QtWidgets.QMessageBox.warning(
-                self, 'Save This Allele',
-                f'FOV{fov:03d} has not been loaded this session, so what is on '
-                f'disk is unknown. Select the FOV first.')
-            return
-        allele = self.chromatin_alleles.by_id(key, allele_id)
-        if allele is None:
-            return
-        if not (allele.polymer or allele.rejected_hybes):
-            reply = QtWidgets.QMessageBox.question(
-                self, 'Save This Allele',
-                f'Allele {allele_id} has no trace yet -- View Crop has not been '
-                f'run on it, or it produced nothing. Save it anyway?',
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No)
-            if reply != QtWidgets.QMessageBox.Yes:
-                return
-        self.chromatin_alleles_permanent.promote_one(
-            self.chromatin_alleles, key, allele_id)
-        analysis_store.mirror_write_fov_alleles(
-            self._all_analysis_storage_paths(), fov,
-            self.chromatin_alleles_permanent.of_fov(key))
-        self._refresh_chromatin_allele_lists(storage_path, fov)
-        msg = (f'Saved allele {allele_id} of FOV{fov:03d} '
-               f'({len(allele.polymer or {})} hybe(s) traced).')
-        chp.StatusLabel.setText(msg)
-        self.log(msg + ' -> ' + ', '.join(self._all_analysis_storage_paths()))
 
     def _save_chromatin_alleles(self):
         """Promote this FOV's transient alleles to permanent and to disk.

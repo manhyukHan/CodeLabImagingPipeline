@@ -411,17 +411,13 @@ class ChromatinTracingPanelUI(object):
             'Select ONE allele in the list above, then:'))
         self.ViewCropPushButton = QtWidgets.QPushButton('View Crop (fiducial + readout grids)')
         previewLayout.addWidget(self.ViewCropPushButton)
-        # View Crop runs a REAL fit and mutates the allele, but nothing
-        # persisted it -- so a trace you had just looked at could not be
-        # kept without re-running the whole FOV. This saves that one
-        # allele, promoting it into the permanent tier and writing the FOV.
-        self.SaveTracedAllelePushButton = QtWidgets.QPushButton(
-            'Save This Allele (promote the traced result to the store)')
-        self.SaveTracedAllelePushButton.setToolTip(
-            'Writes the selected allele, including the trace View Crop just '
-            'produced, into the store. The rest of the FOV is left exactly '
-            'as it is on disk.')
-        previewLayout.addWidget(self.SaveTracedAllelePushButton)
+        # NO save button here. View Crop mutates the allele IN the transient
+        # container, and section 2's Save writes that container -- so the
+        # trace View Crop just produced is already persistable, and a second
+        # button was duplicate surface on a false premise.
+        previewLayout.addWidget(QtWidgets.QLabel(
+            'The trace lands in the allele list above; press Save there to '
+            'write it.'))
         layout.addWidget(previewGroup)
 
         # -- 5. fit all fovs --
