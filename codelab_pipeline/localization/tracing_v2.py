@@ -111,6 +111,30 @@ FIDUCIAL_GATES = {
     # Position at a bound is different and stays fatal: it means the fit
     # could not reach the emitter, so the value IS the bound and the drift
     # correction built from it is fiction.
+    #
+    # THAT WAS REASONING, NOT MEASUREMENT, until 2026-08-28. The famous
+    # 295/311 pairs @ 0.218 um result is a READOUT number --
+    # gate_sweep_v2.score applies its `keep` to ra/rb only and never to
+    # ga/gb -- so nothing on record had ever tested the fiducial side.
+    # Measured now, through the app, 127 alleles of MP58 FOV1 at the 7 px
+    # / 15 plane bound:
+    #
+    #                        FATAL   IGNORED
+    #     pairs scored         364       368   +1.1%
+    #     traced readouts     5015      5064   +1.0%
+    #     fiducial at-bound    659         0
+    #     median 3D (nm)       164       166   +0.9%
+    #     p90 3D (nm)          771       850   +10.3% WORSE
+    #
+    # Ignoring it recovers 659 rejected hybes and converts only 49 of them
+    # into accepted readouts -- a 7% yield, i.e. those hybes were failing
+    # for other reasons anyway -- while the handful of extra pairs land in
+    # the tail. So it costs ~1% of the data and buys a 10% better p90.
+    #
+    # It is cheap ONLY because the bound is now 7 px. At the old 5 px it
+    # cost 33 of 73 hybes on one real allele. The gate was never the
+    # problem; the leash was. Tighten the bound again and this becomes
+    # expensive again.
     'at_bound_fatal': ('y', 'x', 'z'),
     'min_occupancy': 0.25,      # looser: an extended object spreads its peak
     'max_uncert_xy_nm': None,
