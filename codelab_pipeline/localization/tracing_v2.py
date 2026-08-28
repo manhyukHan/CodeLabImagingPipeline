@@ -653,6 +653,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
 
     # -- phase 2: fit the fiducials at their own expected depth ---------
     fid_local, ref_note = {}, None
+    precut = {}     # hybe -> (cube, ymin, xmin) already read for the preview
     for hybe, cube in fid_cubes.items():
         if debug is not None:
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
@@ -695,6 +696,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # so. The frame cancels out of pair distances, but it still bounds
         # precision and the operator deserves to know.
         allele.reference_warning = ref_note
+        # AND into provenance, which is persisted and readable. The
+        # attribute alone was written by v2 and read by NOTHING -- not
+        # saved (AnAllele.save never carried it), not displayed, not
+        # logged -- so a whole FOV could be traced against a doubtful
+        # reference frame with the only record living in an object that
+        # is discarded at the end of the run.
+        allele.provenance = dict(allele.provenance or {})
+        allele.provenance['reference_warning'] = ref_note
         if debug is not None:
             debug.setdefault(reference_hybe, {})['reference_warning'] = ref_note
 
@@ -715,9 +724,15 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             ch0 = hybe_readout_channels.get(hybe)
             if ch0 is not None:
                 try:
-                    c0, _y0, _x0 = _cut(hybe, ch0)
+                    c0, y0, x0 = _cut(hybe, ch0)
                     if c0 is not None and c0.size:
                         debug[hybe]['readout_cubic'] = c0
+                        # REUSE IT below. Cutting the preview tile here and
+                        # then cutting the same crop again for the fit read
+                        # every accepted hybe's readout stack TWICE from the
+                        # NAS -- ~111 extra stack opens per previewed allele,
+                        # for bytes already in hand.
+                        precut[hybe] = (c0, y0, x0)
                 except (OSError, ValueError):
                     pass
         if hybe in allele.rejected_hybes:
@@ -755,11 +770,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         if channel is None:
             allele.rejected_hybes[hybe] = 'no readout channel configured'
             continue
-        try:
-            cube, ymin, xmin = _cut(hybe, channel)
-        except (OSError, ValueError):
-            allele.rejected_hybes[hybe] = 'readout crop unreadable'
-            continue
+        if hybe in precut:
+            cube, ymin, xmin = precut.pop(hybe)
+        else:
+            try:
+                cube, ymin, xmin = _cut(hybe, channel)
+            except (OSError, ValueError):
+                allele.rejected_hybes[hybe] = 'readout crop unreadable'
+                continue
         if cube is None or cube.size == 0:
             allele.rejected_hybes[hybe] = 'readout crop empty'
             continue
@@ -838,6 +856,37 @@ def allele_task(payload):
     return (int(meta['id']), allele.fiducial_trace, allele.polymer,
             allele.rejected_hybes, getattr(allele, 'reference_warning', None),
             dict(getattr(allele, 'provenance', {}) or {}))
+
+
+def allele_task_with_debug(payload):
+    """allele_task, but returning the debug crops the preview renders.
+
+    Separate from allele_task because the crops are ~12 MB per allele and
+    a BATCH run must never ship them back -- it renders nothing. The
+    preview does, once, for one allele, and paying that transfer is what
+    buys keeping every HDF5 read out of the GUI thread.
+    """
+    (meta, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov, modality,
+     cell, fov_matrices, params, max_drift, max_drift_z, spad, resolver) = payload
+    from codelab_pipeline.models.allele import AnAllele
+    import time as _time
+    allele = AnAllele()
+    allele.set_metadata(**meta)
+    allele.provenance = {
+        'engine': 'v2', 'engine_label': 'v2',
+        'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'voxel_um': list(params.voxel_um) if params else None,
+        'psf': (params.psf_label or None) if params else None,
+        'psf_family': params.psf_family if params else None,
+    }
+    _a, debug = build_chromatin_trace_allele(
+        allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,
+        modality, cell, fov_matrices, params=params,
+        max_fiducial_drift=max_drift, max_fiducial_drift_z=max_drift_z,
+        spad=spad, collect_debug=True, resolver=resolver)
+    return ((int(meta['id']), allele.fiducial_trace, allele.polymer,
+             allele.rejected_hybes, getattr(allele, 'reference_warning', None),
+             dict(allele.provenance or {})), debug)
 
 
 def apply_allele_result(allele, result):

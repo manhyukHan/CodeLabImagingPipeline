@@ -876,6 +876,23 @@ class ChromatinTracingPanelUI(object):
                 break
         if idx >= 0:
             self.ReadoutPsfComboBox.setCurrentIndex(idx)
+        elif want:
+            # THE LABEL IS NOT IN THIS MACHINE'S LIBRARY. Leaving the combo
+            # where it was meant the config named one PSF, the run used
+            # another, the log confidently named the wrong one, and pressing
+            # Save Config then overwrote the record of which calibration
+            # actually produced the traces.
+            #
+            # <repo>/psf is git-tracked but a fresh calibration lands there
+            # untracked, so "calibrated on machine A, opened on machine B"
+            # is the normal way to reach this, not an exotic one.
+            #
+            # Show it, select it, and mark it. V2Params cannot resolve a
+            # shape for it, so v2 falls back to free sigma and SAYS so
+            # rather than silently substituting a different shape.
+            self.ReadoutPsfComboBox.addItem(f'{want}  --  MISSING FROM LIBRARY', want)
+            self.ReadoutPsfComboBox.setCurrentIndex(
+                self.ReadoutPsfComboBox.count() - 1)
         self.ReadoutPsfComboBox.blockSignals(False)
         return self.ReadoutPsfComboBox.count()
 

@@ -7147,6 +7147,26 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pool = None
             try:
+                # v2: ONE child for the whole allele. The pool exists so
+                # the stack reads happen in a CHILD -- ProcWorker's own
+                # measurement is that a background thread doing them took a
+                # 16.5 ms MIP open to 2043 ms, 124x, while the same reads
+                # in separate processes stayed at 16.8 ms. v2 was handed
+                # the pool and dropped it, putting ~222 crop reads back on
+                # the QThread. One allele cannot use per-hybe fan-out (its
+                # consensus depth needs every crop first), so it uses the
+                # grain it does have.
+                if pool is not None and tracing_v2.is_v2(full_params.get('engine')):
+                    payload = (allele.save(), hybes, reference_hybe,
+                               hybe_fiducial_channels, hybe_readout_channels,
+                               storage_path, fov, modality, cell, fov_matrices,
+                               v2_params, full_params['max_fiducial_drift'],
+                               full_params['max_fiducial_drift_z'],
+                               full_params['spad'], resolver)
+                    result, debug = pool.submit(
+                        tracing_v2.allele_task_with_debug, payload).result()
+                    tracing_v2.apply_allele_result(allele, result)
+                    return debug
                 _, debug = tracing_v2.trace_allele(
                     full_params.get('engine'),
                     allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
@@ -7258,6 +7278,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log('WARNING: readout sigma will be fitted per spot, which '
                      'gives up both the accuracy and the ~37% speed the fixed '
                      'calibrated shape buys.')
+            if label and LIB.read(label) is None:
+                # Loud, because the alternative is a run that quietly used
+                # a different PSF than the config records.
+                QtWidgets.QMessageBox.warning(
+                    self, 'Readout PSF missing',
+                    f'The configuration names the readout PSF {label!r}, which '
+                    f'is not in the library on this machine '
+                    f'({LIB.library_dir()}). v2 will run with the readout sigma '
+                    f'FITTED PER SPOT rather than substituting a different '
+                    f'calibration. Copy the entry in, or pick one from the '
+                    f'list, if you want the fixed shape.')
         return p
 
     def _fit_readout_psf(self):
