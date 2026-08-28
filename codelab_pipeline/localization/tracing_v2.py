@@ -141,7 +141,15 @@ READOUT_GATES = {
 # ~34k of out-of-focus content, so least squares spends its position and
 # sigma parameters describing background. That single change moved
 # occupancy 0.373 -> 0.806.
-FIDUCIAL_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
+# Widened with the bounds above, and for their sake: a position bound must
+# sit INSIDE the fitted box or the fit is allowed to walk somewhere it has
+# no data (this module already carries that lesson at an axial radius of
+# 2.0 um, where the bound equalled the domain). At 7 px the bound is
+# 1.456 um and at 15 planes it is 3.000 um, so both old radii were too
+# small to hold them. READOUT_FIT_RADIUS_UM is deliberately NOT changed:
+# every readout number on record was measured at (1.0, 1.0, 3.0), and the
+# readout is not what is railing.
+FIDUCIAL_FIT_RADIUS_UM = (1.7, 1.7, 3.6)
 # THE SAME domain for both channels, because that is what was measured.
 # tools/fiducial_match.py, tools/v2_variants.py and tools/gate_sweep_v2.py
 # all use (1.0, 1.0, 3.0) for readouts as well as fiducials, so every
@@ -160,8 +168,16 @@ READOUT_FIT_RADIUS_UM = (1.0, 1.0, 3.0)
 # fits on a constraint, which is why every dz in a fiducial overlay used
 # to print as a whole number: fitted z = integer argmax +/- exactly the
 # bound.
-FIDUCIAL_PEAK_BOUND_UM = 1.04        # ~5 px
-FIDUCIAL_PEAK_BOUND_Z_UM = 2.0       # ~10 planes
+# 7 px / 15 planes, raised from 5/10. THE BOUND AND THE DRIFT GATE ARE THE
+# SAME NUMBER and have to move together: the fit cannot travel further than
+# its bound, so a drift gate at 7 px could never observe a value above the
+# 5 px bound -- it would gate on a quantity the fit was incapable of
+# producing, and every genuinely-larger drift would arrive pre-labelled
+# 'at bound' instead. Measured on FOV1 allele 15 at 5/10: 33 of 73 hybes
+# rejected 'fiducial at bound', 29 of them on y alone, while the readout
+# crops in those same hybes are clean, bright and obviously fittable.
+FIDUCIAL_PEAK_BOUND_UM = 1.456       # 7 px
+FIDUCIAL_PEAK_BOUND_Z_UM = 3.0       # 15 planes
 READOUT_PEAK_BOUND_UM = 1.04
 READOUT_PEAK_BOUND_Z_UM = 2.0
 
@@ -485,6 +501,23 @@ def _local_background_plane(cube, voxel_um=DEFAULT_VOXEL_UM,
     return c[0] + c[1] * Y + c[2] * X + c[3] * Z
 
 
+def uncertainty_nm(fit):
+    """(lateral, axial) FULL 95% interval in nanometres, or (nan, nan).
+
+    THE SAME EXPRESSION THE GATE TESTS, deliberately shared rather than
+    re-derived at the display: `2000 * max(ci_y, ci_x)` and `2000 * ci_z`.
+    FitUm.ci_*_um are HALF-widths, so a display that used 1000x would show
+    a number half the size of the threshold it is meant to help choose --
+    the exact off-by-2x this module already carries a comment about.
+    """
+    if fit is None:
+        return float('nan'), float('nan')
+    xy = 2000.0 * max(getattr(fit, 'ci_y_um', 0.0) or 0.0,
+                      getattr(fit, 'ci_x_um', 0.0) or 0.0)
+    z = 2000.0 * (getattr(fit, 'ci_z_um', 0.0) or 0.0)
+    return float(xy), float(z)
+
+
 def gate(fit, cube, gates, voxel_um=DEFAULT_VOXEL_UM):
     """(passed, reason) -- reason is None when it passed.
 
@@ -661,7 +694,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
                                     'readout_cubic': None, 'readout_centroids': None,
                                     'fiducial_occupancy': float('nan'),
-                                    'readout_occupancy': float('nan')})
+                                    'readout_occupancy': float('nan'),
+                                    'fiducial_uncert_nm': (float('nan'), float('nan')),
+                                    'readout_uncert_nm': (float('nan'), float('nan'))})
             debug[hybe]['fiducial_cubic'] = cube
         z0 = zexp.get(hybe, cube.shape[2] / 2.0)
         f = fit_fiducial(cube, z0, p)
@@ -674,6 +709,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # nothing in a batch run, where debug is None.
         if debug is not None:
             debug[hybe]['fiducial_occupancy'] = occupancy(cube, f, p.voxel_um)
+            debug[hybe]['fiducial_uncert_nm'] = uncertainty_nm(f)
         # THE REFERENCE IS NOT AN ORDINARY HYBE. Every delta is measured
         # against it, so gating it out does not reject one round -- it
         # rejects the ALLELE, and it does so while reporting one bland
@@ -739,7 +775,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
                                     'readout_cubic': None, 'readout_centroids': None,
                                     'fiducial_occupancy': float('nan'),
-                                    'readout_occupancy': float('nan')})
+                                    'readout_occupancy': float('nan'),
+                                    'fiducial_uncert_nm': (float('nan'), float('nan')),
+                                    'readout_uncert_nm': (float('nan'), float('nan'))})
         if debug is not None and debug[hybe].get('readout_cubic') is None:
             ch0 = hybe_readout_channels.get(hybe)
             if ch0 is not None:
@@ -809,6 +847,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # still reports the number it was gated on.
         if debug is not None:
             debug[hybe]['readout_occupancy'] = occupancy(cube, r, p.voxel_um)
+            debug[hybe]['readout_uncert_nm'] = uncertainty_nm(r)
         if not ok:
             allele.rejected_hybes[hybe] = f'readout {why}'
             continue

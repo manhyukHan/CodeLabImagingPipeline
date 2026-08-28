@@ -51,8 +51,12 @@ VOXEL_DEFAULTS = {'voxel_xy_um': 0.208, 'voxel_z_um': 0.2}
 # calibration crops are reselected.
 DEFAULT_READOUT_PSF = 'universal-default'
 
-CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 5.0,
-                       'max_fiducial_drift_z': 10.0, 'z_boundary_trim': 10}
+# max_fiducial_drift / _z track tracing_v2's FIDUCIAL_PEAK_BOUND_UM and
+# _Z_UM, which are the same physical limits expressed as fit bounds. A gate
+# looser than the bound cannot fire (the fit rails first and is rejected as
+# at-bound); a gate tighter than the bound just moves the rejection.
+CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 7.0,
+                       'max_fiducial_drift_z': 15.0, 'z_boundary_trim': 10}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,

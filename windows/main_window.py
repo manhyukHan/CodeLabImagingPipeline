@@ -7186,27 +7186,72 @@ class MainWindow(QtWidgets.QMainWindow):
         def _done(debug):
             chp.ViewCropPushButton.setEnabled(True)
             fid_results, readout_results = [], []
-            def _titled(hybe, occ):
-                """'Hyb_050\\nocc 0.87' -- the gated quantity, on its own line.
+            rejected = allele.rejected_hybes or {}
 
-                Occupancy is what both grids' gates actually reject on, so
-                reading a tile and reading the number that condemned it
-                should not need two windows. 'n/a' where the fit failed
-                outright, since occupancy is undefined without a centroid.
+            def _titled(hybe, occ, unc, channel):
+                """'Hyb_023 / occ 0.69 / at bound (z)' -- number AND verdict.
+
+                A tile with no circle looked identical whether the fit was
+                good and something else rejected the hybe, whether the
+                gate rejected this very fit, or whether nothing was ever
+                fitted here. All three are common (on one real allele: 37
+                shown, 33 never attempted because the fiducial failed
+                first, 3 rejected before fitting), and the grid could not
+                tell them apart -- which is the opposite of what a gate-
+                tuning view is for.
+
+                'occ n/a' is now always accompanied by the reason it is
+                n/a. Occupancy is undefined without a fit, so n/a means
+                "never fitted", never "fitted and unmeasurable".
+
+                The reason line is filtered by channel: rejected_hybes
+                holds ONE string per hybe, and 'readout occupancy 0.00 <
+                0.40' on a FIDUCIAL tile would read as an accusation
+                against a fiducial that was in fact fine.
                 """
-                if occ is None or not np.isfinite(occ):
-                    return f'{hybe}\nocc n/a'
-                return f'{hybe}\nocc {occ:.2f}'
+                occ_s = ('occ n/a' if occ is None or not np.isfinite(occ)
+                         else f'occ {occ:.2f}')
+                # The FULL 95% interval in nm, the same expression the gate
+                # tests (tracing_v2.uncertainty_nm) -- so a number read off
+                # a tile can be typed straight into max_uncert_*_nm. A
+                # display using the raw half-width would be half the
+                # threshold it is meant to help choose.
+                xy, z = (unc or (float('nan'), float('nan')))[:2]
+                if np.isfinite(xy) or np.isfinite(z):
+                    xy_s = f'{xy:.0f}' if np.isfinite(xy) else '--'
+                    z_s = f'{z:.0f}' if np.isfinite(z) else '--'
+                    occ_s += f'   xy {xy_s}  z {z_s} nm'
+                head = f'{hybe}\n{occ_s}'
+                why = str(rejected.get(hybe, '') or '')
+                if not why:
+                    return head
+                # THE READOUT TILE SHOWS EVERY REASON, the fiducial tile only
+                # its own. Asymmetric on purpose: a readout is suppressed by
+                # whatever killed the hybe, so 'fiducial at bound (z)' is
+                # precisely why that tile has no circle -- reported, the
+                # picture of a perfectly good spot stops being a mystery.
+                # The reverse is not true: 'readout occupancy 0.00 < 0.40'
+                # on a FIDUCIAL tile would accuse a fiducial that was fine.
+                if channel == 'fiducial' and not why.startswith('fiducial'):
+                    return head
+                # strip only this tile's own channel word -- it is the
+                # window's title already; a foreign one must keep its name
+                short = why[len(channel):].strip() if why.startswith(channel) else why
+                return f'{head}\n{short}'
 
             for hybe in hybes:
                 d = debug.get(hybe, {})
                 if d.get('fiducial_cubic') is not None:
                     centroid = [d['fiducial_centroid']] if d['fiducial_centroid'] is not None else None
                     fid_results.append((d['fiducial_cubic'], centroid,
-                                        _titled(hybe, d.get('fiducial_occupancy'))))
+                                        _titled(hybe, d.get('fiducial_occupancy'),
+                                                d.get('fiducial_uncert_nm'),
+                                                'fiducial')))
                 if d.get('readout_cubic') is not None:
                     readout_results.append((d['readout_cubic'], d['readout_centroids'],
-                                            _titled(hybe, d.get('readout_occupancy'))))
+                                            _titled(hybe, d.get('readout_occupancy'),
+                                                    d.get('readout_uncert_nm'),
+                                                    'readout')))
 
             allele_label = f'FOV{fov:03d}_allele{allele.id}'
             # allele figures default into figures/{modality}/alleles/fov###/,
