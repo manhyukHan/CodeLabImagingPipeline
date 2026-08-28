@@ -144,6 +144,15 @@ class IngestionPanelUI(object):
         # setting; it is entered once here instead, travels in the config,
         # and every consumer reads it from one place.
         #
+        # NOT A SPINBOX, deliberately. A QDoubleSpinBox takes the mouse
+        # wheel, and this panel lives inside a scroll area -- so scrolling
+        # the page with the cursor over the box would silently change the
+        # voxel size. That is intolerable for THIS value specifically: a
+        # wrong voxel size cannot be spotted in the results, because every
+        # length downstream stays self-consistent and simply describes a
+        # differently-sized world. Typed text plus an explicit Apply means
+        # the value only ever changes when someone means it to.
+        #
         # Lateral and axial are SEPARATE inputs and neither is derived from
         # the other. On this microscope a pixel is 0.208 um and a plane
         # 0.2 um -- close enough that assuming a ratio looks harmless, and
@@ -152,24 +161,39 @@ class IngestionPanelUI(object):
         voxelRow = QtWidgets.QWidget()
         voxelLayout = QtWidgets.QHBoxLayout(voxelRow)
         voxelLayout.setContentsMargins(0, 0, 0, 0)
-        self.VoxelXYSpinBox = QtWidgets.QDoubleSpinBox()
-        self.VoxelXYSpinBox.setDecimals(4)
-        self.VoxelXYSpinBox.setRange(0.0001, 10.0)
-        self.VoxelXYSpinBox.setSingleStep(0.001)
-        self.VoxelXYSpinBox.setValue(VOXEL_DEFAULTS['voxel_xy_um'])
-        self.VoxelXYSpinBox.setSuffix(' um/px')
-        self.VoxelZSpinBox = QtWidgets.QDoubleSpinBox()
-        self.VoxelZSpinBox.setDecimals(4)
-        self.VoxelZSpinBox.setRange(0.0001, 20.0)
-        self.VoxelZSpinBox.setSingleStep(0.001)
-        self.VoxelZSpinBox.setValue(VOXEL_DEFAULTS['voxel_z_um'])
-        self.VoxelZSpinBox.setSuffix(' um/plane')
+
+        def voxel_edit(default):
+            e = QtWidgets.QLineEdit(f'{default:g}')
+            v = QtGui.QDoubleValidator(0.0001, 100.0, 6)
+            v.setNotation(QtGui.QDoubleValidator.StandardNotation)
+            e.setValidator(v)
+            e.setMaximumWidth(90)
+            return e
+
+        self.VoxelXYLineEdit = voxel_edit(VOXEL_DEFAULTS['voxel_xy_um'])
+        self.VoxelZLineEdit = voxel_edit(VOXEL_DEFAULTS['voxel_z_um'])
+        self.ApplyVoxelPushButton = QtWidgets.QPushButton('Apply')
+        self.ApplyVoxelPushButton.setToolTip(
+            'Commit the typed voxel size. Nothing reads the boxes until you '
+            'press this, so a half-typed number is never in force.')
+        self.VoxelStatusLabel = QtWidgets.QLabel('')
+        self.VoxelStatusLabel.setStyleSheet('color: #555;')
         voxelLayout.addWidget(QtWidgets.QLabel('lateral'))
-        voxelLayout.addWidget(self.VoxelXYSpinBox)
-        voxelLayout.addWidget(QtWidgets.QLabel('axial'))
-        voxelLayout.addWidget(self.VoxelZSpinBox)
-        voxelLayout.addStretch(1)
+        voxelLayout.addWidget(self.VoxelXYLineEdit)
+        voxelLayout.addWidget(QtWidgets.QLabel('um/px    axial'))
+        voxelLayout.addWidget(self.VoxelZLineEdit)
+        voxelLayout.addWidget(QtWidgets.QLabel('um/plane'))
+        voxelLayout.addWidget(self.ApplyVoxelPushButton)
+        voxelLayout.addWidget(self.VoxelStatusLabel, 1)
         form.addRow('Voxel size:', voxelRow)
+
+        # What is actually IN FORCE, as opposed to what is typed. Committed
+        # only by apply_voxel(); every reader asks for this.
+        self._voxel_committed = (VOXEL_DEFAULTS['voxel_xy_um'],
+                                 VOXEL_DEFAULTS['voxel_xy_um'],
+                                 VOXEL_DEFAULTS['voxel_z_um'])
+        self.ApplyVoxelPushButton.clicked.connect(self.apply_voxel)
+        self.apply_voxel()
 
         self.ParseLayoutPushButton = QtWidgets.QPushButton('Parse Layouts (all modalities)')
         layout.addWidget(self.ParseLayoutPushButton)
@@ -538,3 +562,37 @@ class IngestionPanelUI(object):
     def remove_selected_jobs(self):
         for item in self.JobQueueListWidget.selectedItems():
             self.JobQueueListWidget.takeItem(self.JobQueueListWidget.row(item))
+
+
+    def voxel_um(self):
+        """(dy, dx, dz) currently IN FORCE -- never the raw edit text."""
+        return self._voxel_committed
+
+    def apply_voxel(self):
+        """Commit the typed voxel size, or refuse it and say why.
+
+        Refusing rather than clamping: a value outside the plausible range
+        is a typo, and silently turning 2080 into 100 would put a wrong
+        number in force while looking like it worked.
+        """
+        def parse(edit, what):
+            text = edit.text().strip().replace(',', '.')
+            try:
+                v = float(text)
+            except ValueError:
+                return None, f'{what} "{text}" is not a number'
+            if not (0.0001 <= v <= 100.0):
+                return None, f'{what} {v:g} um is outside 0.0001-100'
+            return v, None
+
+        xy, err_xy = parse(self.VoxelXYLineEdit, 'lateral')
+        z, err_z = parse(self.VoxelZLineEdit, 'axial')
+        err = err_xy or err_z
+        if err:
+            self.VoxelStatusLabel.setText(f'NOT applied -- {err}')
+            self.VoxelStatusLabel.setStyleSheet('color: #b00;')
+            return False
+        self._voxel_committed = (xy, xy, z)
+        self.VoxelStatusLabel.setText(f'in force: {xy:g} x {xy:g} x {z:g} um')
+        self.VoxelStatusLabel.setStyleSheet('color: #555;')
+        return True

@@ -7218,9 +7218,7 @@ class MainWindow(QtWidgets.QMainWindow):
         disagrees with the data is not detectable from the numbers it
         produces.
         """
-        ip = self.ui.IngestionPanel
-        xy = float(ip.VoxelXYSpinBox.value())
-        return (xy, xy, float(ip.VoxelZSpinBox.value()))
+        return self.ui.IngestionPanel.voxel_um()
 
     def _chromatin_v2_params(self, full_params, storage_path, install=True):
         """V2Params for this run, or None when v1 is selected.
@@ -11058,8 +11056,8 @@ One PNG PER MODALITY: each modality has its own reference and its
         # length reads the SAME pair. It sat in chromatin_tracing while v2
         # was the only consumer, which made it look like a tracing setting.
         'acquisition': {
-            'voxel_xy_um': ('IngestionPanel', 'VoxelXYSpinBox'),
-            'voxel_z_um': ('IngestionPanel', 'VoxelZSpinBox'),
+            'voxel_xy_um': ('IngestionPanel', 'VoxelXYLineEdit'),
+            'voxel_z_um': ('IngestionPanel', 'VoxelZLineEdit'),
         },
         'cell_segmentation': {
             'reference_hybe': ('CellSegmentPanel', 'ReferenceHybeComboBox'),
@@ -11280,6 +11278,14 @@ One PNG PER MODALITY: each modality has its own reference and its
                     pending.append((w, value))
         for w, value in pending:
             self._apply_widget_value(w, value)
+        # The voxel edits are text with an explicit Apply, so loading a
+        # config must COMMIT them -- otherwise the file would say one thing
+        # and the value in force would still be the default, with nothing
+        # on screen disagreeing.
+        if not self.ui.IngestionPanel.apply_voxel():
+            self.log('WARNING: the config carries a voxel size this app will '
+                     'not accept; the default stays in force. See the '
+                     'Ingestion panel.')
 
     def _load_config_dialog(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Load configuration file', self.save_path, 'configuration file (*.xml)')
