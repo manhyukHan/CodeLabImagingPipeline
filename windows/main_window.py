@@ -1552,7 +1552,11 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.SaveAllelesPushButton.clicked.connect(self._save_chromatin_alleles)
         chp.RevertAllelesPushButton.clicked.connect(self._revert_chromatin_alleles)
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
-        chp.FitAllFovsPushButton.clicked.connect(self._run_chromatin_tracing_fit_all)
+        # NOT the bare method: clicked passes its `checked` bool as the
+        # first positional argument, which would arrive as fov_subset=False
+        # and crash on iteration ({int(f) for f in False}). Confirmed real.
+        chp.FitAllFovsPushButton.clicked.connect(
+            lambda _checked=False: self._run_chromatin_tracing_fit_all())
         chp.FitThisFovPushButton.clicked.connect(self._run_chromatin_tracing_fit_this_fov)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
         # The engine combo was connected to NOTHING, so selecting v2 left
@@ -7783,6 +7787,13 @@ class MainWindow(QtWidgets.QMainWindow):
         CellAlignmentWorker/CrossModalAlignmentWorker; persists via
         mirror_write_fov_alleles as soon as the batch completes.
         """
+        # A Qt clicked signal delivers its `checked` bool positionally, so
+        # a direct connect hands this method fov_subset=False. The lambda
+        # at the connect site absorbs it, and this guard makes the method
+        # itself immune to the next connect that forgets to: a bool is
+        # never a FOV list.
+        if isinstance(fov_subset, bool):
+            fov_subset = None
         chp = self.ui.ChromatinTracingPanel
         ctx = self._chromatin_tracing_context()
         if ctx is None:
