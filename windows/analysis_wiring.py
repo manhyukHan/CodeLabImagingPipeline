@@ -343,6 +343,34 @@ class AnalysisWiring(QtCore.QObject):
         self.panel.ConditionListWidget.addItem(item)
         self._refresh_gate_summary()
 
+    def gate_dict(self):
+        """The gate as plain data -- what Save Config persists. The gate
+        is a DESCRIPTION (clauses of predicate dicts); which cells pass
+        is derived data, re-computed against whatever population is
+        built, and deliberately never saved as state -- the Save Result
+        sidecar snapshots membership at figure-save time instead."""
+        return self.condition().to_dict()
+
+    def set_gate_dict(self, d):
+        """Rebuild the condition list from a saved gate (config load).
+        Binds to nothing: predicates only touch data when mask(pop)
+        runs, so restoring at app start cannot go stale."""
+        p = self.panel
+        p.ConditionListWidget.clear()
+        for ci, clause in enumerate((d or {}).get('clauses') or []):
+            if ci:
+                item = QtWidgets.QListWidgetItem('---------- OR ----------')
+                item.setData(QtCore.Qt.UserRole, self.OR_MARKER)
+                p.ConditionListWidget.addItem(item)
+            for pd in clause:
+                pred = gate.Predicate.from_dict(pd)   # validate, or raise
+                item = QtWidgets.QListWidgetItem(repr(pred))
+                # store the NORMALIZED dict (to_dict of the parsed
+                # predicate), so save->load->save is byte-stable
+                item.setData(QtCore.Qt.UserRole, pred.to_dict())
+                p.ConditionListWidget.addItem(item)
+        self._refresh_gate_summary()
+
     def add_condition(self):
         try:
             d = self.panel.predicate_dict()

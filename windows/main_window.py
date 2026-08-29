@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import re
 import time
@@ -11394,6 +11395,16 @@ One PNG PER MODALITY: each modality has its own reference and its
             out['cross_modal_alignment'][f'reference_hybe_{name}'] = hybe
         out['chromatin_tracing']['hybes'] = ','.join(
             f'{folder}|{modality}' for folder, modality in self.ui.ChromatinTracingPanel.checked_hybes())
+        # The analysis GATE is config-shaped state: a declarative
+        # description (predicate clauses), like a checked-hybe set.
+        # Which cells pass is derived data and is deliberately NOT
+        # saved -- it is re-derived against whatever population the
+        # loaded app builds, so a config can never carry stale
+        # membership; Save Result's sidecar snapshots membership at
+        # figure-save time instead.
+        gd = self.analysis.gate_dict()
+        if gd.get('clauses'):
+            out['analysis_gate'] = {'condition': json.dumps(gd, sort_keys=True)}
         return out
 
     def _apply_config_params(self, params):
@@ -11427,6 +11438,16 @@ One PNG PER MODALITY: each modality has its own reference and its
                 if section == 'chromatin_tracing' and param == 'hybes':
                     keys = [tuple(pair.split('|', 1)) for pair in value.split(',') if '|' in pair]
                     self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
+                    continue
+                if section == 'analysis_gate' and param == 'condition':
+                    try:
+                        self.analysis.set_gate_dict(json.loads(value))
+                    except Exception as e:
+                        # a gate from a newer build (unknown predicate
+                        # kind) degrades to "not restored", never an
+                        # error -- same contract as unknown params
+                        self.log(f'WARNING: config gate not restored: '
+                                 f'{type(e).__name__}: {e}')
                     continue
                 target = entries.get(param)
                 if target is None:

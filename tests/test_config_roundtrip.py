@@ -83,6 +83,17 @@ def main():
                 combo = combos.get(name)
                 if combo is not None and combo.count() > 1:
                     combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
+        # the analysis gate: config-shaped DESCRIPTION (clauses of
+        # predicates, OR-of-AND, normalize and all); membership is
+        # derived data and deliberately not part of the config
+        a.analysis.set_gate_dict({'clauses': [
+            [{'kind': 'celltype_in', 'names': ['WT', 'KI']},
+             {'kind': 'expression_range', 'source': ['DNA', 'Hyb_001', 561],
+              'metric': 'n_spots', 'lo': 1.0, 'hi': None,
+              'normalize': ['by_modality']}],
+            [{'kind': 'completeness_range', 'lo': 10, 'hi': None},
+             {'kind': 'barcode_presence', 'hybes': ['Hyb_002'],
+              'absent': True}]]})
 
         with mock.patch.object(QtWidgets.QFileDialog, 'getSaveFileName',
                                return_value=(OUT, '')):
