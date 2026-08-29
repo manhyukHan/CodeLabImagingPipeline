@@ -1188,6 +1188,12 @@ def allele_task(payload):
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
         'psf_family': params.psf_family if params else None,
+        # reconcile (analysis/reconcile.py) re-derives polymer_adj from
+        # polymer_raw under CURRENT matrices; the fiducial correction it
+        # re-applies is ref-relative, so the trace must say which hybe
+        # was its reference -- and which modality frame its hybes name.
+        'reference_hybe': reference_hybe,
+        'modality': modality,
     }
     build_chromatin_trace_allele(
         allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,
@@ -1220,6 +1226,12 @@ def allele_task_with_debug(payload):
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
         'psf_family': params.psf_family if params else None,
+        # reconcile (analysis/reconcile.py) re-derives polymer_adj from
+        # polymer_raw under CURRENT matrices; the fiducial correction it
+        # re-applies is ref-relative, so the trace must say which hybe
+        # was its reference -- and which modality frame its hybes name.
+        'reference_hybe': reference_hybe,
+        'modality': modality,
     }
     _a, debug = build_chromatin_trace_allele(
         allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,

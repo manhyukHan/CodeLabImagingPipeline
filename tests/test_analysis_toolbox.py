@@ -330,6 +330,68 @@ od = detection.count_overdispersion(X_indep, fit['b'], fit['tau'],
 check('independent data is not overdispersed', od['p'] > 0.05,
       f"p={od['p']:.3f} ratio={od['ratio']:.2f}")
 
+print('\nreconcile: adj re-derived from raw under CURRENT matrices')
+from codelab_pipeline.analysis import reconcile as rec               # noqa: E402
+
+
+class StubResolver:
+    """+2 y, +3 x for every projection; +5 planes on the z chain."""
+
+    def to_shared(self, hybe, modality, cell):
+        return np.array([[1., 0, 2], [0, 1, 3], [0, 0, 1]])
+
+    def z_to_shared(self, hybe, modality, cell):
+        return 5.0
+
+
+spots_r = [{'hybe': 'H1', 'modality': 'DNA', 'cell': -1,
+            'raw_coordinate': (10.0, 20.0, 30.0),
+            'adj_coordinate': (0.0, 0.0, 0.0)},
+           {'hybe': 'H1', 'modality': 'DNA', 'cell': 7,
+            'raw_coordinate': (1.0, 1.0, 0.0),
+            'adj_coordinate': (1.0, 1.0, 0.0)}]
+st = rec.reconcile_spot_dicts(spots_r, StubResolver(), {})
+check('spot adj = H @ raw, z = raw z + z chain',
+      spots_r[0]['adj_coordinate'] == (12.0, 23.0, 35.0))
+check('the 2D placeholder z (raw 0, adj 0) is NEVER minted into depth',
+      spots_r[1]['adj_coordinate'] == (3.0, 4.0, 0.0)
+      and st['z_placeholder'] == 1)
+
+al_r = [{'id': 1, 'cell': -1, 'anchor_hybe': 'H1',
+         'raw_coordinate': (0.0, 0.0, 10.0), 'coordinate': (9., 9., 9.),
+         'provenance': {'reference_hybe': 'H1', 'modality': 'DNA'},
+         'fiducial_trace_raw': {'H1': (0., 0., 10., 5.),
+                                'H2': (1., 1., 12., 5.)},
+         'fiducial_trace_adj': {},
+         'polymer_raw': {'H2': [(4.0, 4.0, 12.0, 99.0)]},
+         'polymer_adj': {}},
+        {'id': 2, 'cell': -1, 'anchor_hybe': 'H1',
+         'raw_coordinate': (0., 0., 0.), 'coordinate': (0., 0., 0.),
+         'provenance': {},
+         'fiducial_trace_raw': {'H1': (0., 0., 0., 1.)},
+         'fiducial_trace_adj': {}, 'polymer_raw': {}, 'polymer_adj': {}},
+        {'id': 3, 'cell': -1, 'anchor_hybe': 'H1',
+         'raw_coordinate': (0., 0., 0.), 'coordinate': (0., 0., 0.),
+         'provenance': {}, 'fiducial_trace_raw': {},
+         'fiducial_trace_adj': {}, 'polymer_raw': {}, 'polymer_adj': {}}]
+st = rec.reconcile_allele_dicts(al_r, StubResolver(), {})
+# stub projects both fiducials by the same shift, so the re-derived
+# correction is exactly the RAW fiducial difference: H1 - H2 = (-1,-1,-2)
+got = al_r[0]['polymer_adj']['H2'][0]
+check('polymer adj = projected raw + re-derived ref-relative correction',
+      got == (4.0 + 2 - 1, 4.0 + 3 - 1, 12.0 + 5 - 2, 99.0), str(got))
+check('fiducial adj re-derived from raw',
+      al_r[0]['fiducial_trace_adj']['H2'] == (3.0, 4.0, 17.0, 5.0))
+check('an allele naming no reference is SKIPPED, never guessed',
+      st['skipped']['no_reference'] == 1)
+check('an allele with no raw at all is skipped and counted',
+      st['skipped']['no_raw'] == 1)
+check('exactly the reconcilable allele updated', st['updated'] == 1)
+st2 = rec.reconcile_allele_dicts([al_r[1]], StubResolver(), {},
+                                 modality='DNA', reference_hybe='H1')
+check('arguments stand in when provenance is unstamped (old traces)',
+      st2['updated'] == 1)
+
 print('\nthe headless contract')
 # THE toolbox promise, pinned: importing the whole analysis package --
 # resolvers included -- loads no Qt and no app module. A fresh
