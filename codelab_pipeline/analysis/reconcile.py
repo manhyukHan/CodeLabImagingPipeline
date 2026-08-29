@@ -51,6 +51,65 @@ def _shift_stats(deltas):
             'p90': float(np.percentile(d, 90)), 'max': float(d.max())}
 
 
+def _anchor_hybe_of(cell_dict, modality):
+    """The hybe this modality's cell residuals were measured against,
+    parsed from matrix_provenance's reference_sequence ('Hyb_103(cell
+    3)->Hyb_101 [...]' -> 'Hyb_101'). None when nothing testifies."""
+    for key, prov in (cell_dict.get('matrix_provenance') or {}).items():
+        k_hybe, k_mod = (key if isinstance(key, tuple) else (key, modality))
+        if k_mod != modality:
+            continue
+        seq = str((prov or {}).get('reference_sequence') or '')
+        if '->' in seq:
+            target = seq.split('->', 1)[1]
+            target = target.split(' [', 1)[0].split('(', 1)[0].strip()
+            if target:
+                return target
+    return None
+
+
+def reconcile_cell_dicts(cells, resolver):
+    """Refresh every cell's matrix_anchors under the CURRENT matrices.
+
+    The mask needs nothing -- it lives in the cell's own reference
+    frame, raw-like. But matrix_anchors are alignment-time SNAPSHOTS
+    (bridge @ within[anchor_hybe] as of that run), sitting inside every
+    cell-route transform; a later FOV or cross-modal refit strands them
+    exactly like an adj coordinate. The anchor hybe per modality is
+    parsed from the residuals' own provenance; a modality nothing
+    testifies for is skipped and counted, never guessed.
+    """
+    shifts = []
+    skipped = {'anchor_hybe_unknown': 0, 'no_within': 0}
+    updated = 0
+    for d in cells:
+        anchors = dict(d.get('matrix_anchors') or {})
+        touched = False
+        for modality in list(anchors.keys()):
+            hybe = _anchor_hybe_of(d, modality)
+            if hybe is None:
+                skipped['anchor_hybe_unknown'] += 1
+                continue
+            H_w = (resolver.within.get(modality) or {}).get(hybe)
+            if H_w is None:
+                skipped['no_within'] += 1
+                continue
+            bridge = resolver.bridge(modality, resolver.shared)
+            if bridge is None:
+                bridge = np.eye(3)
+            new = np.asarray(bridge, float) @ np.asarray(H_w, float)
+            old = np.asarray(anchors[modality], float)
+            shifts.append(float(np.hypot(new[0, 2] - old[0, 2],
+                                         new[1, 2] - old[1, 2])))
+            anchors[modality] = new
+            touched = True
+        if touched:
+            d['matrix_anchors'] = anchors
+            updated += 1
+    return {'updated': updated, 'skipped': skipped,
+            'shift_px': _shift_stats(shifts)}
+
+
 def reconcile_spot_dicts(spots, resolver, cells_by_id):
     """Recompute adj for spot dicts IN PLACE; returns the stats dict.
 
@@ -171,13 +230,30 @@ def reconcile_fov(storage_path, fov, resolver=None, modality=None,
         from codelab_pipeline.analysis import resolvers as R
         resolver = R.resolver_for(storage_path, fov)
     cells, _ = analysis_store.read_cells(storage_path, fov)
+    cells = cells or []
+
+    # CELLS FIRST. Their matrix_anchors are the stalest layer -- every
+    # cell-route projection below composes through them, so spots and
+    # alleles must see the REFRESHED anchors, not the harvested
+    # snapshots (the factory resolver was built from the store's own
+    # possibly-stale cells).
+    cell_stats = reconcile_cell_dicts(cells, resolver)
+    fresh_anchors = {}
+    for c in cells:
+        for m, H in (c.get('matrix_anchors') or {}).items():
+            fresh_anchors.setdefault(m, np.asarray(H, float))
+    if fresh_anchors:
+        resolver.anchors = fresh_anchors
+
     cells_by_id = {}
-    for c in (cells or []):
+    for c in cells:
         obj = ACell()
         obj.set_metadata(**c)
         cells_by_id[int(c['id'])] = obj
 
-    report = {'fov': int(fov), 'written': bool(write)}
+    report = {'fov': int(fov), 'written': bool(write), 'cells': cell_stats}
+    if write and cell_stats['updated']:
+        analysis_store.write_cell_dicts(storage_path, fov, cells)
     slice_stats, all_shifts = [], []
     for (mod_s, hybe, channel) in analysis_store.spot_slices(storage_path, fov):
         spots = analysis_store.read_spots(storage_path, fov, modality=mod_s,

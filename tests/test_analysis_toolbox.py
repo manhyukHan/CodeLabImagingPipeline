@@ -392,6 +392,33 @@ st2 = rec.reconcile_allele_dicts([al_r[1]], StubResolver(), {},
 check('arguments stand in when provenance is unstamped (old traces)',
       st2['updated'] == 1)
 
+print('\nreconcile: cell anchors refresh under current matrices')
+
+
+class StubResolver2(StubResolver):
+    shared = 'DNA'
+    within = {'RNA': {'Hyb_101': np.array([[1., 0, 10], [0, 1, 20],
+                                           [0, 0, 1]])}}
+
+    def bridge(self, modality, shared):
+        return np.array([[1., 0, 1], [0, 1, 2], [0, 0, 1]])
+
+
+cell_r = [{'id': 1,
+           'matrix_anchors': {'RNA': np.eye(3)},
+           'matrix_provenance': {('Hyb_103', 'RNA'): {
+               'reference_sequence': 'Hyb_103(cell 3)->Hyb_101 [z=3.0px]'}}},
+          {'id': 2, 'matrix_anchors': {'RNA': np.eye(3)},
+           'matrix_provenance': {}}]
+st = rec.reconcile_cell_dicts(cell_r, StubResolver2())
+new_a = cell_r[0]['matrix_anchors']['RNA']
+check('anchor = bridge @ within[anchor hybe], anchor hybe parsed from '
+      'the residuals\' own provenance',
+      new_a[0, 2] == 11.0 and new_a[1, 2] == 22.0,
+      f'({new_a[0, 2]}, {new_a[1, 2]})')
+check('a modality nothing testifies for is skipped, never guessed',
+      st['skipped']['anchor_hybe_unknown'] == 1 and st['updated'] == 1)
+
 print('\nthe headless contract')
 # THE toolbox promise, pinned: importing the whole analysis package --
 # resolvers included -- loads no Qt and no app module. A fresh
