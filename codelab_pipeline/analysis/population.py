@@ -34,7 +34,7 @@ DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 def _fov_bundle(item):
     """One FOV's full extraction -- module-level for pmap."""
     (storage_path, fov, hybes, sources, spot_sources, voxel_um,
-     mask_intensity) = item
+     mask_intensity, resolver) = item
     out = {'fov': int(fov)}
     cells, _ = analysis_store.read_cells(storage_path, fov)
     out['cells'] = [{'fov': int(fov), 'cell': int(c['id']),
@@ -45,7 +45,8 @@ def _fov_bundle(item):
                                              voxel_um=voxel_um)
     if sources:
         table, extra = E.fov_expression_table(storage_path, fov, sources,
-                                              mask_intensity=mask_intensity)
+                                              mask_intensity=mask_intensity,
+                                              resolver=resolver)
         out['expression'] = table
         out['homeless'] = extra['homeless']
     if spot_sources:
@@ -84,7 +85,8 @@ class Population:
     @classmethod
     def build(cls, storage_path, fovs, records=None, hybes=None,
               sources=None, spot_sources=None, voxel_um=DEFAULT_VOXEL_UM,
-              mask_intensity=False, jobs=None, on_done=None):
+              mask_intensity=False, resolvers=None, jobs=None,
+              on_done=None):
         """Assemble a Population from the store, headless.
 
         records: parsed layout records (preprocess.parse_experiment_layout)
@@ -92,6 +94,16 @@ class Population:
         / spot_sources: [(modality, hybe, channel)] for expression / spot
         tables; either may be omitted and the matching predicates then
         refuse with an actionable error rather than a KeyError.
+
+        resolvers: {fov: FrameResolver} for EXACT mask projection into
+        each source hybe's own raw frame (mask_frame='native'). The
+        resolver is plain-data by design and pickles into the child
+        processes; without one, post-cell-alignment cells fall to the
+        FLAGGED reference-frame mask -- which, for a cross-modal source,
+        is off by the whole cross-modal bridge (~13 px measured), not a
+        rounding error. The app passes MainWindow._frame_resolver(None,
+        fov) per FOV; cell-level residuals still apply because
+        transform(..., cell=cell) takes the cell at call time.
         """
         fovs = [int(f) for f in fovs]
         if len(set(fovs)) != len(fovs):
@@ -101,7 +113,8 @@ class Population:
         if hybes is None and records is not None:
             hybes = P.bin_hybes(records)
         items = [(storage_path, int(f), hybes, sources, spot_sources,
-                  tuple(voxel_um), bool(mask_intensity)) for f in fovs]
+                  tuple(voxel_um), bool(mask_intensity),
+                  (resolvers or {}).get(int(f))) for f in fovs]
         results = parallel.pmap(_fov_bundle, items, kind='io', jobs=jobs,
                                 on_done=on_done)
         bundles, fails = [], []

@@ -20,8 +20,11 @@ matrices can compose it (matrix_to), it is used; when they are residual-
 form (post cell-alignment), the reference-frame mask is used unprojected
 and the row says so in mask_frame -- 'native' vs 'reference'. Callers
 with a FrameResolver (the app) can pass it for exact projection in every
-case. Alignment offsets are a few px against ~50 px cell masks, so the
-fallback is a small, FLAGGED approximation, never a silent one.
+case, and for CROSS-MODAL sources they should: the reference-frame
+fallback is off by the whole cross-modal bridge there (~13 px measured
+against ~50 px masks -- background dilution, not a rounding error).
+Same-modality offsets are a few px. Either way the approximation is
+FLAGGED, never silent.
 """
 import os
 
@@ -113,13 +116,18 @@ def _mask_median(cell, mip, hybe, modality, resolver):
             # alignment offset while labeling the result exact; caught
             # by adversarial review with a stub resolver before any
             # caller shipped.
-            H, _dz, _missing = resolver.transform(
+            H, _dz, missing = resolver.transform(
                 (cell.reference_hybe, cell.reference_modality),
                 (hybe, modality), cell=cell)
             ay, ax = cell.area
             pts = np.stack([ay, ax, np.ones(len(ay))])
             moved = H @ pts
             ys, xs = moved[0], moved[1]
+            if missing:
+                # the resolver ALWAYS returns a usable transform, with
+                # uncomputed layers defaulted to identity -- 'native'
+                # would overclaim exactness, so the row names the gap
+                frame = 'native-partial:' + ','.join(sorted(missing))
         except Exception:
             ys = xs = None
     if ys is None:

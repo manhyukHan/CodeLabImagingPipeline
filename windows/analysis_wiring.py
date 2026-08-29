@@ -94,6 +94,19 @@ class AnalysisWiring(QtCore.QObject):
         records = self.mw._active_hybe_records_for_modality(modality) or []
         voxel = self.mw._voxel_um()
         mask_int = p.MaskIntensityCheckBox.isChecked()
+        # EXACT mask projection: one plain-data resolver per FOV (they
+        # pickle into the extraction children); the cell is supplied at
+        # transform time, so cell-level residuals still apply. Without
+        # these, every post-cell-alignment cell falls to the flagged
+        # reference-frame mask -- measured 'reference' on 386/386 cells,
+        # and for cross-modal sources that is the whole bridge of error.
+        resolvers = {}
+        if mask_int:
+            for f in fovs:
+                try:
+                    resolvers[int(f)] = self.mw._frame_resolver(None, f)
+                except Exception:
+                    pass
         p.BuildPopulationPushButton.setEnabled(False)
         p.PopulationStatusLabel.setText('building population...')
 
@@ -101,7 +114,8 @@ class AnalysisWiring(QtCore.QObject):
             return population.Population.build(
                 storage_path, fovs, records=records,
                 sources=sources or None, spot_sources=sources or None,
-                voxel_um=voxel, mask_intensity=mask_int)
+                voxel_um=voxel, mask_intensity=mask_int,
+                resolvers=resolvers or None)
 
         def _done(pop):
             p.BuildPopulationPushButton.setEnabled(True)
