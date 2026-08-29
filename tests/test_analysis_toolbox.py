@@ -513,6 +513,24 @@ try:
     b5 = popmod2._fov_bundle(_item([SRC1, SRC2], overwrite=True))
     check('overwrite recomputes everything requested',
           b5['expr_cache'] == {'cached': 0, 'computed': 2})
+    # a FOV with NO segmented cells (the store-wide build case that
+    # KeyError'd 37/41 FOVs): zero rows is a cacheable RESULT, its
+    # homeless spots counted, and the rebuild reads no spots
+    ASt.read_cells = lambda s, f: (None, '')
+    b6 = popmod2._fov_bundle((_csp, 2, None, [SRC1], None,
+                              (0.208, 0.208, 0.2), False, None, None,
+                              False))
+    ent6 = (ASt.read_fov_expression(_csp, 2) or {}).get(
+        'sources', {}).get('RNA|Hyb_101|555')
+    check('a cell-less FOV builds clean and caches its empty result',
+          'expression' not in b6 and ent6 is not None
+          and ent6['rows'] == [] and ent6['homeless'] == 1)
+    ASt.read_spots = _spots_boom
+    b7 = popmod2._fov_bundle((_csp, 2, None, [SRC1], None,
+                              (0.208, 0.208, 0.2), False, None, None,
+                              False))
+    check('and its rebuild is served from the capsule',
+          b7['expr_cache'] == {'cached': 1, 'computed': 0})
 finally:
     ASt.read_cells, ASt.read_spots = _orig_rc, _orig_rs
     shutil.rmtree(_croot, ignore_errors=True)

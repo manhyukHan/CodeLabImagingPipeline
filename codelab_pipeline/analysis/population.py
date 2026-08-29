@@ -161,13 +161,23 @@ def _fov_bundle(item):
                         if c in table_new.columns]
                 for src in fresh_srcs:
                     m, h, ch = src
-                    sub = table_new[(table_new['modality'] == m)
-                                    & (table_new['hybe'] == h)
-                                    & (table_new['channel'] == int(ch))]
+                    if len(table_new):
+                        sub = table_new[(table_new['modality'] == m)
+                                        & (table_new['hybe'] == h)
+                                        & (table_new['channel'] == int(ch))]
+                        rows = sub[keep].to_dict('records')
+                    else:
+                        # a FOV with no segmented cells computes to zero
+                        # rows -- still a result worth caching (its spot
+                        # slices were read; homeless got counted). The
+                        # empty frame has NO columns, so slicing it
+                        # KeyErrors -- the bug that failed 37/41 FOVs on
+                        # the first store-wide build.
+                        rows = []
                     csources[_skey(src)] = {
                         'mask': bool(mask_intensity),
                         'homeless': int(homeless.get(src, 0)),
-                        'rows': sub[keep].to_dict('records')}
+                        'rows': rows}
             for m in fresh_mods:
                 cagg[m] = {str(k): v for k, v in agg_by_mod[m].items()}
             analysis_store.write_fov_expression(
@@ -344,5 +354,11 @@ class Population:
         if self.spots is not None:
             parts.append(f'{len(self.spots)} spots')
         if self.failures:
-            parts.append(f'FAILED FOVs: {self.failures}')
+            # readable, not exhaustive: 37 stacked tracebacks once made
+            # the status label a wall -- name the FOVs, show one message
+            fovs = [f for f, _m in self.failures]
+            parts.append(f'FAILED FOVs {fovs}: {self.failures[0][1]}'
+                         + (' (first of '
+                            f'{len(self.failures)} messages)'
+                            if len(self.failures) > 1 else ''))
         return ' | '.join(parts) + f' | celltypes: {dict(n_ct)}'
