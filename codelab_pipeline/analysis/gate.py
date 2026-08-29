@@ -89,7 +89,8 @@ class ExpressionRange(Predicate):
 
     source: (modality, hybe, channel). metric: 'n_spots' |
     'brightness_median' | 'brightness_total' | 'mask_median'.
-    normalize: None | ('by_source', ref_source) | ('by_total_count',).
+    normalize: None | ('by_modality',) | ('by_source', ref_source)
+    ('by_total_count' is the legacy alias of by_modality).
     Open bounds via lo=None / hi=None.
     """
     kind = 'expression_range'

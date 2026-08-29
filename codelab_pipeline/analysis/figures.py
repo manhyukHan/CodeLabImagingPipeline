@@ -30,19 +30,28 @@ def style_ax(ax):
     return ax
 
 
-def dmap_ticks(ax, n):
-    """Barcode-index ticks for an n-bin distance map: [0] + every 10th
-    + [n-1], DISPLAYED 1-based (real barcode indices, per request)."""
-    pos = [0] + list(range(9, n - 1, 10)) + [n - 1]
-    pos = sorted(set(pos))
+def _tick_positions(n):
+    return sorted(set([0] + list(range(9, n - 1, 10)) + [n - 1]))
+
+
+def dmap_ticks(ax, n, ids=None):
+    """Ticks for an n-bin distance map: [0] + every 10th + [n-1].
+
+    With ids (the layout's readout_id per bin, in bin order) the labels
+    are the REAL readout indices -- the name the experiment layout gives
+    each round, gaps and all -- per explicit request. Without them the
+    fallback is the 1-based bin position."""
+    pos = _tick_positions(n)
+    have_ids = ids is not None and len(ids) == n
+    labels = [str(int(ids[p])) if have_ids else str(p + 1) for p in pos]
     ax.set_xticks(pos)
     ax.set_yticks(pos)
-    ax.set_xticklabels([str(p + 1) for p in pos], fontsize=6)
-    ax.set_yticklabels([str(p + 1) for p in pos], fontsize=6)
-    ax.set_xlabel('barcode', fontsize=8)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel('readout id' if have_ids else 'barcode', fontsize=10)
 
 
-def _dmap_ax(ax, m, title, vmin=None, vmax=None):
+def _dmap_ax(ax, m, title, vmin=None, vmax=None, ids=None):
     finite = m[np.isfinite(m)]
     if vmin is None:
         vmin = np.quantile(finite, 0.02) if len(finite) else 0
@@ -51,13 +60,13 @@ def _dmap_ax(ax, m, title, vmin=None, vmax=None):
     cmap = cm.seismic_r.copy()
     cmap.set_bad('0.15')
     im = ax.imshow(m, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
-    ax.set_title(title, fontsize=9)
-    dmap_ticks(ax, m.shape[0])
+    ax.set_title(title, fontsize=10)
+    dmap_ticks(ax, m.shape[0], ids=ids)
     return im
 
 
 def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
-                 min_n=1, group_masks=None):
+                 min_n=1, group_masks=None, bin_ids=None):
     """One ensemble map, optionally decomposed by named group masks
     (the FLAG axis: groups split the gated stack, they never re-gate)."""
     groups = [('all', mask)] if not group_masks else list(group_masks.items())
@@ -67,7 +76,7 @@ def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
     for ax, (name, gmask) in zip(axes[0], groups):
         m, counts = ens.ensemble_map(dmaps, gmask, reducer, min_n)
         n_al = int(gmask.sum()) if gmask is not None else len(dmaps)
-        ims.append(_dmap_ax(ax, m, f'{name}  (n={n_al})'))
+        ims.append(_dmap_ax(ax, m, f'{name}  (n={n_al})', ids=bin_ids))
     vmin = min(i.get_clim()[0] for i in ims)
     vmax = max(i.get_clim()[1] for i in ims)
     for i in ims:
@@ -78,7 +87,7 @@ def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
 
 
 def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
-                        show_maps=True):
+                        show_maps=True, bin_ids=None):
     """FOV-level QC: the MSD test, optionally with the per-FOV maps.
 
     SCC is GONE, per explicit decision -- one correlation between two
@@ -87,11 +96,28 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
     to just the tested histogram; every panel names its n.
     """
     groups = [('all', mask)] if not group_masks else list(group_masks.items())
+    fov_n = len(np.asarray(fovs))
+    # a group emptied by the gate gets NO row -- the gate summary
+    # already reports per-celltype counts, and a full-size blank panel
+    # per excluded celltype is dead space (reported from the GUI)
+    empty = [name for name, g in groups
+             if int((np.ones(fov_n, bool) if g is None
+                     else np.asarray(g, bool)).sum()) == 0]
+    groups = [(name, g) for name, g in groups if name not in empty]
+    if not groups:
+        fig, ax = plt.subplots(figsize=(6.4, 3))
+        ax.set_axis_off()
+        ax.set_title('every group is empty after the gate', fontsize=10)
+        return fig
     all_fovs = sorted(set(int(f) for f in np.asarray(fovs)))
     k = len(all_fovs) if show_maps else 0
     ncols = k + 1
+    # histogram-only mode keeps a readable width -- 3.1 in is the MAP
+    # column's size, and a lone 3.1-in histogram under a two-line title
+    # is what made the stacked view collide (reported from the GUI)
+    width = 3.1 * ncols if show_maps else 6.4
     fig, axes = plt.subplots(len(groups), ncols,
-                             figsize=(3.1 * ncols, 3.5 * len(groups)),
+                             figsize=(width, 3.5 * len(groups)),
                              squeeze=False)
     fov_arr = np.asarray(fovs)
     for row, (name, gmask) in enumerate(groups):
@@ -104,7 +130,7 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
                 n_f = int((base & (fov_arr == f)).sum())
                 if f in res['maps']:
                     _dmap_ax(ax, res['maps'][f],
-                             f'{name} FOV{f:03d} (n={n_f})')
+                             f'{name} FOV{f:03d} (n={n_f})', ids=bin_ids)
                 else:
                     ax.set_axis_off()
         ax = axes[row][-1]
@@ -118,16 +144,29 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
             ax.hist(t['msd_in'], bins=edges, density=True, alpha=0.6,
                     color='crimson', label=f"in-FOV (n={len(t['msd_in'])})")
             ax.legend(fontsize=7)
-            per = '  '.join(f"F{d['fov']}:{d['signed_neglog10p']:+.1f}"
-                            for d in t['per_fov'])
+            # wrapped, not one endless line: 41 FOVs of verdicts in a
+            # single title row blows past any figure width
+            items = [f"F{d['fov']}:{d['signed_neglog10p']:+.1f}"
+                     for d in t['per_fov']]
+            per = '\n'.join('  '.join(items[i:i + 8])
+                            for i in range(0, len(items), 8))
             ax.set_title(f"{name} (n={int(base.sum())}): "
                          f"MSD -log10 p = {t['neglog10p']:.1f}\n"
-                         f'per-FOV signed (+ = deviant)  {per}', fontsize=8)
+                         f'per-FOV signed (+ = deviant)\n{per}', fontsize=8)
+            ax.set_xlabel('pairwise map MSD (um^2)', fontsize=8)
+            ax.set_ylabel('density', fontsize=8)
         else:
-            ax.set_title(f'{name}: too few pairs', fontsize=9)
-        ax.set_xlabel('pairwise map MSD (um^2)', fontsize=8)
-        ax.set_ylabel('density', fontsize=8)
-    fig.suptitle('FOV-level consistency', fontsize=12)
+            # a degenerate group (e.g. 2 Unassigned alleles) gets a
+            # labeled BLANK, not an empty axes with phantom 0..1 ticks
+            ax.set_title(f'{name} (n={int(base.sum())}): too few pairs',
+                         fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    sup = 'FOV-level consistency'
+    if empty:
+        sup += f"  (empty after gate: {', '.join(empty)})"
+    fig.suptitle(sup, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
 
 
@@ -152,7 +191,7 @@ def fig_allele_difference(dmaps, fovs, cells, mask=None):
     return fig
 
 
-def fig_polymer_qc(table, dmaps, thresholds, qc_result=None):
+def fig_polymer_qc(table, dmaps, thresholds, qc_result=None, bin_ids=None):
     """The polymeric-QC view: every gated quantity as a histogram with
     its threshold drawn ON the distribution it was derived from, plus
     efficacy per bin and completeness per allele -- the tracked, visible
@@ -190,8 +229,17 @@ def fig_polymer_qc(table, dmaps, thresholds, qc_result=None):
     ax.bar(np.arange(len(eff)), eff,
            color=cm.rainbow(np.linspace(0, 1, max(len(eff), 1))))
     ax.set_ylim(0, 1)
-    ax.set_xlabel('barcode', fontsize=8)
-    ax.set_ylabel('efficacy', fontsize=8)
+    if bin_ids is not None and len(bin_ids) == len(eff):
+        # tpos, NOT pos: reusing `pos` here shadowed the position array
+        # the completeness panel below still reads (hard-crashed the
+        # preview through the Qt slot before the rename)
+        tpos = _tick_positions(len(eff))
+        ax.set_xticks(tpos)
+        ax.set_xticklabels([str(int(bin_ids[p])) for p in tpos], fontsize=8)
+        ax.set_xlabel('readout id', fontsize=10)
+    else:
+        ax.set_xlabel('barcode', fontsize=10)
+    ax.set_ylabel('efficacy', fontsize=10)
     ax.set_title('efficacy per bin (after QC)' if qc_result is not None
                  else 'efficacy per bin', fontsize=9)
     ax = axes[4]
@@ -243,12 +291,18 @@ def fig_polymer_qc(table, dmaps, thresholds, qc_result=None):
 
 
 def fig_expression_hist(table, source, metric='n_spots', bins=30,
-                        per_celltype=True, picked_range=None):
+                        per_celltype=True, picked_range=None,
+                        source_label=None, norm_label=None):
     """Expression histogram, celltype-decomposed; the range picker's view.
 
     picked_range=(lo, hi) draws the chosen gate band -- what the panel
-    shows while the user drags the ExpressionRange condition."""
+    shows while the user drags the ExpressionRange condition. norm_label
+    (e.g. 'normalized: by_source, Hyb_133 (SO57_exon)') is appended to
+    the title on its own line, so the figure SAYS which normalization
+    produced its axis."""
     m, h, ch = source
+    source_label = source_label or f'{m}/{h}/ch{ch}'
+    tail = f'\n{norm_label}' if norm_label else ''
     rows = table[(table['modality'] == m) & (table['hybe'] == h)
                  & (table['channel'] == int(ch))]
     fig, ax = plt.subplots(figsize=(5.6, 4))
@@ -256,7 +310,7 @@ def fig_expression_hist(table, source, metric='n_spots', bins=30,
     vals_all = rows[metric].to_numpy(dtype=float)
     finite = vals_all[np.isfinite(vals_all)]
     if len(finite) == 0:
-        ax.set_title(f'{source}: no finite {metric}')
+        ax.set_title(f'{source_label}: no finite {metric}{tail}')
         return fig
     edges = np.histogram_bin_edges(finite, bins=bins)
     if per_celltype:
@@ -274,14 +328,15 @@ def fig_expression_hist(table, source, metric='n_spots', bins=30,
                    label='selected range')
     ax.set_xlabel(metric)
     ax.set_ylabel('cells')
-    ax.set_title(f'{m}/{h}/ch{ch} -- {metric} per cell '
-                 f'({len(rows)} cells)', fontsize=10)
+    ax.set_title(f'{source_label} -- {metric} per cell '
+                 f'({len(rows)} cells){tail}', fontsize=10)
     return fig
 
 
-def fig_brightness_vs_count(table, source):
+def fig_brightness_vs_count(table, source, source_label=None):
     """QC view 4b: per-cell brightness vs spot count."""
     m, h, ch = source
+    source_label = source_label or f'{m}/{h}/ch{ch}'
     rows = table[(table['modality'] == m) & (table['hybe'] == h)
                  & (table['channel'] == int(ch))]
     fig, ax = plt.subplots(figsize=(5, 4.2))
@@ -293,7 +348,7 @@ def fig_brightness_vs_count(table, source):
     ax.set_xlabel('spots per cell')
     ax.set_ylabel('median spot brightness (counts)')
     ax.legend(fontsize=8)
-    ax.set_title(f'{m}/{h}/ch{ch} -- brightness vs count', fontsize=10)
+    ax.set_title(f'{source_label} -- brightness vs count', fontsize=10)
     return fig
 
 
@@ -318,17 +373,19 @@ def fig_distance_hist(hists, title, range_um=None):
 
 
 def expression_hist_ax(ax, table, source, metric='n_spots', bins=30,
-                       per_celltype=True, picked_range=None):
+                       per_celltype=True, picked_range=None, label=None):
     """One expression histogram INTO a given axes -- the composable form
-    the allele-mode group panels build on."""
+    the allele-mode group panels build on. label: display name for the
+    source (e.g. 'RNA/Hyb_111 (Gorab_exon)/ch635')."""
     style_ax(ax)
     m, h, ch = source
+    label = label or f'{m}/{h}/ch{ch}'
     rows = table[(table['modality'] == m) & (table['hybe'] == h)
                  & (table['channel'] == int(ch))]
     vals_all = rows[metric].to_numpy(dtype=float)
     finite = vals_all[np.isfinite(vals_all)]
     if len(finite) == 0:
-        ax.set_title(f'{m}/{h}/ch{ch}: no finite {metric}', fontsize=9)
+        ax.set_title(f'{label}: no finite {metric}', fontsize=9)
         return ax
     edges = np.histogram_bin_edges(finite, bins=bins)
     if per_celltype:
@@ -345,7 +402,7 @@ def expression_hist_ax(ax, table, source, metric='n_spots', bins=30,
         ax.axvspan(picked_range[0], picked_range[1], color='gold', alpha=0.25)
     ax.set_xlabel(metric, fontsize=8)
     ax.set_ylabel('cells', fontsize=8)
-    ax.set_title(f'{m}/{h}/ch{ch}', fontsize=9)
+    ax.set_title(label, fontsize=9)
     return ax
 
 
@@ -394,7 +451,11 @@ def fig_repeat_toe_qc(pop):
     style_ax(ax)
     if rep is not None and len(rep_ids) and bin_ids:
         colors = cm.rainbow(np.linspace(0, 1, len(rep_ids)))
-        drew = False
+        # DENSITY step lines on SHARED edges, per request: pair counts
+        # differ (n=56..156 measured), so raw allele counts make the
+        # best-covered pair look like the widest error, and seven
+        # overlapping bar sets are unreadable anyway
+        dists = {}
         for j, rid in enumerate(rep_ids):
             if rid not in bin_ids:
                 continue
@@ -403,14 +464,21 @@ def fig_repeat_toe_qc(pop):
             d = np.sqrt(((hpos - rpos) ** 2).sum(1))
             d = d[np.isfinite(d)]
             if len(d):
-                ax.hist(d, bins=30, alpha=0.5, color=colors[j],
-                        label=f'H{rid} vs R{rid} (n={len(d)}, '
+                dists[j] = d
+        if dists:
+            # ONE axis for every pair: 40 equal-width bins from 0 to the
+            # pooled maximum -- per-pair binning gave each line its own
+            # range AND width, which reads as spread that is not there
+            top = float(max(d.max() for d in dists.values()))
+            edges = np.linspace(0.0, top if top > 0 else 1.0, 41)
+            for j, d in dists.items():
+                ax.hist(d, bins=edges, density=True, histtype='step',
+                        linewidth=1.5, color=colors[j],
+                        label=f'H{rep_ids[j]} vs R{rep_ids[j]} (n={len(d)}, '
                               f'med {np.median(d):.2f} um)')
-                drew = True
-        if drew:
             ax.legend(fontsize=7)
         ax.set_xlabel('|H - R| same-bin distance (um)', fontsize=8)
-        ax.set_ylabel('alleles', fontsize=8)
+        ax.set_ylabel('density (1/um)', fontsize=8)
         ax.set_title('hybe-repeat replication error', fontsize=10)
     else:
         ax.set_title('no repeat rounds in the layout / population',

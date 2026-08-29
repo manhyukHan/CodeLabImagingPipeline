@@ -47,6 +47,16 @@ class AnalysisPanelUI(object):
         self.UncheckSelectedSourcesPushButton = QtWidgets.QPushButton(
             'Uncheck Selected')
         srcBtnRow.addWidget(self.UncheckSelectedSourcesPushButton)
+        self.BulkModalityComboBox = QtWidgets.QComboBox()
+        srcBtnRow.addWidget(self.BulkModalityComboBox)
+        self.BulkChannelComboBox = QtWidgets.QComboBox()
+        srcBtnRow.addWidget(self.BulkChannelComboBox)
+        self.CheckModalityChannelPushButton = QtWidgets.QPushButton(
+            'Check Modality+Channel (non-fiducial)')
+        self.CheckModalityChannelPushButton.setToolTip(
+            'Check every hybe of the picked modality at the picked '
+            'channel, skipping fiducial-channel entries.')
+        srcBtnRow.addWidget(self.CheckModalityChannelPushButton)
         self.CheckSpotSourcesPushButton = QtWidgets.QPushButton(
             'Check All With Spots')
         self.CheckSpotSourcesPushButton.setToolTip(
@@ -56,6 +66,7 @@ class AnalysisPanelUI(object):
         popLayout.addRow('', srcBtnRow)
         self.MaskIntensityCheckBox = QtWidgets.QCheckBox(
             'mask-based intensity (median MIP over each cell mask; slower)')
+        self.MaskIntensityCheckBox.setChecked(True)
         popLayout.addRow('', self.MaskIntensityCheckBox)
         self.OverwriteCacheCheckBox = QtWidgets.QCheckBox(
             'overwrite cached cell attributes (recompute already-built '
@@ -104,6 +115,10 @@ class AnalysisPanelUI(object):
         self.PreviewQcPushButton = QtWidgets.QPushButton(
             'Preview QC (histograms + efficacy/completeness)')
         qcRow.addWidget(self.PreviewQcPushButton)
+        # repeat/toe QC lives HERE with the other polymer-quality views
+        # (it reads the traces, not the gated population), per request
+        self.RepeatToeQcPushButton = QtWidgets.QPushButton('Repeat / Toe QC')
+        qcRow.addWidget(self.RepeatToeQcPushButton)
         self.ApplyQcCheckBox = QtWidgets.QCheckBox(
             'apply QC to all views and gates')
         self.ApplyQcCheckBox.setChecked(True)
@@ -231,14 +246,12 @@ class AnalysisPanelUI(object):
         self.ExpressionHistPushButton = QtWidgets.QPushButton('Expression Histogram (source A)')
         self.BrightnessVsCountPushButton = QtWidgets.QPushButton('Brightness vs Count (source A)')
         self.DistanceHistPushButton = QtWidgets.QPushButton('Distance Histogram (A vs B)')
-        self.RepeatToeQcPushButton = QtWidgets.QPushButton('Repeat / Toe QC')
         for i, b in enumerate((self.EnsembleMapPushButton,
                                self.FovConsistencyPushButton,
                                self.AlleleDifferencePushButton,
                                self.ExpressionHistPushButton,
                                self.BrightnessVsCountPushButton,
-                               self.DistanceHistPushButton,
-                               self.RepeatToeQcPushButton)):
+                               self.DistanceHistPushButton)):
             grid.addWidget(b, i // 2, i % 2)
         viewLayout.addLayout(grid)
         layout.addWidget(viewGroup)
@@ -256,7 +269,8 @@ class AnalysisPanelUI(object):
         is_pres = kind == 'BarcodePresence'
         is_allele = kind in ('AlleleCount', 'CompletenessRange')
         self.SourceAComboBox.setEnabled(is_expr or is_pair)
-        self.SourceBComboBox.setEnabled(is_pair)
+        # expr needs B too: it is by_source normalization's reference
+        self.SourceBComboBox.setEnabled(is_pair or is_expr)
         self.MetricComboBox.setEnabled(is_expr)
         self.NormalizeComboBox.setEnabled(is_expr)
         self.CollapseComboBox.setEnabled(is_pair)
@@ -316,10 +330,17 @@ class AnalysisPanelUI(object):
                                  'at least one checked source first)')
             norm = self.NormalizeComboBox.currentText()
             normalize = None
-            if norm == 'by_total_count':
-                normalize = ['by_total_count']
+            if norm in ('by_modality', 'by_total_count'):
+                # the combo said by_modality while the harvest still
+                # matched the retired name -- selecting it silently
+                # gated the RAW metric (reported: "not what I expected")
+                normalize = ['by_modality']
             elif norm == 'by_source':
-                normalize = ['by_source', list(src)]
+                ref = self.combo_source(self.SourceBComboBox)
+                if ref is None:
+                    raise ValueError("normalize 'by_source' divides by the "
+                                     'same metric of Source B -- pick it')
+                normalize = ['by_source', list(ref)]
             return {'kind': 'expression_range', 'source': list(src),
                     'metric': self.MetricComboBox.currentText(),
                     'lo': lo, 'hi': hi, 'normalize': normalize}

@@ -561,6 +561,18 @@ qp.alleles = {
 figq = figures.fig_repeat_toe_qc(qp)
 check('repeat/toe QC figure renders from build-time R/T positions',
       len(figq.axes) == 2)
+# distance-map ticks label the LAYOUT'S readout ids, not bin positions
+# (ticks at [0] + every 10th + [n-1]: n=3 marks positions 0 and 2)
+_figt, _axt = figures.plt.subplots()
+figures.dmap_ticks(_axt, 3, ids=[15, 40, 74])
+check('dmap ticks show readout ids from the layout, gaps and all',
+      [t.get_text() for t in _axt.get_xticklabels()] == ['15', '74']
+      and _axt.get_xlabel() == 'readout id')
+figures.dmap_ticks(_axt, 3)
+check('without ids the fallback is the 1-based bin position',
+      [t.get_text() for t in _axt.get_xticklabels()] == ['1', '3']
+      and _axt.get_xlabel() == 'barcode')
+figures.plt.close(_figt)
 import matplotlib.pyplot as plt                                # noqa: E402
 plt.close(figq)
 # the H-vs-R distance the left panel histograms: allele 0 only

@@ -38,6 +38,8 @@ class AnalysisWiring(QtCore.QObject):
         p.UncheckSelectedSourcesPushButton.clicked.connect(
             lambda: self._set_selected_sources(False))
         p.CheckSpotSourcesPushButton.clicked.connect(self.check_spot_sources)
+        p.CheckModalityChannelPushButton.clicked.connect(
+            self.check_modality_channel)
         p.DeriveQcPushButton.clicked.connect(self.derive_qc)
         p.PreviewQcPushButton.clicked.connect(self.preview_qc)
         p.ApplyQcCheckBox.toggled.connect(self._refresh_gate_summary)
@@ -55,6 +57,34 @@ class AnalysisWiring(QtCore.QObject):
         p.RepeatToeQcPushButton.clicked.connect(self.view_repeat_toe_qc)
 
     # -- population --------------------------------------------------------
+    def _hybe_name(self, modality, hybe):
+        """The layout's common name for a round (readout_name, e.g.
+        'Gorab_exon' for Hyb_111), or '' when the layout gives none."""
+        for r in (self.mw.hybe_records_by_modality or {}).get(modality, []):
+            if r.get('folder') == hybe:
+                return str(r.get('readout_name') or '')
+        return ''
+
+    def _source_label(self, src):
+        """Display name for figure titles: the common hybe name shown
+        beside the folder when the layout has one, per request."""
+        m, h, ch = src
+        name = self._hybe_name(m, h)
+        return f'{m}/{h} ({name})/ch{ch}' if name else f'{m}/{h}/ch{ch}'
+
+    def _norm_label(self, normalize):
+        """Title line naming the applied normalization, per request:
+        'normalized: by_source, Hyb_133 (SO57_exon)' / 'by_modality'."""
+        if not normalize:
+            return None
+        mode = normalize[0]
+        if mode == 'by_source' and len(normalize) > 1:
+            rm, rh, _rch = normalize[1]
+            name = self._hybe_name(rm, rh)
+            ref = f'{rh} ({name})' if name else rh
+            return f'normalized: by_source, {ref}'
+        return 'normalized: by_modality'
+
     def populate_sources(self):
         """Fill the source list + combos from the layouts' hybe records.
         Called by MainWindow after layouts parse."""
@@ -62,11 +92,18 @@ class AnalysisWiring(QtCore.QObject):
         p.SourceListWidget.clear()
         p.SourceAComboBox.clear()
         p.SourceBComboBox.clear()
+        p.BulkModalityComboBox.clear()
+        p.BulkChannelComboBox.clear()
+        all_channels = set()
         for modality, records in (self.mw.hybe_records_by_modality or {}).items():
+            p.BulkModalityComboBox.addItem(modality)
             for r in records:
                 fid = r.get('fiducial_channel')
+                name = str(r.get('readout_name') or '')
                 for ch in r.get('channels', []):
-                    label = f'{modality} | {r["folder"]} | ch{ch}' + (
+                    all_channels.add(int(ch))
+                    shown = f'{r["folder"]} ({name})' if name else r['folder']
+                    label = f'{modality} | {shown} | ch{ch}' + (
                         '  (fiducial)' if ch == fid else '')
                     src = (modality, r['folder'], int(ch))
                     item = QtWidgets.QListWidgetItem(label)
@@ -79,12 +116,39 @@ class AnalysisWiring(QtCore.QObject):
                     p.ViewExprSourceComboBox.addItem(label, list(src))
                     p.ViewDistSourceAComboBox.addItem(label, list(src))
                     p.ViewDistSourceBComboBox.addItem(label, list(src))
+        for ch in sorted(all_channels):
+            p.BulkChannelComboBox.addItem(str(ch))
 
     def _set_selected_sources(self, checked):
         lw = self.panel.SourceListWidget
         for item in lw.selectedItems():
             item.setCheckState(QtCore.Qt.Checked if checked
                                else QtCore.Qt.Unchecked)
+
+    def check_modality_channel(self):
+        """Check every NON-FIDUCIAL source of the picked modality at the
+        picked channel -- the one-push way to build over a whole readout
+        channel, per request."""
+        p = self.panel
+        modality = p.BulkModalityComboBox.currentText()
+        ch_text = p.BulkChannelComboBox.currentText()
+        if not modality or not ch_text:
+            return
+        channel = int(ch_text)
+        fid_by_hybe = {r['folder']: r.get('fiducial_channel')
+                       for r in (self.mw.hybe_records_by_modality
+                                 or {}).get(modality, [])}
+        lw = p.SourceListWidget
+        n = 0
+        for i in range(lw.count()):
+            item = lw.item(i)
+            m, h, ch = item.data(QtCore.Qt.UserRole)
+            if (m == modality and int(ch) == channel
+                    and fid_by_hybe.get(h) != int(ch)):
+                item.setCheckState(QtCore.Qt.Checked)
+                n += 1
+        self.mw.log(f'Analysis: checked {n} non-fiducial {modality} '
+                    f'ch{channel} source(s).')
 
     def check_spot_sources(self):
         """Check every source with localized spots in the store -- the
@@ -231,7 +295,8 @@ class AnalysisWiring(QtCore.QObject):
                 raise ValueError('derive (or type) the thresholds first')
             self._run_qc(thr)
             fig = figures.fig_polymer_qc(pop.alleles, pop.dmaps(), thr,
-                                         qc_result=self.qc)
+                                         qc_result=self.qc,
+                                         bin_ids=pop.alleles.get('bin_ids'))
             eff = polymer.efficacy(self.qc['pos_um'])
             self._show(fig, 'polymer_qc',
                        tables={'efficacy_per_bin': eff,
@@ -379,9 +444,9 @@ class AnalysisWiring(QtCore.QObject):
             dm, idx = self._allele_state()
             groups = self._groups(idx)
             min_n = self.panel.MinNSpinBox.value()
-            fig = figures.fig_ensemble(dm, group_masks=groups,
-                                       title='ensemble distance map',
-                                       min_n=min_n)
+            fig = figures.fig_ensemble(
+                dm, group_masks=groups, title='ensemble distance map',
+                min_n=min_n, bin_ids=self.pop.alleles.get('bin_ids'))
             tables = {}
             for name, gmask in groups.items():
                 m, counts = ensemble.ensemble_map(dm, gmask, 'median', min_n)
@@ -401,7 +466,8 @@ class AnalysisWiring(QtCore.QObject):
             fig = figures.fig_fov_consistency(
                 dm, fovs, group_masks=groups,
                 min_n=self.panel.MinNSpinBox.value(),
-                show_maps=self.panel.ShowFovMapsCheckBox.isChecked())
+                show_maps=self.panel.ShowFovMapsCheckBox.isChecked(),
+                bin_ids=self.pop.alleles.get('bin_ids'))
             tables = {}
             for name, gmask in groups.items():
                 t = ensemble.fov_msd_test(dm, fovs, gmask)
@@ -478,7 +544,7 @@ class AnalysisWiring(QtCore.QObject):
             for ax, (gname, cells_df) in zip(axes[0], groups.items()):
                 figures.expression_hist_ax(
                     ax, self._rows_for_cells(pop.expression, cells_df),
-                    src, metric,
+                    src, metric, label=self._source_label(src),
                     per_celltype=self.panel.CelltypeDecomposeCheckBox.isChecked())
                 ax.set_title(f'{gname} ({len(cells_df)} cells)\n'
                              + ax.get_title(), fontsize=9)
@@ -495,7 +561,8 @@ class AnalysisWiring(QtCore.QObject):
             src = self.panel.combo_source(self.panel.ViewExprSourceComboBox)
             if src is None:
                 raise ValueError('pick the expression source (section 3)')
-            fig = figures.fig_brightness_vs_count(pop.expression, src)
+            fig = figures.fig_brightness_vs_count(
+                pop.expression, src, source_label=self._source_label(src))
             self._show(fig, 'brightness_vs_count',
                        {'expression': pop.expression},
                        params={'source': list(src)})
@@ -525,7 +592,7 @@ class AnalysisWiring(QtCore.QObject):
                 unit = 'pairs' if collapse == 'all' else 'cells'
                 ax.set_title(f'{gname} ({len(cells_df)} cells, '
                              f'{len(sub)} {unit}, {collapse})', fontsize=9)
-            fig.suptitle(f'{a[1]}({a[0]}) to {b[1]}({b[0]}) '
+            fig.suptitle(f'{self._source_label(a)} to {self._source_label(b)} '
                          f'within gated cells', fontsize=11)
             self._show(fig, 'distance_hist', {'pairs': pairs},
                        params={'source_a': list(a), 'source_b': list(b),
@@ -555,11 +622,27 @@ class AnalysisWiring(QtCore.QObject):
                 src = self.panel.combo_source(self.panel.SourceAComboBox)
                 if src is None:
                     raise ValueError('pick source A')
+                # the preview must show the DISTRIBUTION THE GATE READS:
+                # harvesting through predicate_dict keeps normalization
+                # identical to the gate's (previewing raw while gating
+                # normalized draws the range on the wrong axis)
+                d = self.panel.predicate_dict()
+                table = pop.expression
+                metric = d['metric']
+                if d.get('normalize'):
+                    from codelab_pipeline.analysis import expression as E
+                    ref = (tuple(d['normalize'][1])
+                           if len(d['normalize']) > 1 else None)
+                    table = E.normalize(table, metric, d['normalize'][0],
+                                        ref_source=ref)
+                    metric = f'{metric}_norm'
                 fig = figures.fig_expression_hist(
-                    pop.expression, src, self.panel.MetricComboBox.currentText(),
-                    picked_range=picked)
+                    table, src, metric, picked_range=picked,
+                    source_label=self._source_label(src),
+                    norm_label=self._norm_label(d.get('normalize')))
                 self._show(fig, 'gate_range_preview',
-                           params={'source': list(src)})
+                           params={'source': list(src),
+                                   'normalize': d.get('normalize')})
             elif kind == 'PairDistanceRange':
                 pop = self._need_pop(spots=True)
                 a = self.panel.combo_source(self.panel.SourceAComboBox)
