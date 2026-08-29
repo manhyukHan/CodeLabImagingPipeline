@@ -44,6 +44,16 @@ def _fov_bundle(item):
         out['alleles'] = P.fov_polymer_table(storage_path, fov, hybes,
                                              voxel_um=voxel_um)
     if sources:
+        if mask_intensity and resolver is None:
+            # exact projection BY DEFAULT, headless: the store carries
+            # everything the resolver needs (analysis/resolvers.py); a
+            # store with no alignment yet falls back to the flagged
+            # reference-frame mask exactly as before
+            from codelab_pipeline.analysis import resolvers as R
+            try:
+                resolver = R.resolver_for(storage_path, fov)
+            except Exception:
+                resolver = None
         table, extra = E.fov_expression_table(storage_path, fov, sources,
                                               mask_intensity=mask_intensity,
                                               resolver=resolver)

@@ -330,6 +330,23 @@ od = detection.count_overdispersion(X_indep, fit['b'], fit['tau'],
 check('independent data is not overdispersed', od['p'] > 0.05,
       f"p={od['p']:.3f} ratio={od['ratio']:.2f}")
 
+print('\nthe headless contract')
+# THE toolbox promise, pinned: importing the whole analysis package --
+# resolvers included -- loads no Qt and no app module. A fresh
+# subprocess, because this test file itself may run beside app tests.
+import subprocess                                              # noqa: E402
+r = subprocess.run(
+    [sys.executable, '-c',
+     'import sys; import codelab_pipeline.analysis; '
+     'import codelab_pipeline.analysis.resolvers; '
+     'bad = [m for m in sys.modules if "PyQt5" in m '
+     'or m.split(".")[0] in ("windows", "ui", "canvas")]; '
+     'sys.exit(1 if bad else 0)'],
+    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    capture_output=True, text=True)
+check('importing the toolbox loads no Qt and no app module',
+      r.returncode == 0, r.stdout + r.stderr)
+
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
 if FAIL:
     for nme in FAIL:
