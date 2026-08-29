@@ -18,7 +18,7 @@ from PyQt5 import QtWidgets, QtCore
 # population was built with mask intensity
 EXPR_METRICS = ['n_spots', 'brightness_median', 'brightness_total',
                 'mask_median']
-NORM_MODES = ['none', 'by_total_count', 'by_source']
+NORM_MODES = ['none', 'by_modality', 'by_source']
 
 
 class AnalysisPanelUI(object):
@@ -40,9 +40,27 @@ class AnalysisPanelUI(object):
             QtWidgets.QAbstractItemView.ExtendedSelection)
         popLayout.addRow('Expression/spot sources\n(check to include):',
                          self.SourceListWidget)
+        srcBtnRow = QtWidgets.QHBoxLayout()
+        self.CheckSelectedSourcesPushButton = QtWidgets.QPushButton(
+            'Check Selected')
+        srcBtnRow.addWidget(self.CheckSelectedSourcesPushButton)
+        self.UncheckSelectedSourcesPushButton = QtWidgets.QPushButton(
+            'Uncheck Selected')
+        srcBtnRow.addWidget(self.UncheckSelectedSourcesPushButton)
+        self.CheckSpotSourcesPushButton = QtWidgets.QPushButton(
+            'Check All With Spots')
+        self.CheckSpotSourcesPushButton.setToolTip(
+            'Check every (modality | hybe | channel) that has localized '
+            'spots in the store -- the simple default start.')
+        srcBtnRow.addWidget(self.CheckSpotSourcesPushButton)
+        popLayout.addRow('', srcBtnRow)
         self.MaskIntensityCheckBox = QtWidgets.QCheckBox(
             'mask-based intensity (median MIP over each cell mask; slower)')
         popLayout.addRow('', self.MaskIntensityCheckBox)
+        self.OverwriteCacheCheckBox = QtWidgets.QCheckBox(
+            'overwrite cached cell attributes (recompute already-built '
+            'sources; use after re-detection or re-alignment)')
+        popLayout.addRow('', self.OverwriteCacheCheckBox)
         self.BuildPopulationPushButton = QtWidgets.QPushButton(
             'Build / Refresh Population')
         popLayout.addRow(self.BuildPopulationPushButton)
@@ -88,6 +106,7 @@ class AnalysisPanelUI(object):
         qcRow.addWidget(self.PreviewQcPushButton)
         self.ApplyQcCheckBox = QtWidgets.QCheckBox(
             'apply QC to all views and gates')
+        self.ApplyQcCheckBox.setChecked(True)
         qcRow.addWidget(self.ApplyQcCheckBox)
         qcLayout.addLayout(qcRow)
         self.QcStatusLabel = QtWidgets.QLabel('QC not derived')
@@ -104,7 +123,7 @@ class AnalysisPanelUI(object):
         self.PredicateKindComboBox = QtWidgets.QComboBox()
         self.PredicateKindComboBox.addItems(
             ['ExpressionRange', 'PairDistanceRange', 'BarcodePresence',
-             'CelltypeIn', 'FovIn', 'AlleleCount'])
+             'CompletenessRange', 'CelltypeIn', 'FovIn', 'AlleleCount'])
         form.addRow('Kind:', self.PredicateKindComboBox)
         self.SourceAComboBox = QtWidgets.QComboBox()
         form.addRow('Source (A):', self.SourceAComboBox)
@@ -177,8 +196,34 @@ class AnalysisPanelUI(object):
         self.MinNSpinBox.setRange(1, 10000)
         self.MinNSpinBox.setValue(5)
         flagRow.addWidget(self.MinNSpinBox)
+        flagRow.addWidget(QtWidgets.QLabel('allele gate mode:'))
+        self.AlleleModeComboBox = QtWidgets.QComboBox()
+        self.AlleleModeComboBox.addItems(
+            ['All (pool gated cells)', 'Presence vs Absence',
+             'Full decompose (3 groups)'])
+        flagRow.addWidget(self.AlleleModeComboBox)
+        self.ShowFovMapsCheckBox = QtWidgets.QCheckBox(
+            'FOV consistency: show per-FOV maps')
+        flagRow.addWidget(self.ShowFovMapsCheckBox)
         flagRow.addStretch(1)
         viewLayout.addLayout(flagRow)
+        # the views' OWN inputs, per explicit decision: expression and
+        # distance histograms are final-layer callers like the ensemble
+        # map; they read the GATED cells but never the condition form.
+        viewForm = QtWidgets.QFormLayout()
+        self.ViewExprSourceComboBox = QtWidgets.QComboBox()
+        viewForm.addRow('Expression source:', self.ViewExprSourceComboBox)
+        self.ViewExprMetricComboBox = QtWidgets.QComboBox()
+        self.ViewExprMetricComboBox.addItems(EXPR_METRICS)
+        viewForm.addRow('Expression metric:', self.ViewExprMetricComboBox)
+        self.ViewDistSourceAComboBox = QtWidgets.QComboBox()
+        viewForm.addRow('Distance source A:', self.ViewDistSourceAComboBox)
+        self.ViewDistSourceBComboBox = QtWidgets.QComboBox()
+        viewForm.addRow('Distance source B:', self.ViewDistSourceBComboBox)
+        self.ViewDistCollapseComboBox = QtWidgets.QComboBox()
+        self.ViewDistCollapseComboBox.addItems(['all', 'median', 'min'])
+        viewForm.addRow('Distance collapse:', self.ViewDistCollapseComboBox)
+        viewLayout.addLayout(viewForm)
         grid = QtWidgets.QGridLayout()
         self.EnsembleMapPushButton = QtWidgets.QPushButton('Ensemble Distance Map')
         self.FovConsistencyPushButton = QtWidgets.QPushButton('FOV Consistency (SCC + MSD test)')
@@ -186,12 +231,14 @@ class AnalysisPanelUI(object):
         self.ExpressionHistPushButton = QtWidgets.QPushButton('Expression Histogram (source A)')
         self.BrightnessVsCountPushButton = QtWidgets.QPushButton('Brightness vs Count (source A)')
         self.DistanceHistPushButton = QtWidgets.QPushButton('Distance Histogram (A vs B)')
+        self.RepeatToeQcPushButton = QtWidgets.QPushButton('Repeat / Toe QC')
         for i, b in enumerate((self.EnsembleMapPushButton,
                                self.FovConsistencyPushButton,
                                self.AlleleDifferencePushButton,
                                self.ExpressionHistPushButton,
                                self.BrightnessVsCountPushButton,
-                               self.DistanceHistPushButton)):
+                               self.DistanceHistPushButton,
+                               self.RepeatToeQcPushButton)):
             grid.addWidget(b, i // 2, i % 2)
         viewLayout.addLayout(grid)
         layout.addWidget(viewGroup)
@@ -207,7 +254,7 @@ class AnalysisPanelUI(object):
         is_pair = kind == 'PairDistanceRange'
         is_list = kind in ('CelltypeIn', 'FovIn')
         is_pres = kind == 'BarcodePresence'
-        is_allele = kind == 'AlleleCount'
+        is_allele = kind in ('AlleleCount', 'CompletenessRange')
         self.SourceAComboBox.setEnabled(is_expr or is_pair)
         self.SourceBComboBox.setEnabled(is_pair)
         self.MetricComboBox.setEnabled(is_expr)
@@ -306,6 +353,10 @@ class AnalysisPanelUI(object):
             if not fovs:
                 raise ValueError('list the FOVs')
             return {'kind': 'fov_in', 'fovs': fovs}
+        if kind == 'CompletenessRange':
+            return {'kind': 'completeness_range',
+                    'lo': int(lo) if lo is not None else None,
+                    'hi': int(hi) if hi is not None else None}
         if kind == 'AlleleCount':
             return {'kind': 'allele_count',
                     'lo': int(lo) if lo is not None else 1,

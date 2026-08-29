@@ -38,6 +38,9 @@ RECORDS = [
 print('bins')
 check('bins are H-only, readout_id-ordered',
       polymer.bin_hybes(RECORDS) == ['Hyb_001', 'Hyb_002', 'Hyb_003'])
+qcr = polymer.qc_rounds(RECORDS)
+check('qc_rounds lists R and T rounds, never as polymer bins',
+      qcr == {'repeats': [(1, 'Rep_001')], 'toes': [(50, 'Toe_050')]})
 
 print('\npolymer collapse')
 allele = {'polymer_adj': {
@@ -230,11 +233,38 @@ d_or = mixed2.to_dict()
 check('OR-composed gates round-trip through plain data',
       gate.Condition.from_dict(d_or).to_dict() == d_or)
 
+print('\ncompleteness gate (allele-level, integer bounds)')
+cr = gate.CompletenessRange(lo=35)
+check('CompletenessRange gates ALLELES on n_traced',
+      list(cr.allele_mask(pop)) == [True, True, False])
+check('its cell projection: cell holds >= 1 qualifying allele',
+      list(cr.mask(pop)) == [True, False, False, False])
+check('hi bound is inclusive',
+      list(gate.CompletenessRange(lo=30, hi=40).allele_mask(pop))
+      == [False, True, True])
+d_cr = gate.CompletenessRange(lo=30, hi=40).to_dict()
+check('completeness gate round-trips through plain data',
+      gate.Predicate.from_dict(d_cr).to_dict() == d_cr)
+
 print('\nexpression normalization')
-t = pop.expression
-n1 = expression.normalize(t, 'n_spots', 'by_total_count')
-check('by_total_count divides by the cell total across sources',
-      n1['n_spots_norm'].iloc[0] == 1.0)
+t = pop.expression.copy()
+# modality-wide per-cell denominators, as the population build computes
+t['mod_n_spots'] = [20, 3, 7, 0]
+n1 = expression.normalize(t, 'n_spots', 'by_modality')
+check('by_modality divides by the modality-wide per-cell quantity',
+      n1['n_spots_norm'].iloc[0] == 0.5)
+check("legacy alias 'by_total_count' lands on by_modality",
+      expression.normalize(t, 'n_spots',
+                           'by_total_count')['n_spots_norm'].iloc[0] == 0.5)
+check('zero denominator is NaN, never fabricated',
+      np.isnan(n1['n_spots_norm'].iloc[3]))
+try:
+    expression.normalize(pop.expression, 'n_spots', 'by_modality')
+    refused = False
+except ValueError:
+    refused = True
+check('a table without mod_* columns refuses, not silently normalizes',
+      refused)
 n2 = expression.normalize(t, 'brightness_total', 'by_source',
                           ref_source=('RNA', 'Hyb_101', 555))
 check('by_source normalizes against the reference source, NaN-honest',
@@ -418,6 +448,109 @@ check('anchor = bridge @ within[anchor hybe], anchor hybe parsed from '
       f'({new_a[0, 2]}, {new_a[1, 2]})')
 check('a modality nothing testifies for is skipped, never guessed',
       st['skipped']['anchor_hybe_unknown'] == 1 and st['updated'] == 1)
+
+print('\ncomputed-attribute cache (append mode)')
+# item 3's contract, pinned end to end on a real temp capsule: build
+# persists per-source rows + per-modality aggregates; a rebuild reuses
+# them WITHOUT touching spots; appending a source computes only the new
+# one; overwrite recomputes; celltype is never trusted from the cache.
+import shutil                                                  # noqa: E402
+import tempfile                                                # noqa: E402
+from codelab_pipeline.analysis import population as popmod2    # noqa: E402
+from codelab_pipeline.io import analysis_store as ASt          # noqa: E402
+from codelab_pipeline.io import paths as iopaths               # noqa: E402
+
+_croot = tempfile.mkdtemp(prefix='exprcache_')
+iopaths.write_manifest(os.path.join(_croot, 'proj'), ['RNA'])
+_csp = os.path.join(_croot, 'proj', 'RNA')
+
+
+def _cells_v1(s, f):
+    return [{'id': 1, 'celltype': 'WT'}, {'id': 2, 'celltype': 'KI'}], ''
+
+
+def _spots_ok(s, f, modality=None, hybe=None, channel=None):
+    return [{'cell': 1, 'brightness': 100.0},
+            {'cell': 1, 'brightness': 50.0},
+            {'cell': -1, 'brightness': 1.0}]
+
+
+def _spots_boom(s, f, modality=None, hybe=None, channel=None):
+    raise AssertionError('cached build must not read spots')
+
+
+_orig_rc, _orig_rs = ASt.read_cells, ASt.read_spots
+try:
+    ASt.read_cells, ASt.read_spots = _cells_v1, _spots_ok
+    SRC1, SRC2 = ('RNA', 'Hyb_101', 555), ('RNA', 'Hyb_102', 555)
+
+    def _item(srcs, overwrite=False):
+        return (_csp, 1, None, srcs, None, (0.208, 0.208, 0.2), False,
+                None, None, overwrite)
+
+    b1 = popmod2._fov_bundle(_item([SRC1]))
+    check('first build computes, persists the capsule, joins mod_*',
+          ASt.read_fov_expression(_csp, 1) is not None
+          and b1['expr_cache'] == {'cached': 0, 'computed': 1}
+          and b1['expression']['n_spots'].tolist() == [2, 0]
+          and b1['expression']['mod_n_spots'].tolist()[0] == 2)
+    ASt.read_spots = _spots_boom
+    b2 = popmod2._fov_bundle(_item([SRC1]))
+    check('rebuild reuses the capsule -- ZERO spot reads',
+          b2['expr_cache'] == {'cached': 1, 'computed': 0}
+          and b2['expression']['n_spots'].tolist() == [2, 0]
+          and b2['expression']['mod_n_spots'].tolist()[0] == 2)
+    ASt.read_cells = lambda s, f: ([{'id': 1, 'celltype': 'NEW'},
+                                    {'id': 2, 'celltype': 'KI'}], '')
+    b3 = popmod2._fov_bundle(_item([SRC1]))
+    check('cached rows refresh celltype from the CURRENT cells',
+          b3['expression']['celltype'].tolist() == ['NEW', 'KI'])
+    ASt.read_spots = _spots_ok
+    b4 = popmod2._fov_bundle(_item([SRC1, SRC2]))
+    check('appending a source computes ONLY the new one',
+          b4['expr_cache'] == {'cached': 1, 'computed': 1}
+          and len(b4['expression']) == 4)
+    b5 = popmod2._fov_bundle(_item([SRC1, SRC2], overwrite=True))
+    check('overwrite recomputes everything requested',
+          b5['expr_cache'] == {'cached': 0, 'computed': 2})
+finally:
+    ASt.read_cells, ASt.read_spots = _orig_rc, _orig_rs
+    shutil.rmtree(_croot, ignore_errors=True)
+
+print('\nrepeat/toe QC figure')
+import matplotlib                                              # noqa: E402
+matplotlib.use('Agg')
+from codelab_pipeline.analysis import figures                  # noqa: E402
+
+
+class QcPop:
+    pass
+
+
+qp = QcPop()
+qp.alleles = {
+    'bin_ids': [1, 2, 3],
+    'pos_um': np.array([[[0., 0, 0], [1, 1, 1], [2, 2, 2]],
+                        [[0., 0, 0], [np.nan] * 3, [2, 2, 2]]]),
+    # repeat of bin 2: allele 0 re-imaged 1 um off; allele 1 has no H fix
+    'repeat_pos_um': np.array([[[1., 2, 1]], [[5., 5, 5]]]),
+    'repeat_ids': [2],
+    # two toe rounds: first seen in both alleles, second in one
+    'toe_pos_um': np.array([[[1., 1, 1], [np.nan] * 3],
+                            [[2., 2, 2], [3., 3, 3]]]),
+    'toe_ids': [50, 51],
+}
+figq = figures.fig_repeat_toe_qc(qp)
+check('repeat/toe QC figure renders from build-time R/T positions',
+      len(figq.axes) == 2)
+import matplotlib.pyplot as plt                                # noqa: E402
+plt.close(figq)
+# the H-vs-R distance the left panel histograms: allele 0 only
+# (allele 1's H bin 2 is NaN -> its pair is NaN-honestly dropped)
+d_hr = np.sqrt(((qp.alleles['pos_um'][:, 1, :]
+                 - qp.alleles['repeat_pos_um'][:, 0, :]) ** 2).sum(1))
+check('repeat distance is NaN-honest per allele',
+      d_hr[0] == 1.0 and np.isnan(d_hr[1]))
 
 print('\nthe headless contract')
 # THE toolbox promise, pinned: importing the whole analysis package --

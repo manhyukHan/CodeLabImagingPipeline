@@ -29,9 +29,15 @@ class AnalysisWiring(QtCore.QObject):
         self.pop = None
         self.qc = None            # apply_qc output when applied
         self.qc_thresholds = None
-        self.displayer = AnalysisFigureDisplayer(parent=mw)
+        self.displayers = []   # ADDITIVE windows: every view pops a
+        # new one and old ones stay (per explicit request)
         p = self.panel
         p.BuildPopulationPushButton.clicked.connect(self.build_population)
+        p.CheckSelectedSourcesPushButton.clicked.connect(
+            lambda: self._set_selected_sources(True))
+        p.UncheckSelectedSourcesPushButton.clicked.connect(
+            lambda: self._set_selected_sources(False))
+        p.CheckSpotSourcesPushButton.clicked.connect(self.check_spot_sources)
         p.DeriveQcPushButton.clicked.connect(self.derive_qc)
         p.PreviewQcPushButton.clicked.connect(self.preview_qc)
         p.ApplyQcCheckBox.toggled.connect(self._refresh_gate_summary)
@@ -46,6 +52,7 @@ class AnalysisWiring(QtCore.QObject):
         p.ExpressionHistPushButton.clicked.connect(self.view_expression_hist)
         p.BrightnessVsCountPushButton.clicked.connect(self.view_brightness_vs_count)
         p.DistanceHistPushButton.clicked.connect(self.view_distance_hist)
+        p.RepeatToeQcPushButton.clicked.connect(self.view_repeat_toe_qc)
 
     # -- population --------------------------------------------------------
     def populate_sources(self):
@@ -69,6 +76,39 @@ class AnalysisWiring(QtCore.QObject):
                     p.SourceListWidget.addItem(item)
                     p.SourceAComboBox.addItem(label, list(src))
                     p.SourceBComboBox.addItem(label, list(src))
+                    p.ViewExprSourceComboBox.addItem(label, list(src))
+                    p.ViewDistSourceAComboBox.addItem(label, list(src))
+                    p.ViewDistSourceBComboBox.addItem(label, list(src))
+
+    def _set_selected_sources(self, checked):
+        lw = self.panel.SourceListWidget
+        for item in lw.selectedItems():
+            item.setCheckState(QtCore.Qt.Checked if checked
+                               else QtCore.Qt.Unchecked)
+
+    def check_spot_sources(self):
+        """Check every source with localized spots in the store -- the
+        simple default start, per explicit request."""
+        from codelab_pipeline.io import analysis_store
+        modality = next(iter(self.mw.hybe_records_by_modality or {}), None)
+        sp = self.mw._storage_path_for_modality(modality)
+        if not sp:
+            return
+        have = set()
+        for f in self._fovs():
+            for sl in analysis_store.spot_slices(sp, int(f)):
+                have.add((sl[0], sl[1], int(sl[2])))
+        lw = self.panel.SourceListWidget
+        n = 0
+        for i in range(lw.count()):
+            item = lw.item(i)
+            src = tuple(item.data(QtCore.Qt.UserRole))
+            src = (src[0], src[1], int(src[2]))
+            if src in have:
+                item.setCheckState(QtCore.Qt.Checked)
+                n += 1
+        self.mw.log(f'Analysis: checked {n} source(s) with spots '
+                    f'({len(have)} slices in the store).')
 
     def _fovs(self):
         text = self.panel.FovListLineEdit.text().strip()
@@ -91,6 +131,13 @@ class AnalysisWiring(QtCore.QObject):
             QtWidgets.QMessageBox.warning(self.mw, 'Analysis', 'No FOVs.')
             return
         sources = p.checked_sources()
+        if not sources:
+            # THE DEFAULT, per explicit request: nothing checked means
+            # every source that has spots in the store. Resolved here,
+            # not at layout parse -- the scan reads the store (one
+            # listdir per FOV) and startup stays lazy.
+            self.check_spot_sources()
+            sources = p.checked_sources()
         records = self.mw._active_hybe_records_for_modality(modality) or []
         voxel = self.mw._voxel_um()
         mask_int = p.MaskIntensityCheckBox.isChecked()
@@ -115,7 +162,8 @@ class AnalysisWiring(QtCore.QObject):
                 storage_path, fovs, records=records,
                 sources=sources or None, spot_sources=sources or None,
                 voxel_um=voxel, mask_intensity=mask_int,
-                resolvers=resolvers or None)
+                resolvers=resolvers or None,
+                overwrite_cache=p.OverwriteCacheCheckBox.isChecked())
 
         def _done(pop):
             p.BuildPopulationPushButton.setEnabled(True)
@@ -272,12 +320,15 @@ class AnalysisWiring(QtCore.QObject):
 
     # -- views -------------------------------------------------------------
     def _show(self, fig, name, tables=None, params=None):
-        self.displayer.set_figure(
-            fig, name=name, tables=tables, pop=self.pop,
-            condition=self.condition(), params=params,
-            default_dir=self._default_dir())
-        self.displayer.show()
-        self.displayer.raise_()
+        d = AnalysisFigureDisplayer(title=f'Analysis -- {name}',
+                                    parent=self.mw)
+        d.set_figure(fig, name=name, tables=tables, pop=self.pop,
+                     condition=self.condition(), params=params,
+                     default_dir=self._default_dir())
+        d.show()
+        d.raise_()
+        self.displayers.append(d)
+        self.displayer = d      # tests/tools peek at the latest
 
     def _default_dir(self):
         try:
@@ -347,8 +398,10 @@ class AnalysisWiring(QtCore.QObject):
             dm, idx = self._allele_state()
             fovs = self.pop.alleles['fov'][idx]
             groups = self._groups(idx)
-            fig = figures.fig_fov_consistency(dm, fovs, group_masks=groups,
-                                              min_n=self.panel.MinNSpinBox.value())
+            fig = figures.fig_fov_consistency(
+                dm, fovs, group_masks=groups,
+                min_n=self.panel.MinNSpinBox.value(),
+                show_maps=self.panel.ShowFovMapsCheckBox.isChecked())
             tables = {}
             for name, gmask in groups.items():
                 t = ensemble.fov_msd_test(dm, fovs, gmask)
@@ -370,30 +423,78 @@ class AnalysisWiring(QtCore.QObject):
                        {'within': res['within'], 'null': res['null']})
         self._guard(go)
 
+    def _allele_cell_groups(self):
+        """items 14: gated cells partitioned by allele-gate status.
+
+        Cell gates narrow first; the allele-level predicates then label
+        each gated cell: 'no gated allele' / 'mixed' / 'all gated'. The
+        mode combo picks the view: pool everything, presence-vs-absence,
+        or the full three-way decompose. Returns {name: cells DataFrame}.
+        """
+        pop = self.pop
+        cond = self.condition()
+        cmask = cond.mask(pop)
+        gated = pop.cells.loc[np.asarray(cmask, bool), ['fov', 'cell',
+                                                        'celltype']]
+        mode = self.panel.AlleleModeComboBox.currentIndex()
+        has_allele_pred = any(getattr(p_, 'level', 'cell') == 'allele'
+                              for p_ in cond.predicates)
+        if mode == 0 or not has_allele_pred or pop.alleles is None:
+            return {'gated': gated}
+        amask = cond.allele_mask(pop)
+        al = pop.alleles
+        adf = pd.DataFrame({'fov': al['fov'], 'cell': al['cell'],
+                            'gated': amask,
+                            'traced': al['n_traced'] >= 2})
+        adf = adf[(adf['cell'] >= 0) & adf['traced']]
+        counts = adf.groupby(['fov', 'cell'])['gated'].agg(['sum', 'count'])
+        idx = pd.MultiIndex.from_frame(gated[['fov', 'cell']])
+        got = counts.reindex(idx)
+        n_g = got['sum'].fillna(0).to_numpy()
+        n_t = got['count'].fillna(0).to_numpy()
+        if mode == 1:
+            return {'>=1 gated allele': gated[n_g >= 1],
+                    'no gated allele': gated[n_g == 0]}
+        return {'all alleles gated': gated[(n_t > 0) & (n_g == n_t)],
+                'mixed': gated[(n_g >= 1) & (n_g < n_t)],
+                'no gated allele': gated[n_g == 0]}
+
+    def _rows_for_cells(self, table, cells_df):
+        return table.merge(cells_df[['fov', 'cell']].drop_duplicates(),
+                           on=['fov', 'cell'], how='inner')
+
     def view_expression_hist(self):
         def go():
             pop = self._need_pop(expr=True)
-            src = self.panel.combo_source(self.panel.SourceAComboBox)
+            src = self.panel.combo_source(self.panel.ViewExprSourceComboBox)
             if src is None:
-                raise ValueError('pick source A')
-            metric = self.panel.MetricComboBox.currentText()
-            lo, hi = self.panel.range_values()
-            picked = (lo, hi) if lo is not None and hi is not None else None
-            fig = figures.fig_expression_hist(
-                pop.expression, src, metric,
-                per_celltype=self.panel.CelltypeDecomposeCheckBox.isChecked(),
-                picked_range=picked)
+                raise ValueError('pick the expression source (section 3)')
+            metric = self.panel.ViewExprMetricComboBox.currentText()
+            groups = self._allele_cell_groups()
+            import matplotlib.pyplot as plt
+            n = len(groups)
+            fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),
+                                     squeeze=False)
+            for ax, (gname, cells_df) in zip(axes[0], groups.items()):
+                figures.expression_hist_ax(
+                    ax, self._rows_for_cells(pop.expression, cells_df),
+                    src, metric,
+                    per_celltype=self.panel.CelltypeDecomposeCheckBox.isChecked())
+                ax.set_title(f'{gname} ({len(cells_df)} cells)\n'
+                             + ax.get_title(), fontsize=9)
             self._show(fig, 'expression_hist',
                        {'expression': pop.expression},
-                       params={'source': list(src), 'metric': metric})
+                       params={'source': list(src), 'metric': metric,
+                               'allele_mode':
+                               self.panel.AlleleModeComboBox.currentText()})
         self._guard(go)
 
     def view_brightness_vs_count(self):
         def go():
             pop = self._need_pop(expr=True)
-            src = self.panel.combo_source(self.panel.SourceAComboBox)
+            src = self.panel.combo_source(self.panel.ViewExprSourceComboBox)
             if src is None:
-                raise ValueError('pick source A')
+                raise ValueError('pick the expression source (section 3)')
             fig = figures.fig_brightness_vs_count(pop.expression, src)
             self._show(fig, 'brightness_vs_count',
                        {'expression': pop.expression},
@@ -403,19 +504,41 @@ class AnalysisWiring(QtCore.QObject):
     def view_distance_hist(self):
         def go():
             pop = self._need_pop(spots=True)
-            a = self.panel.combo_source(self.panel.SourceAComboBox)
-            b = self.panel.combo_source(self.panel.SourceBComboBox)
+            a = self.panel.combo_source(self.panel.ViewDistSourceAComboBox)
+            b = self.panel.combo_source(self.panel.ViewDistSourceBComboBox)
             if a is None or b is None:
-                raise ValueError('pick sources A and B')
-            mask = self.condition().mask(pop)
+                raise ValueError('pick distance sources A and B (section 3)')
+            collapse = self.panel.ViewDistCollapseComboBox.currentText()
             per_ct = self.panel.CelltypeDecomposeCheckBox.isChecked()
-            h = distances.distance_histogram(pop, a, b, mask=mask,
-                                             per_celltype=per_ct)
-            fig = figures.fig_distance_hist(
-                h, f'{a[1]}({a[0]}) to {b[1]}({b[0]}) within gated cells')
+            groups = self._allele_cell_groups()
             pairs = distances.pair_distances(pop, a, b)
+            import matplotlib.pyplot as plt
+            n = len(groups)
+            fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),
+                                     squeeze=False)
+            for ax, (gname, cells_df) in zip(axes[0], groups.items()):
+                sub = self._rows_for_cells(pairs, cells_df)
+                if collapse != 'all' and len(sub):
+                    agg = {'median': 'median', 'min': 'min'}[collapse]
+                    sub = sub.groupby(['fov', 'cell'], as_index=False)                         .agg({'d_um': agg, 'celltype': 'first'})
+                figures.distance_hist_ax(ax, sub, per_celltype=per_ct)
+                unit = 'pairs' if collapse == 'all' else 'cells'
+                ax.set_title(f'{gname} ({len(cells_df)} cells, '
+                             f'{len(sub)} {unit}, {collapse})', fontsize=9)
+            fig.suptitle(f'{a[1]}({a[0]}) to {b[1]}({b[0]}) '
+                         f'within gated cells', fontsize=11)
             self._show(fig, 'distance_hist', {'pairs': pairs},
-                       params={'source_a': list(a), 'source_b': list(b)})
+                       params={'source_a': list(a), 'source_b': list(b),
+                               'collapse': collapse,
+                               'allele_mode':
+                               self.panel.AlleleModeComboBox.currentText()})
+        self._guard(go)
+
+    def view_repeat_toe_qc(self):
+        def go():
+            pop = self._need_pop(alleles=True)
+            fig = figures.fig_repeat_toe_qc(pop)
+            self._show(fig, 'repeat_toe_qc')
         self._guard(go)
 
     def preview_histogram(self):

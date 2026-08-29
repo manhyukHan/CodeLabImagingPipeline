@@ -29,7 +29,13 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
         # before. Swapping figures does no widget churn at all.
         from matplotlib.figure import Figure
         self.canvas = FigureCanvasQTAgg(Figure())
-        layout.insertWidget(0, self.canvas)
+        # SCROLLABLE: multi-group QC figures grow tall/wide (measured: a
+        # celltype-decomposed FOV view is 4 rows x 6 panels); the scroll
+        # area shows them at natural size instead of crushing them.
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(self.canvas)
+        scroll.setWidgetResizable(False)
+        layout.insertWidget(0, scroll, stretch=1)
         zoom_pan.install_scroll_zoom(self.canvas)
         zoom_pan.install_drag_pan(self.canvas)
         row = QtWidgets.QHBoxLayout()
@@ -48,6 +54,9 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
         old = self.canvas.figure
         self.canvas.figure = fig
         fig.set_canvas(self.canvas)
+        # natural pixel size inside the scroll area
+        w, h = fig.get_size_inches() * fig.dpi
+        self.canvas.resize(int(w), int(h))
         if old is not None and old is not fig:
             plt.close(old)      # pyplot keeps registry references otherwise
         self._payload = {'fig': fig, 'name': name, 'tables': tables or {},

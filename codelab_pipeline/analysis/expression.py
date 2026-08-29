@@ -144,18 +144,25 @@ def _mask_median(cell, mip, hybe, modality, resolver):
 
 
 def normalize(table, metric, mode, ref_source=None):
-    """Add a normalized column to an expression table.
+    """Add a normalized column '<metric>_norm' to an expression table.
 
     metric: 'n_spots' | 'brightness_median' | 'brightness_total' |
-    'mask_median'. mode:
-      'by_source'      value / the SAME cell's value of `ref_source`
-                       (modality, hybe, channel) -- expression relative
-                       to a reference gene/round;
-      'by_total_count' value / the cell's total n_spots across every
-                       source in the table -- a per-cell detection-load
-                       normalization.
-    Returns a COPY with '<metric>_norm'; division by zero or a missing
-    reference yields NaN, never a fabricated value.
+    'mask_median'. mode, per the redefined semantics (2026-08-30):
+
+      'by_modality'  divide by the SAME KIND of quantity over the whole
+                     MODALITY within the cell -- n_spots / all spots of
+                     that modality in the cell; brightness_median / the
+                     modality-wide per-cell median; brightness_total /
+                     the modality-wide total; mask_median / the median
+                     over that modality's mask sources in the cell.
+                     ('by_total_count' is accepted as the legacy alias.)
+      'by_source'    divide by the SAME metric of ref_source
+                     (modality, hybe, channel) in the same cell.
+
+    Division by zero or a missing denominator yields NaN, never a
+    fabricated value. Modality-wide denominators come from the
+    population build (mod_* columns); a table without them refuses with
+    an actionable message rather than silently normalizing by nothing.
     """
     t = table.copy()
     if mode == 'by_source':
@@ -166,9 +173,16 @@ def normalize(table, metric, mode, ref_source=None):
         ref_by_cell = ref.set_index(['fov', 'cell'])[metric]
         idx = pd.MultiIndex.from_frame(t[['fov', 'cell']])
         denom = ref_by_cell.reindex(idx).to_numpy(dtype=float)
-    elif mode == 'by_total_count':
-        totals = t.groupby(['fov', 'cell'])['n_spots'].transform('sum').to_numpy(dtype=float)
-        denom = totals
+    elif mode in ('by_modality', 'by_total_count'):
+        col = {'n_spots': 'mod_n_spots',
+               'brightness_median': 'mod_brightness_median',
+               'brightness_total': 'mod_brightness_total',
+               'mask_median': 'mod_mask_median'}[metric]
+        if col not in t.columns:
+            raise ValueError(
+                f'{col} missing -- rebuild the population (modality-wide '
+                f'denominators are computed at build)')
+        denom = t[col].to_numpy(dtype=float)
     else:
         raise ValueError(f'unknown mode {mode!r}')
     with np.errstate(all='ignore'):

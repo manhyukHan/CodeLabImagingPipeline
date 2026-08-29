@@ -250,6 +250,42 @@ class BarcodePresence(Predicate):
         return got.reindex(idx, fill_value=False).to_numpy()
 
 
+@_register
+class CompletenessRange(Predicate):
+    """ALLELE-LEVEL: traced-bin count within [lo, hi] -- the polymer-QC
+    completeness as a gate, integer bounds, per explicit request."""
+    kind = 'completeness_range'
+    level = 'allele'
+
+    def __init__(self, lo=None, hi=None):
+        self.lo = int(lo) if lo is not None else None
+        self.hi = int(hi) if hi is not None else None
+
+    def _params(self):
+        return {'lo': self.lo, 'hi': self.hi}
+
+    def allele_mask(self, pop):
+        if pop.alleles is None:
+            raise ValueError('population carries no alleles')
+        n = np.asarray(pop.alleles['n_traced'])
+        ok = np.ones(len(n), dtype=bool)
+        if self.lo is not None:
+            ok &= n >= self.lo
+        if self.hi is not None:
+            ok &= n <= self.hi
+        return ok
+
+    def mask(self, pop):
+        amask = self.allele_mask(pop)
+        al = pop.alleles
+        keep = pd.DataFrame({'fov': al['fov'][amask],
+                             'cell': al['cell'][amask]})
+        keep = keep[keep['cell'] >= 0].drop_duplicates()
+        idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
+        got = pd.Series(True, index=pd.MultiIndex.from_frame(keep))
+        return got.reindex(idx, fill_value=False).to_numpy()
+
+
 class Condition:
     """OR of AND-clauses over predicates -> boolean masks.
 

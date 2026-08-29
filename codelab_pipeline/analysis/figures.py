@@ -22,6 +22,26 @@ from codelab_pipeline.analysis import ensemble as ens          # noqa: E402
 UNASSIGNED = 'Unassigned'
 
 
+def style_ax(ax):
+    """The house style, applied to every non-image axes: no top/right
+    spines (universal view convention, per explicit request)."""
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    return ax
+
+
+def dmap_ticks(ax, n):
+    """Barcode-index ticks for an n-bin distance map: [0] + every 10th
+    + [n-1], DISPLAYED 1-based (real barcode indices, per request)."""
+    pos = [0] + list(range(9, n - 1, 10)) + [n - 1]
+    pos = sorted(set(pos))
+    ax.set_xticks(pos)
+    ax.set_yticks(pos)
+    ax.set_xticklabels([str(p + 1) for p in pos], fontsize=6)
+    ax.set_yticklabels([str(p + 1) for p in pos], fontsize=6)
+    ax.set_xlabel('barcode', fontsize=8)
+
+
 def _dmap_ax(ax, m, title, vmin=None, vmax=None):
     finite = m[np.isfinite(m)]
     if vmin is None:
@@ -32,8 +52,7 @@ def _dmap_ax(ax, m, title, vmin=None, vmax=None):
     cmap.set_bad('0.15')
     im = ax.imshow(m, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
     ax.set_title(title, fontsize=9)
-    ax.set_xticks([])
-    ax.set_yticks([])
+    dmap_ticks(ax, m.shape[0])
     return im
 
 
@@ -58,48 +77,38 @@ def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
     return fig
 
 
-def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None):
-    """FOV-level QC: per-FOV ensembles, SCC matrix, and the MSD TEST.
+def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
+                        show_maps=True):
+    """FOV-level QC: the MSD test, optionally with the per-FOV maps.
 
-    group_masks decomposes the whole view -- celltype-decompose means
-    THREE FOV matrices, not one, per the flag principle: flags multiply
-    figures. One ROW per group: its per-FOV maps, its SCC matrix, and
-    the in-FOV vs cross-FOV allele-map MSD distributions with the Welch
-    verdict. The MSD test is the quantitative instrument: SCC compares
-    two grainy ensembles (one number per FOV pair) while the MSD
-    histogram carries thousands of allele pairs per class -- p-values
-    are ranking scores (pairs share alleles; see fov_msd_test).
+    SCC is GONE, per explicit decision -- one correlation between two
+    grainy ensembles is meaningless next to the MSD distributions, which
+    carry thousands of allele pairs. show_maps=False collapses each row
+    to just the tested histogram; every panel names its n.
     """
     groups = [('all', mask)] if not group_masks else list(group_masks.items())
     all_fovs = sorted(set(int(f) for f in np.asarray(fovs)))
-    k = len(all_fovs)
-    ncols = k + 2
+    k = len(all_fovs) if show_maps else 0
+    ncols = k + 1
     fig, axes = plt.subplots(len(groups), ncols,
                              figsize=(3.1 * ncols, 3.5 * len(groups)),
                              squeeze=False)
+    fov_arr = np.asarray(fovs)
     for row, (name, gmask) in enumerate(groups):
-        res = ens.fov_consistency(dmaps, fovs, gmask, min_n=min_n)
-        for col, f in enumerate(all_fovs):
-            ax = axes[row][col]
-            if f in res['maps']:
-                _dmap_ax(ax, res['maps'][f], f'{name}  FOV{f:03d}')
-            else:
-                ax.set_axis_off()
-        ax = axes[row][k]
-        kk = len(res['fovs'])
-        im = ax.imshow(res['scc'], cmap='viridis', vmin=0, vmax=1)
-        ax.set_xticks(range(kk))
-        ax.set_yticks(range(kk))
-        ax.set_xticklabels([str(f) for f in res['fovs']], fontsize=7)
-        ax.set_yticklabels([str(f) for f in res['fovs']], fontsize=7)
-        for i in range(kk):
-            for j in range(kk):
-                ax.text(j, i, f'{res["scc"][i, j]:.2f}', ha='center',
-                        va='center', fontsize=6,
-                        color='white' if res['scc'][i, j] < 0.6 else 'black')
-        ax.set_title(f'{name}: SCC', fontsize=9)
-
-        ax = axes[row][k + 1]
+        base = np.ones(len(fov_arr), bool) if gmask is None \
+            else np.asarray(gmask, bool)
+        if show_maps:
+            res = ens.fov_consistency(dmaps, fovs, gmask, min_n=min_n)
+            for col, f in enumerate(all_fovs):
+                ax = axes[row][col]
+                n_f = int((base & (fov_arr == f)).sum())
+                if f in res['maps']:
+                    _dmap_ax(ax, res['maps'][f],
+                             f'{name} FOV{f:03d} (n={n_f})')
+                else:
+                    ax.set_axis_off()
+        ax = axes[row][-1]
+        style_ax(ax)
         t = ens.fov_msd_test(dmaps, fovs, gmask)
         if len(t['msd_in']) and len(t['msd_cross']):
             edges = np.histogram_bin_edges(
@@ -111,11 +120,13 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None):
             ax.legend(fontsize=7)
             per = '  '.join(f"F{d['fov']}:{d['signed_neglog10p']:+.1f}"
                             for d in t['per_fov'])
-            ax.set_title(f"{name}: MSD  -log10 p = {t['neglog10p']:.1f}\n"
+            ax.set_title(f"{name} (n={int(base.sum())}): "
+                         f"MSD -log10 p = {t['neglog10p']:.1f}\n"
                          f'per-FOV signed (+ = deviant)  {per}', fontsize=8)
         else:
             ax.set_title(f'{name}: too few pairs', fontsize=9)
         ax.set_xlabel('pairwise map MSD (um^2)', fontsize=8)
+        ax.set_ylabel('density', fontsize=8)
     fig.suptitle('FOV-level consistency', fontsize=12)
     return fig
 
@@ -124,6 +135,7 @@ def fig_allele_difference(dmaps, fovs, cells, mask=None):
     """Within-cell allele-pair dissimilarity against the cross-cell null."""
     res = ens.allele_difference(dmaps, fovs, cells, mask)
     fig, ax = plt.subplots(figsize=(5.2, 4))
+    style_ax(ax)
     w = res['within'][np.isfinite(res['within'])]
     nl = res['null'][np.isfinite(res['null'])]
     if len(nl):
@@ -175,16 +187,51 @@ def fig_polymer_qc(table, dmaps, thresholds, qc_result=None):
     from codelab_pipeline.analysis import polymer as _P
     pos = qc_result['pos_um'] if qc_result is not None else table['pos_um']
     eff = _P.efficacy(pos)
-    ax.bar(np.arange(len(eff)), eff, color='steelblue')
+    ax.bar(np.arange(len(eff)), eff,
+           color=cm.rainbow(np.linspace(0, 1, max(len(eff), 1))))
     ax.set_ylim(0, 1)
+    ax.set_xlabel('barcode', fontsize=8)
+    ax.set_ylabel('efficacy', fontsize=8)
     ax.set_title('efficacy per bin (after QC)' if qc_result is not None
                  else 'efficacy per bin', fontsize=9)
     ax = axes[4]
     comp = _P.completeness(pos)
     if len(comp):
-        ax.hist(comp, bins=min(40, max(5, int(comp.max()) + 1)),
-                color='steelblue')
-    ax.set_title('completeness per allele', fontsize=9)
+        bins = np.arange(comp.max() + 2) - 0.5
+        ax.hist(comp, bins=bins, color='steelblue', density=True,
+                label=f'observed (n={len(comp)})')
+        # the QUALITY MODEL's fit, drawn over the data (per request):
+        # completeness K under u_i ~ N(0, tau^2) with per-bin b_j --
+        # detection.fit_quality_model on the binary matrix, then the
+        # model's K distribution by GHQ mixture of Poisson-binomials
+        # (normal approximation per node, adequate at these n_bins).
+        try:
+            from codelab_pipeline.analysis import detection as _D
+            from scipy import stats as _st
+            X = _D.detection_matrix(pos)
+            keep = X.sum(1) > 0
+            if keep.sum() >= 20:
+                fit = _D.fit_quality_model(X[keep], n_nodes=15, maxiter=200)
+                nodes, w = np.polynomial.hermite_e.hermegauss(15)
+                w = w / w.sum()
+                u = nodes * fit['tau']
+                S = 1 / (1 + np.exp(-(fit['b'][None, :] + u[:, None])))
+                ks = np.arange(0, X.shape[1] + 1)
+                pdf = np.zeros_like(ks, dtype=float)
+                for i in range(len(u)):
+                    mu = S[i].sum()
+                    var = (S[i] * (1 - S[i])).sum()
+                    pdf += w[i] * _st.norm.pdf(ks, mu, np.sqrt(max(var, 1e-9)))
+                ax.plot(ks, pdf, color='crimson', lw=2,
+                        label=f"quality model (tau={fit['tau']:.2f})")
+        except Exception:
+            pass
+        ax.legend(fontsize=7)
+    ax.set_xlabel('traced bins per allele', fontsize=8)
+    ax.set_ylabel('density', fontsize=8)
+    ax.set_title('completeness per allele + model fit', fontsize=9)
+    for a in axes:
+        style_ax(a)
     if qc_result is not None:
         kept = int(qc_result['kept'].sum())
         fig.suptitle(f'polymer QC -- {kept}/{len(table["amp"])} alleles kept, '
@@ -205,6 +252,7 @@ def fig_expression_hist(table, source, metric='n_spots', bins=30,
     rows = table[(table['modality'] == m) & (table['hybe'] == h)
                  & (table['channel'] == int(ch))]
     fig, ax = plt.subplots(figsize=(5.6, 4))
+    style_ax(ax)
     vals_all = rows[metric].to_numpy(dtype=float)
     finite = vals_all[np.isfinite(vals_all)]
     if len(finite) == 0:
@@ -237,6 +285,7 @@ def fig_brightness_vs_count(table, source):
     rows = table[(table['modality'] == m) & (table['hybe'] == h)
                  & (table['channel'] == int(ch))]
     fig, ax = plt.subplots(figsize=(5, 4.2))
+    style_ax(ax)
     for ct, g in rows.groupby('celltype'):
         name = ct if ct else UNASSIGNED
         ax.scatter(g['n_spots'], g['brightness_median'], s=14, alpha=0.6,
@@ -252,6 +301,7 @@ def fig_distance_hist(hists, title, range_um=None):
     """distances.distance_histogram output -> figure. hists is either
     (counts, edges) or {celltype: (counts, edges)}."""
     fig, ax = plt.subplots(figsize=(5.6, 4))
+    style_ax(ax)
     if isinstance(hists, dict):
         for name, (counts, edges) in hists.items():
             ax.stairs(counts, edges, alpha=0.7, fill=False,
@@ -264,4 +314,136 @@ def fig_distance_hist(hists, title, range_um=None):
     ax.set_xlabel('pair distance (um)')
     ax.set_ylabel('pairs')
     ax.set_title(title, fontsize=10)
+    return fig
+
+
+def expression_hist_ax(ax, table, source, metric='n_spots', bins=30,
+                       per_celltype=True, picked_range=None):
+    """One expression histogram INTO a given axes -- the composable form
+    the allele-mode group panels build on."""
+    style_ax(ax)
+    m, h, ch = source
+    rows = table[(table['modality'] == m) & (table['hybe'] == h)
+                 & (table['channel'] == int(ch))]
+    vals_all = rows[metric].to_numpy(dtype=float)
+    finite = vals_all[np.isfinite(vals_all)]
+    if len(finite) == 0:
+        ax.set_title(f'{m}/{h}/ch{ch}: no finite {metric}', fontsize=9)
+        return ax
+    edges = np.histogram_bin_edges(finite, bins=bins)
+    if per_celltype:
+        for ct, g in rows.groupby('celltype'):
+            name = ct if ct else UNASSIGNED
+            v = g[metric].to_numpy(dtype=float)
+            ax.hist(v[np.isfinite(v)], bins=edges, alpha=0.55,
+                    label=f'{name} (n={len(g)})',
+                    color='0.6' if not ct else None)
+        ax.legend(fontsize=7)
+    else:
+        ax.hist(finite, bins=edges, alpha=0.8)
+    if picked_range is not None:
+        ax.axvspan(picked_range[0], picked_range[1], color='gold', alpha=0.25)
+    ax.set_xlabel(metric, fontsize=8)
+    ax.set_ylabel('cells', fontsize=8)
+    ax.set_title(f'{m}/{h}/ch{ch}', fontsize=9)
+    return ax
+
+
+def distance_hist_ax(ax, pairs, bins=40, per_celltype=True):
+    """One distance histogram INTO a given axes, from tidy pair/cell rows
+    carrying d_um and celltype."""
+    style_ax(ax)
+    vals = pairs['d_um'].to_numpy(dtype=float) if len(pairs) else np.array([])
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        ax.set_title('no pairs', fontsize=9)
+        return ax
+    edges = np.histogram_bin_edges(vals, bins=bins)
+    if per_celltype:
+        for ct, g in pairs.groupby('celltype'):
+            name = ct if ct else UNASSIGNED
+            ax.hist(g['d_um'].to_numpy(dtype=float), bins=edges, alpha=0.55,
+                    label=f'{name} (n={len(g)})',
+                    color='0.6' if not ct else None)
+        ax.legend(fontsize=7)
+    else:
+        ax.hist(vals, bins=edges, alpha=0.8)
+    ax.set_xlabel('distance (um)', fontsize=8)
+    ax.set_ylabel('count', fontsize=8)
+    return ax
+
+
+def fig_repeat_toe_qc(pop):
+    """The missed QC pair, per request: hybe-repeat distance and toe
+    efficacy.
+
+    Repeat rounds (datatype R) re-image the SAME genomic bin as their H
+    round; |pos_H - pos_R| per allele is the whole-pipeline replication
+    error in um. Toe rounds (datatype T) carry identity markers whose
+    per-round efficacy is a hybridization health bar. Both extracted at
+    Population.build (repeat_pos_um / toe_pos_um beside the H bins).
+    """
+    al = pop.alleles or {}
+    rep = al.get('repeat_pos_um')
+    rep_ids = al.get('repeat_ids') or []
+    toe = al.get('toe_pos_um')
+    toe_ids = al.get('toe_ids') or []
+    bin_ids = list(al.get('bin_ids') or [])
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4))
+    ax = axes[0]
+    style_ax(ax)
+    if rep is not None and len(rep_ids) and bin_ids:
+        colors = cm.rainbow(np.linspace(0, 1, len(rep_ids)))
+        drew = False
+        for j, rid in enumerate(rep_ids):
+            if rid not in bin_ids:
+                continue
+            hpos = al['pos_um'][:, bin_ids.index(rid), :]
+            rpos = rep[:, j, :]
+            d = np.sqrt(((hpos - rpos) ** 2).sum(1))
+            d = d[np.isfinite(d)]
+            if len(d):
+                ax.hist(d, bins=30, alpha=0.5, color=colors[j],
+                        label=f'H{rid} vs R{rid} (n={len(d)}, '
+                              f'med {np.median(d):.2f} um)')
+                drew = True
+        if drew:
+            ax.legend(fontsize=7)
+        ax.set_xlabel('|H - R| same-bin distance (um)', fontsize=8)
+        ax.set_ylabel('alleles', fontsize=8)
+        ax.set_title('hybe-repeat replication error', fontsize=10)
+    else:
+        ax.set_title('no repeat rounds in the layout / population',
+                     fontsize=10)
+    ax = axes[1]
+    style_ax(ax)
+    if toe is not None and len(toe_ids) and len(toe):
+        # toes are IDENTITY markers -- a toe absent outside its own
+        # celltype is working, not failing; pooled efficacy buries that
+        # (measured on MP58: pooled reads ~0 while the signal is
+        # celltype-structured), so the bars decompose by celltype
+        cts = np.array([c if c else UNASSIGNED
+                        for c in al.get('celltype', [''] * len(toe))])
+        names = sorted(set(cts))
+        width = 0.8 / max(len(names), 1)
+        hit = np.isfinite(toe[:, :, 0])
+        top = 0.0
+        for k, name in enumerate(names):
+            sel = cts == name
+            eff = hit[sel].mean(0) if sel.any() else np.zeros(len(toe_ids))
+            top = max(top, float(eff.max()) if len(eff) else 0.0)
+            ax.bar(np.arange(len(toe_ids)) + k * width, eff, width=width,
+                   label=f'{name} (n={int(sel.sum())})',
+                   color='0.6' if name == UNASSIGNED else None)
+        ax.set_xticks(np.arange(len(toe_ids)) + 0.4 - width / 2)
+        ax.set_xticklabels([f'T{t}' for t in toe_ids], fontsize=8)
+        ax.set_ylim(0, max(0.05, top * 1.25))
+        ax.legend(fontsize=7)
+        ax.set_xlabel('toe round', fontsize=8)
+        ax.set_ylabel('traced fraction (alleles)', fontsize=8)
+        ax.set_title(f'toe efficacy by celltype (n={len(toe)} alleles)',
+                     fontsize=10)
+    else:
+        ax.set_title('no toe rounds in the layout / population', fontsize=10)
+    fig.suptitle('repeat / toe QC', fontsize=12)
     return fig

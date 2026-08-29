@@ -74,6 +74,22 @@ def bin_hybes(records):
     return [h for _rid, h in genomic_bins(records)]
 
 
+def qc_rounds(records):
+    """{'repeats': [(readout_id, hybe)], 'toes': [...]} -- the R and T
+    rounds, readout_id-ordered. R re-images an H bin (same readout_id);
+    T carries identity markers. Neither is ever a polymer bin."""
+    out = {'repeats': [], 'toes': []}
+    for r in records:
+        dt = str(r.get('datatype', '')).upper()
+        if dt == 'R':
+            out['repeats'].append((int(r['readout_id']), str(r['folder'])))
+        elif dt == 'T':
+            out['toes'].append((int(r['readout_id']), str(r['folder'])))
+    out['repeats'].sort()
+    out['toes'].sort()
+    return out
+
+
 def max_brightness(candidates):
     """The default Selector: the brightest candidate, whole.
 

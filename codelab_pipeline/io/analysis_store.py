@@ -661,6 +661,37 @@ def mirror_write_fov_alleles(storage_paths, fov, alleles):
         write_fov_alleles(path, fov, alleles)
 
 
+# -- computed cell attributes (the population's append-mode cache) -------
+
+def _expression_path(storage_path, fov):
+    return os.path.join(_fov_dir(storage_path, fov), 'expression.json')
+
+
+def read_fov_expression(storage_path, fov):
+    """The FOV's cached computed cell attributes, or None.
+
+    Shape (population._fov_bundle owns the append-mode contract):
+      {'version': 1,
+       'sources': {'MOD|HYBE|CH': {'mask': bool, 'homeless': n,
+                                   'rows': [{cell, celltype, n_spots,
+                                             brightness_median,
+                                             brightness_total,
+                                             mask_median?, mask_frame?}]}},
+       'agg_by_mod': {'MOD': {'<cell>': {mod_n_spots, ...}}}}
+    """
+    path = _expression_path(storage_path, fov)
+    return _cached(path, 'expression', lambda: _read_json(path))
+
+
+def write_fov_expression(storage_path, fov, payload):
+    """Full-replace the FOV's computed-attribute capsule (atomic door,
+    like every writer here). Callers merge before writing -- append
+    semantics live in population._fov_bundle, not in this file."""
+    path = _expression_path(storage_path, fov)
+    _atomic_json(path, payload)
+    _poke_cache(path, 'expression', json.loads(json.dumps(payload)))
+
+
 # -- counts (status panels) ----------------------------------------------
 
 def fov_counts(storage_path, fovs):
