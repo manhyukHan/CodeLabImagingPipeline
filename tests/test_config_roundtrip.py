@@ -83,6 +83,16 @@ def main():
                 combo = combos.get(name)
                 if combo is not None and combo.count() > 1:
                     combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
+        # Analysis section 1: checked sources (dynamic, list-shaped) --
+        # check a few real entries; 1b: the editable QC thresholds
+        alp = a.ui.AnalysisPanel
+        for i in range(min(3, alp.SourceListWidget.count())):
+            alp.SourceListWidget.item(i).setCheckState(2)  # Qt.Checked
+        for key, text in (('min_brightness', '123.5'),
+                          ('max_brightness', '1500'),
+                          ('max_jump_um', '0.9'),
+                          ('max_dist_um', '1.7')):
+            alp.QcFields[key].setText(text)
         # the analysis gate: config-shaped DESCRIPTION (clauses of
         # predicates, OR-of-AND, normalize and all); membership is
         # derived data and deliberately not part of the config

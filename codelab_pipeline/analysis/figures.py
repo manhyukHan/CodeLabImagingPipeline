@@ -226,8 +226,9 @@ def fig_polymer_qc(table, dmaps, thresholds, qc_result=None, bin_ids=None):
     from codelab_pipeline.analysis import polymer as _P
     pos = qc_result['pos_um'] if qc_result is not None else table['pos_um']
     eff = _P.efficacy(pos)
+    # red-to-purple across the bins (reversed rainbow, per request)
     ax.bar(np.arange(len(eff)), eff,
-           color=cm.rainbow(np.linspace(0, 1, max(len(eff), 1))))
+           color=cm.rainbow.reversed()(np.linspace(0, 1, max(len(eff), 1))))
     ax.set_ylim(0, 1)
     if bin_ids is not None and len(bin_ids) == len(eff):
         # tpos, NOT pos: reusing `pos` here shadowed the position array

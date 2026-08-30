@@ -21,6 +21,77 @@ EXPR_METRICS = ['n_spots', 'brightness_median', 'brightness_total',
 NORM_MODES = ['none', 'by_modality', 'by_source']
 
 
+class SourcePicker(QtWidgets.QWidget):
+    """(modality, hybe, channel) through three cascading combos in a row.
+
+    One flat list stops scaling once several modalities x a hundred hybes
+    x channels exist (per explicit request). The hybe combo shows the
+    layout's common name beside the folder; the channel combo tags the
+    fiducial. current() is the source triple or None."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.ModalityComboBox = QtWidgets.QComboBox()
+        self.HybeComboBox = QtWidgets.QComboBox()
+        self.ChannelComboBox = QtWidgets.QComboBox()
+        lay.addWidget(self.ModalityComboBox, 1)
+        lay.addWidget(self.HybeComboBox, 3)
+        lay.addWidget(self.ChannelComboBox, 1)
+        self._tree = {}     # {modality: [(hybe, common_name, [(ch, fid?)])]}
+        self.ModalityComboBox.currentTextChanged.connect(self._fill_hybes)
+        self.HybeComboBox.currentIndexChanged.connect(self._fill_channels)
+
+    def populate(self, tree):
+        self._tree = tree
+        self.ModalityComboBox.blockSignals(True)
+        self.ModalityComboBox.clear()
+        self.ModalityComboBox.addItems(list(tree))
+        self.ModalityComboBox.blockSignals(False)
+        self._fill_hybes()
+
+    def _fill_hybes(self, *_a):
+        m = self.ModalityComboBox.currentText()
+        self.HybeComboBox.blockSignals(True)
+        self.HybeComboBox.clear()
+        for hybe, name, _chs in self._tree.get(m, []):
+            self.HybeComboBox.addItem(f'{hybe} ({name})' if name else hybe,
+                                      hybe)
+        self.HybeComboBox.blockSignals(False)
+        self._fill_channels()
+
+    def _fill_channels(self, *_a):
+        m = self.ModalityComboBox.currentText()
+        hybe = self.HybeComboBox.currentData()
+        self.ChannelComboBox.clear()
+        for h, _n, chs in self._tree.get(m, []):
+            if h == hybe:
+                for ch, fid in chs:
+                    self.ChannelComboBox.addItem(
+                        f'ch{ch}  (fiducial)' if fid else f'ch{ch}', int(ch))
+                break
+
+    def current(self):
+        """(modality, hybe, channel) or None when nothing is populated."""
+        m = self.ModalityComboBox.currentText()
+        h = self.HybeComboBox.currentData()
+        ch = self.ChannelComboBox.currentData()
+        if not m or h is None or ch is None:
+            return None
+        return (m, h, int(ch))
+
+    def set_current(self, src):
+        m, h, ch = src
+        self.ModalityComboBox.setCurrentText(str(m))
+        i = self.HybeComboBox.findData(str(h))
+        if i >= 0:
+            self.HybeComboBox.setCurrentIndex(i)
+        j = self.ChannelComboBox.findData(int(ch))
+        if j >= 0:
+            self.ChannelComboBox.setCurrentIndex(j)
+
+
 class AnalysisPanelUI(object):
     def setupUi(self, Widget):
         layout = QtWidgets.QVBoxLayout(Widget)
@@ -140,10 +211,11 @@ class AnalysisPanelUI(object):
             ['ExpressionRange', 'PairDistanceRange', 'BarcodePresence',
              'CompletenessRange', 'CelltypeIn', 'FovIn', 'AlleleCount'])
         form.addRow('Kind:', self.PredicateKindComboBox)
-        self.SourceAComboBox = QtWidgets.QComboBox()
-        form.addRow('Source (A):', self.SourceAComboBox)
-        self.SourceBComboBox = QtWidgets.QComboBox()
-        form.addRow('Source B (pair distance):', self.SourceBComboBox)
+        self.SourceAPicker = SourcePicker()
+        form.addRow('Source (A):', self.SourceAPicker)
+        self.SourceBPicker = SourcePicker()
+        form.addRow('Source B (pair dist / by_source ref):',
+                    self.SourceBPicker)
         self.MetricComboBox = QtWidgets.QComboBox()
         self.MetricComboBox.addItems(EXPR_METRICS)
         form.addRow('Metric:', self.MetricComboBox)
@@ -226,15 +298,15 @@ class AnalysisPanelUI(object):
         # distance histograms are final-layer callers like the ensemble
         # map; they read the GATED cells but never the condition form.
         viewForm = QtWidgets.QFormLayout()
-        self.ViewExprSourceComboBox = QtWidgets.QComboBox()
-        viewForm.addRow('Expression source:', self.ViewExprSourceComboBox)
+        self.ViewExprSourcePicker = SourcePicker()
+        viewForm.addRow('Expression source:', self.ViewExprSourcePicker)
         self.ViewExprMetricComboBox = QtWidgets.QComboBox()
         self.ViewExprMetricComboBox.addItems(EXPR_METRICS)
         viewForm.addRow('Expression metric:', self.ViewExprMetricComboBox)
-        self.ViewDistSourceAComboBox = QtWidgets.QComboBox()
-        viewForm.addRow('Distance source A:', self.ViewDistSourceAComboBox)
-        self.ViewDistSourceBComboBox = QtWidgets.QComboBox()
-        viewForm.addRow('Distance source B:', self.ViewDistSourceBComboBox)
+        self.ViewDistSourceAPicker = SourcePicker()
+        viewForm.addRow('Distance source A:', self.ViewDistSourceAPicker)
+        self.ViewDistSourceBPicker = SourcePicker()
+        viewForm.addRow('Distance source B:', self.ViewDistSourceBPicker)
         self.ViewDistCollapseComboBox = QtWidgets.QComboBox()
         self.ViewDistCollapseComboBox.addItems(['all', 'median', 'min'])
         viewForm.addRow('Distance collapse:', self.ViewDistCollapseComboBox)
@@ -268,9 +340,9 @@ class AnalysisPanelUI(object):
         is_list = kind in ('CelltypeIn', 'FovIn')
         is_pres = kind == 'BarcodePresence'
         is_allele = kind in ('AlleleCount', 'CompletenessRange')
-        self.SourceAComboBox.setEnabled(is_expr or is_pair)
+        self.SourceAPicker.setEnabled(is_expr or is_pair)
         # expr needs B too: it is by_source normalization's reference
-        self.SourceBComboBox.setEnabled(is_pair or is_expr)
+        self.SourceBPicker.setEnabled(is_pair or is_expr)
         self.MetricComboBox.setEnabled(is_expr)
         self.NormalizeComboBox.setEnabled(is_expr)
         self.CollapseComboBox.setEnabled(is_pair)
@@ -324,7 +396,7 @@ class AnalysisPanelUI(object):
         kind = self.PredicateKindComboBox.currentText()
         lo, hi = self.range_values()
         if kind == 'ExpressionRange':
-            src = self.combo_source(self.SourceAComboBox)
+            src = self.SourceAPicker.current()
             if src is None:
                 raise ValueError('pick a source (build the population with '
                                  'at least one checked source first)')
@@ -336,7 +408,7 @@ class AnalysisPanelUI(object):
                 # gated the RAW metric (reported: "not what I expected")
                 normalize = ['by_modality']
             elif norm == 'by_source':
-                ref = self.combo_source(self.SourceBComboBox)
+                ref = self.SourceBPicker.current()
                 if ref is None:
                     raise ValueError("normalize 'by_source' divides by the "
                                      'same metric of Source B -- pick it')
@@ -345,8 +417,8 @@ class AnalysisPanelUI(object):
                     'metric': self.MetricComboBox.currentText(),
                     'lo': lo, 'hi': hi, 'normalize': normalize}
         if kind == 'PairDistanceRange':
-            a = self.combo_source(self.SourceAComboBox)
-            b = self.combo_source(self.SourceBComboBox)
+            a = self.SourceAPicker.current()
+            b = self.SourceBPicker.current()
             if a is None or b is None:
                 raise ValueError('pick both sources')
             return {'kind': 'pair_distance_range', 'source_a': list(a),

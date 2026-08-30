@@ -90,16 +90,19 @@ class AnalysisWiring(QtCore.QObject):
         Called by MainWindow after layouts parse."""
         p = self.panel
         p.SourceListWidget.clear()
-        p.SourceAComboBox.clear()
-        p.SourceBComboBox.clear()
         p.BulkModalityComboBox.clear()
         p.BulkChannelComboBox.clear()
         all_channels = set()
+        tree = {}
         for modality, records in (self.mw.hybe_records_by_modality or {}).items():
             p.BulkModalityComboBox.addItem(modality)
+            entries = []
             for r in records:
                 fid = r.get('fiducial_channel')
                 name = str(r.get('readout_name') or '')
+                entries.append((r['folder'], name,
+                                [(int(ch), ch == fid)
+                                 for ch in r.get('channels', [])]))
                 for ch in r.get('channels', []):
                     all_channels.add(int(ch))
                     shown = f'{r["folder"]} ({name})' if name else r['folder']
@@ -111,11 +114,11 @@ class AnalysisWiring(QtCore.QObject):
                     item.setCheckState(QtCore.Qt.Unchecked)
                     item.setData(QtCore.Qt.UserRole, list(src))
                     p.SourceListWidget.addItem(item)
-                    p.SourceAComboBox.addItem(label, list(src))
-                    p.SourceBComboBox.addItem(label, list(src))
-                    p.ViewExprSourceComboBox.addItem(label, list(src))
-                    p.ViewDistSourceAComboBox.addItem(label, list(src))
-                    p.ViewDistSourceBComboBox.addItem(label, list(src))
+            tree[modality] = entries
+        for picker in (p.SourceAPicker, p.SourceBPicker,
+                       p.ViewExprSourcePicker, p.ViewDistSourceAPicker,
+                       p.ViewDistSourceBPicker):
+            picker.populate(tree)
         for ch in sorted(all_channels):
             p.BulkChannelComboBox.addItem(str(ch))
 
@@ -560,7 +563,7 @@ class AnalysisWiring(QtCore.QObject):
     def view_expression_hist(self):
         def go():
             pop = self._need_pop(expr=True)
-            src = self.panel.combo_source(self.panel.ViewExprSourceComboBox)
+            src = self.panel.ViewExprSourcePicker.current()
             if src is None:
                 raise ValueError('pick the expression source (section 3)')
             metric = self.panel.ViewExprMetricComboBox.currentText()
@@ -586,7 +589,7 @@ class AnalysisWiring(QtCore.QObject):
     def view_brightness_vs_count(self):
         def go():
             pop = self._need_pop(expr=True)
-            src = self.panel.combo_source(self.panel.ViewExprSourceComboBox)
+            src = self.panel.ViewExprSourcePicker.current()
             if src is None:
                 raise ValueError('pick the expression source (section 3)')
             fig = figures.fig_brightness_vs_count(
@@ -599,8 +602,8 @@ class AnalysisWiring(QtCore.QObject):
     def view_distance_hist(self):
         def go():
             pop = self._need_pop(spots=True)
-            a = self.panel.combo_source(self.panel.ViewDistSourceAComboBox)
-            b = self.panel.combo_source(self.panel.ViewDistSourceBComboBox)
+            a = self.panel.ViewDistSourceAPicker.current()
+            b = self.panel.ViewDistSourceBPicker.current()
             if a is None or b is None:
                 raise ValueError('pick distance sources A and B (section 3)')
             collapse = self.panel.ViewDistCollapseComboBox.currentText()
@@ -647,7 +650,7 @@ class AnalysisWiring(QtCore.QObject):
                 hi if hi is not None else np.inf)
             if kind == 'ExpressionRange':
                 pop = self._need_pop(expr=True)
-                src = self.panel.combo_source(self.panel.SourceAComboBox)
+                src = self.panel.SourceAPicker.current()
                 if src is None:
                     raise ValueError('pick source A')
                 # the preview must show the DISTRIBUTION THE GATE READS:
@@ -673,8 +676,8 @@ class AnalysisWiring(QtCore.QObject):
                                    'normalize': d.get('normalize')})
             elif kind == 'PairDistanceRange':
                 pop = self._need_pop(spots=True)
-                a = self.panel.combo_source(self.panel.SourceAComboBox)
-                b = self.panel.combo_source(self.panel.SourceBComboBox)
+                a = self.panel.SourceAPicker.current()
+                b = self.panel.SourceBPicker.current()
                 if a is None or b is None:
                     raise ValueError('pick sources A and B')
                 per_cell = distances.pair_distance_per_cell(pop, a, b)

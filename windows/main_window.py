@@ -11319,6 +11319,21 @@ One PNG PER MODALITY: each modality has its own reference and its
             'readout_min_sep': ('ChromatinTracingPanel', 'ReadoutMinSepSpinBox'),
             'multi_component_fit': ('ChromatinTracingPanel', 'ReadoutMultiModeCheckBox'),
         },
+        # The Analysis tab's build setup (section 1) and polymer-QC
+        # values (1b), per explicit request -- alongside the dynamic
+        # 'sources' and per-threshold entries added in
+        # _capture_config_params. overwrite_cache is deliberately NOT
+        # saved: it is a one-shot action flag, and a config that
+        # silently recomputes every cached attribute on every build
+        # would defeat the cache it controls.
+        'analysis_population': {
+            'fov_list': ('AnalysisPanel', 'FovListLineEdit'),
+            'mask_intensity': ('AnalysisPanel', 'MaskIntensityCheckBox'),
+        },
+        'analysis_polymer_qc': {
+            'min_traced': ('AnalysisPanel', 'QcMinTracedSpinBox'),
+            'apply_qc': ('AnalysisPanel', 'ApplyQcCheckBox'),
+        },
     }
 
     # A combo whose DISPLAY text is decorated cannot round-trip through
@@ -11405,6 +11420,14 @@ One PNG PER MODALITY: each modality has its own reference and its
         gd = self.analysis.gate_dict()
         if gd.get('clauses'):
             out['analysis_gate'] = {'condition': json.dumps(gd, sort_keys=True)}
+        # section 1's checked sources and 1b's editable thresholds --
+        # dynamic like the checked-hybe set (list-shaped / dict-shaped
+        # state the widget map cannot name)
+        alp = self.ui.AnalysisPanel
+        out['analysis_population']['sources'] = ','.join(
+            f'{m}|{h}|{ch}' for m, h, ch in alp.checked_sources())
+        for key, w in alp.QcFields.items():
+            out['analysis_polymer_qc'][key] = w.text()
         return out
 
     def _apply_config_params(self, params):
@@ -11438,6 +11461,20 @@ One PNG PER MODALITY: each modality has its own reference and its
                 if section == 'chromatin_tracing' and param == 'hybes':
                     keys = [tuple(pair.split('|', 1)) for pair in value.split(',') if '|' in pair]
                     self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
+                    continue
+                if section == 'analysis_population' and param == 'sources':
+                    wanted = {tuple(x.split('|', 2)) for x in value.split(',')
+                              if x.count('|') == 2}
+                    lw = self.ui.AnalysisPanel.SourceListWidget
+                    for i in range(lw.count()):
+                        m, h, ch = lw.item(i).data(QtCore.Qt.UserRole)
+                        lw.item(i).setCheckState(
+                            QtCore.Qt.Checked if (str(m), str(h), str(ch))
+                            in wanted else QtCore.Qt.Unchecked)
+                    continue
+                if section == 'analysis_polymer_qc' \
+                        and param in self.ui.AnalysisPanel.QcFields:
+                    self.ui.AnalysisPanel.QcFields[param].setText(value)
                     continue
                 if section == 'analysis_gate' and param == 'condition':
                     try:
