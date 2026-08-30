@@ -1,0 +1,17 @@
+# Read the Docs build configuration.
+# The docs build in a plain python env from docs/requirements.txt --
+# the pipeline's own heavy env (torch, cellpose, PyQt5) is never needed
+# because the documentation imports nothing from the package.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+
+sphinx:
+  configuration: docs/conf.py
+
+python:
+  install:
+    - requirements: docs/requirements.txt

@@ -1,0 +1,5 @@
+# Documentation build only (Read the Docs installs from this file; the
+# app's own env never needs any of it -- see the root requirements.txt).
+sphinx>=7
+myst-parser>=2
+furo
