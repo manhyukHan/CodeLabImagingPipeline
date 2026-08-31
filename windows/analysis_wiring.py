@@ -67,10 +67,12 @@ class AnalysisWiring(QtCore.QObject):
 
     def _source_label(self, src):
         """Display name for figure titles: the common hybe name shown
-        beside the folder when the layout has one, per request."""
+        beside the folder when the layout has one, per request. A traced
+        source names the POLYMER position, not a channel."""
         m, h, ch = src
         name = self._hybe_name(m, h)
-        return f'{m}/{h} ({name})/ch{ch}' if name else f'{m}/{h}/ch{ch}'
+        head = f'{m}/{h} ({name})' if name else f'{m}/{h}'
+        return f'{head}/traced' if str(ch) == 'traced' else f'{head}/ch{ch}'
 
     def _norm_label(self, normalize):
         """Title line naming the applied normalization, per request:
@@ -129,29 +131,33 @@ class AnalysisWiring(QtCore.QObject):
                                else QtCore.Qt.Unchecked)
 
     def check_modality_channel(self):
-        """Check every NON-FIDUCIAL source of the picked modality at the
-        picked channel -- the one-push way to build over a whole readout
-        channel, per request."""
+        """Check EVERY source of the picked modality at the picked
+        channel -- general in channel, per correction.
+
+        The earlier version excluded hybes where this channel happens to
+        be the fiducial one. That is a bad assumption twice over: the
+        fiducial role is a PER-HYBE fact (with three channels the same
+        wavelength is fiducial in one round and a real readout in
+        another), and a fiducial-channel source is legitimately wanted
+        anyway -- as a mask-intensity source, or simply as spots the
+        user localized there. The picker names a channel; it should
+        select that channel."""
         p = self.panel
         modality = p.BulkModalityComboBox.currentText()
         ch_text = p.BulkChannelComboBox.currentText()
         if not modality or not ch_text:
             return
         channel = int(ch_text)
-        fid_by_hybe = {r['folder']: r.get('fiducial_channel')
-                       for r in (self.mw.hybe_records_by_modality
-                                 or {}).get(modality, [])}
         lw = p.SourceListWidget
         n = 0
         for i in range(lw.count()):
             item = lw.item(i)
             m, h, ch = item.data(QtCore.Qt.UserRole)
-            if (m == modality and int(ch) == channel
-                    and fid_by_hybe.get(h) != int(ch)):
+            if m == modality and int(ch) == channel:
                 item.setCheckState(QtCore.Qt.Checked)
                 n += 1
-        self.mw.log(f'Analysis: checked {n} non-fiducial {modality} '
-                    f'ch{channel} source(s).')
+        self.mw.log(f'Analysis: checked {n} {modality} ch{channel} '
+                    f'source(s).')
 
     def check_spot_sources(self):
         """Check every source with localized spots in the store -- the
@@ -321,6 +327,24 @@ class AnalysisWiring(QtCore.QObject):
             return self.qc['dmaps'], self.qc['index']
         dm = pop.dmaps()
         return dm, np.arange(len(dm))
+
+    def _qc_alleles(self):
+        """The allele dict TRACED distance sources should read: the
+        QC-filtered positions when Apply QC is on (so a traced distance
+        and a map are computed from the same alleles), else the
+        population's own. Returns None when nothing is filtered, which
+        distances reads as 'use pop.alleles'."""
+        pop = self._need_pop(alleles=True)
+        if not self.panel.ApplyQcCheckBox.isChecked() or self.qc is None:
+            return None
+        idx = self.qc['index']
+        al = pop.alleles
+        out = {'pos_um': self.qc['pos_um'],
+               'bin_hybes': list(al.get('bin_hybes') or []),
+               'fov': np.asarray(al['fov'])[idx],
+               'cell': np.asarray(al['cell'])[idx],
+               'celltype': [al['celltype'][i] for i in idx]}
+        return out
 
     # -- conditions --------------------------------------------------------
     OR_MARKER = '__or__'
@@ -645,7 +669,12 @@ class AnalysisWiring(QtCore.QObject):
             collapse = self.panel.ViewDistCollapseComboBox.currentText()
             per_ct = self.panel.CelltypeDecomposeCheckBox.isChecked()
             groups = self._allele_cell_groups()
-            pairs = distances.pair_distances(pop, a, b)
+            # traced sources read the SAME alleles the views use, so
+            # Apply QC governs them exactly as it governs the maps
+            alleles = None
+            if (distances.is_traced_source(a) or distances.is_traced_source(b)):
+                alleles = self._qc_alleles()
+            pairs = distances.pair_distances(pop, a, b, alleles)
             import matplotlib.pyplot as plt
             n = len(groups)
             fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),

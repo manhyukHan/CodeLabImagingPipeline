@@ -181,7 +181,9 @@ class AlleleCount(Predicate):
     """Cells holding between lo and hi TRACED alleles (n_traced >= min_bins)."""
     kind = 'allele_count'
 
-    def __init__(self, lo=1, hi=None, min_bins=2):
+    def __init__(self, lo=0, hi=None, min_bins=2):
+        # lo=0 (or None) means no minimum -- cells with NO alleles
+        # stay in, which is what an RNA-expression view needs
         self.lo, self.hi, self.min_bins = lo, hi, int(min_bins)
 
     def _params(self):
@@ -198,7 +200,7 @@ class AlleleCount(Predicate):
             got = df.value_counts(['fov', 'cell'])
             idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
             counts = got.reindex(idx, fill_value=0).to_numpy()
-        ok = counts >= int(self.lo)
+        ok = counts >= int(self.lo or 0)
         if self.hi is not None:
             ok &= counts <= int(self.hi)
         return ok

@@ -29,8 +29,12 @@ class SourcePicker(QtWidgets.QWidget):
     layout's common name beside the folder; the channel combo tags the
     fiducial. current() is the source triple or None."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, allow_traced=False):
+        # allow_traced: offer the polymer TRACE as a channel choice --
+        # a distance source can be a traced genomic bin (one point per
+        # allele) rather than a spot slice (per request)
         super().__init__(parent)
+        self._allow_traced = allow_traced
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.ModalityComboBox = QtWidgets.QComboBox()
@@ -71,6 +75,8 @@ class SourcePicker(QtWidgets.QWidget):
         # first NON-fiducial channel, not the fiducial
         prev = self.ChannelComboBox.currentData()
         self.ChannelComboBox.clear()
+        if prev == 'traced':
+            prev = None if not self._allow_traced else prev
         first_readout = None
         for h, _n, chs in self._tree.get(m, []):
             if h == hybe:
@@ -80,8 +86,11 @@ class SourcePicker(QtWidgets.QWidget):
                     if first_readout is None and not fid:
                         first_readout = i
                 break
+        if self._allow_traced:
+            self.ChannelComboBox.addItem('traced (polymer)', 'traced')
         if prev is not None:
-            i = self.ChannelComboBox.findData(int(prev))
+            i = self.ChannelComboBox.findData(
+                prev if prev == 'traced' else int(prev))
             if i >= 0:
                 self.ChannelComboBox.setCurrentIndex(i)
                 return
@@ -95,7 +104,7 @@ class SourcePicker(QtWidgets.QWidget):
         ch = self.ChannelComboBox.currentData()
         if not m or h is None or ch is None:
             return None
-        return (m, h, int(ch))
+        return (m, h, ch if ch == 'traced' else int(ch))
 
     def set_current(self, src):
         m, h, ch = src
@@ -103,7 +112,8 @@ class SourcePicker(QtWidgets.QWidget):
         i = self.HybeComboBox.findData(str(h))
         if i >= 0:
             self.HybeComboBox.setCurrentIndex(i)
-        j = self.ChannelComboBox.findData(int(ch))
+        j = self.ChannelComboBox.findData(
+            ch if str(ch) == 'traced' else int(ch))
         if j >= 0:
             self.ChannelComboBox.setCurrentIndex(j)
 
@@ -139,10 +149,11 @@ class AnalysisPanelUI(object):
         self.BulkChannelComboBox = QtWidgets.QComboBox()
         srcBtnRow.addWidget(self.BulkChannelComboBox)
         self.CheckModalityChannelPushButton = QtWidgets.QPushButton(
-            'Check Modality+Channel (non-fiducial)')
+            'Check Modality+Channel')
         self.CheckModalityChannelPushButton.setToolTip(
             'Check every hybe of the picked modality at the picked '
-            'channel, skipping fiducial-channel entries.')
+            'channel -- fiducial-channel entries included: the fiducial '
+            'role is a per-hybe fact, not a property of the channel.')
         srcBtnRow.addWidget(self.CheckModalityChannelPushButton)
         self.CheckSpotSourcesPushButton = QtWidgets.QPushButton(
             'Check All With Spots')
@@ -191,7 +202,9 @@ class AnalysisPanelUI(object):
             qcForm.addWidget(w, 1, col)
         qcForm.addWidget(QtWidgets.QLabel('min traced bins'), 0, 4)
         self.QcMinTracedSpinBox = QtWidgets.QSpinBox()
-        self.QcMinTracedSpinBox.setRange(2, 1000)
+        # 0 allowed: a QC pass that drops nothing is a legitimate
+        # setting, and 2 silently discarded every single-point allele
+        self.QcMinTracedSpinBox.setRange(0, 1000)
         self.QcMinTracedSpinBox.setValue(2)
         qcForm.addWidget(self.QcMinTracedSpinBox, 1, 4)
         qcLayout.addLayout(qcForm)
@@ -227,9 +240,9 @@ class AnalysisPanelUI(object):
             ['ExpressionRange', 'PairDistanceRange', 'BarcodePresence',
              'CompletenessRange', 'CelltypeIn', 'FovIn', 'AlleleCount'])
         form.addRow('Kind:', self.PredicateKindComboBox)
-        self.SourceAPicker = SourcePicker()
+        self.SourceAPicker = SourcePicker(allow_traced=True)
         form.addRow('Source (A):', self.SourceAPicker)
-        self.SourceBPicker = SourcePicker()
+        self.SourceBPicker = SourcePicker(allow_traced=True)
         form.addRow('Source B (pair dist / by_source ref):',
                     self.SourceBPicker)
         self.MetricComboBox = QtWidgets.QComboBox()
@@ -296,7 +309,9 @@ class AnalysisPanelUI(object):
         flagRow.addWidget(self.CelltypeDecomposeCheckBox)
         flagRow.addWidget(QtWidgets.QLabel('min alleles per map pixel:'))
         self.MinNSpinBox = QtWidgets.QSpinBox()
-        self.MinNSpinBox.setRange(1, 10000)
+        # 0 allowed (per report): bounded at 1 there was no way to see
+        # a view that includes cells carrying NO alleles at all
+        self.MinNSpinBox.setRange(0, 10000)
         self.MinNSpinBox.setValue(5)
         flagRow.addWidget(self.MinNSpinBox)
         flagRow.addWidget(QtWidgets.QLabel('allele gate mode:'))
@@ -328,9 +343,9 @@ class AnalysisPanelUI(object):
         self.ViewExprMetricComboBox = QtWidgets.QComboBox()
         self.ViewExprMetricComboBox.addItems(EXPR_METRICS)
         viewForm.addRow('Expression metric:', self.ViewExprMetricComboBox)
-        self.ViewDistSourceAPicker = SourcePicker()
+        self.ViewDistSourceAPicker = SourcePicker(allow_traced=True)
         viewForm.addRow('Distance source A:', self.ViewDistSourceAPicker)
-        self.ViewDistSourceBPicker = SourcePicker()
+        self.ViewDistSourceBPicker = SourcePicker(allow_traced=True)
         viewForm.addRow('Distance source B:', self.ViewDistSourceBPicker)
         self.ViewDistCollapseComboBox = QtWidgets.QComboBox()
         self.ViewDistCollapseComboBox.addItems(['all', 'median', 'min'])
@@ -425,6 +440,10 @@ class AnalysisPanelUI(object):
             if src is None:
                 raise ValueError('pick a source (build the population with '
                                  'at least one checked source first)')
+            if str(src[2]) == 'traced':
+                raise ValueError('a traced polymer bin has no expression '
+                                 'metric -- pick a real channel, or use '
+                                 'PairDistanceRange for traced positions')
             norm = self.NormalizeComboBox.currentText()
             normalize = None
             if norm in ('by_modality', 'by_total_count'):
@@ -476,8 +495,11 @@ class AnalysisPanelUI(object):
                     'lo': int(lo) if lo is not None else None,
                     'hi': int(hi) if hi is not None else None}
         if kind == 'AlleleCount':
+            # an EMPTY low bound means "no minimum" (0), not 1 -- the old
+            # default silently excluded every cell without a traced
+            # allele, which is exactly the RNA-expression case (report)
             return {'kind': 'allele_count',
-                    'lo': int(lo) if lo is not None else 1,
+                    'lo': int(lo) if lo is not None else 0,
                     'hi': int(hi) if hi is not None else None,
                     'min_bins': 2}
         raise ValueError(f'unknown kind {kind}')
