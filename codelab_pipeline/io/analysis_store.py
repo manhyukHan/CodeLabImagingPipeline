@@ -667,6 +667,40 @@ def _expression_path(storage_path, fov):
     return os.path.join(_fov_dir(storage_path, fov), 'expression.json')
 
 
+def _stat_stamp(path):
+    """(mtime_ns, size) or None -- the same identity the read cache in
+    this module keys on."""
+    try:
+        st = os.stat(path)
+        return [int(st.st_mtime_ns), int(st.st_size)]
+    except OSError:
+        return None
+
+
+def fov_input_stamp(storage_path, fov, modality=None, hybe=None,
+                    channel=None, with_matrices=False):
+    """What a DERIVED per-FOV product was computed from.
+
+    Any cache of computed cell attributes must record this and refuse
+    itself when it changes: an entry that stores only its RESULT cannot
+    know that the FOV was segmented afterwards, that spots were
+    re-detected, or that alignment moved the masks -- and append mode
+    then serves a stale answer forever (confirmed real: ten FOVs cached
+    an EMPTY row set before they had cells, and every later build
+    reported those cells as having no expression at all).
+    """
+    stamp = {'cells': _stat_stamp(
+        os.path.join(_fov_dir(storage_path, fov), 'cells.h5'))}
+    if modality is not None and hybe is not None and channel is not None:
+        stamp['spots'] = _stat_stamp(os.path.join(
+            _spots_dir(storage_path, fov),
+            _slice_name(modality, hybe, channel) + '.h5'))
+    if with_matrices and modality is not None:
+        stamp['matrices'] = _stat_stamp(
+            _matrices_path(storage_path, fov, modality))
+    return stamp
+
+
 def read_fov_expression(storage_path, fov):
     """The FOV's cached computed cell attributes, or None.
 

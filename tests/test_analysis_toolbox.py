@@ -531,6 +531,19 @@ try:
                               False))
     check('and its rebuild is served from the capsule',
           b7['expr_cache'] == {'cached': 1, 'computed': 0})
+    # THE REPORTED BUG: that FOV is segmented LATER. A cache that stored
+    # only its result kept serving the empty row set forever -- 2266
+    # gated cells but 1090 in the histogram, on the real store.
+    ASt.read_spots = _spots_ok
+    ASt.read_cells = _cells_v1                 # FOV 2 now HAS cells
+    b8 = popmod2._fov_bundle((_csp, 2, None, [SRC1], None,
+                              (0.208, 0.208, 0.2), False, None, None,
+                              False))
+    check('a FOV segmented AFTER caching recomputes, not serves empty',
+          b8['expr_cache'] == {'cached': 0, 'computed': 1}
+          and len(b8.get('expression', [])) == 2)
+    check('every cell gets a row, allele-bearing or not',
+          sorted(b8['expression']['cell'].tolist()) == [1, 2])
 finally:
     ASt.read_cells, ASt.read_spots = _orig_rc, _orig_rs
     shutil.rmtree(_croot, ignore_errors=True)

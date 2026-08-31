@@ -439,12 +439,15 @@ class AnalysisWiring(QtCore.QObject):
         p.GateSummaryLabel.setText('\n'.join(lines))
 
     # -- views -------------------------------------------------------------
-    def _show(self, fig, name, tables=None, params=None):
+    def _show(self, fig, name, tables=None, params=None, rebuild=None):
+        """rebuild(bins) -> a new figure over the SAME rows, for the
+        displayer's view-range panel. Presentation only: it re-renders,
+        it never re-gates (per explicit requirement)."""
         d = AnalysisFigureDisplayer(title=f'Analysis -- {name}',
                                     parent=self.mw)
         d.set_figure(fig, name=name, tables=tables, pop=self.pop,
                      condition=self.condition(), params=params,
-                     default_dir=self._default_dir())
+                     default_dir=self._default_dir(), rebuild=rebuild)
         d.show()
         d.raise_()
         self.displayers.append(d)
@@ -628,18 +631,27 @@ class AnalysisWiring(QtCore.QObject):
                 label = f'{label}\n{nl}'
             groups = self._allele_cell_groups()
             import matplotlib.pyplot as plt
-            n = len(groups)
-            fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),
-                                     squeeze=False)
-            for ax, (gname, cells_df) in zip(axes[0], groups.items()):
-                figures.expression_hist_ax(
-                    ax, self._rows_for_cells(table, cells_df),
-                    src, metric_col, label=label,
-                    per_celltype=self.panel.CelltypeDecomposeCheckBox.isChecked())
-                ax.set_title(f'{gname} ({len(cells_df)} cells)\n'
-                             + ax.get_title(), fontsize=9)
+            per_ct = self.panel.CelltypeDecomposeCheckBox.isChecked()
+
+            def _render(bins=None):
+                # SAME rows, different binning -- presentation only, so
+                # the displayer's view-range panel can re-bin without
+                # touching the gate or the prepared data
+                n = len(groups)
+                f, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),
+                                       squeeze=False)
+                for ax, (gname, cells_df) in zip(axes[0], groups.items()):
+                    figures.expression_hist_ax(
+                        ax, self._rows_for_cells(table, cells_df),
+                        src, metric_col, label=label,
+                        bins=bins or 30, per_celltype=per_ct)
+                    ax.set_title(f'{gname} ({len(cells_df)} cells)\n'
+                                 + ax.get_title(), fontsize=9)
+                return f
+
+            fig = _render()
             self._show(fig, 'expression_hist',
-                       {'expression': table},
+                       {'expression': table}, rebuild=_render,
                        params={'source': list(src), 'metric': metric,
                                'normalize': normalize,
                                'allele_mode':
@@ -676,21 +688,29 @@ class AnalysisWiring(QtCore.QObject):
                 alleles = self._qc_alleles()
             pairs = distances.pair_distances(pop, a, b, alleles)
             import matplotlib.pyplot as plt
-            n = len(groups)
-            fig, axes = plt.subplots(1, n, figsize=(5.6 * n, 4),
-                                     squeeze=False)
-            for ax, (gname, cells_df) in zip(axes[0], groups.items()):
-                sub = self._rows_for_cells(pairs, cells_df)
-                if collapse != 'all' and len(sub):
-                    agg = {'median': 'median', 'min': 'min'}[collapse]
-                    sub = sub.groupby(['fov', 'cell'], as_index=False)                         .agg({'d_um': agg, 'celltype': 'first'})
-                figures.distance_hist_ax(ax, sub, per_celltype=per_ct)
-                unit = 'pairs' if collapse == 'all' else 'cells'
-                ax.set_title(f'{gname} ({len(cells_df)} cells, '
-                             f'{len(sub)} {unit}, {collapse})', fontsize=9)
-            fig.suptitle(f'{self._source_label(a)} to {self._source_label(b)} '
-                         f'within gated cells', fontsize=11)
-            self._show(fig, 'distance_hist', {'pairs': pairs},
+
+            def _render(bins=None):
+                # SAME pairs, different binning -- presentation only
+                f, axes2 = plt.subplots(1, len(groups),
+                                        figsize=(5.6 * len(groups), 4),
+                                        squeeze=False)
+                for ax, (gname, cells_df) in zip(axes2[0], groups.items()):
+                    sub = self._rows_for_cells(pairs, cells_df)
+                    if collapse != 'all' and len(sub):
+                        agg = {'median': 'median', 'min': 'min'}[collapse]
+                        sub = sub.groupby(['fov', 'cell'], as_index=False)                             .agg({'d_um': agg, 'celltype': 'first'})
+                    figures.distance_hist_ax(ax, sub, bins=bins or 40,
+                                             per_celltype=per_ct)
+                    unit = 'pairs' if collapse == 'all' else 'cells'
+                    ax.set_title(f'{gname} ({len(cells_df)} cells, '
+                                 f'{len(sub)} {unit}, {collapse})', fontsize=9)
+                f.suptitle(f'{self._source_label(a)} to '
+                           f'{self._source_label(b)} within gated cells',
+                           fontsize=11)
+                return f
+
+            fig = _render()
+            self._show(fig, 'distance_hist', {'pairs': pairs}, rebuild=_render,
                        params={'source_a': list(a), 'source_b': list(b),
                                'collapse': collapse,
                                'allele_mode':

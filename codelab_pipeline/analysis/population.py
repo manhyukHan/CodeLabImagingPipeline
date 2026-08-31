@@ -72,12 +72,31 @@ def _fov_bundle(item):
         csources = dict(cache.get('sources') or {})
         cagg = dict(cache.get('agg_by_mod') or {})
         celltype_of = {r['cell']: r['celltype'] for r in out['cells']}
+        cell_ids = set(celltype_of)
         cached_rows, fresh_srcs, homeless = [], [], {}
         for src in sources:
             ent = csources.get(_skey(src))
-            # a cached entry without mask columns cannot serve a
-            # mask_intensity build -- recompute that source
-            if ent is not None and (not mask_intensity or ent.get('mask')):
+            # COVERAGE, not mere presence: an entry is only usable if it
+            # holds a row for exactly the cells this FOV has NOW. A FOV
+            # whose expression was cached BEFORE it was segmented keeps
+            # an empty row list, and re-segmentation adds or removes
+            # cells -- either way the cache would otherwise serve a
+            # short answer forever (reported: 2266 gated cells but only
+            # 1090 in the histogram, because 10 FOVs cached zero rows).
+            covered = ({int(r['cell']) for r in ent['rows']}
+                       if ent is not None else set())
+            # INPUT IDENTITY, not just presence: the entry is usable only
+            # if the files it was computed from are still the ones on
+            # disk (cells, this source's spot slice, and -- for mask
+            # metrics -- the alignment matrices). Coverage alone would
+            # still serve stale brightness after a re-detection, or a
+            # stale mask median after re-alignment.
+            stamp = analysis_store.fov_input_stamp(
+                storage_path, fov, modality=src[0], hybe=src[1],
+                channel=int(src[2]), with_matrices=bool(mask_intensity))
+            if (ent is not None and covered == cell_ids
+                    and ent.get('stamp') == stamp
+                    and (not mask_intensity or ent.get('mask'))):
                 m, h, ch = src
                 for r in ent['rows']:
                     row = dict(r)
@@ -177,6 +196,10 @@ def _fov_bundle(item):
                     csources[_skey(src)] = {
                         'mask': bool(mask_intensity),
                         'homeless': int(homeless.get(src, 0)),
+                        'stamp': analysis_store.fov_input_stamp(
+                            storage_path, fov, modality=m, hybe=h,
+                            channel=int(ch),
+                            with_matrices=bool(mask_intensity)),
                         'rows': rows}
             for m in fresh_mods:
                 cagg[m] = {str(k): v for k, v in agg_by_mod[m].items()}
