@@ -34,6 +34,17 @@ def _traced_of(pop, source, alleles=None):
     if al is None:
         raise ValueError('population carries no alleles; build with '
                          'records=/hybes= first')
+    # MODALITY-GENERAL, and checked: the polymer was traced in ONE
+    # modality, and the cross-modal bridge hybe exists in both -- so a
+    # traced source naming the other modality would silently return the
+    # traced one's bin. Refuse instead. (An older population carries no
+    # stamp; then the hybe name is all there is and it stands alone.)
+    traced_modality = al.get('modality')
+    if traced_modality and m and str(m) != str(traced_modality):
+        raise ValueError(f'{m}/{h} is not a traced bin: the polymer was '
+                         f'traced in {traced_modality}, so a traced '
+                         f'source must name {traced_modality} '
+                         f'(spot sources are unrestricted)')
     bins = list(al.get('bin_hybes') or [])
     if h not in bins:
         raise ValueError(f'{h} is not a traced genomic bin '

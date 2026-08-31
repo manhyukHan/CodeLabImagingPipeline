@@ -232,7 +232,7 @@ class AnalysisWiring(QtCore.QObject):
 
         def _compute():
             return population.Population.build(
-                storage_path, fovs, records=records,
+                storage_path, fovs, records=records, modality=modality,
                 sources=sources or None, spot_sources=sources or None,
                 voxel_um=voxel, mask_intensity=mask_int,
                 resolvers=resolvers or None,

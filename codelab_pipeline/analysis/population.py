@@ -225,7 +225,7 @@ class Population:
     def build(cls, storage_path, fovs, records=None, hybes=None,
               sources=None, spot_sources=None, voxel_um=DEFAULT_VOXEL_UM,
               mask_intensity=False, resolvers=None, jobs=None,
-              on_done=None, overwrite_cache=False):
+              on_done=None, overwrite_cache=False, modality=None):
         """Assemble a Population from the store, headless.
 
         records: parsed layout records (preprocess.parse_experiment_layout)
@@ -294,6 +294,11 @@ class Population:
                 'n_traced': np.concatenate([p['n_traced'] for p in parts]),
                 'bin_hybes': list(hybes or []),
                 'bin_ids': list(bin_ids or []),
+                # WHICH modality these bins were traced in -- a
+                # traced distance source names (modality, hybe), and
+                # the bridge hybe exists in BOTH modalities, so the
+                # name alone cannot disambiguate it
+                'modality': modality,
             }
             for key, rounds in (qc_round_hybes or {}).items():
                 if rounds and all(f'{key}_pos_um' in p for p in parts):
