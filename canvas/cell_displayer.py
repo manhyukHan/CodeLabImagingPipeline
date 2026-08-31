@@ -129,6 +129,13 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self.RemoveIdsPushButton = QtWidgets.QPushButton('Remove')
         removeLayout.addWidget(self.RemoveIdsLineEdit)
         removeLayout.addWidget(self.RemoveIdsPushButton)
+        self.RemoveEdgeCellsPushButton = QtWidgets.QPushButton(
+            'Remove Edge Cells')
+        self.RemoveEdgeCellsPushButton.setToolTip(
+            'Remove every cell touching the frame boundary: they are '
+            'clipped by the field of view, so their masks are partial '
+            'and they align and analyse poorly.')
+        removeLayout.addWidget(self.RemoveEdgeCellsPushButton)
         # Undo/redo over the CELL CONTAINER (two diff streaks, wired by
         # MainWindow) -- this widget only emits; it owns no cell state.
         self.UndoPushButton = QtWidgets.QPushButton('Undo')
@@ -142,6 +149,7 @@ class CellDisplayer(QtWidgets.QMainWindow):
         layout.addWidget(removeRow)
 
         self.RemoveIdsPushButton.clicked.connect(self._remove_ids)
+        self.RemoveEdgeCellsPushButton.clicked.connect(self._remove_edge_cells)
 
     def set_data(self, reference_image, mask):
         self.reference_image = reference_image
@@ -203,6 +211,39 @@ class CellDisplayer(QtWidgets.QMainWindow):
         # the receiver's job, and a container-backed receiver re-renders
         # this displayer from the container afterwards anyway.
         self.ids_removed.emit([int(i) for i in ids])
+
+    def _remove_edge_cells(self):
+        """Remove every cell whose mask touches the frame boundary.
+
+        A cell clipped by the field of view carries a partial mask: its
+        centroid is biased inward, its area is arbitrary, and both
+        alignment and analysis inherit that -- so they are removed as a
+        class rather than hunted for by eye. Emits ids_removed like the
+        manual path, so the container (not this widget) owns the change.
+        """
+        if self.mask is None:
+            return
+        edge = np.concatenate([self.mask[0, :], self.mask[-1, :],
+                               self.mask[:, 0], self.mask[:, -1]])
+        ids = sorted({int(i) for i in np.unique(edge) if int(i) != 0})
+        if not ids:
+            QtWidgets.QMessageBox.information(
+                self, 'Remove Edge Cells',
+                'No cell touches the frame boundary.')
+            return
+        n_total = len({int(i) for i in np.unique(self.mask) if int(i) != 0})
+        if QtWidgets.QMessageBox.question(
+                self, 'Remove Edge Cells',
+                f'Remove {len(ids)} of {n_total} cell(s) touching the frame '
+                f'boundary?\n\n{", ".join(str(i) for i in ids[:20])}'
+                + (' ...' if len(ids) > 20 else ''),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Yes) != QtWidgets.QMessageBox.Yes:
+            return
+        self.mask = self.mask.copy()
+        self.mask[np.isin(self.mask, ids)] = 0
+        self._redraw()
+        self.ids_removed.emit(ids)
 
     def _set_manual_mode(self, on):
         self._manual_mode = on

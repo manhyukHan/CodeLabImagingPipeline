@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import json
 import os
@@ -5118,7 +5119,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(H_cellref), cell.frame_shape)
         return cy, cx
 
-    def _build_cell_display_crop(self, cell, hybe, channel, storage_path, fov, pad, modality):
+    def _build_cell_display_crop(self, cell, hybe, channel, storage_path, fov, pad, modality, mip=None):
         """
         Raw (unmasked) crop + cell-boundary mask for the interactive
         displayer's Current Cell scope -- per explicit request, the
@@ -5139,7 +5140,10 @@ class MainWindow(QtWidgets.QMainWindow):
         height, width = cell.frame_shape
         rymin, rymax = max(0, y_area.min() - pad), min(height, y_area.max() + pad + 1)
         rxmin, rxmax = max(0, x_area.min() - pad), min(width, x_area.max() + pad + 1)
-        mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        # `mip` pre-read by the caller when it came from a child process
+        # (see _mip_then); read here only for callers that have none
+        if mip is None:
+            mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
         if mip is None:
             return None
         mip_crop = mip[rymin:rymax, rxmin:rxmax]
@@ -5205,7 +5209,22 @@ class MainWindow(QtWidgets.QMainWindow):
         storage_path = self._storage_path_for_modality(sp.current_hybe_modality())
         fov = self._current_spot_fov()
         pad = sp.PadSpinBox.value()
-        crop = self._build_cell_display_crop(cell, hybe, channel, storage_path, fov, pad, modality=sp.current_hybe_modality())
+        modality = sp.current_hybe_modality()
+        # same door as the FOV view: the MIP read is the only part of
+        # this path that ever blocked the GUI thread
+        return self._mip_then(storage_path, fov, hybe, channel,
+                              lambda mip: self._render_spot_crop_display(
+                                  mip, cell, hybe, channel, storage_path,
+                                  fov, pad, modality, keep_view))
+
+    def _render_spot_crop_display(self, mip, cell, hybe, channel, storage_path,
+                                  fov, pad, modality, keep_view=False):
+        """The Cell view's in-memory half -- see
+        _load_spot_crop_for_display, which resolves the MIP first."""
+        sp = self.ui.SpotLocalizationPanel
+        crop = self._build_cell_display_crop(cell, hybe, channel, storage_path,
+                                             fov, pad, modality=modality,
+                                             mip=mip)
         if crop is None:
             self.log(f'Cell {cell.id}: no crop for {hybe} -- the hybe has no image data '
                      f'for this FOV, or the cell mask projects outside its frame. '
@@ -5243,6 +5262,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_view_spot_refs = [(s, cell) for s in scoped_spots]
         self._refresh_localize_3d_spot_choices(preserve_selected_ids=preserve_ids)
 
+    _MIP_CACHE_MAX = 8
+
+    def _mip_then(self, storage_path, fov, hybe, channel, render):
+        """Hand `render` this hybe/channel's MIP -- from a small session
+        cache when it is warm (SYNCHRONOUSLY, so the common path keeps
+        its old behaviour exactly), otherwise from a CHILD PROCESS,
+        calling `render` when it arrives.
+
+        Why: the display path read the MIP on the GUI thread. Idle that
+        is 0.12 s, but while cell alignment has 16 children streaming
+        ~278 MB stacks off the same local disk (measured ~51 MB/s for
+        stack reads on G:), the same read stalls for seconds to minutes
+        and the window goes Not Responding -- reported, for FOVs the
+        alignment never touched. A process, not a thread, because h5py
+        holds ONE lock per process for every call (this module's own
+        measurement: a 16.5 ms MIP open became 2043 ms behind a
+        background thread doing HDF5).
+
+        render(mip) is called with None when the hybe is not ingested.
+        Returns True when it rendered synchronously.
+        """
+        key = (storage_path, int(fov), hybe, int(channel))
+        cache = getattr(self, '_mip_cache', None)
+        if cache is None:
+            cache = self._mip_cache = collections.OrderedDict()
+        if key in cache:
+            cache.move_to_end(key)
+            render(cache[key])
+            return True
+
+        def _done(results):
+            mip = results[0]
+            cache[key] = mip
+            while len(cache) > self._MIP_CACHE_MAX:
+                cache.popitem(last=False)
+            self.statusBar().clearMessage()
+            render(mip)
+
+        def _fail(message):
+            self.log(f'MIP read failed for FOV{fov:03d} {hybe} '
+                     f'ch{channel}: {message}')
+            render(None)
+
+        self.statusBar().showMessage(
+            f'Loading FOV{fov:03d} {hybe} ch{channel}...')
+        worker = ProcWorker([(analysis_store.read_hybe_mip,
+                              (storage_path, fov, hybe, channel))])
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_fail)
+        self._mip_workers = getattr(self, '_mip_workers', [])
+        self._mip_workers = [w for w in self._mip_workers if w.isRunning()]
+        self._mip_workers.append(worker)      # keep a reference
+        worker.start()
+        return False
+
     def _load_fov_spot_display(self, keep_view=False):
         """
         FOV view -- the full raw hybe/channel MIP with BOTH the current
@@ -5277,7 +5351,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if not storage_path or fov is None or not hybe or not channel_text:
             return
         channel = int(channel_text)
-        mip = analysis_store.read_hybe_mip(storage_path, fov, hybe, channel)
+        # The MIP read goes to a CHILD PROCESS on a cache miss (see
+        # _mip_then): everything below is in-memory work plus matplotlib,
+        # so only this one read ever blocked the GUI thread.
+        return self._mip_then(storage_path, fov, hybe, channel,
+                              lambda mip: self._render_fov_spot_display(
+                                  mip, storage_path, fov, hybe, channel,
+                                  modality, keep_view))
+
+    def _render_fov_spot_display(self, mip, storage_path, fov, hybe, channel,
+                                 modality, keep_view=False):
+        """The FOV view's in-memory half -- see _load_fov_spot_display,
+        which resolves the MIP (possibly off-thread) and calls this."""
+        sp = self.ui.SpotLocalizationPanel
         if mip is None:
             self.log(f'{hybe} ch{channel} not ingested for FOV{fov:03d} -- ingest it first.')
             return
