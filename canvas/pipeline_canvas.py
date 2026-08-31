@@ -1163,9 +1163,12 @@ class PipelineCanvas():
         DNA-first-hub configuration (confirmed by audit). Callers pass
         the names they already hold locally -- no I/O here, per P1.
         """
-        mip_fn = analysis_store.fiducial_channel_mip if channel_type == 'fiducial' else analysis_store.readout_channel_mip
-        rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
-        dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
+        # channel_mip resolves 'fiducial'/'readout'/a concrete channel
+        # alike -- same generalization as the alignment fit itself
+        rna_mip = analysis_store.channel_mip(rna_storage_path, fov,
+                                             rna_reference_hybe, channel_type)
+        dna_mip = analysis_store.channel_mip(dna_storage_path, fov,
+                                             dna_reference_hybe, channel_type)
 
         h, w = rna_mip.shape
         H_rna_within = _bare_hybe(rna_fov_matrices).get(rna_reference_hybe, np.eye(3))

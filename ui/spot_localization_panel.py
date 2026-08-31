@@ -328,21 +328,28 @@ class SpotLocalizationPanelUI(object):
     def _on_hybe_changed(self):
         data = self.HybeComboBox.currentData()
         record = data[0] if data is not None else None
+        # PRESERVE the chosen channel across hybe changes (per request:
+        # switching the hybe used to reset the channel every time) --
+        # only when the new hybe lacks it does the selection move, and
+        # then to the first READOUT channel, never the fiducial (spots
+        # live in the signal channel).
+        previous = self.ChannelComboBox.currentText()
         # blockSignals so clear()+addItems() reads as one atomic "channel
         # list changed" update, not a transient empty-then-refilled state
         self.ChannelComboBox.blockSignals(True)
         self.ChannelComboBox.clear()
         if record is not None:
             self.ChannelComboBox.addItems([str(c) for c in record['channels']])
-            # default to the readout channel, not the fiducial one -- spots
-            # live in the actual signal channel, fiducial is only ever used
-            # for alignment/segmentation elsewhere in this app
-            fiducial = record.get('fiducial_channel')
-            readout_channels = [c for c in record['channels'] if c != fiducial]
-            if readout_channels:
-                idx = self.ChannelComboBox.findText(str(readout_channels[0]))
-                if idx >= 0:
-                    self.ChannelComboBox.setCurrentIndex(idx)
+            idx = self.ChannelComboBox.findText(previous) if previous else -1
+            if idx < 0:
+                fiducial = record.get('fiducial_channel')
+                readout_channels = [c for c in record['channels']
+                                    if c != fiducial]
+                if readout_channels:
+                    idx = self.ChannelComboBox.findText(
+                        str(readout_channels[0]))
+            if idx >= 0:
+                self.ChannelComboBox.setCurrentIndex(idx)
         self.ChannelComboBox.blockSignals(False)
         self.ChannelComboBox.currentIndexChanged.emit(self.ChannelComboBox.currentIndex())
 

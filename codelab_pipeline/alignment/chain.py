@@ -909,6 +909,18 @@ def max_alignment_workers(hard_ceiling=32):
 # docstring for why it is these three and nothing else) is faithful, not
 # approximate.
 
+class CellOffFrameError(ValueError):
+    """The cell's mask, projected into a pass's reference-hybe frame,
+    lands entirely outside the image: the cell is simply not visible in
+    that modality's view (the two cameras' frames overlap imperfectly --
+    measured up to ~28 px of bridge shift on real data, enough to carry
+    a thin edge cell wholly off-frame). Callers SKIP that pass: the cell
+    keeps FOV/bridge-level transforms for that modality, per the
+    absence-of-alignment-is-identity principle. It must never abort a
+    batch -- one real store held exactly 2 such slivers among 1091
+    cells, and aborting cost the other 1089 their run."""
+
+
 def _init_cell_align_worker():
     """One cv2 thread per child -- same oversubscription guard as the pools
     above; the fit maths here is small, the reads are the real cost."""
@@ -929,14 +941,20 @@ def _align_one_cell(task):
     arrays back per cell would be pure overhead.
     """
     cell, fov, passes, channel_type, pad, z_max_shift = task
+    skipped = []
     for p in passes:
-        compute_cell_alignment(
-            cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
-            reference_hybe=p['reference_hybe'], channel_type=channel_type,
-            pad=pad, modality=p['modality'],
-            cell_reference_hybe_matrix=p['cellref_matrix'],
-            z_max_shift=z_max_shift)
-    return fov, cell.id, cell.matrices, cell.matrix_anchors, cell.matrix_provenance
+        try:
+            compute_cell_alignment(
+                cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
+                reference_hybe=p['reference_hybe'], channel_type=channel_type,
+                pad=pad, modality=p['modality'],
+                cell_reference_hybe_matrix=p['cellref_matrix'],
+                z_max_shift=z_max_shift)
+        except CellOffFrameError as e:
+            # skip THIS pass, keep the others (see the class docstring)
+            skipped.append(f"{p['modality']}: {e}")
+    return (fov, cell.id, cell.matrices, cell.matrix_anchors,
+            cell.matrix_provenance, skipped)
 
 
 def max_cell_alignment_workers(hard_ceiling=16):
@@ -1115,10 +1133,14 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     report the bridge's fit quality, not just its dx/dy/angle.
     """
     # Cross-modality alignment is not one of the 3D exceptions -- reads
-    # vlinks.h5's real MIP copies, never the raw stack file.
-    mip_fn = analysis_store.fiducial_channel_mip if channel_type == 'fiducial' else analysis_store.readout_channel_mip
-    rna_mip = mip_fn(rna_storage_path, fov, rna_reference_hybe)
-    dna_mip = mip_fn(dna_storage_path, fov, dna_reference_hybe)
+    # vlinks.h5's real MIP copies, never the raw stack file. channel_mip
+    # resolves 'fiducial'/'readout'/a CONCRETE channel value alike (the
+    # old either/or branch silently read the readout MIP for a concrete
+    # choice -- exactly the second-readout channel it was picked FOR).
+    rna_mip = analysis_store.channel_mip(rna_storage_path, fov,
+                                         rna_reference_hybe, channel_type)
+    dna_mip = analysis_store.channel_mip(dna_storage_path, fov,
+                                         dna_reference_hybe, channel_type)
     if rna_mip is None or dna_mip is None:
         # real modality names, not the historical RNA/DNA slot names --
         # the positional slots carry shared/moving semantics since the
@@ -1289,11 +1311,23 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
 
 def pick_channel_by_type(record, channel_type):
-    """'readout' -> that hybe's one non-fiducial channel (falls back to
-    fiducial if a hybe genuinely has none); 'fiducial' -> always fiducial."""
+    """Resolve a channel CHOICE to this hybe's actual channel.
+
+    'fiducial' -> always the fiducial; 'readout' -> the FIRST
+    non-fiducial in the layout's channel order (falls back to fiducial
+    if a hybe genuinely has none). Any other value is a CONCRETE
+    channel (e.g. '488' -- the generalization the two role labels
+    could not express once hybes carry more than one readout channel,
+    per report): used when this hybe has it, else the readout rule --
+    per-hybe channel lists differ, and a hybe lacking the requested
+    wavelength still needs SOME same-role crop to align."""
     fiducial = record['fiducial_channel']
     if channel_type == 'fiducial':
         return fiducial
+    if channel_type != 'readout':
+        for c in record['channels']:
+            if str(c) == str(channel_type):
+                return c
     readout = [c for c in record['channels'] if c != fiducial]
     return readout[0] if readout else fiducial
 
@@ -1530,7 +1564,41 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     ctx['ref_channel'] = ref_channel
     ref_result = _cell_native_crop(ctx, reference_hybe, ref_channel)
     if ref_result is None:
-        raise ValueError(f"Cell {cell.id} doesn't overlap reference hybe {reference_hybe}'s frame")
+        # No reference crop exists to fit ANY of this pass's hybes
+        # against -- the cell is wholly outside this modality's view.
+        # Per the same principle as the per-hybe no-overlap branch in
+        # _cell_hybe_task (omitting entries was that code's own
+        # confirmed-wrong earlier behavior): write explicit IDENTITY
+        # residuals with honest provenance for the whole pass, so reads
+        # compose the FOV/cross-modal matrices alone and append mode
+        # sees the pass as done -- then raise so callers log the skip.
+        H_ref_to_shared = fov_matrices.get(
+            (reference_hybe, fov_matrices.modality), np.eye(3))
+        cell.matrix_anchors[modality] = H_ref_to_shared
+        for record in hybe_records:
+            key = (record['folder'], modality)
+            cell.matrices[key] = {'yx': np.eye(3), 'dz': 0.0,
+                                  'yx_is_residual': True}
+            if record['folder'] == reference_hybe:
+                # the reference carries no provenance entry -- and a
+                # stale one from a run where it wasn't reference must go
+                cell.matrix_provenance.pop(key, None)
+                continue
+            H1 = compose_chain([
+                fov_matrices.get((record['folder'], fov_matrices.modality),
+                                 np.eye(3)),
+                la.inv(H_ref_to_shared)])
+            cell.matrix_provenance[key] = {
+                'reference_sequence':
+                    f'{record["folder"]}(cell {cell.id})->{reference_hybe} '
+                    f'[cell-level residual SKIPPED: cell does not overlap '
+                    f'reference hybe {reference_hybe}\'s frame, fell back '
+                    f'to FOV/cross-modal only]',
+                'steps': np.stack([H1, np.eye(3)]),
+            }
+        raise CellOffFrameError(
+            f"Cell {cell.id} doesn't overlap reference hybe "
+            f"{reference_hybe}'s frame")
     reference_crop, ref_window = ref_result
     ctx['ref_window'] = ref_window
     # Optional background suppression, computed ONCE for reference_crop

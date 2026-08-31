@@ -424,6 +424,53 @@ def _restore_missing_mip(storage_path, fov, folder, channels, fiducial_channel):
         return False
 
 
+def publish_stack(stack_h5name, attributes, channel_arrays, storage_path,
+                  fov, folder, fiducial_channel):
+    """The ONE stack-publishing door, shared by every ingestion path
+    (DAX today, TIFF via tiff_ingestion) so a reader can never tell
+    which produced a file.
+
+    channel_arrays: {channel: (height, width, depth) uint16-able} --
+    z-LAST, the store's one axis order. Writes the .part with the
+    measured chunking/compression, reads the MIPs back out of the .part
+    BEFORE the atomic os.replace publish, then writes the per-hybe MIP
+    file whose existence is the ingestion-complete flag. Returns None on
+    success or an error string; never raises for Exception-class
+    failures, and always discards its .part on the way out of one.
+    """
+    tmp_h5name = stack_h5name + '.part'
+    try:
+        with h5py.File(tmp_h5name, 'w') as f:
+            stack_group = f.create_group('/stack')
+            mip_group = f.create_group('/mip')
+            f.attrs.update(attributes)
+            for ch, dat in channel_arrays.items():
+                # the measured NAS-crop chunking, clamped to the data --
+                # h5py refuses a chunk larger than the dataset on any axis
+                chunks = (min(dat.shape[0], 32), min(dat.shape[1], 32),
+                          min(dat.shape[-1], 64))
+                stack_group.create_dataset(f'ch{ch}', data=dat, dtype='uint16',
+                                           chunks=chunks,
+                                           compression='gzip',
+                                           compression_opts=1, shuffle=True)
+                create_or_replace_dataset(mip_group, f'ch{ch}',
+                                          np.max(dat, axis=-1), 'uint16')
+        with h5py.File(tmp_h5name, 'r') as f:
+            channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channel_arrays}
+        os.replace(tmp_h5name, stack_h5name)
+        from . import analysis_store
+        analysis_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
+                                      fiducial_channel=fiducial_channel)
+        logging.info(f'Published FOV {fov}, hybe {folder}')
+        return None
+    except BaseException as e:
+        logging.error(f'Error publishing FOV {fov}, hybe {folder}: {e}')
+        _discard_partial(tmp_h5name)
+        if not isinstance(e, Exception):
+            raise
+        return str(e)
+
+
 def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False):
     """
     Convert one FOV's raw .dax for one hybe into a per-(fov,hybe) H5 file,
@@ -484,74 +531,30 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
             'path': dax_path,
         }
 
-        # ATOMIC PUBLISH: build into a sibling .part and os.replace it into
-        # position only once it is complete and closed. The old code did
-        # os.remove(stack) and then rebuilt in place, so the file was missing
-        # or half-written for the entire multi-second write -- kill the run in
-        # that window (a user quitting an overwrite pass) and the stack is
-        # destroyed, with its MIP left behind from the previous run to make it
-        # look ingested. os.replace is atomic on Windows and POSIX alike for
-        # same-directory paths, so a reader sees either the old complete file
-        # or the new complete one, never a partial.
-        #
-        # Peak extra disk is bounded by CONCURRENT workers, not by store size:
-        # one .part per worker in flight, so ~278 MB x n_workers (~3.3 GB at
-        # 12 workers on this dataset), released as each is published.
-        tmp_h5name = stack_h5name + '.part'
-        with h5py.File(tmp_h5name, 'w') as f:
-            # No /matrix group: alignment matrices are metadata and live in
-            # vlinks.h5 alone (see chain.write_same_modality_matrices). A
-            # stack file holds raw data plus the MIP derived from it in this
-            # same pass -- nothing mutable, so nothing here can go stale.
-            stack_group = f.create_group('/stack')
-            mip_group = f.create_group('/mip')
-            f.attrs.update(attributes)
-
-            dat = None
-            for cid, ch in enumerate(channels):
-                dat = dax[:, :, cid::len(channels)]
-                if dat.shape[-1] != expected_depth:
-                    # Layout and actual DAX content disagree -- surface it loudly
-                    # rather than silently ingesting a shape the layout didn't predict.
-                    raise ValueError(f'depth mismatch for {folder} ch{ch}: DAX has '
-                                     f'{dat.shape[-1]} z-planes, ExperimentLayout '
-                                     f'totalFrames predicts {expected_depth}')
-                # Chunked + lightly compressed, sized for the pipeline's
-                # real access pattern: small-XY x deep-Z crops (3D
-                # localization, chromatin tracing). On the measured NAS
-                # (12.6 ms per scattered read) a contiguous stack made one
-                # 17x17xZ crop ~3.6 s (289 scattered runs); (32, 32,
-                # z-slab) chunks make it a handful of contiguous chunk
-                # reads (~0.1 s), and partial-Z access stays partial --
-                # chunks decompress independently, so only the z-slabs
-                # overlapping a request are touched.
-                zslab = min(dat.shape[-1], 64)
-                stack_group.create_dataset(f'ch{ch}', data=dat, dtype='uint16',
-                                           chunks=(32, 32, zslab),
-                                           compression='gzip', compression_opts=1,
-                                           shuffle=True)
-                create_or_replace_dataset(mip_group, f'ch{ch}', np.max(dat, axis=-1), 'uint16')
-            attributes['shape'] = dat.shape
-            f.attrs.update(attributes)
-        # Read the MIPs back out of the .part BEFORE publishing, so a
-        # failure here still leaves the previous stack untouched.
-        with h5py.File(tmp_h5name, 'r') as f:
-            channel_mips = {ch: f[f'/mip/ch{ch}'][:] for ch in channels}
-
-        os.replace(tmp_h5name, stack_h5name)
-
-        if channel_mips is not None:
-            # this worker writes the per-hybe MIP file itself
-            # (atomically -- see analysis_store.write_hybe_mip), so the
-            # coordinator never touches MIPs and the analysis store sees
-            # no ingestion traffic at all: the UI stays live mid-ingestion
-            # and each hybe becomes browsable the moment ITS file lands.
-            # Written AFTER the stack is published, so the only interruption
-            # window left leaves a complete stack with a stale MIP -- fully
-            # recoverable, since the MIP is derived from the stack.
-            from . import analysis_store
-            analysis_store.write_hybe_mip(storage_path, fov, folder, channel_mips,
-                                        fiducial_channel=hybe_record['fiducial_channel'])
+        # De-interleave every channel (views into the one dax array -- no
+        # copies), validating depth per channel: layout and actual DAX
+        # content disagreeing must surface loudly, never ingest a shape
+        # the layout didn't predict.
+        channel_arrays = {}
+        for cid, ch in enumerate(channels):
+            dat = dax[:, :, cid::len(channels)]
+            if dat.shape[-1] != expected_depth:
+                raise ValueError(f'depth mismatch for {folder} ch{ch}: DAX has '
+                                 f'{dat.shape[-1]} z-planes, ExperimentLayout '
+                                 f'totalFrames predicts {expected_depth}')
+            channel_arrays[ch] = dat
+        attributes['shape'] = next(iter(channel_arrays.values())).shape
+        # The shared atomic door (publish_stack): .part build with the
+        # measured (32, 32, z-slab) gzip chunking, MIPs read back before
+        # the os.replace publish, then the per-hybe MIP file whose
+        # existence is the ingestion flag. One door for every ingestion
+        # path -- see publish_stack's own docstring; the peak-disk and
+        # crash-window analyses that used to live inline here are its.
+        err = publish_stack(stack_h5name, attributes, channel_arrays,
+                            storage_path, fov, folder,
+                            hybe_record['fiducial_channel'])
+        if err is not None:
+            return fov, folder, err
         logging.info(f'Converted FOV {fov}, hybe {folder} ({modality})')
         return fov, folder, None
     except FileNotFoundError:

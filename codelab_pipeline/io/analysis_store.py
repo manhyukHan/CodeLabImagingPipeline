@@ -1035,6 +1035,13 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
         f.attrs['coordinate_order'] = 'yx'
         if fiducial_channel is not None:
             f.attrs['fiducial_channel'] = int(fiducial_channel)
+        # LAYOUT order, stamped: h5py iterates keys alphabetically, and
+        # with >1 readout channel readout_channel_mip's pick must agree
+        # with every layout-order picker (pick_channel_by_type et al.),
+        # not with ASCII ('ch488' sorts before 'ch647' -- the 3-channel
+        # audit's one real inconsistency)
+        f.attrs['channel_list'] = np.array(
+            [str(c) for c in channel_mips], dtype='S')
         for ch, mip in channel_mips.items():
             f.create_dataset(f'ch{ch}', data=np.asarray(mip),
                              chunks=True, compression='gzip', compression_opts=1)
@@ -1072,20 +1079,44 @@ def fiducial_channel_mip(storage_path, fov, hybe):
 
 
 def readout_channel_mip(storage_path, fov, hybe):
-    """The one non-fiducial channel's MIP for a hybe (falls back to the
-    fiducial when the hybe genuinely has no other channel); None if not
-    ingested/stamped."""
+    """The FIRST non-fiducial channel's MIP for a hybe -- first in the
+    LAYOUT's channel order (the stamped channel_list attr), which is the
+    convention every channel-type picker follows; falls back to the
+    fiducial when the hybe genuinely has no other channel. Files stamped
+    before channel_list existed degrade to alphabetical key order --
+    identical behavior for the one-readout stores that predate it.
+    Returns None if not ingested/stamped."""
     try:
         with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
             if 'fiducial_channel' not in f.attrs:
                 return None
             fid = str(int(f.attrs['fiducial_channel']))
-            chans = [k[2:] for k in f.keys() if k.startswith('ch')]
+            if 'channel_list' in f.attrs:
+                chans = [c.decode() if isinstance(c, bytes) else str(c)
+                         for c in f.attrs['channel_list']]
+            else:
+                chans = [k[2:] for k in f.keys() if k.startswith('ch')]
             readout = [c for c in chans if c != fid]
             name = f'ch{readout[0]}' if readout else f'ch{fid}'
             return f[name][:] if name in f else None
     except OSError:
         return None
+
+
+def channel_mip(storage_path, fov, hybe, channel_choice):
+    """MIP for a channel CHOICE: 'fiducial', 'readout', or a CONCRETE
+    channel value (the generalization beyond the two role labels --
+    with >1 readout channel, 'readout' can only ever name the first).
+    A concrete channel the hybe lacks falls back to the readout rule,
+    the same convention as chain.pick_channel_by_type; None if not
+    ingested."""
+    if channel_choice == 'fiducial':
+        return fiducial_channel_mip(storage_path, fov, hybe)
+    if channel_choice != 'readout':
+        m = read_hybe_mip(storage_path, fov, hybe, channel_choice)
+        if m is not None:
+            return m
+    return readout_channel_mip(storage_path, fov, hybe)
 
 
 def mip_channels_present(storage_path, fov, hybe):

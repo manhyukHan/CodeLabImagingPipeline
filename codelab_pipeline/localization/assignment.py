@@ -203,3 +203,69 @@ def recast_spots_to_shared(spots, matrix_to_shared, cells_by_id):
         if _apply_transform(spot, resolve(spot.hybe, getattr(spot, 'modality', '') or '', owner)):
             n += 1
     return n
+
+
+def recast_fov_spots_worker(payload):
+    """One FOV's full post-matrix-write spot recast, in a CHILD PROCESS.
+
+    Top-level and Qt-free by contract (spawn pickles it), and a PROCESS
+    rather than a thread because every read/write here is HDF5: h5py
+    takes one lock per PROCESS for every call, so doing this work in a
+    background THREAD of the GUI process still stalls the GUI's own
+    image loads (measured on the real store: a 16.5 ms MIP open became
+    2043 ms). That is precisely what made Spot Localization and Cell
+    Segmentation crawl during an all-FOVs cell alignment, whatever FOV
+    was on screen.
+
+    payload: (any_path, fov, storage_path_by_modality, resolver) --
+    `resolver` is a plain-data FrameResolver built by the caller for
+    THIS fov (it pickles by design; see analysis/resolvers.py).
+
+    Returns (fov, n_spots, error_or_None). Never raises: one bad FOV
+    must not abort a batch.
+    """
+    from codelab_pipeline.io import analysis_store
+    from codelab_pipeline.models.cell_container import CellContainer
+    from codelab_pipeline.models.spot import ASpot
+    any_path, fov, storage_path_by_modality, resolver = payload
+    try:
+        dicts = analysis_store.read_spots(any_path, fov)
+        if not dicts:
+            return fov, 0, None
+        spots = []
+        for d in dicts:
+            spot = ASpot()
+            spot.set_metadata(**d)
+            spots.append(spot)
+        cell_dicts, cells_modality = analysis_store.read_cells(any_path, fov)
+        cells = (CellContainer.load({fov: cell_dicts}, modality=cells_modality)
+                 .get_cells(fov) if cell_dicts else [])
+        cells_by_id = {c.id: c for c in cells}
+
+        def to_shared(hybe, modality, owner):
+            # ONE resolver for the whole FOV; the cell leg is an argument
+            # to to_shared, so per-cell resolvers were never needed
+            fallback = owner.reference_modality if owner is not None else None
+            m = modality or fallback
+            if resolver.shared is None:
+                return None
+            return (resolver.to_shared(hybe, m, owner),
+                    resolver.z_to_shared(hybe, m, owner))
+
+        if cells:
+            assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
+                         matrix_to_shared=to_shared)
+        else:
+            recast_spots_to_shared(spots, to_shared, cells_by_id)
+
+        by_slice = {}
+        for spot in spots:
+            by_slice.setdefault(
+                (spot.modality, spot.hybe, int(spot.channel)), []).append(spot)
+        for (modality, hybe, channel), slice_spots in by_slice.items():
+            path = storage_path_by_modality.get(modality) or any_path
+            analysis_store.write_spots(path, fov, modality, hybe, channel,
+                                       slice_spots)
+        return fov, len(spots), None
+    except Exception as e:
+        return fov, 0, f'{type(e).__name__}: {e}'

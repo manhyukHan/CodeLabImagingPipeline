@@ -116,8 +116,8 @@ class AnalysisWiring(QtCore.QObject):
                     p.SourceListWidget.addItem(item)
             tree[modality] = entries
         for picker in (p.SourceAPicker, p.SourceBPicker,
-                       p.ViewExprSourcePicker, p.ViewDistSourceAPicker,
-                       p.ViewDistSourceBPicker):
+                       p.ViewExprSourcePicker, p.ViewExprNormRefPicker,
+                       p.ViewDistSourceAPicker, p.ViewDistSourceBPicker):
             picker.populate(tree)
         for ch in sorted(all_channels):
             p.BulkChannelComboBox.addItem(str(ch))
@@ -530,14 +530,25 @@ class AnalysisWiring(QtCore.QObject):
         """
         pop = self.pop
         cond = self.condition()
-        cmask = cond.mask(pop)
-        gated = pop.cells.loc[np.asarray(cmask, bool), ['fov', 'cell',
-                                                        'celltype']]
         mode = self.panel.AlleleModeComboBox.currentIndex()
         has_allele_pred = any(getattr(p_, 'level', 'cell') == 'allele'
                               for p_ in cond.predicates)
         if mode == 0 or not has_allele_pred or pop.alleles is None:
-            return {'gated': gated}
+            cmask = cond.mask(pop)
+            return {'gated': pop.cells.loc[np.asarray(cmask, bool),
+                                           ['fov', 'cell', 'celltype']]}
+        # decompose modes base on the CELL-LEVEL predicates only (per
+        # request): the full gate projects allele predicates onto cells,
+        # which empties the Absence group BY CONSTRUCTION -- a cell
+        # whose alleles all lack the barcode never passed the gate at
+        # all. Cell gates narrow first; the allele gate then PARTITIONS,
+        # absence included.
+        cell_only = gate.Condition(clauses=[
+            [p_ for p_ in clause if getattr(p_, 'level', 'cell') == 'cell']
+            for clause in cond.clauses])
+        cmask = cell_only.mask(pop)
+        gated = pop.cells.loc[np.asarray(cmask, bool), ['fov', 'cell',
+                                                        'celltype']]
         amask = cond.allele_mask(pop)
         al = pop.alleles
         adf = pd.DataFrame({'fov': al['fov'], 'cell': al['cell'],
@@ -567,6 +578,30 @@ class AnalysisWiring(QtCore.QObject):
             if src is None:
                 raise ValueError('pick the expression source (section 3)')
             metric = self.panel.ViewExprMetricComboBox.currentText()
+            # the view's OWN normalization (per request) -- same semantics
+            # as the gate's: by_modality / by_source with its reference
+            norm_mode = self.panel.ViewExprNormComboBox.currentText()
+            normalize = None
+            if norm_mode == 'by_modality':
+                normalize = ['by_modality']
+            elif norm_mode == 'by_source':
+                ref = self.panel.ViewExprNormRefPicker.current()
+                if ref is None:
+                    raise ValueError("normalize 'by_source' divides by the "
+                                     'same metric of the norm reference -- '
+                                     'pick it (section 3)')
+                normalize = ['by_source', list(ref)]
+            table = pop.expression
+            metric_col = metric
+            if normalize:
+                ref_t = (tuple(normalize[1]) if len(normalize) > 1 else None)
+                table = expression.normalize(table, metric, normalize[0],
+                                             ref_source=ref_t)
+                metric_col = f'{metric}_norm'
+            label = self._source_label(src)
+            nl = self._norm_label(normalize)
+            if nl:
+                label = f'{label}\n{nl}'
             groups = self._allele_cell_groups()
             import matplotlib.pyplot as plt
             n = len(groups)
@@ -574,14 +609,15 @@ class AnalysisWiring(QtCore.QObject):
                                      squeeze=False)
             for ax, (gname, cells_df) in zip(axes[0], groups.items()):
                 figures.expression_hist_ax(
-                    ax, self._rows_for_cells(pop.expression, cells_df),
-                    src, metric, label=self._source_label(src),
+                    ax, self._rows_for_cells(table, cells_df),
+                    src, metric_col, label=label,
                     per_celltype=self.panel.CelltypeDecomposeCheckBox.isChecked())
                 ax.set_title(f'{gname} ({len(cells_df)} cells)\n'
                              + ax.get_title(), fontsize=9)
             self._show(fig, 'expression_hist',
-                       {'expression': pop.expression},
+                       {'expression': table},
                        params={'source': list(src), 'metric': metric,
+                               'normalize': normalize,
                                'allele_mode':
                                self.panel.AlleleModeComboBox.currentText()})
         self._guard(go)

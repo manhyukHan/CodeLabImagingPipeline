@@ -636,7 +636,8 @@ class CellAlignmentWorker(QtCore.QThread):
                 try:
                     futures = {executor.submit(alignment._align_one_cell, t): t for t in tasks}
                     for future in as_completed(futures):
-                        fov, cell_id, matrices, anchors, provenance = future.result()
+                        (fov, cell_id, matrices, anchors, provenance,
+                         skipped) = future.result()
                         # The commit. The child mutated a pickled copy that
                         # started from this exact cell's state, so its end
                         # state IS the serial end state -- replace the three
@@ -648,8 +649,11 @@ class CellAlignmentWorker(QtCore.QThread):
                         real.matrix_provenance = provenance
                         n_passes = len(futures[future][2])
                         done += max(n_passes, 1)
+                        note = (' -- SKIPPED ' + '; '.join(skipped)
+                                if skipped else '')
                         self.progress.emit(done, total,
-                                           f'FOV{fov:03d} cell {cell_id}: aligned ({n_passes} pass(es))')
+                                           f'FOV{fov:03d} cell {cell_id}: aligned '
+                                           f'({n_passes} pass(es)){note}')
                 finally:
                     # cancel_futures so one cell's real failure (e.g. "cell
                     # doesn't overlap reference hybe") aborts the run promptly
@@ -679,15 +683,24 @@ class CellAlignmentWorker(QtCore.QThread):
                 try:
                     for cell, fov, passes, channel_type, pad, z_max_shift in tasks:
                         for p in passes:
-                            alignment.compute_cell_alignment(
-                                cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
-                                reference_hybe=p['reference_hybe'], channel_type=channel_type,
-                                pad=pad, modality=p['modality'],
-                                cell_reference_hybe_matrix=p['cellref_matrix'],
-                                z_max_shift=z_max_shift, executor=hybe_pool)
+                            try:
+                                alignment.compute_cell_alignment(
+                                    cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
+                                    reference_hybe=p['reference_hybe'], channel_type=channel_type,
+                                    pad=pad, modality=p['modality'],
+                                    cell_reference_hybe_matrix=p['cellref_matrix'],
+                                    z_max_shift=z_max_shift, executor=hybe_pool)
+                                note = 'aligned'
+                            except alignment.CellOffFrameError as e:
+                                # off-frame in THIS pass's reference view:
+                                # skip the pass, keep the cell's others --
+                                # never abort the run (see the class
+                                # docstring; 2/1091 real cells, and the
+                                # abort cost the other 1089 their save)
+                                note = f'SKIPPED ({e})'
                             done += 1
                             self.progress.emit(done, total,
-                                               f"FOV{fov:03d} cell {cell.id} ({p['modality']}): aligned")
+                                               f"FOV{fov:03d} cell {cell.id} ({p['modality']}): {note}")
                 finally:
                     if hybe_pool is not None:
                         hybe_pool.shutdown(wait=True, cancel_futures=True)
@@ -1419,6 +1432,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.ViewerHybeComboBox.currentIndexChanged.connect(lambda: self._show_mip_viewer(silent=True) if self.mip_viewer.isVisible() else None)
         ip.ViewerChannelComboBox.currentIndexChanged.connect(lambda: self._show_mip_viewer(silent=True) if self.mip_viewer.isVisible() else None)
         ip.CheckIngestionStatusPushButton.clicked.connect(lambda: self._check_ingestion_status(silent=False))
+        ip.IngestFromTiffPushButton.clicked.connect(self._show_tiff_ingest_dialog)
         ip.ShowCellSpotStatusDisplayerPushButton.clicked.connect(self._show_cell_spot_status_displayer)
         ip.AddJobPushButton.clicked.connect(self._add_job_to_queue)
         ip.RemoveJobPushButton.clicked.connect(self._remove_selected_jobs)
@@ -1553,6 +1567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.SaveAllelesPushButton.clicked.connect(self._save_chromatin_alleles)
         chp.RevertAllelesPushButton.clicked.connect(self._revert_chromatin_alleles)
         chp.ViewCropPushButton.clicked.connect(self._view_chromatin_trace_crop)
+        chp.ViewStoredPushButton.clicked.connect(self._view_chromatin_trace_stored)
         # NOT the bare method: clicked passes its `checked` bool as the
         # first positional argument, which would arrive as fov_subset=False
         # and crash on iteration ({int(f) for f in False}). Confirmed real.
@@ -2099,6 +2114,13 @@ class MainWindow(QtWidgets.QMainWindow):
         ip.populate_viewer_hybe_choices(self.total_active_hybe_list)
         ap.populate_cell_reference_hybe_choices(self.total_active_hybe_list)
         ap.populate_cross_modal_reference_hybe_choices(self.total_active_hybe_list)
+        all_channels = sorted(
+            {ch for records in (self.hybe_records_by_modality or {}).values()
+             for r in records for ch in r.get('channels', [])},
+            key=str)
+        ap.populate_channel_choices(all_channels)
+        self.ui.ChromatinTracingPanel.populate_readout_channel_choices(
+            all_channels)
 
         chp = self.ui.ChromatinTracingPanel
         chp.populate_hybe_list(self.total_active_hybe_list, default_checked=self._default_chromatin_tracing_hybes)
@@ -5414,7 +5436,11 @@ class MainWindow(QtWidgets.QMainWindow):
         localization data (that's coordinate/raw_coordinate themselves).
         """
         status = getattr(spot, '_z_status', None)
-        return {'accepted': 'Z-accepted', 'rejected': 'Z-rejected'}.get(status, 'Z-not run')
+        text = {'accepted': 'Z-accepted', 'rejected': 'Z-rejected'}.get(status, 'Z-not run')
+        reason = getattr(spot, '_z_reason', None)
+        if status == 'rejected' and reason:
+            text += f' ({reason})'      # the v2 gate's own words
+        return text
 
     def _refresh_localize_3d_spot_choices(self, preserve_selected_ids=None):
         """
@@ -5551,6 +5577,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         storage_path, fov, hybe, modality, channel, targets = resolved
         params = self.localize_3d_displayer.params()
+        params['voxel_um'] = self._voxel_um()   # the v2 engine fits in um
 
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
         # ONE resolver for the whole batch, complete for XY and Z alike:
@@ -5581,22 +5608,26 @@ class MainWindow(QtWidgets.QMainWindow):
             elapsed = time.perf_counter() - t_start
             # index-keyed: the child refined COPIES of these spots, so
             # results are mapped back onto this process's own objects
-            refined = [(targets[i][0], coord, raw, mix)
-                       for i, coord, raw, mix, _c, _ct in results[0]]
+            refined = [(targets[i][0], coord, raw, mix, reason)
+                       for i, coord, raw, mix, _c, _ct, reason in results[0]]
             fp_undo = self._begin_spot_edit(fov)
             n_refined = 0
             n_mixture = 0
-            for spot, new_coordinate, new_raw, mixture_centroids in refined:
+            for spot, new_coordinate, new_raw, mixture_centroids, reason in refined:
                 if new_coordinate is not None:
                     spot.adj_coordinate = new_coordinate
                     spot.raw_coordinate = new_raw
                     spot._z_status = 'accepted'
+                    spot._z_reason = None
                     spot.mixture_centroids = mixture_centroids
                     n_refined += 1
                     if mixture_centroids:
                         n_mixture += 1
                 else:
                     spot._z_status = 'rejected'
+                    # the v2 gate's own words (session-transient, like
+                    # _z_status) -- shown in the spot list's status text
+                    spot._z_reason = reason
             # one undo step covers the whole batch
             self._commit_spot_edit(fov, fp_undo)
 
@@ -5641,6 +5672,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         storage_path, fov, hybe, modality, channel, targets = resolved
         params = self.localize_3d_displayer.params()
+        params['voxel_um'] = self._voxel_um()   # the v2 engine fits in um
 
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
         resolver = self._frame_resolver(None, fov)  # same resolver _run_3d_localize uses, so
@@ -5669,9 +5701,18 @@ class MainWindow(QtWidgets.QMainWindow):
             # titles are re-attached HERE because they were resolved from
             # session containers on the GUI thread.
             grid_results, n_would_accept, n_would_be_mixture = [], 0, 0
-            for i, _coord, new_raw, mixture_centroids, cubic, centroid in results[0]:
+            n_gated = 0
+            for i, _coord, new_raw, mixture_centroids, cubic, centroid, reason in results[0]:
                 if cubic is not None:
-                    grid_results.append((cubic, centroid, titles[i]))
+                    if new_raw is None and reason and centroid is not None:
+                        # v2 fitted-but-gate-rejected: BLUE circle at the
+                        # fitted position, reason in the title
+                        grid_results.append((cubic, None,
+                                             f'{titles[i]}\n[{reason}]',
+                                             centroid))
+                        n_gated += 1
+                    else:
+                        grid_results.append((cubic, centroid, titles[i]))
                 if new_raw is not None:
                     n_would_accept += 1
                 if mixture_centroids:
@@ -5679,8 +5720,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.localize_3d_grid_displayer.show_fit_status_grid(grid_results)
             self.localize_3d_grid_displayer.show()
             self.localize_3d_grid_displayer.raise_()
-            mode_label = 'mixture' if params['multi_mode'] else 'single'
+            mode_label = ('v2' if params.get('engine', 'v2') == 'v2'
+                          else ('mixture' if params['multi_mode'] else 'single'))
             mixture_msg = f', {n_would_be_mixture} would save >1 component as mixture_centroids' if n_would_be_mixture else ''
+            if n_gated:
+                mixture_msg += (f', {n_gated} fitted but GATE-REJECTED '
+                                f'(blue circles)')
             d.StatusLabel.setText(
                 f'{hybe} ch{channel}: PREVIEW ONLY, nothing saved -- {n_would_accept}/{len(targets)} '
                 f'selected spot(s) would be accepted{mixture_msg}. '
@@ -6171,6 +6216,90 @@ class MainWindow(QtWidgets.QMainWindow):
             raise RuntimeError('no storage path configured -- cannot allocate spot uids')
         for sp, uid in zip(missing, analysis_store.allocate_spot_uids(any_path, fov, len(missing))):
             sp.uid = int(uid)
+
+    def _start_spot_recast(self, fovs, label):
+        """Run the post-matrix-write spot recast for many FOVs OFF the
+        GUI thread, reporting progress like ingestion does.
+
+        Why background: the recast re-reads each FOV's spots and cells,
+        rebuilds a label mask per (hybe, modality), reassigns every spot
+        and rewrites every slice -- ~1 s of CPU plus several NAS
+        round-trips per FOV, measured. On the GUI thread (where it used
+        to run, once per FOV inside the alignment finish handler) that
+        froze Spot Localization and Cell Segmentation for the whole
+        alignment run, regardless of which FOV was on screen: the GUI
+        thread was busy, and every HDF5 call it made held h5py's
+        PER-PROCESS lock, which is global across files.
+
+        PROCESSES, not a thread: every read and write here is HDF5, and
+        h5py takes one lock per PROCESS for every call -- a background
+        THREAD doing this work still stalls the GUI's own image loads
+        (this module's own measurement: 16.5 ms MIP open -> 2043 ms).
+        The resolver is plain data and pickles into the child by design.
+        STAGED FOVs stay on the GUI thread: they mutate session
+        containers, and they are the cheap case (already in memory).
+        """
+        fovs = [int(f) for f in fovs]
+        if not fovs:
+            return
+        staged = [f for f in fovs if f in self._spot_loaded_fovs]
+        disk_only = [f for f in fovs if f not in self._spot_loaded_fovs]
+        for fov in staged:
+            try:
+                self._recast_persisted_spots(fov)
+            except Exception as e:
+                self.log(f'spot recast failed for FOV{fov:03d}: {e}')
+        if not disk_only:
+            return
+        any_path = next(iter(self._all_analysis_storage_paths()), None)
+        if not any_path:
+            return
+        by_modality = {m: self._storage_path_for_modality(m)
+                       for m in self.ui.IngestionPanel.modality_names}
+        jobs = []
+        for fov in disk_only:
+            # Resolver built HERE (session state), shipped as plain data.
+            # Per FOV and GUARDED: the old inline recast sat inside a
+            # try/except so one unresolvable FOV could not abort the
+            # alignment finish handler, and that property must survive
+            # the move to a worker (a store whose modality is not
+            # declared raises right here -- caught by the suite).
+            try:
+                resolver = self._frame_resolver(None, fov)
+            except Exception as e:
+                self.log(f'spot recast skipped for FOV{fov:03d}: {e}')
+                continue
+            jobs.append((assignment.recast_fov_spots_worker,
+                         ((any_path, fov, by_modality, resolver),)))
+        if not jobs:
+            return
+        self.statusBar().showMessage(
+            f'Recasting spot coordinates for {len(disk_only)} FOV(s) after '
+            f'{label} -- in the background, the app stays usable...')
+
+        def _done(results):
+            errors = [f'FOV{f:03d}: {e}' for f, _n, e in results if e]
+            if errors:
+                self.log(f'spot recast after {label}: {len(errors)} FOV(s) '
+                         f'failed -- ' + '; '.join(errors[:5]))
+            n_spots = sum(n for _f, n, _e in results)
+            self.statusBar().showMessage(
+                f'Spot coordinates recast: {n_spots} spot(s) across '
+                f'{len(results)} FOV(s) after {label}.', 5000)
+            self._refresh_spot_cell_list()
+
+        def _fail(message):
+            self.log(f'spot recast after {label} failed: {message}')
+
+        worker = ProcWorker(jobs, max_workers=min(4, len(jobs)))
+        worker.progress.connect(
+            lambda done, total: self.statusBar().showMessage(
+                f'Recasting spots after {label}: {done}/{total} FOV(s)...'))
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_fail)
+        self._spot_recast_workers = getattr(self, '_spot_recast_workers', [])
+        self._spot_recast_workers.append(worker)     # keep a reference
+        worker.start()
 
     def _recast_persisted_spots(self, fov):
         """
@@ -6798,12 +6927,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # channel is instead whichever of its real channels ISN'T the
         # fiducial one -- independent of allele.anchor_channel entirely.
         hybe_readout_channels = {}
+        # The ACTIVATED readout-channel choice (panel combo + Activate
+        # button; 'auto' = first non-fiducial). A concrete choice
+        # applies per hybe when that hybe carries it; a hybe lacking it
+        # falls back to the auto rule -- per-hybe channel lists differ.
+        chosen = chp.active_readout_channel()
         for folder in hybes:
             record = records_by_folder.get(folder)
             if record is None:
                 continue
             fiducial_channel = record['fiducial_channel']
-            readout = next((c for c in record.get('channels', []) if c != fiducial_channel), None)
+            readout = None
+            if chosen != 'auto':
+                readout = next((c for c in record.get('channels', [])
+                                if str(c) == chosen and c != fiducial_channel),
+                               None)
+            if readout is None:
+                readout = next((c for c in record.get('channels', [])
+                                if c != fiducial_channel), None)
             if readout is not None:
                 hybe_readout_channels[folder] = readout
         return hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe
@@ -7080,6 +7221,85 @@ class MainWindow(QtWidgets.QMainWindow):
             chp.populate_allele_list([])
             return
         self._refresh_chromatin_allele_lists(storage_path, chp.AlleleFovSpinBox.value())
+
+    def _view_chromatin_trace_stored(self):
+        """View WITHOUT fitting (per request: 'Fit + View' re-ran ~200
+        Gaussian fits just to look at an already-traced allele -- total
+        waste). Reads the crops around the allele's PERSISTED raw trace
+        in one child process and circles the stored positions; titles
+        carry the stored rejection reasons. Nothing is computed, nothing
+        is mutated."""
+        chp = self.ui.ChromatinTracingPanel
+        ctx = self._chromatin_tracing_context()
+        if ctx is None:
+            return
+        hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe = ctx
+        fov = chp.AlleleFovSpinBox.value()
+        allele_id = chp.current_allele_id()
+        if allele_id is None:
+            QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing',
+                                          'Select exactly one allele in the list to view.')
+            return
+        self._stage_alleles(storage_path, fov)
+        allele = self.chromatin_alleles.by_id((storage_path, int(fov)), allele_id)
+        if allele is None:
+            return
+        if not (allele.fiducial_trace_raw or allele.polymer_raw):
+            QtWidgets.QMessageBox.information(
+                self, 'Chromatin Tracing',
+                f'Allele {allele.id} carries no stored trace yet -- use '
+                f'Fit + View Crop (or Fit All FOVs) first.')
+            return
+        spad = self.ui.ChromatinTracingPanel.params()['spad']
+        payload = (allele.save(), hybes, hybe_fiducial_channels,
+                   hybe_readout_channels, storage_path, fov, spad)
+        chp.ViewStoredPushButton.setEnabled(False)
+        chp.StatusLabel.setText(f'Allele {allele.id}: reading stored trace crops...')
+        rejected = dict(allele.rejected_hybes or {})
+
+        def _done(results):
+            chp.ViewStoredPushButton.setEnabled(True)
+            debug = results[0]
+            fid_results, readout_results = [], []
+            for hybe in hybes:
+                d = debug.get(hybe, {})
+                why = str(rejected.get(hybe, '') or '')
+                title = f'{hybe}\nstored' + (f'\n{why}' if why else '')
+                if d.get('fiducial_cubic') is not None:
+                    c = d.get('fiducial_centroid')
+                    fid_results.append((d['fiducial_cubic'],
+                                        [c] if c is not None else None,
+                                        title, None))
+                if d.get('readout_cubic') is not None:
+                    readout_results.append((d['readout_cubic'],
+                                            d.get('readout_centroids'),
+                                            title, None))
+            allele_label = f'FOV{fov:03d}_allele{allele.id}_stored'
+            allele_fig_dir = paths.figure_dir(storage_path, 'alleles', fov)
+            self.chromatin_fiducial_grid_displayer.show_fit_status_grid(
+                fid_results, allele_label=allele_label, default_dir=allele_fig_dir)
+            self.chromatin_readout_grid_displayer.show_fit_status_grid(
+                readout_results, allele_label=allele_label, default_dir=allele_fig_dir)
+            self.chromatin_fiducial_grid_displayer.show()
+            self.chromatin_fiducial_grid_displayer.raise_()
+            self.chromatin_readout_grid_displayer.show()
+            self.chromatin_readout_grid_displayer.raise_()
+            chp.StatusLabel.setText(
+                f'Allele {allele.id} (STORED view, nothing fitted): '
+                f'{len(allele.polymer_raw or {})}/{len(hybes)} hybe(s) traced, '
+                f'{len(rejected)} rejected.')
+
+        def _fail(message):
+            chp.ViewStoredPushButton.setEnabled(True)
+            chp.StatusLabel.setText(f'Allele {allele.id}: stored view failed -- {message}')
+
+        # ONE child process for all the crop reads (the h5py
+        # one-lock-per-process rule; a thread doing them starves the GUI)
+        self._chromatin_stored_worker = ProcWorker(
+            [(tracing_v2.stored_allele_debug, (payload,))])
+        self._chromatin_stored_worker.finished_ok.connect(_done)
+        self._chromatin_stored_worker.failed.connect(_fail)
+        self._chromatin_stored_worker.start()
 
     def _view_chromatin_trace_crop(self):
         """
@@ -9746,13 +9966,20 @@ One PNG PER MODALITY: each modality has its own reference and its
             other_data = self.ui.IngestionPanel.modality_data.get(other_modality)
             if not other_storage_path or not other_data or not other_data['layout_path']:
                 continue
-            # the real, persisted same-modality reference hybe for that
-            # storage_path -- read from vlinks.h5 global params (see
-            # _reference_hybe_for_storage_path), not modality_data, since
-            # that no longer tracks a per-modality reference hybe at all.
+            # Informational only -- the caller anchors every pass on
+            # ap.current_cell_reference_hybe(other_modality) and DISCARDS
+            # this value (see _cell_alignment_passes line "other_
+            # reference_hybe = ap.current_cell_reference_hybe(...)").
+            # It used to be a GATE: `continue` when the store's persisted
+            # same_modality_reference_hybe param was empty -- which
+            # silently dropped the whole other-modality pass on a real
+            # store whose FOV alignment predates that param being
+            # written, even with its matrices sitting right there
+            # (confirmed: DNA hybes never cell-aligned in ANY mode while
+            # RNA's param happened to be set, reported as "aligns only
+            # RNA probes"). A stale bookkeeping value must not veto a
+            # pass whose real anchor is configured elsewhere.
             other_reference_hybe = self._reference_hybe_for_storage_path(other_storage_path)
-            if not other_reference_hybe:
-                continue
             # session's parsed store first -- an xlsx parse here is a NAS
             # read on the DAX share, exactly what made this preamble stall
             # mid-ingestion; only a modality never parsed this session
@@ -10043,6 +10270,10 @@ One PNG PER MODALITY: each modality has its own reference and its
         # modality's own configured reference hybe
         # (ap.current_cell_reference_hybe) is what compute_cell_alignment
         # anchors against.
+        # hydrate persisted cells first -- same reason as the all-FOVs
+        # run and the per-cell preview: resident state depends on which
+        # panels were visited this session, the store does not
+        self._activate_fov(fov)
         container = None
         if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
             container = self.cell_container_permanent
@@ -10113,10 +10344,12 @@ One PNG PER MODALITY: each modality has its own reference and its
         cell.matrices, so this is re-runnable as ingestion and FOV
         alignment advance, each pass filling the gap that opened since.
 
-        Cells are HYDRATED per FOV first (_activate_fov): a FOV never
-        visited this session has no cells resident, and skipping that
-        step would silently align only the FOVs that happened to be on
-        screen -- the same failure celltype determination had.
+        Cells are read per FOV first: a FOV never visited this session
+        has no cells resident, and skipping that step would silently
+        align only the FOVs that happened to be on screen -- the same
+        failure celltype determination had. The read is a plain
+        analysis_store.read_cells, NOT the GUI's _activate_fov (measured
+        84.8 s of GUI-thread staging for 40 FOVs before any fit).
         """
         ap, ip = self.ui.AlignmentPanel, self.ui.IngestionPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
@@ -10124,15 +10357,67 @@ One PNG PER MODALITY: each modality has its own reference and its
             QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment (all FOVs)',
                                           "Set the FOV list in the Ingestion tab first.")
             return
+        # cells are mirrored into every modality's store, so any real
+        # configured path resolves them
+        storage_path_hint = next(iter(self._all_analysis_storage_paths()), None)
+        if not storage_path_hint:
+            QtWidgets.QMessageBox.warning(self, 'Run Cell Alignment (all FOVs)',
+                                          'No storage path configured.')
+            return
 
+        # PREPARATION, measured and reported: this used to call the GUI's
+        # own _activate_fov per FOV -- label-mask rebuild, reference-MIP
+        # read, transient-container deepcopy, spot staging -- 84.8 s for
+        # 40 FOVs on the real store BEFORE a single fit started, all on
+        # the GUI thread (reported as "cell alignment makes everything
+        # slow"). Alignment needs CELLS, not a GUI activation, so it
+        # reads them directly; a FOV already resident is used as-is so
+        # in-session edits are never shadowed by the disk copy.
         containers_by_fov, cells_by_fov, empty = {}, {}, []
-        for fov in fov_list:
-            self._activate_fov(fov)
+        progress = QtWidgets.QProgressDialog(
+            'Preparing cell alignment: reading cells...', 'Cancel',
+            0, len(fov_list), self)
+        progress.setWindowTitle('Run Cell Alignment (all FOVs)')
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        cancelled = False
+        for i, fov in enumerate(fov_list):
+            progress.setValue(i)
+            progress.setLabelText(
+                f'Preparing cell alignment: reading cells for '
+                f'FOV{fov:03d} ({i + 1}/{len(fov_list)})...')
+            QtWidgets.QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled = True
+                break
             container = None
             if self.cell_container_permanent is not None and self.cell_container_permanent.data.get(fov):
                 container = self.cell_container_permanent
             elif self.cell_container is not None and self.cell_container.data.get(fov):
                 container = self.cell_container
+            if container is None:
+                # not resident: read this FOV's cells straight from the
+                # store into the permanent container -- the alignment
+                # inputs, without the GUI staging around them. Guarded:
+                # an unreadable/undeclared store leaves this FOV
+                # 'empty', exactly as a failed activation used to.
+                try:
+                    cell_dicts, cells_modality = analysis_store.read_cells(
+                        storage_path_hint, fov)
+                except Exception as e:
+                    self.log(f'cell alignment: cannot read cells for '
+                             f'FOV{fov:03d} ({e})')
+                    cell_dicts, cells_modality = None, ''
+                if cell_dicts:
+                    loaded = CellContainer.load({fov: cell_dicts},
+                                                modality=cells_modality or '')
+                    if self.cell_container_permanent is None:
+                        self.cell_container_permanent = loaded
+                    else:
+                        self.cell_container_permanent.data[fov] = loaded.data[fov]
+                        if fov not in self.cell_container_permanent.fov_list:
+                            self.cell_container_permanent.fov_list.append(fov)
+                    container = self.cell_container_permanent
             if container is None:
                 empty.append(fov)
                 continue
@@ -10142,6 +10427,10 @@ One PNG PER MODALITY: each modality has its own reference and its
                 continue
             containers_by_fov[fov] = container
             cells_by_fov[fov] = cells
+        progress.setValue(len(fov_list))
+        if cancelled:
+            self.log('Cell alignment (all FOVs): cancelled during preparation.')
+            return
         if empty:
             self.log(f'Cell alignment (all FOVs): no segmented cells for '
                      f'FOV(s) {sorted(empty)} -- skipped.')
@@ -10259,12 +10548,6 @@ One PNG PER MODALITY: each modality has its own reference and its
                         twin.matrix_provenance = deepcopy(src.matrix_provenance)
             if storage_paths:
                 analysis_store.mirror_write_cells(storage_paths, fov, container)
-            # matrices changed -> this FOV's spots are stale
-            try:
-                self._recast_persisted_spots(fov)
-            except Exception as e:
-                self.statusBar().showMessage(
-                    f'spot reassignment after cell alignment failed for FOV{fov}: {e}')
             # only WHICH cells need an overlay is decided here (a cheap
             # in-memory residual check); the expensive arg resolution is
             # deferred to the background pipeline below.
@@ -10272,13 +10555,28 @@ One PNG PER MODALITY: each modality has its own reference and its
                 if self._cell_max_residual_shift(cell) >= max(threshold, 1e-9):
                     pending_overlays.append((cell, fov))
 
+        # PASS 1b -- the spot recast, in the BACKGROUND (measured: ~1 s
+        # of CPU plus several NAS round-trips per FOV, and it ran here on
+        # the GUI thread, which is what made Spot Localization and Cell
+        # Segmentation crawl DURING an all-FOVs alignment). Matrices are
+        # already on disk, so a recast that finishes later is still
+        # correct -- it only refreshes DERIVED coordinates.
+        recast_fovs = [fov for fov, _cells in results]
+        try:
+            self._start_spot_recast(recast_fovs, 'cell alignment (all FOVs)')
+        except Exception as e:
+            # never let store maintenance abort the finish handler
+            self.log(f'spot recast could not start: {e}')
+
         self._refresh_cell_fov_panels(self.ui.AlignmentPanel.CellFovSpinBox.value())
         self.statusBar().showMessage('Cell alignment computed for all FOVs.', 5000)
         QtWidgets.QMessageBox.information(
             self, 'Cell alignment complete',
             f'{n_cells} cell(s) across {len(results)} FOV(s) aligned and SAVED.\n\n'
-            f'{len(pending_overlays)} overlay image(s) will render in the background -- '
-            f'the app stays usable, and quitting will warn if any are still running.')
+            f'Spot coordinates are being recast for {len(recast_fovs)} FOV(s) and '
+            f'{len(pending_overlays)} overlay image(s) will render -- both in the '
+            f'background; the app stays usable, and quitting will warn if any are '
+            f'still running.')
         # PASS 2 -- overlays, entirely in the background, only after every
         # matrix is on disk.
         self._queue_cell_overlays(pending_overlays, storage_path, channel_type, pad,
@@ -10973,6 +11271,13 @@ One PNG PER MODALITY: each modality has its own reference and its
         ap = self.ui.AlignmentPanel
         fov = ap.CellFovSpinBox.value()
         cell_id = ap.CellIdSpinBox.value()
+        # HYDRATE first, like the all-FOVs run: the containers fill
+        # lazily, so on a fresh launch a FOV's persisted cells are not
+        # resident until something activates it -- and "no segmented
+        # cell found" for a cell that is sitting on disk (reported: the
+        # preview only worked after visiting the segmentation panel) is
+        # a lie of session state, not of the store.
+        self._activate_fov(fov)
         real_cell = None
         if self.cell_container_permanent is not None:
             real_cell = next((c for c in self.cell_container_permanent.get_cells(fov) if c.id == cell_id), None)
@@ -11410,6 +11715,9 @@ One PNG PER MODALITY: each modality has its own reference and its
             out['cross_modal_alignment'][f'reference_hybe_{name}'] = hybe
         out['chromatin_tracing']['hybes'] = ','.join(
             f'{folder}|{modality}' for folder, modality in self.ui.ChromatinTracingPanel.checked_hybes())
+        # the ACTIVATED readout-channel choice, not the combo's transient
+        out['chromatin_tracing']['readout_channel'] = \
+            self.ui.ChromatinTracingPanel.active_readout_channel()
         # The analysis GATE is config-shaped state: a declarative
         # description (predicate clauses), like a checked-hybe set.
         # Which cells pass is derived data and is deliberately NOT
@@ -11462,6 +11770,9 @@ One PNG PER MODALITY: each modality has its own reference and its
                     keys = [tuple(pair.split('|', 1)) for pair in value.split(',') if '|' in pair]
                     self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
                     continue
+                if section == 'chromatin_tracing' and param == 'readout_channel':
+                    self.ui.ChromatinTracingPanel.set_active_readout_channel(value)
+                    continue
                 if section == 'analysis_population' and param == 'sources':
                     wanted = {tuple(x.split('|', 2)) for x in value.split(',')
                               if x.count('|') == 2}
@@ -11502,6 +11813,20 @@ One PNG PER MODALITY: each modality has its own reference and its
             self.log('WARNING: the config carries a voxel size this app will '
                      'not accept; the default stays in force. See the '
                      'Ingestion panel.')
+
+    def _show_tiff_ingest_dialog(self):
+        """The from-TIFF ingestion pop-up (round-based trial TIFFs --
+        see ui/tiff_ingest_dialog.py). Non-modal and self-contained: it
+        writes an ordinary v2 store plus a generated ExperimentLayout,
+        after which the normal activate/parse flow owns everything."""
+        from ui.tiff_ingest_dialog import TiffIngestDialog
+        if getattr(self, '_tiff_ingest_dialog', None) is None:
+            self._tiff_ingest_dialog = TiffIngestDialog(self)
+            root = self.ui.IngestionPanel.ProjectRootLineEdit.text().strip()
+            if root:
+                self._tiff_ingest_dialog.ProjectRootLineEdit.setText(root)
+        self._tiff_ingest_dialog.show()
+        self._tiff_ingest_dialog.raise_()
 
     def _load_config_dialog(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Load configuration file', self.save_path, 'configuration file (*.xml)')

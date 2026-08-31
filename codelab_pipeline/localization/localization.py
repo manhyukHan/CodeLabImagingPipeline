@@ -1351,6 +1351,91 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.rejected_hybes[hybe] = 'no readout peak accepted'
     return (allele, debug) if collect_debug else allele
 
+SPOT_V2_GATES = {
+    # tracing_v2.READOUT_GATES, adapted for STANDALONE spots: z is
+    # restored to at_bound_fatal, because the tracing exemption's whole
+    # justification -- "the readout box is pre-placed at the CONSENSUS
+    # depth, so a z rail measures allele geometry, not data quality" --
+    # does not exist here: a spot's crop carries the full z stack and
+    # its seed is its own brightest voxel, so a railed z really is a
+    # fit that could not reach the emitter. Everything WITHOUT the
+    # median-z-depth leg, per explicit request.
+    'reject_at_bound': True,
+    'at_bound_fatal': ('y', 'x', 'z'),
+    'min_occupancy': 0.40,
+    'max_uncert_xy_nm': None,
+    'max_uncert_z_nm': 150.0,
+}
+
+
+def refine_spot_z_v2(spot, storage_path, fov, channel, hybe=None, cell=None,
+                     modality=None, spad=8, gates=None, trace_params=None,
+                     fov_matrices=None, resolver=None):
+    """v2 3D refinement: tracing_v2's PSF-aware fit + quality gates
+    (occupancy against a local background plane, 95% CI limits in nm,
+    at-bound rejection) on the spot's OWN crop. The z seed is the
+    crop's own brightest voxel -- deliberately NO consensus/median
+    z-depth leg (that is a tracing construct: standalone spots have no
+    fiducial chain to supply an expected plane; per explicit request).
+    No mixture path either: the v2 fit is one PSF-shaped emitter at the
+    spot's own seed.
+
+    Returns (new_coordinate, new_raw, cubic, fit_local, reason):
+      reason None                    -> ACCEPTED; coordinates real.
+      reason str, fit_local not None -> fitted but GATE-REJECTED (the
+        blue-circle case: the position is known and drawable, but it is
+        not a localization); coordinates None.
+      reason str, fit_local None    -> no usable fit at all.
+    fit_local is the crop-local (y, x, z) of the fit, for the status
+    grid.
+    """
+    from codelab_pipeline.localization import tracing_v2 as V2
+    hybe = hybe or spot.hybe
+    raw_y, raw_x = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
+    try:
+        cubic, (ymin, xmin) = spot_mapper.crop_for_localization(
+            storage_path, fov, hybe, channel, (raw_y, raw_x),
+            pad=spad, use_stack=True)
+    except OSError:
+        return None, None, None, None, 'stack not ingested'
+    if cubic.size == 0 or not np.isfinite(cubic).any():
+        return None, None, cubic, None, 'empty crop'
+    p = trace_params or V2.V2Params()
+    if gates:
+        p = V2.V2Params(voxel_um=p.voxel_um, psf_family=p.psf_family,
+                           psf_shape=p.psf_shape, psf_label=p.psf_label,
+                           readout_gates=gates)
+    z0 = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+    fit = V2.fit_readout(cubic, z0, p)
+    ok, reason = V2.gate(fit, cubic, p.readout_gates, p.voxel_um)
+    if fit is None:
+        return None, None, cubic, None, reason or 'fit failed'
+    # the fit-status grid's centroid contract is crop-local (x, y, z) --
+    # NOT (y, x, z); the transposed-circles bug is on record
+    fit_local = (float(fit.x), float(fit.y), float(fit.z))
+    # crop-local voxels -> frames: the SAME transform refine_spot_z's
+    # _to_real applies (cell residual via resolver, else FOV matrices,
+    # else raw)
+    raw = (float(fit.y + ymin), float(fit.x + xmin), float(fit.z))
+    if cell is not None:
+        m = modality if modality is not None else cell.reference_modality
+        H = (resolver.to_shared(hybe, m, cell) if resolver is not None
+             else cell.matrix_to_shared(hybe, m))
+        y1, x1, _ = H @ np.array([raw[0], raw[1], 1]).reshape(3, 1)
+        coord = (float(y1), float(x1),
+                 float(fit.z + cell_z_offset(cell, hybe, m, resolver)))
+    elif fov_matrices and (hybe, fov_matrices.modality) in fov_matrices:
+        y1, x1 = spot_mapper.raw_to_reference((raw[0], raw[1]), hybe,
+                                              fov_matrices,
+                                              modality=modality, cell=None)
+        coord = (y1, x1, raw[2])
+    else:
+        coord = raw
+    if not ok:
+        return None, None, cubic, fit_local, reason
+    return coord, raw, cubic, fit_local, None
+
+
 def refine_spots_batch(targets, storage_path, fov, channel, hybe, modality,
                        params, fov_matrices, resolver, want_grid=False):
     """
@@ -1374,6 +1459,45 @@ def refine_spots_batch(targets, storage_path, fov, channel, hybe, modality,
     every HDF5 call in a process behind one lock -- as a thread this
     starves the GUI's own image loads (measured 16.5 ms -> 2043 ms).
     """
+    engine = params.get('engine', 'v2')
+    if engine == 'v2':
+        # ONE TraceParams for the whole batch: the PSF (the store's
+        # installed calibration, when plausible -- else free-sigma
+        # fallback) is loaded once, and the popup's gate values merge
+        # over the standalone-spot defaults.
+        from codelab_pipeline.localization import tracing_v2 as V2
+        gates = dict(SPOT_V2_GATES)
+        if params.get('v2_min_occupancy') is not None:
+            gates['min_occupancy'] = float(params['v2_min_occupancy'])
+        for key in ('max_uncert_xy_nm', 'max_uncert_z_nm'):
+            v = params.get(f'v2_{key}')
+            if v is not None:
+                gates[key] = float(v) if v > 0 else None    # 0 = gate off
+        # PSF choice (per request): 'auto' = the store's installed
+        # calibration (free-sigma fallback when none/implausible);
+        # 'free' = deliberately no PSF (fiducial-like fitting); any
+        # other value = a named library PSF (readout-like)
+        vox = params.get('voxel_um', V2.DEFAULT_VOXEL_UM)
+        psf_choice = params.get('v2_psf', 'auto')
+        if psf_choice == 'free':
+            p = V2.V2Params(voxel_um=vox)
+        elif psf_choice == 'auto':
+            p = V2.V2Params.from_panel({'voxel_um': vox}, storage_path)
+        else:
+            p = V2.V2Params.from_panel(
+                {'voxel_um': vox, 'readout_psf': psf_choice}, None)
+        out = []
+        for i, (spot, cell) in enumerate(targets):
+            coord, raw, cubic, fit_local, reason = refine_spot_z_v2(
+                spot, storage_path, fov, channel, hybe=hybe, cell=cell,
+                modality=modality, spad=params['spad'], gates=gates,
+                trace_params=p, fov_matrices=fov_matrices,
+                resolver=resolver)
+            out.append((i, coord, raw, (),
+                        cubic if want_grid else None,
+                        fit_local if want_grid else None,
+                        reason))
+        return out
     claimed_positions = []
     out = []
     for i, (spot, cell) in enumerate(targets):
@@ -1389,5 +1513,6 @@ def refine_spots_batch(targets, storage_path, fov, channel, hybe, modality,
             claimed_positions.append((new_raw[0], new_raw[1]))
         out.append((i, new_coordinate, new_raw, mixture_centroids,
                     cubic if want_grid else None,
-                    centroid if want_grid else None))
+                    centroid if want_grid else None,
+                    None if new_coordinate is not None else 'v1 fit rejected'))
     return out

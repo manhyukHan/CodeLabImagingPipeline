@@ -309,6 +309,23 @@ def main():
     check('each celltype gets a distinct colour',
           len({tuple(v) for v in result_colors.values()}) == len(ct_names))
 
+    # pick_channel_by_type: generalized beyond the two role labels
+    # (reported: alignment offered only fiducial/readout, so a hybe's
+    # SECOND readout channel was unreachable)
+    from codelab_pipeline.alignment import chain
+    r3 = {'folder': 'Hyb_001', 'fiducial_channel': 555,
+          'channels': [555, 647, 488]}
+    check('role labels resolve as before',
+          chain.pick_channel_by_type(r3, 'fiducial') == 555
+          and chain.pick_channel_by_type(r3, 'readout') == 647)
+    check('a concrete channel resolves to itself (the 2nd readout '
+          'is now reachable)',
+          chain.pick_channel_by_type(r3, '488') == 488
+          and chain.pick_channel_by_type(r3, 488) == 488)
+    check('a hybe lacking the requested channel falls back to the '
+          'readout rule',
+          chain.pick_channel_by_type(r3, '405') == 647)
+
     print()
     print(f'{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:

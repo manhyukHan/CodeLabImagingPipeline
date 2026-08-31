@@ -64,13 +64,29 @@ class SourcePicker(QtWidgets.QWidget):
     def _fill_channels(self, *_a):
         m = self.ModalityComboBox.currentText()
         hybe = self.HybeComboBox.currentData()
+        # PRESERVE the chosen channel across hybe changes (per request:
+        # switching the hybe used to reset the channel to the list's
+        # first entry -- the fiducial -- on every change); when the
+        # previous channel doesn't exist in the new hybe, default to the
+        # first NON-fiducial channel, not the fiducial
+        prev = self.ChannelComboBox.currentData()
         self.ChannelComboBox.clear()
+        first_readout = None
         for h, _n, chs in self._tree.get(m, []):
             if h == hybe:
-                for ch, fid in chs:
+                for i, (ch, fid) in enumerate(chs):
                     self.ChannelComboBox.addItem(
                         f'ch{ch}  (fiducial)' if fid else f'ch{ch}', int(ch))
+                    if first_readout is None and not fid:
+                        first_readout = i
                 break
+        if prev is not None:
+            i = self.ChannelComboBox.findData(int(prev))
+            if i >= 0:
+                self.ChannelComboBox.setCurrentIndex(i)
+                return
+        if first_readout is not None:
+            self.ChannelComboBox.setCurrentIndex(first_readout)
 
     def current(self):
         """(modality, hybe, channel) or None when nothing is populated."""
@@ -300,6 +316,15 @@ class AnalysisPanelUI(object):
         viewForm = QtWidgets.QFormLayout()
         self.ViewExprSourcePicker = SourcePicker()
         viewForm.addRow('Expression source:', self.ViewExprSourcePicker)
+        self.ViewExprNormComboBox = QtWidgets.QComboBox()
+        self.ViewExprNormComboBox.addItems(NORM_MODES)
+        viewForm.addRow('Expression normalize:', self.ViewExprNormComboBox)
+        self.ViewExprNormRefPicker = SourcePicker()
+        self.ViewExprNormRefPicker.setEnabled(False)
+        self.ViewExprNormComboBox.currentTextChanged.connect(
+            lambda t: self.ViewExprNormRefPicker.setEnabled(t == 'by_source'))
+        viewForm.addRow('Norm reference (by_source):',
+                        self.ViewExprNormRefPicker)
         self.ViewExprMetricComboBox = QtWidgets.QComboBox()
         self.ViewExprMetricComboBox.addItems(EXPR_METRICS)
         viewForm.addRow('Expression metric:', self.ViewExprMetricComboBox)

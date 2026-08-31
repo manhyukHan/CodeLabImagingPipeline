@@ -71,6 +71,12 @@ def main():
     mw.cell_container = None
     activated = []
     mw._activate_fov = lambda fov: activated.append(fov)
+    # cells for a non-resident FOV now come from a plain store READ, not
+    # from the GUI's _activate_fov (measured: 84.8 s of GUI-thread
+    # staging for 40 FOVs before any fit started)
+    read_fovs = []
+    MW.analysis_store.read_cells = (
+        lambda sp, fov: (read_fovs.append(fov), (None, ''))[1])
     mw._storage_path_for_modality = lambda m: '/store/DNA'
     mw._cell_alignment_passes = lambda modality, sp, fov: [{'fov': fov}]
     ap.build_cell_reference_hybe_fields(['DNA'])
@@ -99,7 +105,10 @@ def main():
          mock.patch.object(mw, '_confirm_batch_mode', return_value='append'):
         mw._run_cell_alignment_all_fovs()
 
-    check('every FOV in the list was hydrated first', activated == [1, 2, 3], str(activated))
+    check('preparation does NOT run the GUI activation path', activated == [],
+          str(activated))
+    check('every FOV without resident cells is READ from the store instead',
+          read_fovs == [2], str(read_fovs))
     check('the run started', started.get('started') is True)
     jobs = started.get('jobs', [])
     check('one job per FOV that has cells', [j[0] for j in jobs] == [1, 3], str([j[0] for j in jobs]))
@@ -120,7 +129,14 @@ def main():
     # store, so interleaving them made later FOVs' saves queue behind
     # earlier FOVs' rendering prep.
     events = []
-    mw._recast_persisted_spots = lambda fov: events.append(('recast', fov))
+    # the recast is BACKGROUNDED now (it re-reads/rewrites every spot
+    # slice: ~1 s CPU + NAS round-trips per FOV, and doing it here on
+    # the GUI thread is what made Spot Localization and Cell
+    # Segmentation crawl during an all-FOVs run). The handler's job is
+    # to HAND every persisted FOV over.
+    mw._start_spot_recast = lambda fovs, label: [
+        events.append(('recast', f)) for f in fovs]
+    mw._recast_persisted_spots = lambda fov: events.append(('inline', fov))
     mw._refresh_cell_fov_panels = lambda fov: None
     mw._cell_overlay_draw_args = lambda c, fov, *a, **k: events.append(('resolve', fov)) or {'save_path': 'x'}
     ap.CellOverlayAutoSaveThresholdSpinBox.setValue(0)     # every cell wants one
@@ -134,7 +150,9 @@ def main():
     written = [f for k, f in events if k == 'save']
     recast = [f for k, f in events if k == 'recast']
     check('every FOV persisted', written == [1, 3], str(written))
-    check('every FOV had its spots recast', recast == [1, 3], str(recast))
+    check('every FOV is handed to the recast', recast == [1, 3], str(recast))
+    check('and NOT recast inline on the GUI thread',
+          [f for k, f in events if k == 'inline'] == [])
     kinds = [k for k, _f in events]
     check('ALL saves happen before ANY overlay work',
           'resolve' not in kinds or kinds.index('resolve') > max(

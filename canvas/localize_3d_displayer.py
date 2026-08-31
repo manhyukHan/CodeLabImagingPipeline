@@ -12,7 +12,13 @@ MAX_GRID_COLUMNS = 8
 # silently drifting apart if one is ever tuned without the other.
 DEFAULT_PARAMS = {'spad': 5, 'peak_bound': 2.0, 'max_sigma': 2.5,
                   'max_uncert': 2.0, 'min_hb_ratio': 1.15, 'min_ah_ratio': 0.15,
-                  'min_sep': 3.0, 'multi_mode': False, 'z_window': 15}
+                  'min_sep': 3.0, 'multi_mode': False, 'z_window': 15,
+                  # v2 (the DEFAULT engine, per explicit request): the
+                  # tracing-v2 PSF-aware fit + quality gates, adapted for
+                  # standalone spots (no consensus z-depth leg; z at-bound
+                  # fatal again). 0 on an uncertainty gate = gate off.
+                  'engine': 'v2', 'v2_min_occupancy': 0.40,
+                  'v2_max_uncert_xy_nm': 0, 'v2_max_uncert_z_nm': 150}
 
 
 class Localize3DDisplayer(QtWidgets.QMainWindow):
@@ -123,6 +129,46 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         # Initial values come from DEFAULT_PARAMS (module-level, see its
         # own comment) -- ResetDefaultsPushButton below restores the same
         # dict, so the two can never silently drift apart.
+        self.EngineComboBox = QtWidgets.QComboBox()
+        self.EngineComboBox.addItem('v2 (PSF fit + quality gates)', 'v2')
+        self.EngineComboBox.addItem('v1 gaussian', 'gaussian')
+        self.EngineComboBox.setToolTip(
+            'v2 (default): the chromatin-tracing fit -- PSF-shaped when '
+            'the store carries a calibrated PSF, free-sigma otherwise -- '
+            'gated on occupancy, uncertainty (nm) and at-bound; no '
+            'consensus z (each spot seeds its own crop). v1: the '
+            'classic bounded gaussian with the pixel-unit thresholds '
+            'below.')
+        form.addRow('Engine:', self.EngineComboBox)
+        # v2 PSF choice (per request): fit with a selected calibrated
+        # PSF (readout / readout-like), the store's installed one, or
+        # free sigma (fiducial-like)
+        self.V2PsfComboBox = QtWidgets.QComboBox()
+        self.V2PsfComboBox.addItem('store-installed (auto)', 'auto')
+        self.V2PsfComboBox.addItem('free sigma (no PSF)', 'free')
+        try:
+            from codelab_pipeline.localization import psf_library as _LIB
+            for doc in _LIB.list_entries():
+                label = doc.get('label', '')
+                if label:
+                    self.V2PsfComboBox.addItem(f'library: {label}', label)
+        except Exception:
+            pass        # an unreadable library never blocks the popup
+        form.addRow('v2: PSF:', self.V2PsfComboBox)
+        self.V2MinOccupancySpinBox = double_spin(
+            DEFAULT_PARAMS['v2_min_occupancy'], 0.0, 1.0, step=0.05)
+        form.addRow('v2: min occupancy:', self.V2MinOccupancySpinBox)
+        self.V2MaxUncertXYSpinBox = QtWidgets.QSpinBox()
+        self.V2MaxUncertXYSpinBox.setRange(0, 5000)
+        self.V2MaxUncertXYSpinBox.setValue(DEFAULT_PARAMS['v2_max_uncert_xy_nm'])
+        form.addRow('v2: max lateral uncert (nm, 0=off):',
+                    self.V2MaxUncertXYSpinBox)
+        self.V2MaxUncertZSpinBox = QtWidgets.QSpinBox()
+        self.V2MaxUncertZSpinBox.setRange(0, 5000)
+        self.V2MaxUncertZSpinBox.setValue(DEFAULT_PARAMS['v2_max_uncert_z_nm'])
+        form.addRow('v2: max axial uncert (nm, 0=off):',
+                    self.V2MaxUncertZSpinBox)
+
         self.SpadSpinBox = QtWidgets.QSpinBox()
         self.SpadSpinBox.setRange(1, 50)
         self.SpadSpinBox.setValue(DEFAULT_PARAMS['spad'])
@@ -227,7 +273,12 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
                 'min_ah_ratio': self.MinAHRatioSpinBox.value(),
                 'min_sep': self.MinSepSpinBox.value(),
                 'multi_mode': self.MultiModeCheckBox.isChecked(),
-                'z_window': self.ZWindowSpinBox.value()}
+                'z_window': self.ZWindowSpinBox.value(),
+                'engine': self.EngineComboBox.currentData(),
+                'v2_psf': self.V2PsfComboBox.currentData(),
+                'v2_min_occupancy': self.V2MinOccupancySpinBox.value(),
+                'v2_max_uncert_xy_nm': self.V2MaxUncertXYSpinBox.value(),
+                'v2_max_uncert_z_nm': self.V2MaxUncertZSpinBox.value()}
 
     def reset_defaults(self):
         """Restores all fields to DEFAULT_PARAMS -- undoes any manual
@@ -241,6 +292,12 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         self.MinSepSpinBox.setValue(DEFAULT_PARAMS['min_sep'])
         self.MultiModeCheckBox.setChecked(DEFAULT_PARAMS['multi_mode'])
         self.ZWindowSpinBox.setValue(DEFAULT_PARAMS['z_window'])
+        idx = self.EngineComboBox.findData(DEFAULT_PARAMS['engine'])
+        self.EngineComboBox.setCurrentIndex(max(idx, 0))
+        self.V2PsfComboBox.setCurrentIndex(0)     # store-installed (auto)
+        self.V2MinOccupancySpinBox.setValue(DEFAULT_PARAMS['v2_min_occupancy'])
+        self.V2MaxUncertXYSpinBox.setValue(DEFAULT_PARAMS['v2_max_uncert_xy_nm'])
+        self.V2MaxUncertZSpinBox.setValue(DEFAULT_PARAMS['v2_max_uncert_z_nm'])
 
     def set_spot_choices(self, labels, keep_selected=None):
         """
@@ -361,13 +418,19 @@ class Localize3DGridDisplayer(QtWidgets.QMainWindow):
         # clipped them off the very top of the canvas (confirmed real bug).
         outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
                                  left=0.03, right=0.98, top=0.90, bottom=0.03)
-        for i, (cubic, centroid, title) in enumerate(results):
+        for i, row in enumerate(results):
+            # 3-tuple (cubic, centroid, title) or 4-tuple with a
+            # gate-REJECTED fit position appended -- drawn blue, the
+            # fitted-but-not-a-localization convention (v2 engine)
+            cubic, centroid, title = row[:3]
+            rejected = row[3] if len(row) > 3 else None
             row_pair, col = divmod(i, ncols)
             inner = outer[row_pair, col].subgridspec(2, 1, hspace=0.08)
             ax_yx = fig.add_subplot(inner[0])
             ax_xz = fig.add_subplot(inner[1], sharex=ax_yx)
             spot_fit_status.draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=centroid,
-                                                 title=title, title_fontsize=8)
+                                                 title=title, title_fontsize=8,
+                                                 rejected=rejected)
         width_px = max(self.canvas.minimumWidth(), ncols * col_px)
         height_px = max(self.canvas.minimumHeight(), nrows_pairs * pair_px)
         self._resize_canvas(width_px, height_px)

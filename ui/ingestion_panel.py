@@ -256,6 +256,14 @@ class IngestionPanelUI(object):
             "uncheck the other modalities' rows.")
         layout.addWidget(self.RunIngestionPushButton)
 
+        self.IngestFromTiffPushButton = QtWidgets.QPushButton(
+            'Ingest From TIFF (round-based trials)...')
+        self.IngestFromTiffPushButton.setToolTip(
+            'Round-based multi-page TIFF experiments (one file per FOV per '
+            'acquisition session) -- opens the trial-table dialog; the '
+            'result is an ordinary v2 store plus a generated '
+            'ExperimentLayout.')
+        layout.addWidget(self.IngestFromTiffPushButton)
         self.CheckIngestionStatusPushButton = QtWidgets.QPushButton('Check Ingestion Status')
         layout.addWidget(self.CheckIngestionStatusPushButton)
         self.IngestionStatusTextEdit = QtWidgets.QTextEdit()

@@ -1206,6 +1206,65 @@ def allele_task(payload):
             dict(getattr(allele, 'provenance', {}) or {}))
 
 
+def stored_allele_debug(payload):
+    """The View-Stored path: the SAME per-hybe grid payload the fit path
+    produces, built from an allele's ALREADY-PERSISTED trace -- crops
+    read around the stored raw positions, circles AT those positions,
+    and NO fitting at all (per request: re-running ~200 Gaussian fits
+    just to LOOK at a finished allele was pure waste; the reads are the
+    image, the fits were the cost). occupancy/uncertainty stay absent --
+    they are properties of a fit, and this view shows the record, not a
+    new measurement (the grid's own 'occ n/a' + stored-reason titling
+    already renders that honestly).
+
+    payload: (allele_dict, hybes, hybe_fiducial_channels,
+    hybe_readout_channels, storage_path, fov, spad). Runs in a child
+    process (stack reads; the h5py one-lock-per-process rule).
+    """
+    from codelab_pipeline.alignment import spot_mapper
+    (allele_dict, hybes, hybe_fiducial_channels, hybe_readout_channels,
+     storage_path, fov, spad) = payload
+    fid = allele_dict.get('fiducial_trace_raw') or {}
+    pol = allele_dict.get('polymer_raw') or {}
+    debug = {}
+    for hybe in hybes:
+        fpos = fid.get(hybe)
+        cands = pol.get(hybe) or []
+        centre = fpos or (cands[0] if cands else None)
+        if centre is None:
+            continue                    # nothing stored -> nothing to show
+        cy, cx = float(centre[0]), float(centre[1])
+        d = {}
+        fch = hybe_fiducial_channels.get(hybe)
+        if fch is not None:
+            try:
+                cube, (ymin, xmin) = spot_mapper.crop_for_localization(
+                    storage_path, fov, hybe, fch, (cy, cx), pad=spad,
+                    use_stack=True)
+                d['fiducial_cubic'] = cube
+                # crop-local (x, y, z), the grids' centroid contract
+                d['fiducial_centroid'] = (
+                    (float(fpos[1] - xmin), float(fpos[0] - ymin),
+                     float(fpos[2])) if fpos else None)
+            except OSError:
+                pass
+        rch = hybe_readout_channels.get(hybe)
+        if rch is not None:
+            try:
+                cube, (ymin, xmin) = spot_mapper.crop_for_localization(
+                    storage_path, fov, hybe, rch, (cy, cx), pad=spad,
+                    use_stack=True)
+                d['readout_cubic'] = cube
+                d['readout_centroids'] = (
+                    [(float(x - xmin), float(y - ymin), float(z))
+                     for y, x, z, *_ in cands] or None)
+            except OSError:
+                pass
+        if d:
+            debug[hybe] = d
+    return debug
+
+
 def allele_task_with_debug(payload):
     """allele_task, but returning the debug crops the preview renders.
 

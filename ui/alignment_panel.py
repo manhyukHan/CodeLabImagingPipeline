@@ -416,6 +416,28 @@ class AlignmentPanelUI(object):
             self.SameModalityReferenceHybeComboBoxes[name] = combo
             self.SameModalityReferenceHybeFormLayout.addRow(f'Reference hybe ({name}):', combo)
 
+    def populate_channel_choices(self, channels):
+        """Extend every channel-TYPE combo with the CONCRETE channels
+        (union across all modalities' records) -- 'fiducial'/'readout'
+        alone cannot name the second readout channel once hybes carry
+        three channels (reported). Selections survive repopulation;
+        pick_channel_by_type resolves a concrete value per hybe, with
+        the readout rule as its fallback for hybes lacking it."""
+        for combo in (self.SameModalityChannelTypeComboBox,
+                      self.ChannelTypeComboBox,
+                      self.CellChannelTypeComboBox):
+            current = combo.currentText()
+            roles = ['fiducial', 'readout']
+            if combo is self.ChannelTypeComboBox:
+                roles = ['readout', 'fiducial']   # its historical default
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(roles + [str(c) for c in channels])
+            i = combo.findText(current)
+            if i >= 0:
+                combo.setCurrentIndex(i)
+            combo.blockSignals(False)
+
     def populate_same_modality_reference_hybe_choices(self, total_active_hybe_list):
         """Route each hybe into its own modality's FOV-alignment combo --
         same scoping as populate_cell_reference_hybe_choices."""

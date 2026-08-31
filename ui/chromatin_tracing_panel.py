@@ -154,6 +154,25 @@ class ChromatinTracingPanelUI(object):
         refForm = QtWidgets.QFormLayout()
         self.ReferenceHybeComboBox = QtWidgets.QComboBox()
         refForm.addRow('Reference hybe (drift baseline):', self.ReferenceHybeComboBox)
+        # Which channel is THE readout channel to trace, now that hybes
+        # can carry more than one non-fiducial channel (per request).
+        # The combo is a STAGING field: nothing changes until Activate
+        # is pressed -- a stray mouse wheel over the combo must never
+        # silently retarget what gets traced.
+        readoutRow = QtWidgets.QHBoxLayout()
+        self.TraceReadoutChannelComboBox = QtWidgets.QComboBox()
+        self.TraceReadoutChannelComboBox.addItem(
+            'auto (first non-fiducial)', 'auto')
+        readoutRow.addWidget(self.TraceReadoutChannelComboBox, stretch=1)
+        self.ActivateReadoutChannelPushButton = QtWidgets.QPushButton(
+            'Activate')
+        readoutRow.addWidget(self.ActivateReadoutChannelPushButton)
+        self.ActiveReadoutChannelLabel = QtWidgets.QLabel('active: auto')
+        readoutRow.addWidget(self.ActiveReadoutChannelLabel)
+        refForm.addRow('Readout channel to trace:', readoutRow)
+        self._active_readout_channel = 'auto'
+        self.ActivateReadoutChannelPushButton.clicked.connect(
+            self._activate_readout_channel)
         hybesLayout.addLayout(refForm)
         layout.addWidget(hybesGroup)
 
@@ -413,8 +432,16 @@ class ChromatinTracingPanelUI(object):
         # comboboxes.
         previewLayout.addWidget(QtWidgets.QLabel(
             'Select ONE allele in the list above, then:'))
-        self.ViewCropPushButton = QtWidgets.QPushButton('View Crop (fiducial + readout grids)')
+        self.ViewCropPushButton = QtWidgets.QPushButton(
+            'Fit + View Crop (re-fits this allele)')
         previewLayout.addWidget(self.ViewCropPushButton)
+        self.ViewStoredPushButton = QtWidgets.QPushButton(
+            'View Stored (no re-fit -- the persisted trace as-is)')
+        self.ViewStoredPushButton.setToolTip(
+            'Reads the crops and circles the STORED positions; runs no '
+            'fits at all. Use Fit + View Crop to recompute with the '
+            'current parameters.')
+        previewLayout.addWidget(self.ViewStoredPushButton)
         # NO save button here. View Crop mutates the allele IN the transient
         # container, and section 2's Save writes that container -- so the
         # trace View Crop just produced is already persistable, and a second
@@ -489,6 +516,39 @@ class ChromatinTracingPanelUI(object):
             item = self.HybeListWidget.item(i)
             item.setCheckState(QtCore.Qt.Checked if tuple(item.data(QtCore.Qt.UserRole)) in want
                                else QtCore.Qt.Unchecked)
+
+    def _activate_readout_channel(self):
+        self._active_readout_channel = (
+            self.TraceReadoutChannelComboBox.currentData() or 'auto')
+        self.ActiveReadoutChannelLabel.setText(
+            f'active: {self._active_readout_channel}')
+
+    def active_readout_channel(self):
+        """The ACTIVATED choice, not the combo's transient value."""
+        return self._active_readout_channel
+
+    def set_active_readout_channel(self, value):
+        """Config-restore door: select AND activate in one step."""
+        value = str(value or 'auto')
+        i = self.TraceReadoutChannelComboBox.findData(value)
+        if i >= 0:
+            self.TraceReadoutChannelComboBox.setCurrentIndex(i)
+        self._active_readout_channel = value
+        self.ActiveReadoutChannelLabel.setText(f'active: {value}')
+
+    def populate_readout_channel_choices(self, channels):
+        """'auto' + the concrete channels (union across modalities);
+        the ACTIVE choice survives repopulation."""
+        combo = self.TraceReadoutChannelComboBox
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('auto (first non-fiducial)', 'auto')
+        for ch in channels:
+            combo.addItem(str(ch), str(ch))
+        i = combo.findData(current)
+        combo.setCurrentIndex(max(i, 0))
+        combo.blockSignals(False)
 
     def populate_reference_hybe_choices(self, total_active_hybe_list):
         current = self.current_reference_hybe_key()
