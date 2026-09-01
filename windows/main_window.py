@@ -4517,13 +4517,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cell_container is None or self._last_segment_context is None:
             QtWidgets.QMessageBox.warning(self, 'Save Cells', 'Run segmentation first.')
             return
-        # The FOV actually staged in the transient container -- not
-        # _last_segment_context's, which only tracks the last SEGMENTATION
-        # run and goes stale after a cytoplasm incorporate on another FOV.
-        fov = self._last_segment_context['fov']
+        # THE FOV ON SCREEN is what Save means.
+        #
+        # This used to start from _last_segment_context['fov'], which is
+        # only updated when a FOV successfully DISPLAYS cells:
+        # _try_show_existing_cells returns early, before setting it, for a
+        # FOV that has none. So switching to a FOV whose cells you just
+        # deleted left the context naming some EARLIER FOV, and Save then
+        # overwrote that one instead -- reported with the panel on FOV004
+        # and the confirmation dialog naming FOV002. Reading the spinbox
+        # cannot go stale that way.
+        #
+        # A FOV the user has not staged anything for still falls back
+        # rather than being written: moving the spinbox to an untouched
+        # FOV must never wipe it.
         staged = self._staged_transient_fovs()
-        if staged and fov not in staged:
-            fov = staged[0]
+        fov = int(cp.FovSpinBox.value())
+        if fov not in staged:
+            fov = self._last_segment_context['fov']
+            if staged and fov not in staged:
+                fov = staged[0]
         already_saved = (self.cell_container_permanent is not None
                           and fov in self.cell_container_permanent.data
                           and len(self.cell_container_permanent.data[fov]) > 0)
