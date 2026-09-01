@@ -89,18 +89,28 @@ if __name__ == '__main__':
     # this file and must not pay for any of it.
     from PyQt5 import QtWidgets, QtGui
     from config import path
-    from windows.main_window import MainWindow
 
     _install_error_dialog_hook()
-    question_app = QtWidgets.QApplication(sys.argv)
-    question_app.setWindowIcon(QtGui.QIcon(ICON_PATH))
+    # ONE QApplication. Constructing a second while the first is alive is
+    # undefined in Qt -- it happened to work, leaving two live objects with
+    # QApplication.instance() pointing at the newer one, which is exactly
+    # the sort of thing that works until a Qt upgrade decides it does not.
+    app = QtWidgets.QApplication(sys.argv)
+    app.setWindowIcon(QtGui.QIcon(ICON_PATH))
     question_window = QtWidgets.QMainWindow()
     question_window.show()
     config_file = QtWidgets.QFileDialog.getOpenFileName(question_window, 'Load configuration file (Cancel to start fresh)', path, 'configuration file (*.xml)')[0]
     question_window.close()
 
-    app = QtWidgets.QApplication(sys.argv)
-    app.setWindowIcon(QtGui.QIcon(ICON_PATH))
+    # The application itself is imported only NOW, after the dialog has
+    # been answered. It is 1555 modules and ~2.5 s on an idle machine
+    # (measured; it inflates to tens of seconds while a cell-alignment run
+    # is competing for the disk), and none of it is needed to ask which
+    # config to open -- paying it first meant the user clicked the icon and
+    # watched nothing happen for those seconds. Same total work, but the
+    # window that asks a question now appears immediately.
+    from windows.main_window import MainWindow
+
     window = MainWindow(config_file if config_file != '' else None)
     # the combined log comes up with the app; shown first so the main
     # window lands on top of it

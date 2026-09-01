@@ -17,3 +17,8 @@ log/*
 # Launcher logs from before they moved into log/, plus any that land beside
 # the app when the project folder is read-only and the launcher falls back.
 codelab_launch_*.log
+
+# The launcher's remembered interpreter path (launch_codelab.bat). Names a
+# location on THIS machine, so it must never be shared -- every checkout
+# resolves its own on first launch.
+.codelab_python

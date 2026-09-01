@@ -32,10 +32,47 @@ set "CODELAB_LEGACY_ENV=cellclassifier"
 set "CODELAB_PY_VERSION=3.11"
 
 if defined CODELAB_PYTHON (
-    "%CODELAB_PYTHON%" main.py
+    call :run_direct "%CODELAB_PYTHON%"
     goto :end
 )
 
+rem -- fast path: a remembered interpreter, run without conda -----------
+rem
+rem Resolving the interpreter through conda costs 5.8 s on this machine,
+rem measured: `where conda` 133 ms, a dead Anaconda husk probed at 62 ms
+rem before the working conda at 175 ms, `conda env list` 1977 ms to ask
+rem whether the env exists, and finally `conda run` -- 3536 ms against
+rem 71 ms for invoking the same interpreter directly, i.e. ~3.5 s of pure
+rem wrapper before python's first line. That was more than the entire
+rem application import (2.5 s) and the user stares at nothing for all of
+rem it.
+rem
+rem None of it changes between launches, so it is resolved ONCE and
+rem remembered next to this script. The remembered path is trusted only
+rem while the file it names still exists, and it is only ever written
+rem after that interpreter has been PROVEN to import the packages the app
+rem cannot start without -- so a cache hit is a validated interpreter,
+rem not a guess. Delete .codelab_python to force re-resolution (after
+rem moving or rebuilding the env, say).
+set "CODELAB_PY_CACHE=%~dp0.codelab_python"
+set "CACHED_PY="
+if not exist "%CODELAB_PY_CACHE%" goto :find_conda
+set /p CACHED_PY=<"%CODELAB_PY_CACHE%"
+if not defined CACHED_PY goto :stale_cache
+if not exist "%CACHED_PY%" goto :stale_cache
+call :run_direct "%CACHED_PY%"
+goto :end
+
+:stale_cache
+rem The remembered interpreter is gone -- env moved, renamed, or rebuilt
+rem somewhere else. FORGET it rather than merely stepping around it: a
+rem cache file that survives while naming a dead path sends this launch
+rem and every later one back down the 5.8 s conda road, which is the exact
+rem cost this is here to avoid.
+del "%CODELAB_PY_CACHE%" >nul 2>&1
+set "CACHED_PY="
+
+:find_conda
 rem -- locate a conda: PATH first, then the usual install roots --
 rem
 rem The non-system-drive roots are not decoration. This machine ran C: out
@@ -115,6 +152,27 @@ echo [launcher] Falling back for this run; the app may not segment correctly.
 goto :base_fallback
 
 :run_env
+rem The ONE slow resolution, paid once per machine: conda names the
+rem interpreter and the interpreter itself writes its path to the cache,
+rem so nothing has to parse `conda env list` output (whose columns shift
+rem with the active-env marker). The imports in the probe are the ones
+rem whose DLLs live in the env's Library\bin -- if a direct call could not
+rem load them, this fails HERE, with conda still available, rather than
+rem leaving a broken path cached for every future launch.
+if exist "%CODELAB_PY_CACHE%" goto :run_env_cached
+"%CONDA%" run -n %CODELAB_ENV% --no-capture-output python -c "import sys, h5py, cv2, PyQt5; open(r'%CODELAB_PY_CACHE%', 'w').write(sys.executable)" 2>nul
+:run_env_cached
+set "CACHED_PY="
+if not exist "%CODELAB_PY_CACHE%" goto :run_env_via_conda
+set /p CACHED_PY=<"%CODELAB_PY_CACHE%"
+if not defined CACHED_PY goto :run_env_via_conda
+if not exist "%CACHED_PY%" goto :run_env_via_conda
+call :run_direct "%CACHED_PY%"
+goto :end
+
+:run_env_via_conda
+rem the probe could not produce a usable interpreter -- keep the original
+rem behavior rather than failing to launch at all
 "%CONDA%" run -n %CODELAB_ENV% --no-capture-output python main.py
 goto :end
 
@@ -145,6 +203,20 @@ if "%CODELAB_LAUNCH_QUIET%"=="1" (
 )
 pause
 goto :end
+
+:run_direct
+rem Run an interpreter WITHOUT `conda run`.
+rem
+rem What conda activation actually contributes on Windows is the env's DLL
+rem directories on PATH: python.exe finds its own prefix, but the HDF5,
+rem OpenCV and Qt DLLs live in <prefix>\Library\bin, which it would not
+rem search. Prepending exactly the directories activation prepends gives
+rem the direct call the same environment for the cost of a `set` instead
+rem of a 3.5 s conda process. PATH is restored by the endlocal at :end.
+set "CODELAB_PREFIX=%~dp1"
+set "PATH=%CODELAB_PREFIX%;%CODELAB_PREFIX%Library\mingw-w64\bin;%CODELAB_PREFIX%Library\usr\bin;%CODELAB_PREFIX%Library\bin;%CODELAB_PREFIX%Scripts;%CODELAB_PREFIX%bin;%PATH%"
+"%~1" main.py
+goto :eof
 
 :try_conda
 rem Accept a candidate only if it actually RUNS. "if exist" alone was not
