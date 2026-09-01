@@ -89,6 +89,7 @@ def main():
             started['jobs'] = jobs
             started['kw'] = kw
             self.progress = mock.MagicMock()
+            self.fov_done = mock.MagicMock()
             self.finished_ok = mock.MagicMock()
             self.failed = mock.MagicMock()
 
@@ -141,6 +142,52 @@ def main():
     mw._cell_overlay_draw_args = lambda c, fov, *a, **k: events.append(('resolve', fov)) or {'save_path': 'x'}
     ap.CellOverlayAutoSaveThresholdSpinBox.setValue(0)     # every cell wants one
     mw._cell_max_residual_shift = staticmethod(lambda c: 1.0)
+
+    # ---- a FOV is SAVED THE MOMENT IT LANDS ----
+    # Persisting only at the end meant stopping a whole-project run (a
+    # day of fitting) threw away every completed FOV: the residuals were
+    # in Results because the cells are mutated in memory, while the store
+    # had never been written, so the status detail showed nothing.
+    landed = []
+    with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
+                           side_effect=lambda paths, fov, cont: landed.append(fov)):
+        mw._on_cell_alignment_fov_done(1, container.get_cells(1), {1: container})
+    check('a finished FOV is written immediately, not at the end of the run',
+          landed == [1], str(landed))
+    check('and is remembered as saved', 1 in mw._cell_align_saved_fovs,
+          str(mw._cell_align_saved_fovs))
+    check('its overlays are collected for the end of the run',
+          len(mw._cell_align_pending_overlays) == 2,
+          str(len(mw._cell_align_pending_overlays)))
+
+    # a FOV that cannot be written must not take the rest of the run
+    # down with it -- the remaining FOVs are still worth hours
+    with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
+                           side_effect=OSError('store went away')):
+        mw._on_cell_alignment_fov_done(3, container.get_cells(3), {3: container})
+    check('a FOV that fails to save is reported, not raised',
+          3 not in mw._cell_align_saved_fovs, 'marked saved despite failing')
+
+    # the finish handler then writes only what never landed (FOV3 here,
+    # whose save failed; in append mode, a FOV whose cells were all
+    # skipped has no tasks and so never fires fov_done at all)
+    with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
+                           side_effect=lambda paths, fov, cont: events.append(('save', fov))), \
+         mock.patch.object(MW.analysis_store, 'write_global_params'):
+        mw._on_cell_alignment_all_finished(
+            [(1, container.get_cells(1)), (3, container.get_cells(3))],
+            {1: container, 3: container}, '/store/DNA', 'H1', 'DNA', 'fiducial', 10)
+    check('the finish handler does not rewrite a FOV already saved',
+          [f for k, f in events if k == 'save'] == [3],
+          str([f for k, f in events if k == 'save']))
+    check('overlays from both paths reach the queue', mw._overlay_total == 3,
+          str(mw._overlay_total))
+
+    # ---- and the whole-run path still holds when nothing landed early ----
+    events.clear()
+    mw._cell_align_saved_fovs = set()
+    mw._cell_align_pending_overlays = []
+    mw._overlay_pending, mw._overlay_ready, mw._overlay_total = [], [], 0
     with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
                            side_effect=lambda paths, fov, cont: events.append(('save', fov))), \
          mock.patch.object(MW.analysis_store, 'write_global_params'):

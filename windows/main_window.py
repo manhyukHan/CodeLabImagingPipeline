@@ -514,6 +514,14 @@ class CellAlignmentWorker(QtCore.QThread):
     kept strictly within one modality.
     """
     progress = QtCore.pyqtSignal(int, int, str)
+    # Same contract as AlignmentWorker.fov_done and for a stronger reason:
+    # a whole-project cell alignment is hours of fitting, and persisting
+    # only at the end meant stopping it threw away every completed FOV --
+    # the results were visible in Results (the cells are mutated in
+    # place, in memory) while the store had never been written, so the
+    # Cell/Spots status detail showed nothing. A FOV is saved the moment
+    # its last cell lands, so stopping costs at most the FOV in flight.
+    fov_done = QtCore.pyqtSignal(int, list)   # (fov, cells)
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
@@ -616,6 +624,12 @@ class CellAlignmentWorker(QtCore.QThread):
                                   self.channel_type, self.pad, self.z_max_shift))
                     cell_by_key[(fov, cell.id)] = cell
             total = max(sum(max(len(t[2]), 1) for t in tasks), 1)
+            # A FOV is finished when its last CELL lands, not when the
+            # run does: cells are dispatched as one flat list so they
+            # complete interleaved across FOVs, and only this count says
+            # which FOV just became safe to write.
+            job_cells = {fov: cells for fov, cells, _passes in self.jobs}
+            remaining = collections.Counter(t[1] for t in tasks)
             if n_skipped:
                 self.progress.emit(0, total,
                                    f'append: {n_skipped} cell(s) already fully aligned -- skipped')
@@ -655,6 +669,9 @@ class CellAlignmentWorker(QtCore.QThread):
                         self.progress.emit(done, total,
                                            f'FOV{fov:03d} cell {cell_id}: aligned '
                                            f'({n_passes} pass(es)){note}')
+                        remaining[fov] -= 1
+                        if remaining[fov] == 0:
+                            self.fov_done.emit(fov, job_cells.get(fov, []))
                 finally:
                     # cancel_futures so one cell's real failure (e.g. "cell
                     # doesn't overlap reference hybe") aborts the run promptly
@@ -702,6 +719,9 @@ class CellAlignmentWorker(QtCore.QThread):
                             done += 1
                             self.progress.emit(done, total,
                                                f"FOV{fov:03d} cell {cell.id} ({p['modality']}): {note}")
+                        remaining[fov] -= 1
+                        if remaining[fov] == 0:
+                            self.fov_done.emit(fov, job_cells.get(fov, []))
                 finally:
                     if hybe_pool is not None:
                         hybe_pool.shutdown(wait=True, cancel_futures=True)
@@ -1259,6 +1279,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._overlay_ctx = None
         self._overlay_label = 'Cell overlays'
         self._pending_per_cell_alignment = None  # (real_cell, staged_cell) awaiting Accept/Reject, or None
+        # per-FOV bookkeeping for an all-FOVs cell alignment run
+        self._cell_align_saved_fovs = set()
+        self._cell_align_pending_overlays = []
+        # a whole-store celltype-name scan deferred until its tab is open
+        self._celltype_names_scan_pending = False
+        # FOVs the user has deliberately edited in the transient container.
+        # Needed because an emptied FOV is indistinguishable from an
+        # untouched one by cell count alone -- see _staged_transient_fovs.
+        self._transient_staged_fovs = set()
         self._pending_per_cell_alignment_fov = None
         self._pending_per_cell_alignment_params = None
         self._cell_alignment_display_cells = []  # [(fov, cell), ...] -- every cell in the Overlay FOV (tier 3); Save All Cell Overlays batches over this
@@ -1559,6 +1588,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ChromatinTracingPanelUI.setupUi itself (same pattern ingestion_
         # panel.py's own HybeListWidget buttons already use) -- nothing to
         # connect here for those two.
+        self.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
         chp.HybeListWidget.itemChanged.connect(lambda _: self._refresh_chromatin_allele_hybe_choices())
         chp.AlleleFovSpinBox.valueChanged.connect(lambda _: self._on_chromatin_allele_fov_changed())
         chp.AlleleHybeComboBox.currentIndexChanged.connect(lambda _: self._on_chromatin_allele_hybe_changed())
@@ -2426,7 +2456,22 @@ class MainWindow(QtWidgets.QMainWindow):
         ctp.ensure_celltype_names(self.current_celltype_list)
         self._refresh_celltype_summaries()
 
-    def _refresh_celltype_names_from_vlinks(self):
+    CELLTYPE_TAB_TITLE = 'Celltype Determination'
+
+    def _celltype_tab_is_current(self):
+        tabs = getattr(self.ui, 'tabWidget', None)
+        return (tabs is not None
+                and tabs.tabText(tabs.currentIndex()) == self.CELLTYPE_TAB_TITLE)
+
+    def _on_tab_changed(self, index):
+        """Pay off work that was deferred because nobody was looking at
+        it -- see _refresh_celltype_names_from_vlinks."""
+        tabs = self.ui.tabWidget
+        if (tabs.tabText(index) == self.CELLTYPE_TAB_TITLE
+                and self._celltype_names_scan_pending):
+            self._refresh_celltype_names_from_vlinks(force=True)
+
+    def _refresh_celltype_names_from_vlinks(self, force=False):
         """
         Scans every FOV in the Ingestion tab's FOV list, across every
         storage path this session knows about, for cells that already
@@ -2440,6 +2485,19 @@ class MainWindow(QtWidgets.QMainWindow):
         classified data, without the user first manually re-typing every
         name back in.
         """
+        # This opens EVERY FOV's cells.h5 in EVERY store -- 1.6 s for the
+        # 50-FOV MAZ project, measured, and it grows with the project --
+        # to collect a handful of names that are only ever displayed in
+        # the Celltype Determination tab. Running it during startup made
+        # every launch pay for a list nobody was looking at yet, so the
+        # scan waits until that tab is actually open. The stated intent
+        # ("usable the moment vlinks has real classified data, without
+        # re-typing every name") is preserved exactly: the names are
+        # there when the tab is.
+        if not force and not self._celltype_tab_is_current():
+            self._celltype_names_scan_pending = True
+            return
+        self._celltype_names_scan_pending = False
         ip = self.ui.IngestionPanel
         ctp = self.ui.CelltypeDeterminationPanel
         storage_paths = self._all_analysis_storage_paths()
@@ -4432,6 +4490,28 @@ class MainWindow(QtWidgets.QMainWindow):
         analysis_store.write_cross_modal_matrix(pair['moving_storage_path'], fov, H,
                                               modality=moving)
 
+    def _staged_transient_fovs(self):
+        """FOVs the transient container is actually holding a result for.
+
+        A result of ZERO cells is a result: removing every cell in a FOV
+        is a legitimate thing to save, and the previous test ("has cells")
+        made it unsaveable -- Save Cells would find the emptied FOV
+        missing from its staged list and silently retarget to whichever
+        OTHER FOV still had cells, saving that one instead. So an FOV
+        counts as staged if it holds cells OR if it was deliberately
+        edited this session (_commit_cell_edit records that).
+
+        Order matters: the caller falls back to staged[0], so FOVs that
+        hold cells come first and an emptied one is only chosen when it
+        is genuinely the one in play.
+        """
+        if self.cell_container is None:
+            return []
+        with_cells = [f for f, cells in self.cell_container.data.items() if cells]
+        emptied = [f for f in sorted(self._transient_staged_fovs)
+                   if f not in with_cells]
+        return with_cells + emptied
+
     def _save_cells(self):
         cp = self.ui.CellSegmentPanel
         if self.cell_container is None or self._last_segment_context is None:
@@ -4441,7 +4521,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # _last_segment_context's, which only tracks the last SEGMENTATION
         # run and goes stale after a cytoplasm incorporate on another FOV.
         fov = self._last_segment_context['fov']
-        staged = [f for f, cells in self.cell_container.data.items() if cells]
+        staged = self._staged_transient_fovs()
         if staged and fov not in staged:
             fov = staged[0]
         already_saved = (self.cell_container_permanent is not None
@@ -5261,6 +5341,75 @@ class MainWindow(QtWidgets.QMainWindow):
         preserve_ids = self._selected_3d_spot_ids()
         self._current_view_spot_refs = [(s, cell) for s in scoped_spots]
         self._refresh_localize_3d_spot_choices(preserve_selected_ids=preserve_ids)
+
+    def _update_spot_markers_only(self):
+        """Patch ONLY the spot markers of the view already on screen.
+
+        A manual click changes the spot lists and nothing else: same FOV,
+        hybe, channel, crop, cell boundaries and context image. This
+        rebuilds the marker coordinates from the just-mutated spot
+        container and hands them to the displayer, reusing
+        _spot_crop_context's own rxmin/rymin -- the crop offset of what is
+        currently displayed -- so no MIP is read, no crop is rebuilt and
+        the FOV's cell boundaries are not re-projected.
+
+        Returns False when the fast path does not apply (no context, no
+        live figure, unexpected state), and the caller then does the full
+        reload -- so this can only ever be an optimisation, never a way
+        to show something stale.
+        """
+        ctx = self._spot_crop_context
+        d = self.spot_crop_displayer
+        if ctx is None or self.spot_container is None:
+            return False
+        hybe, channel = ctx['hybe'], ctx['channel']
+        rxmin, rymin = ctx['rxmin'], ctx['rymin']
+        try:
+            if ctx['kind'] == 'cell':
+                cell = ctx['cell']
+                fov = cell.fov
+                storage_path = self._storage_path_for_modality(ctx.get('modality'))
+                scoped = [s for s in self.spot_container.of_cell(fov, cell.id)
+                          if s.hybe == hybe and s.channel == channel]
+                points = [(s.raw_coordinate[1] - rxmin, s.raw_coordinate[0] - rymin)
+                          for s in scoped]
+                gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
+                indices = [gmap[id(s)] for s in scoped]
+                if not d.update_spots(points, spot_indices=indices):
+                    return False
+                refs = [(s, cell) for s in scoped]
+            else:
+                fov = ctx['fov']
+                storage_path = ctx['storage_path']
+                unassigned = [s for s in self.spot_container.unassigned(fov)
+                              if s.hybe == hybe and s.channel == channel]
+                points = [(float(s.raw_coordinate[1]), float(s.raw_coordinate[0]))
+                          for s in unassigned]
+                owned_points, refs = [], []
+                if self.cell_container is not None:
+                    by_id = {c.id: c for c in self.cell_container.get_cells(fov)}
+                    for s in self.spot_container.all(fov):
+                        cell = by_id.get(int(s.cell)) if int(s.cell) != -1 else None
+                        if cell is not None and s.hybe == hybe and s.channel == channel:
+                            owned_points.append((float(s.raw_coordinate[1]),
+                                                 float(s.raw_coordinate[0]), cell.id))
+                            refs.append((s, cell))
+                gmap = self._global_spot_index_map(storage_path, fov, hybe, channel)
+                indices = [gmap[id(s)] for s in unassigned]
+                owned_indices = [gmap[id(s)] for s, _c in refs]
+                if not d.update_spots(points, spot_indices=indices,
+                                      readonly_points=owned_points,
+                                      readonly_indices=owned_indices):
+                    return False
+                refs = [(s, None) for s in unassigned] + refs
+        except (KeyError, AttributeError, IndexError, TypeError):
+            # any surprise in the view state -- fall back to the full
+            # rebuild rather than leave the markers half-updated
+            return False
+        self._current_view_spot_refs = refs
+        self._refresh_localize_3d_spot_choices(
+            preserve_selected_ids=self._selected_3d_spot_ids())
+        return True
 
     _MIP_CACHE_MAX = 8
 
@@ -6531,6 +6680,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _commit_cell_edit(self, fov, fp):
         if fp is None or self.cell_container is None:
             return
+        # This FOV now carries deliberate transient edits, INCLUDING the
+        # edit that removed its last cell. CellContainer pre-creates an
+        # empty dict for every FOV in its list, so "has no cells" cannot
+        # tell "emptied on purpose" from "never touched" -- and _save_cells
+        # needs that distinction to save an emptied FOV instead of
+        # silently retargeting to a different one. See _staged_transient_fovs.
+        self._transient_staged_fovs.add(int(fov))
         self.cell_undo.container = self.cell_container
         self.cell_undo.push(fov, fp)
         self._update_cell_undo_buttons()
@@ -6761,10 +6917,18 @@ class MainWindow(QtWidgets.QMainWindow):
         # the zoom/pan back to full-frame after every single manual
         # click, making it impossible to place several spots precisely
         # while zoomed in.
-        if ctx['kind'] == 'cell':
-            self._load_spot_crop_for_display(keep_view=True)
-        else:
-            self._load_fov_spot_display(keep_view=True)
+        # A click changed the SPOT LISTS and nothing else: same FOV, hybe,
+        # channel, crop, cell boundaries, context image. Patching just the
+        # markers avoids rebuilding the left context panel -- 438 ms of
+        # CPU on a 73-cell FOV, and 15 s of wall time while an alignment
+        # run has the machine paging (measured). update_spots returns
+        # False if there is no live figure to patch, and then the full
+        # reload below still runs, so a stale view is not possible.
+        if not self._update_spot_markers_only():
+            if ctx['kind'] == 'cell':
+                self._load_spot_crop_for_display(keep_view=True)
+            else:
+                self._load_fov_spot_display(keep_view=True)
 
     def _on_readonly_spot_removed(self, cell_id, x, y):
         """
@@ -10574,10 +10738,18 @@ One PNG PER MODALITY: each modality has its own reference and its
         jobs = [(fov, cells_by_fov[fov],
                  self._cell_alignment_passes(cell_modality, storage_path, fov))
                 for fov in sorted(cells_by_fov)]
+        # run-scoped: which FOVs this run has already written, and the
+        # overlays they earned. Reset HERE, not in the finish handler --
+        # a stopped run never reaches it.
+        self._cell_align_saved_fovs = set()
+        self._cell_align_pending_overlays = []
         self._cell_alignment_worker = CellAlignmentWorker(
             jobs, channel_type=channel_type, pad=pad, z_max_shift=z_max_shift,
             append=(mode == 'append'))
         self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
+        self._cell_alignment_worker.fov_done.connect(
+            lambda fov, cells: self._on_cell_alignment_fov_done(
+                fov, cells, containers_by_fov))
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_all_finished(
                 results, containers_by_fov, storage_path, cell_reference_hybe,
@@ -10585,12 +10757,68 @@ One PNG PER MODALITY: each modality has its own reference and its
         self._cell_alignment_worker.failed.connect(self._on_cell_alignment_all_failed)
         self._cell_alignment_worker.start()
 
+    def _persist_cell_alignment_fov(self, fov, cells, containers_by_fov, threshold):
+        """Write ONE FOV's freshly fitted matrices, and return the cells
+        whose residual earns an overlay. Called as each FOV lands (see
+        CellAlignmentWorker.fov_done) and again from the finish handler
+        for any FOV that never fired -- writing twice is harmless, and
+        never writing is what used to lose a stopped run's work."""
+        container = containers_by_fov.get(fov)
+        if container is None:
+            return []
+        # The OTHER tier holds independent copies of the same cells;
+        # a later legitimate write from that tier would wipe these
+        # matrices from disk (confirmed real), so propagate first.
+        other = (self.cell_container if container is self.cell_container_permanent
+                 else self.cell_container_permanent)
+        if other is not None and other.data.get(fov):
+            src_by_id = {c.id: c for c in container.get_cells(fov)}
+            for twin in other.get_cells(fov):
+                src = src_by_id.get(twin.id)
+                if src is not None:
+                    twin.matrices = deepcopy(src.matrices)
+                    twin.matrix_anchors = deepcopy(src.matrix_anchors)
+                    twin.matrix_provenance = deepcopy(src.matrix_provenance)
+        storage_paths = self._all_analysis_storage_paths()
+        if storage_paths:
+            analysis_store.mirror_write_cells(storage_paths, fov, container)
+        # only WHICH cells need an overlay is decided here (a cheap
+        # in-memory residual check); the expensive arg resolution is
+        # deferred to the background overlay pipeline.
+        return [(cell, fov) for cell in cells
+                if self._cell_max_residual_shift(cell) >= max(threshold, 1e-9)]
+
+    def _on_cell_alignment_fov_done(self, fov, cells, containers_by_fov):
+        """One FOV's cells have all landed: save them NOW.
+
+        The overlay renders and the spot recast stay batched for the end
+        of the run -- they are DERIVED from the matrices this just wrote,
+        so re-deriving them is cheap next time, while the fits are hours.
+        """
+        ap = self.ui.AlignmentPanel
+        threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
+        try:
+            overlays = self._persist_cell_alignment_fov(
+                fov, cells, containers_by_fov, threshold)
+        except Exception as e:
+            # a FOV that cannot be written must not abort the run's
+            # remaining FOVs -- report it and keep fitting
+            self.log(f'cell alignment: FOV{fov:03d} could not be saved: {e}')
+            return
+        self._cell_align_saved_fovs.add(fov)
+        self._cell_align_pending_overlays.extend(overlays)
+        self.statusBar().showMessage(
+            f'FOV{fov:03d} saved ({len(cells)} cell(s)); '
+            f'{len(self._cell_align_saved_fovs)} FOV(s) saved so far.')
+
     def _on_cell_alignment_all_finished(self, results, containers_by_fov, storage_path,
                                         cell_reference_hybe, cell_modality, channel_type, pad):
         """
         results: [(fov, cells), ...] -- the real objects, mutated in place
-        by compute_cell_alignment. Persists EVERY FOV, then queues the
-        overlay pass for all of them at once.
+        by compute_cell_alignment. Every FOV was already persisted as it
+        landed; this catches any that never fired fov_done (in append
+        mode a FOV whose cells were all skipped has no tasks at all),
+        then queues the overlay pass for the whole run at once.
 
         Deliberately does NOT touch _pending_per_cell_alignment: a staged
         single-cell preview belongs to the user's own review loop and an
@@ -10606,40 +10834,13 @@ One PNG PER MODALITY: each modality has its own reference and its
                                                cell_alignment_pad=pad, **cell_alignment_kwargs)
 
         threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
-        pending_overlays = []
-        n_cells = 0
-        # PASS 1 -- persist every FOV. Nothing here waits on rendering:
-        # resolving one cell's overlay args costs ~55 ms on the real store
-        # (measured), so interleaving them with the writes made later
-        # FOVs' saves queue behind earlier FOVs' rendering prep. Matrices
-        # and recast spots are the results; overlays are a picture OF
-        # them, and pictures come last.
+        pending_overlays = list(self._cell_align_pending_overlays)
+        n_cells = sum(len(cells) for _fov, cells in results)
         for fov, cells in results:
-            container = containers_by_fov.get(fov)
-            if container is None:
+            if fov in self._cell_align_saved_fovs:
                 continue
-            n_cells += len(cells)
-            # The OTHER tier holds independent copies of the same cells;
-            # a later legitimate write from that tier would wipe these
-            # matrices from disk (confirmed real), so propagate first.
-            other = (self.cell_container if container is self.cell_container_permanent
-                     else self.cell_container_permanent)
-            if other is not None and other.data.get(fov):
-                src_by_id = {c.id: c for c in container.get_cells(fov)}
-                for twin in other.get_cells(fov):
-                    src = src_by_id.get(twin.id)
-                    if src is not None:
-                        twin.matrices = deepcopy(src.matrices)
-                        twin.matrix_anchors = deepcopy(src.matrix_anchors)
-                        twin.matrix_provenance = deepcopy(src.matrix_provenance)
-            if storage_paths:
-                analysis_store.mirror_write_cells(storage_paths, fov, container)
-            # only WHICH cells need an overlay is decided here (a cheap
-            # in-memory residual check); the expensive arg resolution is
-            # deferred to the background pipeline below.
-            for cell in cells:
-                if self._cell_max_residual_shift(cell) >= max(threshold, 1e-9):
-                    pending_overlays.append((cell, fov))
+            pending_overlays.extend(self._persist_cell_alignment_fov(
+                fov, cells, containers_by_fov, threshold))
 
         # PASS 1b -- the spot recast, in the BACKGROUND (measured: ~1 s
         # of CPU plus several NAS round-trips per FOV, and it ran here on
