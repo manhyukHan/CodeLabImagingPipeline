@@ -191,16 +191,45 @@ def child_guard():
                      daemon=True, name='parent-death-watch').start()
 
 
+# One pool child's MIP cache budget, in GB.
+#
+# analysis_store sizes that cache as a fraction of available RAM, clamped
+# to at most 4 GB. That is right for the ONE GUI process it was written
+# against and wrong by a factor of the pool size in here: 42 children x
+# 4 GB is 168 GB of nominal budget on a 352 GB machine, and the paging it
+# invites hurts far more than the cache helps. Measured while an
+# alignment run had the machine at 5000 pages/s: a GUI redraw that used
+# 438 ms of CPU took 15144 ms of wall time -- 34.6x starved, waiting on
+# page faults, not computing.
+#
+# A child needs exactly ONE FOV's MIPs resident: 319 MB for 76 hybes,
+# ~461 MB for 110. The benefit is a CLIFF at that working set, not a
+# gradient -- measured per-cell sweep over a real FOV: 4343 ms at
+# 0.125 GB, 4061 ms at 0.25 GB, then 3.6 ms at 0.5 GB, 3.0 ms at 1 GB and
+# 3.3 ms at 4 GB. So 1 GB keeps the entire win, with margin for a bigger
+# FOV, at a quarter of the memory.
+#
+# The stack-slab cache is deliberately NOT capped here: one slab is a
+# ~134 MB inflation and a worker sweeps every hybe of its FOV, so its
+# large budget is earned, and shrinking it blindly would cost real work.
+# The lever there is the worker COUNT, not the per-worker budget.
+CHILD_MIP_CACHE_GB = 1.0
+
+
 def child_initializer(user_initializer=None, *user_args):
     """
     THE initializer for every ProcessPoolExecutor in this app: installs
-    the child's own parent-death guard, then runs whatever initializer
-    the pool actually wanted.
+    the child's own parent-death guard, sizes this child's caches for
+    being one of many, then runs whatever initializer the pool wanted.
 
     A module-level function taking the user's initializer as an argument,
     so `functools.partial(child_initializer, real_init)` stays picklable
     under the 'spawn' start method -- a closure or a lambda would not.
     """
     child_guard()
+    # setdefault, so an explicit CODELAB_MIP_CACHE_GB in the environment
+    # (inherited from the parent) still wins -- including the 0 that
+    # turns the cache off.
+    os.environ.setdefault('CODELAB_MIP_CACHE_GB', str(CHILD_MIP_CACHE_GB))
     if user_initializer is not None:
         user_initializer(*user_args)

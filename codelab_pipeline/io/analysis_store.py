@@ -59,6 +59,7 @@ through io/columnar.py's packers.
 """
 import collections
 import contextlib
+import io
 import json
 import os
 import pickle
@@ -1082,13 +1083,199 @@ def write_hybe_mip(storage_path, fov, hybe, channel_mips, fiducial_channel=None)
     _replace(tmp, target)
 
 
+# -- per-process MIP frame cache -----------------------------------------
+#
+# Alignment crops per CELL, so one FOV costs cells x hybes windowed
+# reads -- 9196 of them for MP58's FOV1 (121 cells x 76 hybes) against
+# only 76 distinct files, every one re-opened. That re-reading is what
+# saturates the device: measured, an unrelated FOV's MIP read goes
+# 16.8 ms -> 2704 ms while only FOUR children are cropping, and 16
+# children are barely worse (3383 ms) -- the damage is caused by
+# concurrent readers existing at all, not by how many. Holding decoded
+# frames in memory removes the reads instead of rationing them, which
+# is also why it should survive a move to NAS.
+#
+# A frame enters the cache on the SECOND request for it, never the
+# first: a lone windowed crop stays a windowed read (58x cheaper than
+# inflating the whole gzip-chunked frame), and only a file this process
+# comes back to pays the one full read that then serves every later
+# window for free. Pool workers outlive their tasks, so the second cell
+# a worker handles already reads from RAM.
+#
+# Callers get a private, writable array exactly as they did before --
+# the copy costs ~0.2 ms against the 16 ms read it replaces, and buying
+# back the old semantics for that is worth more than the copy.
+
+_MIP_CACHE = collections.OrderedDict()   # {(path, name, mtime): ndarray}
+_MIP_SEEN = collections.OrderedDict()    # keys this process has read once
+_MIP_SEEN_MAX = 8192
+_MIP_LOCK = threading.Lock()
+_MIP_BYTES = 0
+_MIP_BUDGET = None
+_MIP_BUDGET_FRACTION = 0.05
+_MIP_BUDGET_MIN_GB = 1.0
+_MIP_BUDGET_MAX_GB = 4.0
+# A MIP file is a few MB; this guard only refuses something pathological.
+_MIP_SLURP_MAX = 256 << 20
+
+
+def mip_cache_budget_bytes():
+    """Bytes this process may hold in decoded MIPs. An explicit
+    CODELAB_MIP_CACHE_GB wins; otherwise a clamped fraction of available
+    RAM, measured ONCE -- the budget must not shrink mid-session just
+    because this cache has consumed the memory it is measured against.
+    The cap is per PROCESS and alignment runs a poolful of them, so it
+    stays well under what one machine can spare. CODELAB_MIP_CACHE_GB=0
+    turns the cache off outright.
+
+    Only MIPs live here -- a hybe's MIP is ~2.7 MB (all channels), so a
+    110-hybe FOV's whole working set is ~300 MB. Stack slabs are 243 MB
+    per hybe and are NOT held here; they have their own budgeted cache
+    in stack_cache.py."""
+    global _MIP_BUDGET
+    env = os.environ.get('CODELAB_MIP_CACHE_GB')
+    if env is not None:
+        try:
+            return int(max(float(env), 0.0) * (1 << 30))
+        except ValueError:
+            pass
+    if _MIP_BUDGET is None:
+        try:
+            from . import stack_cache
+            available = stack_cache._available_ram_bytes()
+        except Exception:
+            available = None
+        if available is None:
+            gb = _MIP_BUDGET_MIN_GB
+        else:
+            gb = min(max((available * _MIP_BUDGET_FRACTION) / (1 << 30),
+                         _MIP_BUDGET_MIN_GB), _MIP_BUDGET_MAX_GB)
+            # the floor is a floor on a HEALTHY machine only: on one
+            # that is already short of memory, never claim a quarter of
+            # what is left just to satisfy a default written for a
+            # 352 GB workstation
+            gb = min(gb, (available * 0.25) / (1 << 30))
+        _MIP_BUDGET = int(max(gb, 0.0) * (1 << 30))
+    return _MIP_BUDGET
+
+
+def _mip_cache_get(key):
+    with _MIP_LOCK:
+        frame = _MIP_CACHE.get(key)
+        if frame is not None:
+            _MIP_CACHE.move_to_end(key)
+        return frame
+
+
+def _mip_cache_put(key, frame):
+    """Hold a read-only frame, evicting least-recently-used ones to stay
+    inside the budget. The frame stored is never handed out directly."""
+    global _MIP_BYTES
+    budget = mip_cache_budget_bytes()
+    if frame.nbytes > budget:
+        return
+    with _MIP_LOCK:
+        if key in _MIP_CACHE:
+            return
+        _MIP_CACHE[key] = frame
+        _MIP_BYTES += int(frame.nbytes)
+        while _MIP_BYTES > budget and len(_MIP_CACHE) > 1:
+            _, evicted = _MIP_CACHE.popitem(last=False)
+            _MIP_BYTES -= int(evicted.nbytes)
+
+
+def _mip_seen_before(key):
+    """True once this process has already read this frame -- the signal
+    to stop re-reading it and hold it instead."""
+    with _MIP_LOCK:
+        if key in _MIP_SEEN:
+            return True
+        _MIP_SEEN[key] = True
+        while len(_MIP_SEEN) > _MIP_SEEN_MAX:
+            _MIP_SEEN.popitem(last=False)
+        return False
+
+
+def mip_cache_stats():
+    """(frames, bytes, budget_bytes) -- for probes and status reporting."""
+    with _MIP_LOCK:
+        return len(_MIP_CACHE), _MIP_BYTES, mip_cache_budget_bytes()
+
+
+def clear_mip_cache():
+    global _MIP_BYTES
+    with _MIP_LOCK:
+        _MIP_CACHE.clear()
+        _MIP_SEEN.clear()
+        _MIP_BYTES = 0
+
+
+def _mip_key(path, name):
+    try:
+        return (os.path.abspath(path), name, os.stat(path).st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _crop(frame, window):
+    """A private, writable copy -- the cache only ever hands out copies,
+    so a caller may mutate its MIP exactly as it always could."""
+    if window is None:
+        return np.array(frame)
+    return np.array(frame[window[0]:window[1], window[2]:window[3]])
+
+
+def _load_mip_file(path):
+    """Every channel in one MIP file, decoded from a SINGLE sequential
+    read. Reading through h5py walks the frame's 128 gzip chunks one
+    seek at a time -- measured 1449 ms cold for a 2.5 MB file -- while
+    slurping the whole file and decoding it from RAM costs 388 ms and
+    yields every channel, not one. Returns None (caller falls back) for
+    an unreadable file or one too large to hold whole."""
+    try:
+        if os.path.getsize(path) > _MIP_SLURP_MAX:
+            return None
+        with open(path, 'rb') as fh:
+            blob = fh.read()
+        frames = {}
+        with h5py.File(io.BytesIO(blob), 'r') as f:
+            for k in f.keys():
+                if not k.startswith('ch'):
+                    continue
+                frame = f[k][:]
+                frame.flags.writeable = False
+                frames[k] = frame
+        return frames
+    except (OSError, ValueError, KeyError):
+        return None
+
+
 def read_hybe_mip(storage_path, fov, hybe, channel, window=None):
     """One hybe/channel's stored MIP (or None). window=(ymin, ymax,
     xmin, xmax) reads only the covering chunks -- measured 58x cheaper
-    than inflating the full gzip-chunked frame for a cell-sized crop."""
+    than inflating the whole gzip-chunked frame for a cell-sized crop.
+
+    A frame this process asks for a second time is decoded once and
+    held (see the cache note above), so every later read of it -- any
+    window, any channel of the same file -- costs a memcpy. A full-frame
+    request always takes the held path: it is cheaper outright, 388 ms
+    against 1449 ms, so there is nothing to defer."""
+    path = paths.mip_path(storage_path, fov, hybe)
+    name = f'ch{channel}'
+    key = _mip_key(path, name)
+    if key is not None:
+        frame = _mip_cache_get(key)
+        if frame is not None:
+            return _crop(frame, window)
+        if window is None or _mip_seen_before(key):
+            frames = _load_mip_file(path)
+            if frames is not None:
+                for k, held in frames.items():
+                    _mip_cache_put((key[0], k, key[2]), held)
+                frame = frames.get(name)
+                return None if frame is None else _crop(frame, window)
     try:
-        with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
-            name = f'ch{channel}'
+        with h5py.File(path, 'r') as f:
             if name not in f:
                 return None
             if window is None:
@@ -1099,42 +1286,52 @@ def read_hybe_mip(storage_path, fov, hybe, channel, window=None):
         return None
 
 
+def mip_meta(storage_path, fov, hybe):
+    """{'fiducial': str|None, 'channels': [str, ...]} for a hybe's MIP
+    file, or None if never ingested. Channels are in the LAYOUT's order
+    (the stamped channel_list attr), which is the convention every
+    channel-type picker follows; files stamped before channel_list
+    existed degrade to alphabetical key order -- identical behavior for
+    the one-readout stores that predate it."""
+    path = paths.mip_path(storage_path, fov, hybe)
+
+    def load():
+        try:
+            with h5py.File(path, 'r') as f:
+                fid = (str(int(f.attrs['fiducial_channel']))
+                       if 'fiducial_channel' in f.attrs else None)
+                if 'channel_list' in f.attrs:
+                    chans = [c.decode() if isinstance(c, bytes) else str(c)
+                             for c in f.attrs['channel_list']]
+                else:
+                    chans = [k[2:] for k in f.keys() if k.startswith('ch')]
+                return {'fiducial': fid, 'channels': chans}
+        except OSError:
+            return None
+
+    return _cached(path, 'mip_meta', load)
+
+
 def fiducial_channel_mip(storage_path, fov, hybe):
     """The fiducial channel's MIP for a hybe, resolved from the MIP
     file's own fiducial_channel attr; None if not ingested/stamped."""
-    try:
-        with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
-            if 'fiducial_channel' not in f.attrs:
-                return None
-            name = f"ch{int(f.attrs['fiducial_channel'])}"
-            return f[name][:] if name in f else None
-    except OSError:
+    meta = mip_meta(storage_path, fov, hybe)
+    if not meta or meta['fiducial'] is None:
         return None
+    return read_hybe_mip(storage_path, fov, hybe, meta['fiducial'])
 
 
 def readout_channel_mip(storage_path, fov, hybe):
-    """The FIRST non-fiducial channel's MIP for a hybe -- first in the
-    LAYOUT's channel order (the stamped channel_list attr), which is the
-    convention every channel-type picker follows; falls back to the
-    fiducial when the hybe genuinely has no other channel. Files stamped
-    before channel_list existed degrade to alphabetical key order --
-    identical behavior for the one-readout stores that predate it.
-    Returns None if not ingested/stamped."""
-    try:
-        with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
-            if 'fiducial_channel' not in f.attrs:
-                return None
-            fid = str(int(f.attrs['fiducial_channel']))
-            if 'channel_list' in f.attrs:
-                chans = [c.decode() if isinstance(c, bytes) else str(c)
-                         for c in f.attrs['channel_list']]
-            else:
-                chans = [k[2:] for k in f.keys() if k.startswith('ch')]
-            readout = [c for c in chans if c != fid]
-            name = f'ch{readout[0]}' if readout else f'ch{fid}'
-            return f[name][:] if name in f else None
-    except OSError:
+    """The FIRST non-fiducial channel's MIP for a hybe, in layout order;
+    falls back to the fiducial when the hybe genuinely has no other
+    channel. Returns None if not ingested/stamped."""
+    meta = mip_meta(storage_path, fov, hybe)
+    if not meta or meta['fiducial'] is None:
         return None
+    fid = meta['fiducial']
+    readout = [c for c in meta['channels'] if c != fid]
+    return read_hybe_mip(storage_path, fov, hybe,
+                         readout[0] if readout else fid)
 
 
 def channel_mip(storage_path, fov, hybe, channel_choice):
@@ -1157,8 +1354,5 @@ def mip_channels_present(storage_path, fov, hybe):
     """{channel(str): True} for the channels this hybe's MIP holds, or
     None if never ingested. The MIP file is written atomically, so its
     existence is completeness -- one open only when it exists."""
-    try:
-        with h5py.File(paths.mip_path(storage_path, fov, hybe), 'r') as f:
-            return {k[2:]: True for k in f.keys() if k.startswith('ch')}
-    except OSError:
-        return None
+    meta = mip_meta(storage_path, fov, hybe)
+    return None if meta is None else {c: True for c in meta['channels']}
