@@ -92,6 +92,11 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         # edges -- nothing here constrains it in either direction.
         self.resize(760, 760)
         self.crop_image = None
+        # set when data arrived while hidden; paid off by showEvent
+        self._redraw_deferred = False
+        # the marker artists from the last draw, so update_spots can
+        # replace exactly those and leave the rest of the figure alone
+        self._spot_artists = []
         self.spot_points = []
         self.spot_indices = []
         self.crop_mask = None
@@ -230,8 +235,64 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
         self.context_title = context_title
         self._redraw(keep_view=keep_view)
 
+    def showEvent(self, event):
+        """Draw what arrived while this pop-up was hidden -- see _redraw."""
+        super().showEvent(event)
+        if self._redraw_deferred:
+            self._redraw_deferred = False
+            self._redraw(keep_view=False)
+
+    def update_spots(self, spot_points, spot_indices=None,
+                     readonly_points=None, readonly_indices=None):
+        """Redraw ONLY the spot markers, onto the axes already on screen.
+
+        A manual click changes the spot lists and NOTHING else, yet the
+        full _redraw clears the figure and rebuilds everything on it --
+        including the left context panel's 1024x1024 image, one contour
+        per cell and one text label per cell. On a 73-cell FOV that is
+        438 ms of CPU, and while a cell-alignment run had the machine
+        paging at ~5000 pages/s it was 15 s of WALL time. Per click.
+        None of that content changed, so none of it is touched here: the
+        previous marker artists are removed and the new ones drawn on the
+        same axes.
+
+        Returns False when there is no live figure to patch -- never
+        drawn yet, or hidden, or the axes were torn down -- so the caller
+        can fall back to a full set_data rather than show a stale view.
+        """
+        if not self.isVisible() or self._axes is None or self.crop_image is None:
+            return False
+        ax = self._axes
+        if ax.figure is not self.canvas.figure:
+            return False        # figure was rebuilt under us
+        self.spot_points = list(spot_points)
+        self.spot_indices = (list(spot_indices) if spot_indices is not None
+                             else list(range(1, len(self.spot_points) + 1)))
+        if readonly_points is not None:
+            self.readonly_points = list(readonly_points)
+            self.readonly_indices = (list(readonly_indices)
+                                     if readonly_indices is not None
+                                     else list(range(len(self.readonly_points))))
+        for artist in self._spot_artists:
+            try:
+                artist.remove()
+            except (ValueError, NotImplementedError):
+                pass            # already gone with a cleared figure
+        self._spot_artists = []
+        self._draw_spot_markers(ax)
+        self.canvas.draw_idle()
+        return True
+
     def _redraw(self, keep_view=True):
         if self.crop_image is None:
+            return
+        if not self.isVisible():
+            # A whole-FOV render costs 3.5 s (measured, real store) and
+            # set_data is reached during MainWindow construction, before
+            # this pop-up has ever been shown -- rasterizing a figure
+            # nobody can see was the single largest item in app startup.
+            # showEvent pays this off the moment there is a viewer.
+            self._redraw_deferred = True
             return
         fig = self.canvas.figure
         saved_view = zoom_pan.capture_view(fig) if keep_view else None
@@ -276,26 +337,41 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                     self._contour_one(ax, xs, ys)
             else:
                 ax.contour(arr.astype(np.uint8), levels=[0.5], colors='yellow', linewidths=1)
-        if self.readonly_points:
-            title = f'{len(self.spot_points)} spot(s) + {len(self.readonly_points)} other'
-        else:
-            title = f'{len(self.spot_points)} spot(s)'
-        ax.set_title(title, fontsize=10)
         ax.axis('off')
-        # A single batched scatter call regardless of point count -- one
-        # ax.scatter([x],[y]) + one ax.text() PER POINT was fine for a
-        # handful of manually-clicked spots, but is ruinously slow (each
-        # Text artist does real font-layout work) once a view can
-        # legitimately carry thousands of real detected spots (see
-        # fov_unassigned_spots). Per-point index labels are only useful
-        # at a glance for small counts anyway, so they're skipped above
-        # LABEL_LIMIT rather than rendered unreadably on top of each other.
+        # sets the spot-count title too, so it stays correct on both the
+        # full redraw and the incremental update
+        self._draw_spot_markers(ax)
+        fig.tight_layout()
+        zoom_pan.restore_view(fig, saved_view)
+        self._axes = ax
+        self.canvas.draw()
+
+    def _draw_spot_markers(self, ax):
+        """The spot markers and their index labels, and nothing else.
+
+        Factored out of _redraw so update_spots draws them the SAME way
+        on an existing figure -- one implementation, so an incremental
+        update can never disagree with a full redraw. Every artist it
+        creates is recorded in _spot_artists so update_spots can take
+        them back off again.
+
+        A single batched scatter call regardless of point count -- one
+        ax.scatter([x],[y]) + one ax.text() PER POINT was fine for a
+        handful of manually-clicked spots, but is ruinously slow (each
+        Text artist does real font-layout work) once a view can
+        legitimately carry thousands of real detected spots (see
+        fov_unassigned_spots). Per-point index labels are only useful
+        at a glance for small counts anyway, so they're skipped above
+        LABEL_LIMIT rather than rendered unreadably on top of each other.
+        """
         LABEL_LIMIT = 300
+        made = []
         total = len(self.spot_points) + len(self.readonly_points)
         if self.readonly_points:
             xs = [p[0] for p in self.readonly_points]
             ys = [p[1] for p in self.readonly_points]
-            ax.scatter(xs, ys, edgecolor='red', facecolor='none', s=60, linewidth=1.2)
+            made.append(ax.scatter(xs, ys, edgecolor='red', facecolor='none',
+                                   s=60, linewidth=1.2))
             if total <= LABEL_LIMIT:
                 for i, p in enumerate(self.readonly_points):
                     x, y = p[0], p[1]
@@ -304,18 +380,24 @@ class SpotCropDisplayer(QtWidgets.QMainWindow):
                     # index is the caller's GLOBAL number, not a local i+1.
                     disp = self.readonly_indices[i] if i < len(self.readonly_indices) else i + 1
                     tag_text = f' | {p[2]}' if len(p) > 2 and p[2] is not None else ''
-                    ax.text(x + 2, y - 2, f'{disp}{tag_text}', color='red', fontsize=8)
+                    made.append(ax.text(x + 2, y - 2, f'{disp}{tag_text}',
+                                        color='red', fontsize=8))
         if self.spot_points:
             xs, ys = zip(*self.spot_points)
-            ax.scatter(xs, ys, edgecolor=self.spot_color, facecolor='none', s=60, linewidth=1.2)
+            made.append(ax.scatter(xs, ys, edgecolor=self.spot_color,
+                                   facecolor='none', s=60, linewidth=1.2))
             if total <= LABEL_LIMIT:
                 for i, (x, y) in enumerate(self.spot_points):
                     disp = self.spot_indices[i] if i < len(self.spot_indices) else i + 1
-                    ax.text(x + 2, y - 2, str(disp), color=self.spot_color, fontsize=8)
-        fig.tight_layout()
-        zoom_pan.restore_view(fig, saved_view)
-        self._axes = ax
-        self.canvas.draw()
+                    made.append(ax.text(x + 2, y - 2, str(disp),
+                                        color=self.spot_color, fontsize=8))
+        # the title counts spots, so it moves with them
+        if self.readonly_points:
+            ax.set_title(f'{len(self.spot_points)} spot(s) + '
+                         f'{len(self.readonly_points)} other', fontsize=10)
+        else:
+            ax.set_title(f'{len(self.spot_points)} spot(s)', fontsize=10)
+        self._spot_artists = made
 
     def _draw_context(self, ax):
         """

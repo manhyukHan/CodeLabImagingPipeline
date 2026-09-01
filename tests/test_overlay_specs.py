@@ -205,6 +205,12 @@ def main():
     from canvas.spot_crop_displayer import SpotCropDisplayer
     import numpy as _np
     d = SpotCropDisplayer()
+    # This section reads the figure's own artists, so the window has to be
+    # VISIBLE: a hidden displayer defers its redraw (rasterizing a whole
+    # FOV for nobody was 3.5 s of app startup) and its figure would hold
+    # no axes to inspect. Showing it is also the condition being tested --
+    # these are the colors a user sees.
+    d.show()
     ys_g, xs_g = _np.mgrid[0:64, 0:64]
     masks = []
     for cid, (cx, cy) in enumerate([(15, 15), (45, 20), (30, 45)], start=44):

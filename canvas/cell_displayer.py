@@ -84,6 +84,8 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self.resize(760, 480)
         self.reference_image = None
         self.mask = None
+        # set when data arrived while hidden; paid off by showEvent
+        self._redraw_deferred = False
         self._mask_axes = None
         self._manual_mode = False
         self._pending_vertices = []
@@ -157,8 +159,28 @@ class CellDisplayer(QtWidgets.QMainWindow):
         self._pending_vertices = []
         self._redraw(keep_view=False)
 
+    def showEvent(self, event):
+        """Draw what arrived while this window was hidden.
+
+        _redraw scatters and labels every cell boundary through
+        matplotlib -- measured 1.4 s for one real FOV -- and set_data is
+        called during MainWindow construction, when this window has never
+        been shown. Rasterizing for nobody is the whole cost of that
+        step, so it is deferred to the moment there is actually someone
+        to see it. A window that is already visible redraws immediately,
+        exactly as before.
+        """
+        super().showEvent(event)
+        if self._redraw_deferred:
+            self._redraw_deferred = False
+            self._redraw(keep_view=False)
+
     def _redraw(self, keep_view=True):
         if self.reference_image is None or self.mask is None:
+            return
+        if not self.isVisible():
+            # remember that this window owes a draw; showEvent pays it
+            self._redraw_deferred = True
             return
         fig = self.canvas.figure
         # capture BEFORE fig.clear() -- every interaction (add/remove a
