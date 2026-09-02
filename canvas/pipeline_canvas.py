@@ -769,7 +769,14 @@ class PipelineCanvas():
                         [('raw', raw_zx), ('FOV/cross-modal', fov_zx), ('final', final_zx)]))
 
         reference_summary = ', '.join(f"{spec['hybe']} ({spec.get('modality')})" for spec in reference_specs)
-        title = f'cell {cell.id}: {target_hybe} vs {reference_summary}'
+        # The target is named the SAME way as the references it is being
+        # compared against: hybe (modality). A bare folder name is
+        # ambiguous by construction here -- the cross-modal bridge hybe is
+        # a real, distinct acquisition in BOTH modalities, so "Hyb_130 vs
+        # Hyb_002 (DNA)" does not say which Hyb_130 was warped.
+        target_label = (f'{target_hybe} ({target_modality})' if target_modality
+                        else str(target_hybe))
+        title = f'cell {cell.id}: {target_label} vs {reference_summary}'
         self._draw_three_way(rows, title, lb, ub, save_path)
 
     def draw_all_readouts_overlay(self, before_images, after_images, title, save_path=None):
@@ -833,7 +840,11 @@ class PipelineCanvas():
             before_images[hybe] = mip
             after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
 
-        title = f'FOV{fov:03d}: all readouts vs {reference_hybe} (before/after)'
+        # same hybe (modality) naming as every other alignment figure --
+        # this store's own modality, resolved once from its path
+        modality = analysis_store.modality_of(storage_path)
+        ref_label = f'{reference_hybe} ({modality})' if modality else reference_hybe
+        title = f'FOV{fov:03d}: all readouts vs {ref_label} (before/after)'
         self.draw_all_readouts_overlay(before_images, after_images, title, save_path)
 
     def draw_cell_all_readouts_overlay(self, cell, fov, reference_hybe, reference_storage_path, reference_channel,
@@ -1118,8 +1129,11 @@ class PipelineCanvas():
         # is warped into the pipeline's ONE shared frame (RNA's own same-
         # modality reference hybe, see ACell.matrix_to_shared), regardless
         # of which hybe reference_hybe happens to be.
+        ref_modality = analysis_store.modality_of(reference_storage_path)
+        ref_label = (f'{reference_hybe} ({ref_modality})' if ref_modality
+                     else str(reference_hybe))
         fig.suptitle(f'cell {cell.id}: {n_readouts} readout(s) across {num_blocks} modality block(s), '
-                    f'reference panel={reference_hybe} '
+                    f'reference panel={ref_label} '
                     f'(sequential color, red=frame, yellow=cell boundary)', fontsize=10, wrap=True)
         fig.tight_layout(rect=[0, 0, 1, 0.93])
         if figure is None:
@@ -1136,8 +1150,13 @@ class PipelineCanvas():
         matrices = _bare_hybe(matrices)
         reference_mip = _read_mip(storage_path, fov, reference_hybe, fiducial_channels[reference_hybe])
         moving_mip = _read_mip(storage_path, fov, target_hybe, fiducial_channels[target_hybe])
+        # hybe (modality), like every other alignment figure. Both hybes
+        # are same-modality here by construction, so one lookup names both.
+        modality = analysis_store.modality_of(storage_path)
+        tag = f' ({modality})' if modality else ''
         self.draw_alignment_preview(reference_mip, moving_mip, matrices[target_hybe],
-                                    f'{target_hybe} -> {reference_hybe} (fiducial)')
+                                    f'{target_hybe}{tag} -> {reference_hybe}{tag} '
+                                    f'(fiducial)')
 
     def draw_cross_modal_preview(self, rna_storage_path, dna_storage_path, fov,
                                  rna_reference_hybe, dna_reference_hybe, channel_type, H_across,
@@ -1176,9 +1195,21 @@ class PipelineCanvas():
         rna_mip_corrected = cv2.warpAffine(rna_mip.astype(np.float32), as_cv2(H_rna_within)[:2], (w, h))
         dna_mip_corrected = cv2.warpAffine(dna_mip.astype(np.float32), as_cv2(H_dna_within)[:2], (w, h))
 
+        # The parenthetical used to carry only the ROLE (moving/shared),
+        # which is the one thing a cross-modal figure can leave unsaid:
+        # the two sides are in DIFFERENT modalities, and that is the whole
+        # point of the comparison. Name both -- "Hyb_002 (DNA, moving) ->
+        # Hyb_101 (RNA, shared)" -- so the figure says which acquisition
+        # each half came from as well as what it is doing.
+        moving_modality = analysis_store.modality_of(dna_storage_path)
+        shared_modality = analysis_store.modality_of(rna_storage_path)
+        moving_tag = (f'{moving_modality}, {moving_label}' if moving_modality
+                      else moving_label)
+        shared_tag = (f'{shared_modality}, {shared_label}' if shared_modality
+                      else shared_label)
         self.draw_alignment_preview(rna_mip_corrected, dna_mip_corrected, H_across,
-                                    f'{dna_reference_hybe} ({moving_label}) -> '
-                                    f'{rna_reference_hybe} ({shared_label}), {channel_type}',
+                                    f'{dna_reference_hybe} ({moving_tag}) -> '
+                                    f'{rna_reference_hybe} ({shared_tag}), {channel_type}',
                                     save_path=save_path)
 
 

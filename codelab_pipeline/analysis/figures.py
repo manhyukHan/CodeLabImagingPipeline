@@ -447,44 +447,81 @@ def fig_repeat_toe_qc(pop):
     toe = al.get('toe_pos_um')
     toe_ids = al.get('toe_ids') or []
     bin_ids = list(al.get('bin_ids') or [])
-    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4))
-    ax = axes[0]
-    style_ax(ax)
+
+    # ONE PANEL PER PAIR, not one axis carrying all of them. Overlaid step
+    # lines answered "how wide is the spread" but not the question a
+    # replication check is actually asking, which is per pair: is THIS
+    # bin's repeat tight? Seven lines sharing one axis also hid a single
+    # bad pair inside the pooled envelope.
+    #
+    # Each panel carries a GRAY reference: the same allele's distance to
+    # every OTHER genomic bin -- non-identical, non-repeat. That is the
+    # null this measurement has to beat. A repeat histogram sitting on top
+    # of the gray one means the "replicate" is no closer than an unrelated
+    # locus, which no summary statistic states as plainly.
+    dists, refs = {}, {}
     if rep is not None and len(rep_ids) and bin_ids:
-        colors = cm.rainbow(np.linspace(0, 1, len(rep_ids)))
-        # DENSITY step lines on SHARED edges, per request: pair counts
-        # differ (n=56..156 measured), so raw allele counts make the
-        # best-covered pair look like the widest error, and seven
-        # overlapping bar sets are unreadable anyway
-        dists = {}
+        pos = al['pos_um']
         for j, rid in enumerate(rep_ids):
             if rid not in bin_ids:
                 continue
-            hpos = al['pos_um'][:, bin_ids.index(rid), :]
-            rpos = rep[:, j, :]
-            d = np.sqrt(((hpos - rpos) ** 2).sum(1))
+            k = bin_ids.index(rid)
+            hpos = pos[:, k, :]
+            d = np.sqrt(((hpos - rep[:, j, :]) ** 2).sum(1))
             d = d[np.isfinite(d)]
-            if len(d):
-                dists[j] = d
-        if dists:
-            # ONE axis for every pair: 40 equal-width bins from 0 to the
-            # pooled maximum -- per-pair binning gave each line its own
-            # range AND width, which reads as spread that is not there
-            top = float(max(d.max() for d in dists.values()))
-            edges = np.linspace(0.0, top if top > 0 else 1.0, 41)
-            for j, d in dists.items():
-                ax.hist(d, bins=edges, density=True, histtype='step',
-                        linewidth=1.5, color=colors[j],
-                        label=f'H{rep_ids[j]} vs R{rep_ids[j]} (n={len(d)}, '
-                              f'med {np.median(d):.2f} um)')
-            ax.legend(fontsize=7)
-        ax.set_xlabel('|H - R| same-bin distance (um)', fontsize=8)
-        ax.set_ylabel('density (1/um)', fontsize=8)
-        ax.set_title('hybe-repeat replication error', fontsize=10)
+            if not len(d):
+                continue
+            dists[j] = d
+            # distance from THIS bin to every other bin, same alleles
+            other = np.delete(np.arange(pos.shape[1]), k)
+            if len(other):
+                dd = np.sqrt(((hpos[:, None, :] - pos[:, other, :]) ** 2).sum(-1))
+                dd = dd[np.isfinite(dd)]
+                refs[j] = dd
+
+    n_pairs = len(dists)
+    ncols = min(4, max(1, n_pairs))
+    nrows = int(np.ceil(n_pairs / ncols)) if n_pairs else 1
+    # constrained_layout: a per-pair grid stacked above a full-width toe
+    # panel collides otherwise -- row 2's titles land on row 1's x labels
+    fig = plt.figure(figsize=(3.3 * ncols, 2.9 * nrows + 3.8),
+                     constrained_layout=True)
+    gs = fig.add_gridspec(nrows + 1, ncols,
+                          height_ratios=[1] * nrows + [1.3])
+    if n_pairs:
+        colors = cm.rainbow(np.linspace(0, 1, len(rep_ids)))
+        # one shared x-range across every panel, so the panels can be
+        # compared to each other and not just to their own gray
+        top = float(max(d.max() for d in dists.values()))
+        edges = np.linspace(0.0, top if top > 0 else 1.0, 41)
+        for i, (j, d) in enumerate(sorted(dists.items())):
+            ax = fig.add_subplot(gs[i // ncols, i % ncols])
+            style_ax(ax)
+            ref = refs.get(j)
+            if ref is not None and len(ref):
+                ax.hist(ref, bins=edges, density=True, color='0.85',
+                        label=f'other bins (n={len(ref)})')
+            ax.hist(d, bins=edges, density=True, histtype='step',
+                    linewidth=1.6, color=colors[j])
+            ax.axvline(float(np.median(d)), color=colors[j], linestyle='--',
+                       linewidth=1.0)
+            ax.set_title(f'H{rep_ids[j]} vs R{rep_ids[j]}\n'
+                         f'n={len(d)}, med {np.median(d):.2f} um', fontsize=8)
+            ax.set_xlim(edges[0], edges[-1])
+            if i % ncols == 0:
+                ax.set_ylabel('density (1/um)', fontsize=8)
+            ax.set_xlabel('distance (um)', fontsize=8)
+            ax.tick_params(labelsize=7)
+        # the gray legend once, on the first panel only
+        first = fig.axes[0]
+        first.legend(fontsize=6, loc='upper right')
     else:
+        ax = fig.add_subplot(gs[0, :])
+        style_ax(ax)
         ax.set_title('no repeat rounds in the layout / population',
                      fontsize=10)
-    ax = axes[1]
+
+    ax = fig.add_subplot(gs[nrows, :])
     style_ax(ax)
     if toe is not None and len(toe_ids) and len(toe):
         # toes are IDENTITY markers -- a toe absent outside its own
