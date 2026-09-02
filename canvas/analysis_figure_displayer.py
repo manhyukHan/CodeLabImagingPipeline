@@ -49,11 +49,21 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
         self.YMinLineEdit = QtWidgets.QLineEdit()
         self.YMaxLineEdit = QtWidgets.QLineEdit()
         self.BinsLineEdit = QtWidgets.QLineEdit()
+        # COLOR SCALE -- the distance map's own range. It was set from the
+        # 2%/98% quantiles of whatever was on screen and could not be
+        # touched, so two maps could not be compared: each got its own
+        # scale, and the same colour meant a different distance in each.
+        # Setting it is a pure set_clim on the images already drawn: no
+        # re-gate, no rebuild, not even a re-render of the data.
+        self.ColorMinLineEdit = QtWidgets.QLineEdit()
+        self.ColorMaxLineEdit = QtWidgets.QLineEdit()
         for label, w, tip in (('X', self.XMinLineEdit, 'x min'),
                               ('-', self.XMaxLineEdit, 'x max'),
                               ('Y', self.YMinLineEdit, 'y min'),
                               ('-', self.YMaxLineEdit, 'y max'),
-                              ('bins', self.BinsLineEdit, 'x bins')):
+                              ('bins', self.BinsLineEdit, 'x bins'),
+                              ('color', self.ColorMinLineEdit, 'color min'),
+                              ('-', self.ColorMaxLineEdit, 'color max')):
             w.setPlaceholderText(tip + ' (auto)')
             w.setMaximumWidth(90)
             rangeRow.addWidget(QtWidgets.QLabel(label + ':'))
@@ -79,6 +89,8 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
         layout.addLayout(row)
         self.setCentralWidget(central)
         self._payload = None
+        # per-image clim the current figure chose for itself; Auto restores it
+        self._auto_clims = []
 
     def _range_values(self):
         def num(w, cast=float):
@@ -86,7 +98,39 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
             return cast(t) if t else None
         return {'xmin': num(self.XMinLineEdit), 'xmax': num(self.XMaxLineEdit),
                 'ymin': num(self.YMinLineEdit), 'ymax': num(self.YMaxLineEdit),
-                'bins': num(self.BinsLineEdit, int)}
+                'bins': num(self.BinsLineEdit, int),
+                'cmin': num(self.ColorMinLineEdit),
+                'cmax': num(self.ColorMaxLineEdit)}
+
+    def _images(self):
+        """Every drawn image in the figure, in axes order -- the things a
+        colour scale applies to. A figure with none (a histogram, a line
+        plot) simply has no colour scale to set."""
+        return [im for ax in self.canvas.figure.axes for im in ax.get_images()]
+
+    def _apply_color_scale(self, cmin, cmax):
+        """set_clim on every image, filling either end from what that
+        image already has, so setting only one end keeps the other.
+
+        Every image gets the SAME range on purpose: the panels of an
+        ensemble figure are meant to be compared against each other, and
+        fig_ensemble already unifies them for exactly that reason.
+        """
+        images = self._images()
+        if not images:
+            return False
+        for im in images:
+            lo, hi = im.get_clim()
+            im.set_clim(lo if cmin is None else cmin,
+                        hi if cmax is None else cmax)
+        # the colorbar tracks its mappable, but ask for the update
+        # explicitly: a colorbar built over a DIFFERENT image of the same
+        # figure (fig_ensemble attaches one to the last panel) does not
+        # otherwise notice the others changing
+        for im in images:
+            if getattr(im, 'colorbar', None) is not None:
+                im.colorbar.update_normal(im)
+        return True
 
     def _apply_view_range(self):
         try:
@@ -117,12 +161,23 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
                 ax.set_xlim(left=v['xmin'], right=v['xmax'])
             if v['ymin'] is not None or v['ymax'] is not None:
                 ax.set_ylim(bottom=v['ymin'], top=v['ymax'])
+        if v['cmin'] is not None or v['cmax'] is not None:
+            if not self._apply_color_scale(v['cmin'], v['cmax']):
+                self.RangeHintLabel.setText(
+                    'view range (display only) -- this figure has no image '
+                    'to colour-scale')
         self.canvas.draw()
 
     def _auto_view_range(self):
         for w in (self.XMinLineEdit, self.XMaxLineEdit, self.YMinLineEdit,
-                  self.YMaxLineEdit, self.BinsLineEdit):
+                  self.YMaxLineEdit, self.BinsLineEdit,
+                  self.ColorMinLineEdit, self.ColorMaxLineEdit):
             w.clear()
+        # put back the scale the figure chose for itself
+        for im, clim in zip(self._images(), getattr(self, '_auto_clims', [])):
+            im.set_clim(*clim)
+            if getattr(im, 'colorbar', None) is not None:
+                im.colorbar.update_normal(im)
         rebuild = (self._payload or {}).get('rebuild')
         if rebuild is not None:
             fig = rebuild(None)
@@ -159,13 +214,31 @@ class AnalysisFigureDisplayer(QtWidgets.QMainWindow):
                          'rebuild': rebuild}
         has = rebuild is not None
         self.BinsLineEdit.setEnabled(has)
+        # the scale the figure CHOSE for itself, remembered per image so
+        # Auto can put it back exactly rather than re-deriving it
+        images = self._images()
+        self._auto_clims = [im.get_clim() for im in images]
+        for w in (self.ColorMinLineEdit, self.ColorMaxLineEdit):
+            w.setEnabled(bool(images))
         self.RangeHintLabel.setText(
             'view range (display only)' if has else
             'view range (display only; bins n/a for this view)')
         if not keep_range:
             for w in (self.XMinLineEdit, self.XMaxLineEdit, self.YMinLineEdit,
-                      self.YMaxLineEdit, self.BinsLineEdit):
+                      self.YMaxLineEdit, self.BinsLineEdit,
+                      self.ColorMinLineEdit, self.ColorMaxLineEdit):
                 w.clear()
+        elif images and (self.ColorMinLineEdit.text().strip()
+                         or self.ColorMaxLineEdit.text().strip()):
+            # a rebuild (new bins) discards the images the scale was set
+            # on; re-apply it so a re-render does not silently snap the
+            # colour scale back to automatic
+            try:
+                v = self._range_values()
+            except ValueError:
+                v = None
+            if v is not None:
+                self._apply_color_scale(v['cmin'], v['cmax'])
         # SYNCHRONOUS draw, deliberately: draw_idle defers rendering into
         # a later paint event, and a figure swapped mid-schedule died
         # 0xC0000409 (fail-fast -- faulthandler prints nothing for those).
