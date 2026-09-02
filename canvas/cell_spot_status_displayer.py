@@ -217,6 +217,11 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
     cell_fov_changed = QtCore.pyqtSignal()
     spot_scope_changed = QtCore.pyqtSignal()
     allele_fov_changed = QtCore.pyqtSignal()
+    # Export belongs HERE rather than in a pipeline tab for the same
+    # reason this window exists: it answers "what is really persisted",
+    # and the exported tables are exactly that, read off the store rather
+    # than off whatever the session happens to be holding.
+    export_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -236,9 +241,17 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         # mirrored no longer exists.
         self.RefreshPushButton = QtWidgets.QPushButton('Refresh')
         topRowLayout.addWidget(self.RefreshPushButton)
+        self.ExportPushButton = QtWidgets.QPushButton('Export Spots / Alleles...')
+        self.ExportPushButton.setToolTip(
+            'Write every persisted spot and allele to flat CSV/Excel tables:\n'
+            'one row per spot, and one row per (allele, genomic bin, candidate).')
+        topRowLayout.addWidget(self.ExportPushButton)
+        self.ExportStatusLabel = QtWidgets.QLabel('')
+        topRowLayout.addWidget(self.ExportStatusLabel)
         topRowLayout.addStretch()
         outer.addWidget(topRow)
         self.RefreshPushButton.clicked.connect(self.refresh_requested.emit)
+        self.ExportPushButton.clicked.connect(self.export_requested.emit)
 
         # -- Matrix panel: ground-truth check, reads directly off vlinks.h5
         # (bypassing MainWindow's own self.fov_matrices/cross_modal_result
