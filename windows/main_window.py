@@ -1237,6 +1237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cssd.cell_fov_changed.connect(self._refresh_cell_spot_status_cell_panel)
         cssd.spot_scope_changed.connect(self._on_cell_spot_status_spot_scope_changed)
         cssd.allele_fov_changed.connect(self._refresh_cell_spot_status_allele_panel)
+        cssd.export_requested.connect(self._export_spots_and_alleles)
 
         self.barcode_overview_displayer = BarcodeOverviewDisplayer()
         self.celltype_result_displayer = CelltypeResultDisplayer()
@@ -1594,6 +1595,8 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.AlleleHybeComboBox.currentIndexChanged.connect(lambda _: self._on_chromatin_allele_hybe_changed())
         chp.AlleleChannelComboBox.currentIndexChanged.connect(lambda _: self._refresh_chromatin_allele_spot_choices())
         chp.BuildAllelesPushButton.clicked.connect(self._build_chromatin_alleles_from_selection)
+        chp.BuildAllelesAllFovsPushButton.clicked.connect(
+            self._build_chromatin_alleles_all_fovs)
         chp.RemoveAllelesPushButton.clicked.connect(self._remove_selected_alleles)
         chp.SaveAllelesPushButton.clicked.connect(self._save_chromatin_alleles)
         chp.RevertAllelesPushButton.clicked.connect(self._revert_chromatin_alleles)
@@ -3031,6 +3034,99 @@ class MainWindow(QtWidgets.QMainWindow):
         single worker slot: several ingestions into different stores may
         legitimately run at once now."""
         return bool(self._active_ingestions)
+
+    def _export_spots_and_alleles(self):
+        """Write every PERSISTED spot and allele to flat tables.
+
+        Reads the store, never the session's own containers -- same
+        contract as the window this is launched from: it answers "what is
+        really saved", which is also the only thing worth handing to
+        someone for analysis.
+
+        .xlsx gives one workbook with a spots sheet and an alleles sheet;
+        .csv gives two files (the alleles table is the big one and Excel
+        stops at ~1.05M rows, so a large project must be CSV -- rather
+        than truncate, the writer refuses and this falls back, saying so).
+        """
+        # imported HERE, like the rest of the analysis toolbox: it is not
+        # needed to start the app, and the toolbox stays Qt-free
+        from codelab_pipeline.analysis import export
+        cssd = self.cell_spot_status_displayer
+        by_modality = {m: self._storage_path_for_modality(m)
+                       for m in self.ui.IngestionPanel.modality_names}
+        by_modality = {m: sp for m, sp in by_modality.items() if sp}
+        if not by_modality:
+            QtWidgets.QMessageBox.warning(
+                self, 'Export', 'No storage path is configured yet.')
+            return
+        # the Ingestion FOV list when set, otherwise every FOV each store
+        # actually holds -- exporting less than the project by accident is
+        # worse than exporting a FOV nobody wanted
+        fovs = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text()) or None
+        default = os.path.join(
+            os.path.dirname(next(iter(by_modality.values()))) or '.',
+            'spots_and_alleles.xlsx')
+        path, _sel = QtWidgets.QFileDialog.getSaveFileName(
+            cssd, 'Export spots and alleles', default,
+            'Excel workbook (*.xlsx);;CSV files (*.csv)')
+        if not path:
+            return
+        voxel = self._voxel_um()
+        cssd.ExportPushButton.setEnabled(False)
+        cssd.ExportStatusLabel.setText('reading the store...')
+
+        def work():
+            rows_s, rows_a, summary = export.collect(
+                by_modality, fovs=fovs, voxel_um=voxel)
+            wrote = []
+            if path.lower().endswith('.csv'):
+                base = path[:-4]
+                wrote.append(export.write_csv(rows_s, export.SPOT_COLUMNS,
+                                              base + '_spots.csv'))
+                wrote.append(export.write_csv(rows_a, export.ALLELE_COLUMNS,
+                                              base + '_alleles.csv'))
+            else:
+                try:
+                    wrote.append(export.write_excel(
+                        [('spots', rows_s, export.SPOT_COLUMNS),
+                         ('alleles', rows_a, export.ALLELE_COLUMNS)], path))
+                except ValueError as e:
+                    base = os.path.splitext(path)[0]
+                    wrote.append(export.write_csv(rows_s, export.SPOT_COLUMNS,
+                                                  base + '_spots.csv'))
+                    wrote.append(export.write_csv(rows_a, export.ALLELE_COLUMNS,
+                                                  base + '_alleles.csv'))
+                    summary['errors'].append(f'wrote CSV instead: {e}')
+            summary['files'] = wrote
+            return summary
+
+        def _done(summary):
+            cssd.ExportPushButton.setEnabled(True)
+            files = '\n'.join(summary.get('files') or [])
+            cssd.ExportStatusLabel.setText(
+                f"exported {summary['n_spots']} spot(s), "
+                f"{summary['n_allele_rows']} allele row(s)")
+            note = ''
+            if summary.get('errors'):
+                note = ('\n\nNot everything succeeded:\n  '
+                        + '\n  '.join(summary['errors'][:8]))
+                self.log('spot/allele export: '
+                         + '; '.join(summary['errors'][:8]))
+            QtWidgets.QMessageBox.information(
+                self, 'Export complete',
+                f"{summary['n_spots']} spot row(s) and "
+                f"{summary['n_allele_rows']} allele row(s) across "
+                f"{len(summary['fovs'])} FOV(s) written to:\n\n{files}{note}")
+
+        def _fail(message):
+            cssd.ExportPushButton.setEnabled(True)
+            cssd.ExportStatusLabel.setText('export failed')
+            QtWidgets.QMessageBox.critical(self, 'Export failed', message)
+
+        self._export_worker = FnWorker(work)
+        self._export_worker.finished_ok.connect(_done)
+        self._export_worker.failed.connect(_fail)
+        self._export_worker.start()
 
     def _show_cell_spot_status_displayer(self):
         # Refused only while a V1-STORE ingestion is live: v1 is the layout
@@ -7267,6 +7363,149 @@ class MainWindow(QtWidgets.QMainWindow):
             chp.populate_spot_choices([])
             return
         chp.populate_spot_choices(self._ordered_spot_dicts_for_scope(storage_path, fov, hybe, channel, hybe_modality))
+
+    def _build_chromatin_alleles_all_fovs(self):
+        """
+        Every spot in the picked hybe/channel becomes an allele, in every
+        FOV of the Ingestion FOV list, saved as each FOV completes.
+
+        The per-FOV button is the same decision made once per FOV: pick
+        the FOV, select the whole list, Add, Save. This is that, for the
+        FOV list, and it deliberately shares the single-FOV path's exact
+        semantics rather than reimplementing them:
+
+          - scope comes from the SAME hybe/channel combos, resolved
+            through the SAME _ordered_spot_dicts_for_scope, so what it
+            builds from is what the list on screen is showing;
+          - a spot whose uid already anchors an allele is SKIPPED, so
+            running this twice adds nothing and it composes with alleles
+            built by hand;
+          - ids come from next_id across BOTH tiers, never reminted.
+
+        Saved per FOV, for the reason the all-FOVs cell alignment is:
+        a run that is interrupted keeps every FOV it finished. _stage_
+        alleles runs first for each FOV, because write_fov_alleles is a
+        whole-FOV atomic REPLACE and saving a FOV whose existing alleles
+        were never loaded would delete them.
+
+        On the GUI thread, with a cancellable progress dialog, because it
+        mutates the session's own allele containers -- the thing FnWorker
+        explicitly must not do.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        _modality, storage_path = self._chromatin_storage_path_and_modality()
+        if not storage_path:
+            QtWidgets.QMessageBox.warning(
+                self, 'Chromatin Tracing',
+                'Check at least one hybe (Hybes Involved) first.')
+            return
+        hybe, hybe_modality = chp.current_allele_hybe_key()
+        channel = chp.current_allele_channel()
+        if not hybe or channel is None:
+            QtWidgets.QMessageBox.warning(
+                self, 'Chromatin Tracing',
+                'Pick a hybe and channel in the Alleles section first.')
+            return
+        fov_list = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text())
+        if not fov_list:
+            QtWidgets.QMessageBox.warning(
+                self, 'Chromatin Tracing',
+                'The Ingestion tab has no FOV list to run over.')
+            return
+        if QtWidgets.QMessageBox.question(
+                self, 'Add alleles for every FOV',
+                f'Turn EVERY spot in {hybe} ({hybe_modality}) ch{channel} into an '
+                f'allele, across {len(fov_list)} FOV(s), saving each FOV as it '
+                f'completes?\n\nSpots that already anchor an allele are skipped.',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
+            return
+
+        progress = QtWidgets.QProgressDialog(
+            'Building alleles...', 'Cancel', 0, len(fov_list), self)
+        progress.setWindowTitle('Add alleles for every FOV')
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        added = skipped = saved_fovs = 0
+        empty_fovs, errors = [], []
+        try:
+            for i, fov in enumerate(fov_list):
+                if progress.wasCanceled():
+                    errors.append('cancelled -- FOVs already saved are kept')
+                    break
+                progress.setValue(i)
+                progress.setLabelText(f'FOV{fov:03d} ({i + 1}/{len(fov_list)})')
+                QtWidgets.QApplication.processEvents()
+                try:
+                    n_add, n_skip, n_spots = self._build_alleles_for_fov(
+                        storage_path, fov, hybe, channel, hybe_modality)
+                except Exception as e:
+                    errors.append(f'FOV{fov:03d}: {e}')
+                    continue
+                added += n_add
+                skipped += n_skip
+                if not n_spots:
+                    empty_fovs.append(fov)
+                if n_add:
+                    saved_fovs += 1
+            progress.setValue(len(fov_list))
+        finally:
+            progress.close()
+
+        # the panel is showing ONE FOV; refresh it so its counts are not stale
+        self._refresh_chromatin_allele_lists(storage_path,
+                                             chp.AlleleFovSpinBox.value())
+        parts = [f'Added {added} allele(s) across {saved_fovs} FOV(s)']
+        if skipped:
+            parts.append(f'{skipped} spot(s) already anchored an allele')
+        if empty_fovs:
+            parts.append(f'{len(empty_fovs)} FOV(s) had no spots in this scope')
+        msg = '; '.join(parts) + '.'
+        chp.StatusLabel.setText(msg)
+        self.log(f'Add alleles (all FOVs, {hybe}/{hybe_modality}/ch{channel}): {msg}')
+        if errors:
+            self.log('add alleles (all FOVs): ' + '; '.join(errors[:8]))
+        QtWidgets.QMessageBox.information(
+            self, 'Add alleles for every FOV',
+            msg + ('\n\nNot everything succeeded:\n  '
+                   + '\n  '.join(errors[:8]) if errors else ''))
+
+    def _build_alleles_for_fov(self, storage_path, fov, hybe, channel, hybe_modality):
+        """One FOV of _build_chromatin_alleles_all_fovs: build, then save.
+
+        Returns (added, skipped, n_spots_in_scope). Saving here rather
+        than at the end is what makes an interrupted run keep its work.
+        """
+        key = (storage_path, int(fov))
+        self._stage_alleles(storage_path, fov)
+        indexed = self._ordered_spot_dicts_for_scope(
+            storage_path, fov, hybe, channel, hybe_modality)
+        seen = self.chromatin_alleles.anchor_uids(key)
+        added = skipped = 0
+        for _global_index, d in indexed:
+            uid = int(d.get('uid', 0) or 0)
+            # uid 0 is legacy data with no identity, so it can never dedup
+            if uid and uid in seen:
+                skipped += 1
+                continue
+            allele = AnAllele()
+            allele.set_metadata(
+                id=max(self.chromatin_alleles.next_id(key),
+                       self.chromatin_alleles_permanent.next_id(key)),
+                fov=int(fov), cell=d['cell'], anchor_uid=uid,
+                anchor_hybe=d['hybe'], anchor_channel=d['channel'],
+                coordinate=d['adj_coordinate'], raw_coordinate=d['raw_coordinate'])
+            self.chromatin_alleles.add(key, allele)
+            if uid:
+                seen.add(uid)
+            added += 1
+        if added:
+            # same promote-then-write-from-permanent rule Save Alleles uses
+            self.chromatin_alleles_permanent.sync_from(self.chromatin_alleles, key)
+            analysis_store.mirror_write_fov_alleles(
+                self._all_analysis_storage_paths(), fov,
+                self.chromatin_alleles_permanent.of_fov(key))
+        return added, skipped, len(indexed)
 
     def _build_chromatin_alleles_from_selection(self):
         """

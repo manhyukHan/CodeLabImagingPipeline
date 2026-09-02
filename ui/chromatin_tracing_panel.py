@@ -210,6 +210,23 @@ class ChromatinTracingPanelUI(object):
         self.BuildAllelesPushButton = QtWidgets.QPushButton('Add Alleles from Selected Spots')
         allelesLayout.addWidget(self.BuildAllelesPushButton)
 
+        # The same build, for EVERY FOV at once. The per-FOV button above
+        # needs the FOV picked, the list dragged and Save pressed, once per
+        # FOV -- on a 34-FOV project that is the same decision made 34
+        # times. This takes every spot in the chosen hybe/channel across
+        # the FOV list instead. Scope comes from the SAME hybe/channel
+        # combos above, so what it does is what the list above is showing,
+        # just not limited to one FOV.
+        self.BuildAllelesAllFovsPushButton = QtWidgets.QPushButton(
+            'Add Alleles from ALL Spots in This Hybe/Channel (every FOV, auto-save)')
+        self.BuildAllelesAllFovsPushButton.setToolTip(
+            'Every persisted spot in the selected hybe/channel becomes an '
+            'allele, in every FOV of the Ingestion FOV list.\n'
+            'Spots that already anchor an allele are skipped, so running it '
+            'twice adds nothing.\n'
+            'Each FOV is saved as it completes.')
+        allelesLayout.addWidget(self.BuildAllelesAllFovsPushButton)
+
         self.AlleleCountLabel = QtWidgets.QLabel('0 allele(s) in this FOV.')
         allelesLayout.addWidget(self.AlleleCountLabel)
 
