@@ -22,3 +22,8 @@ codelab_launch_*.log
 # location on THIS machine, so it must never be shared -- every checkout
 # resolves its own on first launch.
 .codelab_python
+
+# Shortcuts made by make_shortcut.vbs. A .lnk stores ABSOLUTE paths, so a
+# committed one is broken for everyone but its author -- run the script
+# once per checkout instead.
+*.lnk
