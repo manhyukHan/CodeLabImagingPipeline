@@ -120,6 +120,7 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
                              figsize=(width, 3.5 * len(groups)),
                              squeeze=False)
     fov_arr = np.asarray(fovs)
+    map_ims = []
     for row, (name, gmask) in enumerate(groups):
         base = np.ones(len(fov_arr), bool) if gmask is None \
             else np.asarray(gmask, bool)
@@ -129,8 +130,9 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
                 ax = axes[row][col]
                 n_f = int((base & (fov_arr == f)).sum())
                 if f in res['maps']:
-                    _dmap_ax(ax, res['maps'][f],
-                             f'{name} FOV{f:03d} (n={n_f})', ids=bin_ids)
+                    map_ims.append(_dmap_ax(
+                        ax, res['maps'][f],
+                        f'{name} FOV{f:03d} (n={n_f})', ids=bin_ids))
                 else:
                     ax.set_axis_off()
         ax = axes[row][-1]
@@ -162,7 +164,25 @@ def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
                          fontsize=9)
             ax.set_xticks([])
             ax.set_yticks([])
-    sup = 'FOV-level consistency'
+    # ONE colour scale across every per-FOV map, the same way fig_ensemble
+    # unifies its group panels -- and for a stronger reason: this figure
+    # exists to compare FOVs AGAINST EACH OTHER, and each panel was
+    # auto-fitting its own 2%/98% quantiles. Measured on MP58, all 12
+    # panels had distinct scales (vmin 0.274-0.351, vmax 0.967-1.184), so
+    # a FOV with systematically larger distances rendered identically to
+    # one with smaller distances -- the exact difference the figure is
+    # supposed to reveal.
+    scale_note = ''
+    if map_ims:
+        vmin = min(i.get_clim()[0] for i in map_ims)
+        vmax = max(i.get_clim()[1] for i in map_ims)
+        for i in map_ims:
+            i.set_clim(vmin, vmax)
+        # the range goes in the TITLE, not a colorbar: a colorbar axes
+        # here is not compatible with this figure's tight_layout (it warns
+        # and shifts the panels), and what a reader needs is the number
+        scale_note = f'  [maps share {vmin:.2f}-{vmax:.2f} um]'
+    sup = 'FOV-level consistency' + scale_note
     if empty:
         sup += f"  (empty after gate: {', '.join(empty)})"
     fig.suptitle(sup, fontsize=12)
@@ -431,7 +451,7 @@ def distance_hist_ax(ax, pairs, bins=40, per_celltype=True):
     return ax
 
 
-def fig_repeat_toe_qc(pop):
+def fig_repeat_toe_qc(pop, dims='xyz'):
     """The missed QC pair, per request: hybe-repeat distance and toe
     efficacy.
 
@@ -459,9 +479,18 @@ def fig_repeat_toe_qc(pop):
     # null this measurement has to beat. A repeat histogram sitting on top
     # of the gray one means the "replicate" is no closer than an unrelated
     # locus, which no summary statistic states as plainly.
+    # BOTH the measurement and its null slice the same axes: the panel's
+    # whole argument is repeat-vs-other-bins on ONE metric, so mixing
+    # dimensionalities across the two would compare a 2D error to a 3D
+    # null and read as excellent reproducibility. Axial error is also
+    # exactly what inflates a repeat distance, so the in-plane view of
+    # this panel is diagnostic in its own right.
+    from . import polymer as _P
+    axes_k = _P._dim_axes(dims)
     dists, refs = {}, {}
     if rep is not None and len(rep_ids) and bin_ids:
-        pos = al['pos_um']
+        pos = np.asarray(al['pos_um'])[..., axes_k]
+        rep = np.asarray(rep)[..., axes_k]
         for j, rid in enumerate(rep_ids):
             if rid not in bin_ids:
                 continue
@@ -551,5 +580,87 @@ def fig_repeat_toe_qc(pop):
                      fontsize=10)
     else:
         ax.set_title('no toe rounds in the layout / population', fontsize=10)
-    fig.suptitle('repeat / toe QC', fontsize=12)
+    fig.suptitle(f'repeat / toe QC   [{str(dims).lower()} distances]', fontsize=12)
+    return fig
+
+
+def fig_anisotropy(pos_um, mask=None, title='isotropy QC'):
+    """Is Z as trustworthy as X and Y? See analysis/anisotropy.py.
+
+    LEFT: every pair measured both ways -- in-plane on x, full 3D on y.
+    An isotropic cloud sits on the sqrt(3/2) line; Z inflation lifts it
+    above. The observed RMS slope is drawn beside the expectation so the
+    gap is read off rather than judged by eye.
+
+    RIGHT: axial excess per separation, measured against an isotropic
+    SURROGATE (the same chains with z replaced by an unrelated in-plane
+    column, so its axial error is zero by construction). 1.0 means this
+    separation's axial spread is what isotropy would give.
+
+    The raw factor cannot be plotted here: conditioning on d_xy makes it
+    rise toward short separation even with no axial error at all --
+    measured 13.3x on a zero-error null, steeper than the real data. An
+    earlier version of this figure plotted that raw curve and told the
+    reader its SHAPE distinguished a scale error from an additive one.
+    It does not: scale, additive and no-error all rise. That claim is
+    withdrawn; only the HEIGHT here carries meaning.
+    """
+    from . import anisotropy as ani
+    s = ani.summary(pos_um, mask)
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4))
+
+    ax = axes[0]
+    style_ax(ax)
+    a, b = s['d_xy'], s['d_xyz']
+    if len(a):
+        hi = float(np.quantile(b, 0.99))
+        # LOG counts, and NO cmin. Two separate causes of the speckle the
+        # linear version had: a linear scale gave the dense ridge (max
+        # 4061 per bin) the whole colour range and left everything else
+        # indistinguishable from empty, and cmin BLANKED every bin under
+        # the cut -- 17% of filled bins hold <= 3 pairs, so the sparse
+        # tail rendered as white dots scattered through the dark, which
+        # reads as noise but is data. Logged and undropped, a sparse bin
+        # is simply dark: present, quiet, and not mistaken for an
+        # artefact. vmin=10 sets where "quiet" starts; zeros stay masked
+        # by LogNorm, so the impossible region (d_xyz < d_xy) is blank.
+        from matplotlib.colors import LogNorm
+        ax.hist2d(a, b, bins=70, range=[[0, hi], [0, hi]],
+                  cmap='magma', norm=LogNorm(vmin=10))
+        xs = np.linspace(0, hi, 2)
+        ax.plot(xs, xs * s['isotropic_slope'], color='cyan', linewidth=1.6,
+                label=f"isotropic  slope {s['isotropic_slope']:.3f}")
+        ax.plot(xs, xs * s['rms_slope'], color='yellow', linewidth=1.6,
+                linestyle='--', label=f"observed  slope {s['rms_slope']:.3f}")
+        ax.set_xlim(0, hi)
+        ax.set_ylim(0, hi)
+        ax.legend(fontsize=8, loc='upper left')
+    ax.set_xlabel('in-plane distance d_xy (um)', fontsize=9)
+    ax.set_ylabel('3D distance d_xyz (um)', fontsize=9)
+    ax.set_title(f"{s['n_pairs']} pairs", fontsize=10)
+
+    ax = axes[1]
+    style_ax(ax)
+    br = s['excess_by_range']
+    if len(br['centers']):
+        ax.plot(br['centers'], br['excess'], 'o-', color='crimson',
+                linewidth=1.6, markersize=4)
+        for c, f, n in zip(br['centers'], br['excess'], br['n']):
+            ax.annotate(f'{n}', (c, f), fontsize=6, color='0.4',
+                        textcoords='offset points', xytext=(0, 5),
+                        ha='center')
+    ax.axhline(1.0, color='0.4', linestyle='--', linewidth=1.0,
+               label='isotropic')
+    ax.set_xlabel('in-plane separation d_xy (um)', fontsize=9)
+    ax.set_ylabel('axial excess vs isotropic surrogate', fontsize=9)
+    ax.set_title('1.0 = no excess at this separation\n'
+                 'height says HOW MUCH, not what kind', fontsize=9)
+    ax.legend(fontsize=8)
+
+    f = s['factor']
+    verdict = ('Z looks isotropic' if abs(f - 1) < 0.1 else
+               f'Z is {(f - 1) * 100:.0f}% WIDER than in-plane'
+               if f > 1 else f'Z is {(1 - f) * 100:.0f}% NARROWER than in-plane')
+    fig.suptitle(f'{title}   factor {f:.3f}  --  {verdict}', fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
     return fig

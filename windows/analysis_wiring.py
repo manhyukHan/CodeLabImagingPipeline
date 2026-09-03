@@ -43,6 +43,9 @@ class AnalysisWiring(QtCore.QObject):
         p.DeriveQcPushButton.clicked.connect(self.derive_qc)
         p.PreviewQcPushButton.clicked.connect(self.preview_qc)
         p.ApplyQcCheckBox.toggled.connect(self._refresh_gate_summary)
+        p.DistanceDimsComboBox.currentIndexChanged.connect(
+            self._on_dims_changed)
+        p.IsotropyQcPushButton.clicked.connect(self.view_isotropy)
         p.AddConditionPushButton.clicked.connect(self.add_condition)
         p.NewOrGroupPushButton.clicked.connect(self.new_or_group)
         p.RemoveConditionPushButton.clicked.connect(self.remove_condition)
@@ -277,7 +280,8 @@ class AnalysisWiring(QtCore.QObject):
     def derive_qc(self):
         try:
             pop = self._need_pop(alleles=True)
-            thr = polymer.qc_thresholds(pop.alleles, pop.dmaps())
+            thr = polymer.qc_thresholds(pop.alleles, pop.dmaps(self.dims()),
+                                        dims=self.dims())
             self.panel.set_qc_thresholds(thr)
             self._run_qc(thr)
         except ValueError as e:
@@ -285,15 +289,30 @@ class AnalysisWiring(QtCore.QObject):
 
     def _run_qc(self, thr):
         pop = self.pop
-        out = polymer.apply_qc(pop.alleles, pop.dmaps(), thr,
+        # STAMP the thresholds with the dimensionality actually in force.
+        # They may have arrived from the edit boxes (which carry only the
+        # four numbers) or from a config, so the stamp cannot be trusted
+        # to have survived -- and an unstamped threshold set is exactly
+        # what lets a 3D bound be applied to 2D data unnoticed.
+        thr = dict(thr)
+        thr['dims'] = self.dims()
+        out = polymer.apply_qc(pop.alleles, pop.dmaps(self.dims()), thr,
+                               dims=self.dims(),
                                min_traced=self.panel.QcMinTracedSpinBox.value())
         self.qc = out
         self.qc_thresholds = thr
         kept = int(out['kept'].sum())
+        # the dimensionality is named FIRST and the numeric thresholds
+        # follow: they are micrometre lengths that mean different cuts in
+        # the two metrics, so the label that reports them has to say
+        # which one they are. (It is also why this formats only the
+        # numeric entries -- the 'dims' stamp is a string.)
         self.panel.QcStatusLabel.setText(
-            f'QC: {kept}/{len(pop.alleles["amp"])} alleles kept, '
+            f'QC [{thr.get("dims", "xyz")} distances]: '
+            f'{kept}/{len(pop.alleles["amp"])} alleles kept, '
             f'{int(out["bads"].sum())} bins removed  |  '
-            + '  '.join(f'{k}={v:.3g}' for k, v in thr.items()))
+            + '  '.join(f'{k}={v:.3g}' for k, v in thr.items()
+                        if isinstance(v, (int, float))))
         self._refresh_gate_summary()
 
     def preview_qc(self):
@@ -303,7 +322,7 @@ class AnalysisWiring(QtCore.QObject):
             if thr is None:
                 raise ValueError('derive (or type) the thresholds first')
             self._run_qc(thr)
-            fig = figures.fig_polymer_qc(pop.alleles, pop.dmaps(), thr,
+            fig = figures.fig_polymer_qc(pop.alleles, pop.dmaps(self.dims()), thr,
                                          qc_result=self.qc,
                                          bin_ids=pop.alleles.get('bin_ids'))
             eff = polymer.efficacy(self.qc['pos_um'])
@@ -317,15 +336,46 @@ class AnalysisWiring(QtCore.QObject):
         except ValueError as e:
             QtWidgets.QMessageBox.warning(self.mw, 'Polymer QC', str(e))
 
+    def dims(self):
+        """'xyz' or 'xy' -- the distance every map, gate and histogram in
+        this tab is computed from. ONE accessor, so no view can disagree
+        with the gate that selected its cells."""
+        return self.panel.DistanceDimsComboBox.currentData() or 'xyz'
+
+    def _on_dims_changed(self):
+        """The dimensionality changed, so every DERIVED number is stale.
+
+        Same tier as Apply QC: it changes the numbers, not the view. That
+        means the QC result and its thresholds must go -- they are
+        micrometre lengths fitted to the other metric, and keeping them
+        would gate bins in one dimensionality and display another. It
+        does NOT rebuild the population: positions are dimension-free, so
+        the expensive part (the store read, the expression cache) stays
+        valid and only the distances downstream of it are recomputed.
+        """
+        self.qc = None
+        self.qc_thresholds = None
+        self.panel.QcStatusLabel.setText(
+            f'QC cleared -- thresholds are {self.dims()}-specific and must '
+            f'be re-derived')
+        self._refresh_gate_summary()
+
     def _allele_state(self):
-        """(dmaps, allele_index) honoring the Apply-QC toggle."""
+        """(dmaps, allele_index) honoring the Apply-QC toggle and the
+        distance dimensionality -- the ONE funnel every map view uses."""
         pop = self._need_pop(alleles=True)
         if self.panel.ApplyQcCheckBox.isChecked():
             if self.qc is None:
                 raise ValueError('Apply QC is on, but QC has not been run -- '
                                  'derive or preview it first')
+            # the QC result stamps the dimensionality it was computed in;
+            # refuse a mismatch rather than plot one metric under another
+            if str(self.qc.get('dims', 'xyz')) != str(self.dims()):
+                raise ValueError(
+                    f"QC was run in {self.qc.get('dims')} but the distance "
+                    f"setting is now {self.dims()} -- re-derive QC first")
             return self.qc['dmaps'], self.qc['index']
-        dm = pop.dmaps()
+        dm = pop.dmaps(self.dims())
         return dm, np.arange(len(dm))
 
     def _qc_alleles(self):
@@ -686,7 +736,7 @@ class AnalysisWiring(QtCore.QObject):
             alleles = None
             if (distances.is_traced_source(a) or distances.is_traced_source(b)):
                 alleles = self._qc_alleles()
-            pairs = distances.pair_distances(pop, a, b, alleles)
+            pairs = distances.pair_distances(pop, a, b, alleles, dims=self.dims())
             import matplotlib.pyplot as plt
 
             def _render(bins=None):
@@ -720,8 +770,32 @@ class AnalysisWiring(QtCore.QObject):
     def view_repeat_toe_qc(self):
         def go():
             pop = self._need_pop(alleles=True)
-            fig = figures.fig_repeat_toe_qc(pop)
-            self._show(fig, 'repeat_toe_qc')
+            fig = figures.fig_repeat_toe_qc(pop, dims=self.dims())
+            self._show(fig, 'repeat_toe_qc',
+                       params={'dims': self.dims()})
+        self._guard(go)
+
+    def view_isotropy(self):
+        """Is Z as trustworthy as X and Y?
+
+        Deliberately NOT routed through self.dims(): this needs the same
+        pairs measured BOTH ways, and in XY mode a dims-following version
+        would compare XY against XY, draw a perfect diagonal and report
+        isotropy on data whose Z is badly inflated -- the QC would hide
+        the very problem it exists to find.
+
+        Reads the QC-filtered positions when Apply QC is on, so the
+        answer describes the alleles the maps are actually built from.
+        """
+        def go():
+            pop = self._need_pop(alleles=True)
+            qa = self._qc_alleles()
+            pos = (qa['pos_um'] if qa is not None
+                   else pop.alleles['pos_um'])
+            fig = figures.fig_anisotropy(pos, title='isotropy QC')
+            self._show(fig, 'isotropy_qc',
+                       params={'measured_in': 'xy and xyz (both, always)',
+                               'apply_qc': self.panel.ApplyQcCheckBox.isChecked()})
         self._guard(go)
 
     def preview_histogram(self):
@@ -765,7 +839,7 @@ class AnalysisWiring(QtCore.QObject):
                 b = self.panel.SourceBPicker.current()
                 if a is None or b is None:
                     raise ValueError('pick sources A and B')
-                per_cell = distances.pair_distance_per_cell(pop, a, b)
+                per_cell = distances.pair_distance_per_cell(pop, a, b, dims=self.dims())
                 vals = per_cell.to_numpy()
                 import matplotlib.pyplot as plt
                 fig, ax = plt.subplots(figsize=(5.6, 4))

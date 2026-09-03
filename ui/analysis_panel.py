@@ -223,6 +223,32 @@ class AnalysisPanelUI(object):
             'apply QC to all views and gates')
         self.ApplyQcCheckBox.setChecked(True)
         qcRow.addWidget(self.ApplyQcCheckBox)
+        # DIMENSIONALITY sits here, beside "apply QC to all views and
+        # gates", because it has the same scope and the same character:
+        # it changes the NUMBERS, not the presentation. It deliberately
+        # does NOT go in the flag row, which is documented as flags that
+        # multiply figures and never re-gate -- a control there reads as
+        # display-only, which is the wrong mental model for something
+        # that changes every distance in the tab.
+        qcRow.addWidget(QtWidgets.QLabel('distance:'))
+        self.DistanceDimsComboBox = QtWidgets.QComboBox()
+        self.DistanceDimsComboBox.addItem('XYZ (3D)', 'xyz')
+        self.DistanceDimsComboBox.addItem('XY (in-plane)', 'xy')
+        self.DistanceDimsComboBox.setToolTip(
+            'Which distance every map, gate and histogram in this tab is '
+            'computed from.\n'
+            'XY drops the axial term. It is a DIFFERENT quantity, smaller '
+            'than the 3D one\nby ~0.82x even for perfectly isotropic data, '
+            'so bounds and thresholds do not\ncarry across. Use the '
+            'Isotropy QC to decide whether Z is trustworthy.')
+        qcRow.addWidget(self.DistanceDimsComboBox)
+        self.IsotropyQcPushButton = QtWidgets.QPushButton('Isotropy QC')
+        self.IsotropyQcPushButton.setToolTip(
+            'Is Z as trustworthy as X and Y? Compares every pair measured '
+            'in-plane against\nthe same pair measured in 3D. Always uses '
+            'BOTH -- it never follows the\ndistance selector, or it would '
+            'compare XY against XY and certify isotropy.')
+        qcRow.addWidget(self.IsotropyQcPushButton)
         qcLayout.addLayout(qcRow)
         self.QcStatusLabel = QtWidgets.QLabel('QC not derived')
         self.QcStatusLabel.setWordWrap(True)
@@ -465,9 +491,14 @@ class AnalysisPanelUI(object):
             b = self.SourceBPicker.current()
             if a is None or b is None:
                 raise ValueError('pick both sources')
+            # the bounds are micrometre lengths, so the gate records the
+            # dimensionality they were chosen in -- a lo/hi in um without
+            # it is not a complete description of the cut, and this dict
+            # is what gets saved to config and re-run later
             return {'kind': 'pair_distance_range', 'source_a': list(a),
                     'source_b': list(b), 'lo': lo, 'hi': hi,
-                    'collapse': self.CollapseComboBox.currentText()}
+                    'collapse': self.CollapseComboBox.currentText(),
+                    'dims': self.DistanceDimsComboBox.currentData() or 'xyz'}
         if kind == 'BarcodePresence':
             hybes = [v.strip() for v in self.ValuesLineEdit.text().split(',')
                      if v.strip()]
