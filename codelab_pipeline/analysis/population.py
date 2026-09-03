@@ -348,14 +348,28 @@ class Population:
         pop.cache_stats = cache_stats
         return pop
 
-    def dmaps(self):
-        """(n_alleles, n_bins, n_bins) um distance maps, computed once."""
+    def dmaps(self, dims='xyz'):
+        """(n_alleles, n_bins, n_bins) um distance maps, computed once
+        PER DIMENSIONALITY.
+
+        The cache is keyed by dims and not merely by presence: an in-plane
+        map and a 3D map are different numbers over the same pairs
+        (smaller by sqrt(2/3) even under perfect isotropy), so a single
+        slot would hand whichever was computed first to every later
+        caller and nothing downstream could tell. Switching the view from
+        XYZ to XY would then change every label and no value.
+        """
         if self.alleles is None:
             raise ValueError('population carries no alleles; build with '
                              'records=/hybes= first')
-        if self._dmaps is None:
-            self._dmaps = P.polymer_distmaps(self.alleles['pos_um'])
-        return self._dmaps
+        key = str(dims or 'xyz').lower()
+        P._dim_axes(key)                    # reject a typo here, not later
+        if not isinstance(self._dmaps, dict):
+            self._dmaps = {}
+        if key not in self._dmaps:
+            self._dmaps[key] = P.polymer_distmaps(self.alleles['pos_um'],
+                                                  dims=key)
+        return self._dmaps[key]
 
     def allele_mask_from_cells(self, cell_mask):
         """Project a CELL gate onto allele rows: an allele survives iff

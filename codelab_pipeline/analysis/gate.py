@@ -142,27 +142,38 @@ class PairDistanceRange(Predicate):
     """Per-cell collapsed distance between two spot sets within [lo, hi] um.
 
     source_a / source_b: (modality, hybe, channel). Per cell, every
-    cross-set spot pair's 3D um distance is collapsed by MEDIAN (never
+    cross-set spot pair's um distance is collapsed by MEDIAN (never
     min -- the zero-bounded noise floor), and the collapsed value is
     gated. Cells missing either set fail.
+
+    dims: 'xyz' (default) or 'xy' -- the DIMENSIONALITY THE BOUNDS WERE
+    TUNED IN, carried in the gate's own params and saved with it. An
+    in-plane distance is smaller than the 3D one by sqrt(2/3) even under
+    perfect isotropy, so a bound of 0.5 um means two different cuts in
+    the two dimensionalities. Recording it here is what stops a gate
+    saved in one mode from silently keeping its number and changing its
+    meaning when the view is switched.
     """
     kind = 'pair_distance_range'
 
     def __init__(self, source_a, source_b, lo=None, hi=None,
-                 collapse='median'):
+                 collapse='median', dims='xyz'):
         self.source_a, self.source_b = tuple(source_a), tuple(source_b)
         self.lo, self.hi = lo, hi
         self.collapse = collapse
+        self.dims = str(dims or 'xyz').lower()
 
     def _params(self):
         return {'source_a': list(self.source_a),
                 'source_b': list(self.source_b),
-                'lo': self.lo, 'hi': self.hi, 'collapse': self.collapse}
+                'lo': self.lo, 'hi': self.hi, 'collapse': self.collapse,
+                'dims': self.dims}
 
     def values(self, pop):
         from codelab_pipeline.analysis import distances as D
         per_cell = D.pair_distance_per_cell(pop, self.source_a, self.source_b,
-                                            collapse=self.collapse)
+                                            collapse=self.collapse,
+                                            dims=self.dims)
         idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
         return per_cell.reindex(idx).to_numpy(dtype=float)
 

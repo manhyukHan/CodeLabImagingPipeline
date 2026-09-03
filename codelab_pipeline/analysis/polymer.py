@@ -175,13 +175,37 @@ def fov_polymer_table(storage_path, fov, hybes, voxel_um=DEFAULT_VOXEL_UM,
             'n_traced': np.isfinite(pos[:, :, 0]).sum(1).astype(np.int32)}
 
 
-def polymer_distmaps(pos_um):
+DIMS_CHOICES = ('xyz', 'xy')
+
+
+def _dim_axes(dims):
+    """Which columns of a (..., 3) y/x/z position array to use.
+
+    'xy' drops z -- an IN-PLANE distance, for data whose axial component
+    is not trustworthy (see analysis/anisotropy.py). Positions are stored
+    (y, x, z), so the in-plane pair is columns 0 and 1.
+    """
+    d = str(dims or 'xyz').lower()
+    if d not in DIMS_CHOICES:
+        raise ValueError(f'dims must be one of {DIMS_CHOICES}, got {dims!r}')
+    return [0, 1] if d == 'xy' else [0, 1, 2]
+
+
+def polymer_distmaps(pos_um, dims='xyz'):
     """(n_alleles, n_bins, n_bins) pairwise Euclidean um distances.
+
+    dims='xy' measures IN-PLANE distance only, dropping z. That is a
+    different quantity, not a cleaner version of the same one: it is
+    smaller by sqrt(2/3) even when the data are perfectly isotropic, so a
+    map, a gate bound or a threshold from one dimensionality must never
+    be compared against the other. Callers that persist or cache a result
+    are responsible for recording which one it is.
 
     NaN positions propagate to NaN rows/columns, exactly the ORCA kappa
     behaviour. Vectorized over alleles; ~25 MB for 127 alleles x 90 bins.
     """
-    pos = np.asarray(pos_um, np.float32)
+    axes = _dim_axes(dims)
+    pos = np.asarray(pos_um, np.float32)[..., axes]
     n_a, n_b = pos.shape[0], pos.shape[1]
     out = np.empty((n_a, n_b, n_b), np.float32)
     # float32 and CHUNKED: cells run to tens of thousands, so alleles do
@@ -199,7 +223,7 @@ def polymer_distmaps(pos_um):
 
 # -- ORCA QC ---------------------------------------------------------------
 
-def qc_thresholds(table, dmaps,
+def qc_thresholds(table, dmaps, dims='xyz',
                   brightness_q=(0.05, 0.95), jump_q=0.75, max_dist_q=0.95):
     """Quantile-derived thresholds, polymeric_qc-style, from THIS data.
 
@@ -222,10 +246,18 @@ def qc_thresholds(table, dmaps,
         'max_brightness': q(finite_amp, brightness_q[1], np.inf),
         'max_jump_um': q(neighbors, jump_q, np.inf),
         'max_dist_um': q(med, max_dist_q, np.inf),
+        # STAMPED with the dimensionality of the maps they were fitted
+        # to. max_jump_um and max_dist_um are lengths, and an in-plane
+        # length is ~0.82x its 3D counterpart under perfect isotropy --
+        # so a threshold reused in the other dimensionality is not merely
+        # imprecise, it is measuring a different quantity. The stamp lets
+        # every consumer (the GUI fields, the config, apply_qc) check
+        # rather than assume.
+        'dims': str(dims or 'xyz').lower(),
     }
 
 
-def apply_qc(table, dmaps, thresholds, min_traced=2):
+def apply_qc(table, dmaps, thresholds, min_traced=2, dims='xyz'):
     """ORCA filtering with the elementwise-brightness bug fixed.
 
     Marks a bin bad when: amplitude outside [min, max] brightness (the
@@ -265,7 +297,13 @@ def apply_qc(table, dmaps, thresholds, min_traced=2):
     out_pos = pos[kept]
     return {'pos_um': out_pos, 'amp': amp[kept], 'bads': bads,
             'kept': kept, 'index': np.flatnonzero(kept),
-            'dmaps': polymer_distmaps(out_pos)}
+            # THE SAME dimensionality the caller gated in. This recompute
+            # feeds every downstream map view, so a hard-coded 3D here
+            # would gate bins in one metric and display another -- and
+            # Apply QC is on by default, so that would be the DEFAULT
+            # path, silently, with nothing on any figure saying so.
+            'dims': str(dims or 'xyz').lower(),
+            'dmaps': polymer_distmaps(out_pos, dims=dims)}
 
 
 def efficacy(pos_um):

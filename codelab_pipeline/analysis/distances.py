@@ -10,6 +10,8 @@ edge-to-edge variant has nothing real to subtract.
 import numpy as np
 import pandas as pd
 
+from . import polymer
+
 
 TRACED = 'traced'
 
@@ -91,7 +93,7 @@ def _spots_of(pop, source):
     return rows
 
 
-def pair_distances(pop, source_a, source_b, alleles=None):
+def pair_distances(pop, source_a, source_b, alleles=None, dims='xyz'):
     """Tidy per-pair rows: fov, cell, celltype, d_um.
 
     Every cross-set pair WITHIN a cell (homeless spots excluded --
@@ -118,9 +120,15 @@ def pair_distances(pop, source_a, source_b, alleles=None):
                 suffixes=('', '_b'))
     if same:
         m = m[m['_ia'] < m['_ib']]
-    d = np.sqrt((m['y_um'].to_numpy() - m['y_um_b'].to_numpy()) ** 2
-                + (m['x_um'].to_numpy() - m['x_um_b'].to_numpy()) ** 2
-                + (m['z_um'].to_numpy() - m['z_um_b'].to_numpy()) ** 2)
+    # dims='xy' drops the axial term -- a DIFFERENT quantity, smaller by
+    # sqrt(2/3) even under perfect isotropy, so a bound tuned in one
+    # dimensionality must never be applied in the other. See
+    # analysis/anisotropy.py for why a user would want in-plane only.
+    sq = ((m['y_um'].to_numpy() - m['y_um_b'].to_numpy()) ** 2
+          + (m['x_um'].to_numpy() - m['x_um_b'].to_numpy()) ** 2)
+    if polymer._dim_axes(dims) == [0, 1, 2]:
+        sq = sq + (m['z_um'].to_numpy() - m['z_um_b'].to_numpy()) ** 2
+    d = np.sqrt(sq)
     return pd.DataFrame({'fov': m['fov'].to_numpy(),
                          'cell': m['cell'].to_numpy(),
                          'celltype': m['celltype'].to_numpy(),
@@ -128,14 +136,14 @@ def pair_distances(pop, source_a, source_b, alleles=None):
 
 
 def pair_distance_per_cell(pop, source_a, source_b, collapse='median',
-                           alleles=None):
+                           alleles=None, dims='xyz'):
     """Series indexed (fov, cell): the collapsed per-cell distance.
 
     MEDIAN by default and deliberately: min rides the zero-bounded noise
     floor (the SG scripts' documented rule). 'min'/'mean' available for
     callers who state their reasons.
     """
-    pairs = pair_distances(pop, source_a, source_b, alleles)
+    pairs = pair_distances(pop, source_a, source_b, alleles, dims=dims)
     if len(pairs) == 0:
         return pd.Series(dtype=float)
     agg = {'median': 'median', 'mean': 'mean', 'min': 'min'}[collapse]
@@ -143,14 +151,15 @@ def pair_distance_per_cell(pop, source_a, source_b, collapse='median',
 
 
 def distance_histogram(pop, source_a, source_b, mask=None, bins=100,
-                       range_um=None, per_celltype=False, alleles=None):
+                       range_um=None, per_celltype=False, alleles=None,
+                       dims='xyz'):
     """Histogram(s) of per-pair distances over gated cells.
 
     Gating is by CELL mask (Population.cells order); the flags axis:
     per_celltype=True returns {celltype: (counts, edges)} with the ''
     bucket labeled 'Unassigned' -- shown grey, never dropped.
     """
-    pairs = pair_distances(pop, source_a, source_b, alleles)
+    pairs = pair_distances(pop, source_a, source_b, alleles, dims=dims)
     if mask is not None:
         # an inner merge, not a Python membership loop: it is a real
         # semi-join at any scale, and on ZERO pairs it stays a 0-row
