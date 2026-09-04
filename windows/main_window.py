@@ -1527,6 +1527,100 @@ class MainWindow(QtWidgets.QMainWindow):
             # python.exe behind.
             os._exit(0)
 
+    # Every long-running worker that READS a store. Named once so the quit
+    # path and the overwrite-ingestion guard cannot drift apart: a worker
+    # missing from this tuple is one that quitting leaves orphaned AND one
+    # that an overwrite ingestion would start on top of.
+    STORE_WORKER_ATTRS = ('_segment_worker', '_cytoplasm_worker', '_alignment_worker',
+                          '_cross_modal_worker', '_cell_alignment_worker',
+                          '_cell_preview_worker', '_chromatin_worker',
+                          '_localize3d_worker', '_chromatin_preview_worker',
+                          '_cell_overlay_worker', '_celltype_worker', '_focus_worker')
+
+    def _store_workers_running(self):
+        """[(label, worker), ...] -- live non-ingestion work reading a store."""
+        out = []
+        for name in self.STORE_WORKER_ATTRS:
+            worker = getattr(self, name, None)
+            if worker is not None and worker.isRunning():
+                out.append((name.strip('_').replace('_', ' '), worker))
+        for worker in (getattr(self, '_fov_overlay_workers', None) or []):
+            if worker is not None and worker.isRunning():
+                out.append(('fov overlay render', worker))
+        return out
+
+    def _stop_store_workers(self, why):
+        """Stop every live reader so an OVERWRITE ingestion starts clean.
+
+        An overwrite rewrites stacks and MIPs that other work is in the
+        middle of reading, and on Windows it cannot even do that while a
+        reader holds the file: os.replace fails outright with
+        PermissionError, measured. Worse than the failure is the success --
+        an alignment that keeps running across the swap fits half its
+        hybes against the old pixels and half against the new, and records
+        the result as if nothing happened.
+
+        Stopping is safe and losing little: cell alignment writes each FOV
+        as it lands, so a stopped run keeps every FOV it finished and a
+        later append fills the rest. Nothing partial is persisted for the
+        FOV in flight -- which is also why the not-yet-ingested hybes of
+        that FOV do not end up permanently marked as aligned.
+
+        Returns the labels of what it stopped.
+        """
+        running = self._store_workers_running()
+        for label, worker in running:
+            try:
+                worker.terminate()
+                worker.wait(3000)
+            except Exception:
+                pass
+        reader = getattr(self, '_store_reader', None)
+        if reader is not None:
+            reader.shutdown(wait=False)
+        # A terminated coordinator never reaps its own pool, and an
+        # orphaned spawn child keeps the very file handles the overwrite
+        # is about to need.
+        for child in multiprocessing.active_children():
+            try:
+                child.terminate()
+            except Exception:
+                pass
+        if running:
+            self.log(f'{why}: stopped {len(running)} running operation(s) -- '
+                     + ', '.join(label for label, _w in running))
+        return [label for label, _w in running]
+
+    def _clear_for_overwrite_ingestion(self, ask):
+        """True if an overwrite ingestion may proceed from a clean state.
+
+        `ask=True` puts the decision to the user (an interactive run);
+        `ask=False` just does it and logs (a queued run was authorised
+        when the queue was started).
+        """
+        running = self._store_workers_running()
+        if not running:
+            return True
+        labels = ', '.join(sorted({label for label, _w in running}))
+        if ask:
+            answer = QtWidgets.QMessageBox.question(
+                self, 'Overwrite ingestion',
+                f'Overwrite rewrites files that {len(running)} running '
+                f'operation(s) are reading ({labels}).\n\n'
+                f'They have to be stopped first: on Windows a file cannot be '
+                f'replaced while anything holds it open, and an alignment that '
+                f'ran across the swap would fit some hybes against the old '
+                f'pixels and some against the new.\n\n'
+                f'Stop them and ingest?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+                QtWidgets.QMessageBox.Cancel)
+            if answer != QtWidgets.QMessageBox.Yes:
+                self.log('Overwrite ingestion cancelled -- '
+                         f'{len(running)} operation(s) left running ({labels}).')
+                return False
+        self._stop_store_workers('Overwrite ingestion')
+        return True
+
     def _kill_running_work(self):
         """Hard-stop every live worker thread and pooled child process;
         returns whether anything was actually running. terminate() rather
@@ -1535,12 +1629,7 @@ class MainWindow(QtWidgets.QMainWindow):
         first" is not wanted."""
         killed = False
         workers = list(self._active_ingestions)   # every live ingestion, single or queued
-        workers += [getattr(self, name, None)
-                    for name in ('_segment_worker', '_cytoplasm_worker', '_alignment_worker',
-                                 '_cross_modal_worker', '_cell_alignment_worker',
-                                 '_cell_preview_worker', '_chromatin_worker',
-                                 '_localize3d_worker', '_chromatin_preview_worker',
-                                 '_cell_overlay_worker', '_celltype_worker', '_focus_worker')]
+        workers += [getattr(self, name, None) for name in self.STORE_WORKER_ATTRS]
         for worker in workers:
             if worker is not None and worker.isRunning():
                 killed = True
@@ -2857,6 +2946,12 @@ class MainWindow(QtWidgets.QMainWindow):
         overwrite_mode = self._confirm_overwrite([(j['storage_path'], j['fov_list'], j['hybe_records']) for j in jobs])
         if overwrite_mode is None:
             return
+        # An overwrite needs the stores to itself. Append does not: it only
+        # ADDS hybes nobody is reading yet, so a concurrent alignment sees
+        # a store that only grows, which is the whole point of the
+        # mid-ingestion append workflow.
+        if overwrite_mode == 'overwrite' and not self._clear_for_overwrite_ingestion(ask=True):
+            return
 
         total_tasks = sum(len(j['fov_list']) * len(j['hybe_records']) for j in jobs)
         self.log(f"Starting ingestion ({overwrite_mode}) across {len(jobs)} modalit(ies) "
@@ -3322,6 +3417,66 @@ class MainWindow(QtWidgets.QMainWindow):
         # every view stays open during a run.
         self.ui.IngestionPanel.ShowCellSpotStatusDisplayerPushButton.setEnabled(True)
 
+    def _incomplete_fovs(self, fov_list, requirements):
+        """{fov: [reason, ...]} for FOVs whose ingestion is not finished.
+
+        `requirements` is [(modality, [hybe_folder, ...]), ...] -- what the
+        run about to start will actually READ. A FOV missing any of it is
+        not a FOV that can be aligned; it is a FOV that is not ready yet.
+
+        The two are worth separating because the pipeline could not tell
+        them apart. A hybe whose MIP is not on disk reaches the fit,
+        _cell_native_crop returns a bare None -- the SAME None it returns
+        for a cell that genuinely projects off-frame -- and an identity
+        residual is persisted with provenance asserting the off-frame
+        cause. Append then treats the key's existence as done, so a hybe
+        that was merely late becomes permanently aligned, and with H2 =
+        identity it scores 0.0 px, the lowest possible, so it is also the
+        entry guaranteed never to be flagged for review.
+
+        Readiness comes from _ready_hybes: one directory listing, since
+        MIP files are written atomically and existence IS completeness
+        (see _ingested_hybes_for_fov), and answered from the in-memory
+        registry while an ingestion runs, so asking costs a live ingestion
+        nothing.
+        """
+        incomplete = {}
+        for fov in fov_list:
+            reasons = []
+            for modality, hybes in requirements:
+                # No modality or no hybes means the caller cannot say what
+                # this leg reads, and a check that cannot be made must not
+                # exclude a FOV -- the gate only ever removes work it can
+                # positively show is not ready.
+                if not modality or not hybes:
+                    continue
+                try:
+                    ready = self._ready_hybes(modality, fov)
+                except Exception:
+                    continue          # cannot answer -> do not exclude
+                absent = [h for h in hybes if h not in ready]
+                if absent:
+                    reasons.append(f'{modality}: {len(absent)} of {len(hybes)} '
+                                   f'hybe(s) not ingested yet')
+            if reasons:
+                incomplete[fov] = reasons
+        return incomplete
+
+    def _report_excluded_fovs(self, title, incomplete, consequence):
+        """Say which FOVs were left out of a run, and why. Returns the detail."""
+        detail = '; '.join(f'FOV{f:03d} ({", ".join(r)})'
+                           for f, r in sorted(incomplete.items())[:8])
+        if len(incomplete) > 8:
+            detail += f' (+{len(incomplete) - 8} more)'
+        self.log(f'{title}: EXCLUDING {len(incomplete)} FOV(s) whose ingestion '
+                 f'is unfinished -- {detail}')
+        QtWidgets.QMessageBox.information(
+            self, title,
+            f'{len(incomplete)} FOV(s) are excluded because their ingestion is '
+            f'not finished:\n\n{detail}\n\n{consequence}\n\n'
+            f'Re-run once ingestion completes.')
+        return detail
+
     def _ingestion_paths_in_flight(self, include_queued=True):
         """
         Absolute storage paths some ingestion is (or will be) writing into:
@@ -3760,6 +3915,12 @@ class MainWindow(QtWidgets.QMainWindow):
         modalities = '+'.join(j['modality'] for j in entry['jobs'])
         self.log(f"Starting queued job {self._job_queue_index + 1}/{len(self._job_queue)}: "
                  f"{modalities}, FOV {entry['fov_list']}...")
+        # Same clean-state rule as an interactive overwrite, without the
+        # prompt: the queue was authorised as a whole when it was started,
+        # and it runs unattended, so a dialog here would just stall it.
+        # Logged instead, so the stop is not silent.
+        if self._job_queue_overwrite:
+            self._clear_for_overwrite_ingestion(ask=False)
         # The entry IS the worker's jobs list -- snapshotted whole at Add
         # time, handed over verbatim (FOV-major demux across its
         # modalities included, exactly like a direct Run Ingestion).
@@ -9576,7 +9737,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f'FOV alignment append: {n_todo} missing (FOV, hybe) pair(s) '
                      f'across {len(specs_by_fov)} FOV(s).')
         else:
-            specs_by_fov = {fov: base_specs for fov in fov_list}
+            # Overwrite had no readiness check at all, while append has had
+            # one all along -- so the SAME button was safe in one mode and
+            # not the other. A FOV whose hybes are still arriving cannot be
+            # aligned; align_same_modality would read a MIP that is not
+            # there and persist whatever that produced.
+            incomplete = self._incomplete_fovs(
+                fov_list,
+                [(sp['modality'], [r['folder'] for r in sp['hybe_records']])
+                 for sp in base_specs])
+            if incomplete:
+                self._report_excluded_fovs(
+                    'Run FOV Alignment (all FOVs)', incomplete,
+                    'Overwriting them now would fit against hybes that are not '
+                    'on disk yet.')
+            specs_by_fov = {fov: base_specs for fov in fov_list
+                            if fov not in incomplete}
+            if not specs_by_fov:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Run FOV Alignment (all FOVs)',
+                    'Every FOV in the list still has unfinished ingestion -- '
+                    'nothing to align.')
+                ap.RunAllFovAlignmentPushButton.setEnabled(True)
+                return
 
         run_fovs = [fov for fov in fov_list if specs_by_fov.get(fov)]
         ap.RunAllFovAlignmentPushButton.setEnabled(False)
@@ -9993,6 +10176,30 @@ One PNG PER MODALITY: each modality has its own reference and its
                     'Nothing to append -- every computable FOV already has a persisted cross-modal result.')
                 return
             pairs = kept_pairs
+        else:
+            # Append already refuses a FOV whose two bridge hybes are not
+            # both ingested; overwrite did not, so the same button was safe
+            # in one mode and not the other. A bridge cannot be fitted
+            # against a reference that has not landed.
+            requirements = []
+            for pair in pairs:
+                requirements.append((pair['shared_modality'],
+                                     [pair['shared_reference_hybe']]))
+                requirements.append((pair['moving_modality'],
+                                     [pair['moving_reference_hybe']]))
+            incomplete = self._incomplete_fovs(fov_list, requirements)
+            if incomplete:
+                self._report_excluded_fovs(
+                    'Run Cross-Modal Alignment (all FOVs)', incomplete,
+                    'Overwriting them now would fit a bridge against a '
+                    'reference hybe that is not on disk yet.')
+                fov_list = [fov for fov in fov_list if fov not in incomplete]
+            if not fov_list:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Run Cross-Modal Alignment',
+                    'Every FOV in the list still has unfinished ingestion -- '
+                    'nothing to align.')
+                return
         self._cross_modal_overlays_saved = 0
         self._start_cross_modal_queue(pairs, fov_list, staged=False,
                                       button=ap.RunAllCrossModalPushButton)
@@ -11124,44 +11331,28 @@ One PNG PER MODALITY: each modality has its own reference and its
         # so this adds no NAS traffic to a live ingestion. Passes are built
         # here rather than at job-assembly time so the confirmation dialog
         # below counts what will really run.
-        passes_by_fov = {}
+        passes_by_fov = {fov: self._cell_alignment_passes(cell_modality, storage_path, fov)
+                         for fov in sorted(cells_by_fov)}
         incomplete = {}
-        for fov in sorted(cells_by_fov):
-            fov_passes = self._cell_alignment_passes(cell_modality, storage_path, fov)
-            reasons = []
-            for p in fov_passes:
-                records = p.get('hybe_records') or []
-                try:
-                    ready = self._ready_hybes(p['modality'], fov)
-                except Exception:
-                    ready = None
-                if ready is None:
-                    continue
-                absent = [r['folder'] for r in records if r['folder'] not in ready]
-                if absent:
-                    reasons.append(f'{p["modality"]}: {len(absent)} of {len(records)} '
-                                   f'hybe(s) not ingested yet')
-            if reasons:
-                incomplete[fov] = reasons
-            else:
-                passes_by_fov[fov] = fov_passes
+        for fov, fov_passes in passes_by_fov.items():
+            found = self._incomplete_fovs(
+                [fov],
+                [(p.get('modality'),
+                  [r['folder'] for r in (p.get('hybe_records') or []) if 'folder' in r])
+                 for p in fov_passes])
+            if found:
+                incomplete[fov] = found[fov]
 
         if incomplete:
             for fov in incomplete:
                 cells_by_fov.pop(fov, None)
                 containers_by_fov.pop(fov, None)
-            detail = '; '.join(f'FOV{f:03d} ({", ".join(r)})'
-                               for f, r in sorted(incomplete.items())[:8])
-            more = '' if len(incomplete) <= 8 else f' (+{len(incomplete) - 8} more)'
-            self.log(f'cell alignment: EXCLUDING {len(incomplete)} FOV(s) whose '
-                     f'ingestion is unfinished -- {detail}{more}')
-            QtWidgets.QMessageBox.information(
-                self, 'Run Cell Alignment (all FOVs)',
-                f'{len(incomplete)} FOV(s) are excluded because their ingestion is '
-                f'not finished:\n\n{detail}{more}\n\n'
-                f'Aligning them now would record an identity matrix for every '
-                f'missing hybe, and append mode would then treat those hybes as '
-                f'done forever. Re-run once ingestion completes.')
+                passes_by_fov.pop(fov, None)
+            self._report_excluded_fovs(
+                'Run Cell Alignment (all FOVs)', incomplete,
+                'Aligning them now would record an identity matrix for every '
+                'missing hybe, and append mode would then treat those hybes as '
+                'done forever.')
         if not cells_by_fov:
             QtWidgets.QMessageBox.warning(
                 self, 'Run Cell Alignment (all FOVs)',
