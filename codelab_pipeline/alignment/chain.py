@@ -1916,19 +1916,32 @@ def commit_cell_alignment(cell, plan, results_by_hybe):
 #     hybe-major   419.8 / 432.3 ms per cell   (FOV 9, 10)   -> 1.85x
 #
 # and the fitted matrices are byte-identical (FOV 12, 696 entries, both
-# ways). But adding workers does NOT compound it. Sweeping 1-3-6-6-3-1
-# over six cold FOVs, normalised per cell:
+# ways).
 #
-#     1 worker    691 ms/cell        3 workers   615 ms/cell   (1.12x)
-#     6 workers   796 ms/cell  -- SLOWER THAN ONE
+# ADDING WORKERS DOES NOT COMPOUND IT, and the phase breakdown says why.
+# Same store, 12 hybes, 11 groups, both arms accounted identically:
 #
-# The spread within each condition is 10-24%, so those ratios are soft;
-# the ORDERING is not, since every 6-worker run came out worse than every
-# 3-worker run. Read it as: this NAS is the bottleneck, and hybe-major's
-# locality already gets close to saturating it from one process. The pool
-# stays because it is one tuning knob away and other stores may differ --
-# but nobody should assume it is buying anything here. Measured at 12
-# hybes per FOV; the real FOVs carry 135.
+#   workers  FOV  cells   prepare   ref_zx   spawn      FIT
+#         1   40     96      0.17     3.07    0.00    46.10 s
+#         6   41     74      0.15     2.69    3.67    49.93 s
+#         6   42     49      0.11     2.22    3.56    42.97 s
+#         1   43     63      0.14     2.51    0.00    45.80 s
+#
+# Two things fall out. Pool overhead is real but small -- 3.6 s to spawn
+# six children and ship them their contexts, against a ~46 s fit. And the
+# FIT ITSELF IS FLAT: not just in workers, but in CELLS. Ninety-six cells
+# cost 46.10 s and forty-nine cost 42.97 s, so doubling the cells adds 7%.
+#
+# So roughly 93% of the cost is per-HYBE NAS access and about 7% is
+# per-cell work. Eleven hybes in 46 s is 4.2 s each, against ~139 MB of
+# compressed channel per stack: this is bandwidth, and six processes
+# reading six different files do not get more of it than one. That is also
+# the real explanation for the 1.85x above -- cell-major was not doing more
+# arithmetic, it was paying that per-hybe access once per CELL.
+#
+# The pool stays because it is one tuning knob away and another store, or
+# a local disk, may behave differently. Nobody should assume it is buying
+# anything here. Measured at 12 hybes per FOV; the real FOVs carry 135.
 
 _HYBE_WORKER_CTXS = {}
 
