@@ -668,7 +668,7 @@ class CellAlignmentWorker(QtCore.QThread):
             n_skipped = 0
             plan_by_fov = []
             done_fovs = []          # read by the failure handler below
-            skip_why = []
+            skip_why, skipped_fovs = [], set()
             for fov, cells, passes in self.jobs:
                 per_cell, todo = {}, []
                 # What this FOV has ON DISK. A FOV missing from the map
@@ -706,17 +706,23 @@ class CellAlignmentWorker(QtCore.QThread):
                             # alone -- which is exactly the report an
                             # append run over a store with NO cell
                             # matrices on disk produced.
-                            if len(skip_why) < 5:
+                            # ONE example per FOV, not the first five
+                            # overall: the first FOV's cells fill the
+                            # sample and hide every other FOV, which is
+                            # exactly what happened -- five FOV001 lines
+                            # said nothing about the FOVs whose store
+                            # holds no matrices at all.
+                            if fov not in skipped_fovs and len(skip_why) < 8:
+                                skipped_fovs.add(fov)
                                 skip_why.append(
                                     f'FOV{fov:03d} cell {cell.id}: '
-                                    f'{len(cell.matrices)} matrix key(s) in memory, '
-                                    + (f'{len(fov_persisted.get(cell.id, ()))} on disk, '
-                                       if fov_persisted is not None else 'disk not read, ')
-                                    + f'{len(passes)} raw pass(es) '
-                                    f'{len(passes)} raw pass(es) '
-                                    f'{[len(p.get("hybe_records") or ()) for p in passes]}h '
-                                    f'-> resolved {[len(p["hybe_records"]) for p in resolved]}h, '
-                                    f'ref={[p["reference_hybe"] or cell.reference_hybe for p in resolved]}')
+                                    f'{len(cell.matrices)} key(s) in memory, '
+                                    + (f'{len(fov_persisted.get(cell.id, ()))} on disk'
+                                       if fov_persisted is not None
+                                       else 'FOV not in the persisted map')
+                                    + f', raw {[len(p.get("hybe_records") or ()) for p in passes]}h'
+                                    f' -> resolved {[len(p["hybe_records"]) for p in resolved]}h,'
+                                    f' ref={[p["reference_hybe"] or cell.reference_hybe for p in resolved]}')
                             continue
                         resolved = kept
                     per_cell[cell.id] = resolved
@@ -11402,6 +11408,66 @@ One PNG PER MODALITY: each modality has its own reference and its
                                           f'No storage path configured for {cell_modality}.')
             return
 
+        # Every FOV's own FOV-level matrices, READ FROM THE STORE for any
+        # this session has not already loaded.
+        #
+        # This is the confirmed cause of "Align All Cells in All FOVs only
+        # did one FOV", reported twice. _fov_matrices_for reads
+        # self.fov_matrices, which is pure session state: it is filled one
+        # FOV at a time by _activate_fov, and by a FOV-alignment run. The
+        # backfill in _refresh_params_from_vlinks skips the store's OWN
+        # modality ("covered by _activate_fov" -- which covers exactly one
+        # FOV), so on a single-modality project, as this one is, that loop
+        # never runs at all.
+        #
+        # A FOV with no matrices ships hybe_records filtered down to []
+        # (see CellAlignmentWorker._resolve_passes), and then append counts
+        # its cells as "already fully aligned" while overwrite raises. Both
+        # are silent about the real reason. Cells are already read per FOV
+        # a few lines up; the matrices are the other half of the same job
+        # and belong in the same place.
+        #
+        # THIS MUST RUN BEFORE passes_by_fov IS BUILT. _cell_alignment_passes
+        # puts a fov_matrices OBJECT into each pass dict -- a snapshot taken
+        # then, not a live view -- so backfilling self.fov_matrices afterwards
+        # updates the session and leaves every already-built pass empty. That
+        # is not hypothetical: with the backfill sitting below the pass
+        # construction, an append run on a freshly started app logged
+        # "loaded FOV-level matrices for 49/49 FOV(s)" and then skipped 3600
+        # of 3600 cells, because only FOV001 -- the one FOV resident before
+        # the run -- had a populated snapshot. Its cells resolved to [1]h
+        # (the reference, correctly kept); every other FOV resolved to [0]h.
+        try:
+            missing = [fov for fov in sorted(cells_by_fov)
+                       if not self._fov_matrices_for(storage_path, fov)]
+        except Exception as e:
+            # Preparation must never be the thing that stops a run: without
+            # this backfill the run still behaves exactly as it did before.
+            missing = []
+            self.log(f'cell alignment: could not check FOV-level matrices ({e})')
+        if missing:
+            records = self._hybe_records_for_storage_path(storage_path)
+            loaded, failed = 0, []
+            for fov in missing:
+                try:
+                    self._merge_fov_matrices(
+                        fov, alignment.read_same_modality_matrices(
+                            storage_path, fov, records))
+                    if self._fov_matrices_for(storage_path, fov):
+                        loaded += 1
+                    else:
+                        failed.append(fov)
+                except Exception as e:
+                    failed.append(fov)
+                    self.log(f'cell alignment: could not read FOV-level '
+                             f'matrices for FOV{fov:03d} ({e})')
+            self.log(f'cell alignment: loaded FOV-level matrices for '
+                     f'{loaded}/{len(missing)} FOV(s) not resident this session.')
+            if failed:
+                self.log(f'cell alignment: FOV(s) {failed} still have no '
+                         f'FOV-level matrices -- run FOV alignment for them '
+                         f'first, or their cells cannot be fitted.')
+
         # A FOV whose ingestion is not finished is excluded from the run
         # ENTIRELY, and the user is told which ones and why.
         #
@@ -11452,55 +11518,6 @@ One PNG PER MODALITY: each modality has its own reference and its
                 self, 'Run Cell Alignment (all FOVs)',
                 'Every FOV with cells still has unfinished ingestion -- nothing to align.')
             return
-
-        # Every FOV's own FOV-level matrices, READ FROM THE STORE for any
-        # this session has not already loaded.
-        #
-        # This is the confirmed cause of "Align All Cells in All FOVs only
-        # did one FOV", reported twice. _fov_matrices_for reads
-        # self.fov_matrices, which is pure session state: it is filled one
-        # FOV at a time by _activate_fov, and by a FOV-alignment run. The
-        # backfill in _refresh_params_from_vlinks skips the store's OWN
-        # modality ("covered by _activate_fov" -- which covers exactly one
-        # FOV), so on a single-modality project, as this one is, that loop
-        # never runs at all.
-        #
-        # A FOV with no matrices ships hybe_records filtered down to []
-        # (see CellAlignmentWorker._resolve_passes), and then append counts
-        # its cells as "already fully aligned" while overwrite raises. Both
-        # are silent about the real reason. Cells are already read per FOV
-        # a few lines up; the matrices are the other half of the same job
-        # and belong in the same place.
-        try:
-            missing = [fov for fov in sorted(cells_by_fov)
-                       if not self._fov_matrices_for(storage_path, fov)]
-        except Exception as e:
-            # Preparation must never be the thing that stops a run: without
-            # this backfill the run still behaves exactly as it did before.
-            missing = []
-            self.log(f'cell alignment: could not check FOV-level matrices ({e})')
-        if missing:
-            records = self._hybe_records_for_storage_path(storage_path)
-            loaded, failed = 0, []
-            for fov in missing:
-                try:
-                    self._merge_fov_matrices(
-                        fov, alignment.read_same_modality_matrices(
-                            storage_path, fov, records))
-                    if self._fov_matrices_for(storage_path, fov):
-                        loaded += 1
-                    else:
-                        failed.append(fov)
-                except Exception as e:
-                    failed.append(fov)
-                    self.log(f'cell alignment: could not read FOV-level '
-                             f'matrices for FOV{fov:03d} ({e})')
-            self.log(f'cell alignment: loaded FOV-level matrices for '
-                     f'{loaded}/{len(missing)} FOV(s) not resident this session.')
-            if failed:
-                self.log(f'cell alignment: FOV(s) {failed} still have no '
-                         f'FOV-level matrices -- run FOV alignment for them '
-                         f'first, or their cells cannot be fitted.')
 
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
@@ -11589,11 +11606,24 @@ One PNG PER MODALITY: each modality has its own reference and its
                          f'them) -- they will produce nothing.')
         except Exception as e:
             self.log(f'cell alignment: could not summarise scope ({e})')
+        persisted = (self._persisted_cell_matrix_keys(storage_path, sorted(cells_by_fov))
+                     if mode == 'append' else None)
+        if persisted is not None:
+            # What append is about to treat as the truth, stated before it
+            # acts on it. A map that silently misses a FOV falls back to the
+            # in-memory cell, which is the exact behaviour this replaced --
+            # so "which FOVs did it cover, and how many of their cells have
+            # nothing stored" has to be visible without reading a skip line.
+            empty_fovs = sorted(f for f, by in persisted.items()
+                                if by and not any(by.values()))
+            self.log(f'cell alignment: persisted state read for '
+                     f'{len(persisted)}/{len(cells_by_fov)} FOV(s); '
+                     f'{len(empty_fovs)} of them have NO stored matrices '
+                     f'{empty_fovs[:12]}{"..." if len(empty_fovs) > 12 else ""}; '
+                     f'store={storage_path}')
         self._cell_alignment_worker = CellAlignmentWorker(
             jobs, channel_type=channel_type, pad=pad, z_max_shift=z_max_shift,
-            append=(mode == 'append'),
-            persisted=(self._persisted_cell_matrix_keys(storage_path, sorted(cells_by_fov))
-                       if mode == 'append' else None))
+            append=(mode == 'append'), persisted=persisted)
         self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
         self._cell_alignment_worker.fov_done.connect(
             lambda fov, cells: self._on_cell_alignment_fov_done(

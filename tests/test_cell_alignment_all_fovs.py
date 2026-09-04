@@ -78,7 +78,20 @@ def main():
     MW.analysis_store.read_cells = (
         lambda sp, fov: (read_fovs.append(fov), (None, ''))[1])
     mw._storage_path_for_modality = lambda m: '/store/DNA'
-    mw._cell_alignment_passes = lambda modality, sp, fov: [{'fov': fov}]
+    # ORDER OF OPERATIONS, pinned. _cell_alignment_passes puts a
+    # fov_matrices OBJECT into each pass -- a snapshot, not a live view --
+    # so the FOV-level backfill has to happen BEFORE the passes are built.
+    # With it below, a freshly started app logged "loaded FOV-level
+    # matrices for 49/49 FOV(s)" and then skipped 3600 of 3600 cells: only
+    # the one FOV resident before the run had a populated snapshot, and
+    # every other FOV's records were filtered down to nothing.
+    order = []
+    mw._fov_matrices_for = lambda sp, fov: None       # nothing resident
+    mw._hybe_records_for_storage_path = lambda sp: [{'folder': 'H1'}]
+    MW.alignment.read_same_modality_matrices = lambda sp, fov, recs: {('H1', 'DNA'): 1}
+    mw._merge_fov_matrices = lambda fov, fm: order.append(('backfill', fov))
+    mw._cell_alignment_passes = (
+        lambda modality, sp, fov: (order.append(('passes', fov)), [{'fov': fov}])[1])
     ap.build_cell_reference_hybe_fields(['DNA'])
     mw._all_analysis_storage_paths = lambda: ['/store/DNA']
 
@@ -115,6 +128,11 @@ def main():
 
     check('preparation does NOT run the GUI activation path', activated == [],
           str(activated))
+    kinds = [k for k, _fov in order]
+    check('FOV-level matrices are backfilled BEFORE any pass is built',
+          'backfill' in kinds and 'passes' in kinds
+          and kinds.index('passes') > max(i for i, k in enumerate(kinds) if k == 'backfill'),
+          str(order))
     check('every FOV without resident cells is READ from the store instead',
           read_fovs and read_fovs[0] == 2, str(read_fovs))
     # ...and then EVERY FOV with cells is read again, because this run is in
