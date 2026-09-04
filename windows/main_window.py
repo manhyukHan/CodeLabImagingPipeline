@@ -640,6 +640,7 @@ class CellAlignmentWorker(QtCore.QThread):
             n_skipped = 0
             plan_by_fov = []
             done_fovs = []          # read by the failure handler below
+            skip_why = []
             for fov, cells, passes in self.jobs:
                 per_cell, todo = {}, []
                 for cell in cells:
@@ -652,12 +653,31 @@ class CellAlignmentWorker(QtCore.QThread):
                         # every pass look busy and fully-aligned cells would
                         # never skip (each paying a reference crop read from
                         # the NAS for nothing)
-                        resolved = [p for p in resolved
-                                    if any(r['folder'] != (p['reference_hybe'] or cell.reference_hybe)
-                                           for r in p['hybe_records'])]
-                        if not resolved:
+                        kept = [p for p in resolved
+                                if any(r['folder'] != (p['reference_hybe'] or cell.reference_hybe)
+                                       for r in p['hybe_records'])]
+                        if not kept:
                             n_skipped += 1
+                            # WHY it skipped, for the first few. "Already
+                            # aligned" is only one of the ways to end up
+                            # here: a pass whose records were all dropped
+                            # by _resolve_passes' fov_matrices membership
+                            # filter reaches this line too, and reports
+                            # itself as done when nothing was ever fitted.
+                            # The two are indistinguishable from the count
+                            # alone -- which is exactly the report an
+                            # append run over a store with NO cell
+                            # matrices on disk produced.
+                            if len(skip_why) < 5:
+                                skip_why.append(
+                                    f'FOV{fov:03d} cell {cell.id}: '
+                                    f'{len(cell.matrices)} matrix key(s) on the cell, '
+                                    f'{len(passes)} raw pass(es) '
+                                    f'{[len(p.get("hybe_records") or ()) for p in passes]}h '
+                                    f'-> resolved {[len(p["hybe_records"]) for p in resolved]}h, '
+                                    f'ref={[p["reference_hybe"] or cell.reference_hybe for p in resolved]}')
                             continue
+                        resolved = kept
                     per_cell[cell.id] = resolved
                     todo.append(cell)
                     total += max(len(resolved), 1)
@@ -676,7 +696,9 @@ class CellAlignmentWorker(QtCore.QThread):
             self.n_tasks = self.n_cells_fitted
             if n_skipped:
                 self.progress.emit(0, total,
-                                   f'append: {n_skipped} cell(s) already fully aligned -- skipped')
+                                   f'append: {n_skipped} cell(s) with nothing to fit -- skipped')
+                for why in skip_why:
+                    self.progress.emit(0, total, f'append skip -- {why}')
 
             if self.workers is not None:
                 n_workers = max(1, int(self.workers))
@@ -11436,9 +11458,8 @@ One PNG PER MODALITY: each modality has its own reference and its
         ap.RunCellAlignmentAllPushButton.setEnabled(False)
         self.statusBar().showMessage(
             f'Computing cell alignment for {len(cells_by_fov)} FOV(s)...')
-        # One job per FOV, FOV-major inside the worker -- a FOV's cells
-        # finish together, and the worker's own pool parallelises the
-        # hybes within a cell.
+        # One job per FOV, taken in order: the worker fits a FOV's hybes
+        # across its pool and writes that FOV before starting the next.
         # passes_by_fov was built during preparation, alongside the
         # ingestion-readiness check that decided which FOVs are in at all.
         jobs = [(fov, cells_by_fov[fov], passes_by_fov[fov])
