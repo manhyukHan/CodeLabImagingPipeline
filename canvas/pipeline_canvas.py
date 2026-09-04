@@ -45,6 +45,78 @@ def render_cell_overlay_to_png(draw_args, figsize=(14, 9), dpi=150):
     return draw_args.get('save_path')
 
 
+def _gather_fov_all_readouts(storage_path, fov, hybe_records, reference_hybe,
+                             matrices, channel_type='readout'):
+    """Read every hybe's MIP and warp each by its own matrix.
+
+    The expensive half of the FOV all-readouts overlay, factored out with
+    no Qt and no `self` so it can run in a child process: ~111 MIPs at
+    ~2 MB is roughly 220 MB per FOV per modality, and it used to run on
+    the GUI thread, where it is a freeze of tens of seconds.
+
+    Returns (before_images, after_images, title) -- the dicts stay HERE,
+    in whichever process called this, because shipping 440 MB of them
+    back over a pipe would give away everything the move gained. A caller
+    in a child composites first (compose_fov_all_readouts) and sends back
+    two finished RGB frames instead.
+    """
+    record_by_folder = {r['folder']: r for r in hybe_records}
+    ref_channel = alignment.pick_channel_by_type(record_by_folder[reference_hybe], channel_type)
+    ref_mip = _read_mip(storage_path, fov, reference_hybe, ref_channel)
+    height, width = ref_mip.shape
+
+    matrices = _bare_hybe(matrices)
+    before_images = {reference_hybe: ref_mip}
+    after_images = {reference_hybe: ref_mip}
+    for record in hybe_records:
+        hybe = record['folder']
+        if hybe == reference_hybe or hybe not in matrices:
+            continue
+        channel = alignment.pick_channel_by_type(record, channel_type)
+        mip = _read_mip(storage_path, fov, hybe, channel)
+        before_images[hybe] = mip
+        after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
+
+    # same hybe (modality) naming as every other alignment figure --
+    # this store's own modality, resolved once from its path
+    modality = analysis_store.modality_of(storage_path)
+    ref_label = f'{reference_hybe} ({modality})' if modality else reference_hybe
+    title = f'FOV{fov:03d}: all readouts vs {ref_label} (before/after)'
+    return before_images, after_images, title
+
+
+def compose_fov_all_readouts(storage_path, fov, hybe_records, reference_hybe,
+                             matrices, channel_type='readout'):
+    """CHILD-PROCESS entry point for the DISPLAYED overlay.
+
+    Does the reading, the warping and the compositing, and returns only
+    what the figure actually needs: two RGB frames and a title. That is
+    ~12 MB each against the ~220 MB read and the ~440 MB of intermediate
+    frames, so the pipe carries a small fraction of the work it replaces.
+
+    Module-level and taking only plain data, so it is picklable under the
+    'spawn' start method.
+    """
+    before_images, after_images, title = _gather_fov_all_readouts(
+        storage_path, fov, hybe_records, reference_hybe, matrices, channel_type)
+    return _composite_multi(before_images), _composite_multi(after_images), title
+
+
+def render_fov_all_readouts_to_png(draw_args, figsize=(12, 6), dpi=150):
+    """CHILD-PROCESS entry point for the SAVED overlay. Returns the path.
+
+    The saving variants never put the figure on screen, so nothing has to
+    come back at all -- the whole cost, read and composite and render and
+    write, stays in the child. Mirrors render_cell_overlay_to_png, and for
+    the same reason: h5py's one lock per process, held across gzip
+    inflation.
+    """
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=figsize, dpi=dpi)
+    PipelineCanvas.draw_fov_all_readouts_overlay(_NoCanvas(), figure=fig, **draw_args)
+    return draw_args.get('save_path')
+
+
 def _sequential_color(i, n):
     """
     Linear interpolation from red (1,0,0) at i=0 to cyan (0,1,1) at i=n-1 --
@@ -779,7 +851,8 @@ class PipelineCanvas():
         title = f'cell {cell.id}: {target_label} vs {reference_summary}'
         self._draw_three_way(rows, title, lb, ub, save_path)
 
-    def draw_all_readouts_overlay(self, before_images, after_images, title, save_path=None):
+    def draw_all_readouts_overlay(self, before_images, after_images, title,
+                                  save_path=None, figure=None):
         """
         before_images/after_images: {label: 2D array} (already cropped by
         the caller for the cell-level variant). One combined image per
@@ -788,23 +861,44 @@ class PipelineCanvas():
         view, vs. the pairwise preview which only ever shows one comparison
         at a time.
         """
-        fig = self.preview_canvas.figure
+        # Unbound for the same reason as draw_fov_all_readouts_overlay:
+        # this runs under a _NoCanvas `self` when a child renders to PNG.
+        PipelineCanvas.draw_all_readouts_composited(
+            self, _composite_multi(before_images), _composite_multi(after_images),
+            title, save_path=save_path, figure=figure)
+
+    def draw_all_readouts_composited(self, before_rgb, after_rgb, title,
+                                     save_path=None, figure=None):
+        """The same figure, from composites that are ALREADY built.
+
+        Split out because building them is the expensive half and does not
+        need a GUI: _composite_multi alone measured 82% of the overlay-PNG
+        cost on a real 78-hybe FOV (17.4 s of 21.3 s), on top of reading
+        ~111 MIPs -- about 220 MB. Everything below is matplotlib on two
+        finished RGB arrays. Keeping the two apart is what lets the
+        expensive half run in a child process while this half stays here.
+        """
+        fig = figure if figure is not None else self.preview_canvas.figure
         fig.clear()
         ax = fig.subplots(1, 2)
-        ax[0].imshow(_composite_multi(before_images))
+        ax[0].imshow(before_rgb)
         ax[0].set_title('before', fontsize=10)
         ax[0].axis('off')
-        ax[1].imshow(_composite_multi(after_images))
+        ax[1].imshow(after_rgb)
         ax[1].set_title('after alignment', fontsize=10)
         ax[1].axis('off')
         fig.suptitle(title, fontsize=10, wrap=True)
         fig.tight_layout(rect=[0, 0, 1, 0.93])
-        self.preview_canvas.draw()
+        # An explicit figure= means there is no Qt canvas to refresh (see
+        # _NoCanvas): touching one would be the exact mistake that guard
+        # exists to name.
+        if figure is None:
+            self.preview_canvas.draw()
         if save_path:
             fig.savefig(save_path, dpi=150)
 
     def draw_fov_all_readouts_overlay(self, storage_path, fov, hybe_records, reference_hybe, matrices,
-                                      save_path=None, channel_type='readout'):
+                                      save_path=None, channel_type='readout', figure=None):
         """
         Reads every hybe's raw MIP, warps each by its own matrix, builds
         one before/after all-readouts composite for the whole FOV.
@@ -823,29 +917,17 @@ class PipelineCanvas():
         biological content worth looking at, not fiducial's plain
         bead/chromatin staining.
         """
-        record_by_folder = {r['folder']: r for r in hybe_records}
-        ref_channel = alignment.pick_channel_by_type(record_by_folder[reference_hybe], channel_type)
-        ref_mip = _read_mip(storage_path, fov, reference_hybe, ref_channel)
-        height, width = ref_mip.shape
-
-        matrices = _bare_hybe(matrices)
-        before_images = {reference_hybe: ref_mip}
-        after_images = {reference_hybe: ref_mip}
-        for record in hybe_records:
-            hybe = record['folder']
-            if hybe == reference_hybe or hybe not in matrices:
-                continue
-            channel = alignment.pick_channel_by_type(record, channel_type)
-            mip = _read_mip(storage_path, fov, hybe, channel)
-            before_images[hybe] = mip
-            after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
-
-        # same hybe (modality) naming as every other alignment figure --
-        # this store's own modality, resolved once from its path
-        modality = analysis_store.modality_of(storage_path)
-        ref_label = f'{reference_hybe} ({modality})' if modality else reference_hybe
-        title = f'FOV{fov:03d}: all readouts vs {ref_label} (before/after)'
-        self.draw_all_readouts_overlay(before_images, after_images, title, save_path)
+        before_images, after_images, title = _gather_fov_all_readouts(
+            storage_path, fov, hybe_records, reference_hybe, matrices, channel_type)
+        # Unbound, not self.<method>: in a child process `self` is a
+        # _NoCanvas whose whole job is to refuse attribute access, so an
+        # ordinary method call would be turned into an error by the very
+        # guard that is supposed to be watching for Qt use. Going through
+        # the class reaches the same code without asking the instance for
+        # anything.
+        PipelineCanvas.draw_all_readouts_overlay(
+            self, before_images, after_images, title,
+            save_path=save_path, figure=figure)
 
     def draw_cell_all_readouts_overlay(self, cell, fov, reference_hybe, reference_storage_path, reference_channel,
                                        target_specs, pad=10, lb=0.3, ub=0.9999,
