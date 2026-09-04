@@ -680,13 +680,20 @@ class CellAlignmentWorker(QtCore.QThread):
 
             if self.workers is not None:
                 n_workers = max(1, int(self.workers))
-            elif self.n_cells_fitted <= 1:
-                # Sized WITHOUT the tuning override: this is what a
-                # single-cell preview runs on, and the override exists to
-                # throttle a batch run that is starving the GUI -- applying
-                # it here would throttle the GUI's own work instead. See
+            elif self.n_cells_fitted == 1:
+                # EXACTLY one cell, i.e. Preview This Cell. Sized WITHOUT
+                # the tuning override: the override exists to throttle a
+                # batch run that is starving the GUI, and applying it here
+                # would throttle the GUI's own work instead. See
                 # chain.measured_cell_alignment_workers for the incident
                 # that makes this worth spelling out.
+                #
+                # Not `<= 1`. Zero cells means an append run found nothing
+                # to fit, which is not a preview -- reading it as one made
+                # the run announce a 16-worker MIP budget it would never
+                # use ("0.50 GB each x 16 worker(s) = 8.0 GB, OVER the
+                # 4.0 GB budget"), overriding the 6 the tuning file asked
+                # for and warning about a slowdown that could not happen.
                 n_workers = alignment.measured_cell_alignment_workers()
             else:
                 n_workers = alignment.max_cell_alignment_workers()
@@ -698,7 +705,11 @@ class CellAlignmentWorker(QtCore.QThread):
             # pool with no total is what drained this machine's free page
             # list and slowed every process on it (see process_guard).
             io_level, cache_gb, cache_note = tuning.apply_child_env(n_workers)
-            self.progress.emit(0, total, f'MIP cache: {cache_note}')
+            if self.n_cells_fitted:
+                # Silent when there is nothing to fit: no pool will exist,
+                # so a budget line there describes memory nobody asks for
+                # and reads as a warning about this run.
+                self.progress.emit(0, total, f'MIP cache: {cache_note}')
             shapes = set()
 
             for fov, cells, todo, per_cell in plan_by_fov:
