@@ -1,5 +1,7 @@
+import collections
 import multiprocessing
 import os
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial, reduce
 import numpy as np
@@ -14,6 +16,7 @@ from skimage.feature import peak_local_max
 from ..io import paths
 from ..io import preprocess
 from .. import process_guard
+from .. import tuning
 from ..io import analysis_store
 import cv2
 
@@ -964,6 +967,40 @@ def max_cell_alignment_workers(hard_ceiling=16):
     measured read-throughput curve has visibly flattened by 16 workers, and
     workers beyond the knee add spawn cost and seek pressure for little
     return. Two cores stay reserved for the GUI thread and the coordinator.
+
+    "Flattened" was as far as that measurement went, and flat is not the
+    same as best: ingestion, which reads the same storage the same way,
+    measured 117.6 MB/s at 12 workers against 66 MB/s at 36 -- so past the
+    knee this store gets actively SLOWER, and nobody has yet found the cell
+    pool's equivalent of that number. Until someone does, tuning.py can
+    override this from a file between runs so the curve can be walked on
+    the real store rather than argued about; an unset knob leaves the
+    measured behaviour exactly as it was.
+    """
+    override, _source = tuning.cell_alignment_workers()
+    if override is not None:
+        # Deliberately NOT floored by hard_ceiling: the whole point of the
+        # override is to test values the current default cannot express,
+        # and the interesting direction is downward.
+        return max(1, int(override))
+    return measured_cell_alignment_workers(hard_ceiling)
+
+
+def measured_cell_alignment_workers(hard_ceiling=16):
+    """The default above with the tuning override deliberately NOT applied.
+
+    For the per-hybe pool, which is a different pool answering a different
+    question. The override exists to throttle a BATCH run that is starving
+    the GUI of disk; the per-hybe pool is what the GUI itself uses to draw
+    a single-cell preview, so throttling it slows down the very thing the
+    throttle is meant to protect.
+
+    That distinction is not hypothetical. An earlier change made the batch
+    path hybe-major by editing the projection helper the preview shares,
+    and the preview -- which calls it 2-3 times per hybe, against a
+    measured break-even of ~55 cells per stack -- became slow enough that
+    the app had to be reverted mid-session. One knob reaching two pools
+    with opposite interests is how that happens.
     """
     return max(1, min((os.cpu_count() or 4) - 2, hard_ceiling))
 
@@ -1269,6 +1306,89 @@ def estimate_cross_modal_z(rna_storage_path, dna_storage_path, fov, rna_hybe, dn
     return dz, quality, diagnostics
 
 
+# One reusable destination for the Z-stack window read, per THREAD.
+#
+# The read at the bottom of hybe_zx_projection is a cell-sized crop across
+# the full depth: at a measured median crop of 79x79 px that is 79x79x110x2
+# = 1.31 MB, and 2.11 MB at 177 planes. Both are over a boundary that was
+# measured on this machine, sharply:
+#
+#     1016 KB  ->  40/40 allocations came back DIRTY  (recycled in-process)
+#     1020 KB  ->   0/40 came back dirty              (fresh from the kernel)
+#
+# Windows' heap hands anything past ~1 MB straight to VirtualAlloc and
+# gives it back on free, so every such read takes freshly zeroed pages from
+# the kernel and returns them to be zeroed again. This leg runs once per
+# (cell, hybe) -- of order 390,000 times in a whole-project run -- so it is
+# the single largest generator of demand-zero traffic on the path.
+#
+# Thread-local, not module-global: pipeline_canvas draws the ZX preview
+# from the GUI's own threads while a pool child may be fitting, and one
+# shared buffer would have them overwrite each other's pixels.
+_ZX_BUFFERS = threading.local()
+
+# The crop is bounded by the cell bbox plus pad. Measured over 227 real
+# cells in two FOVs of a real store: median bbox 58x58, p90 66x67, max
+# 76x118 -- so 160 leaves better than 2x headroom on the largest observed
+# cell. A crop past it still works; it just takes the old fresh-allocation
+# path rather than silently reading into a buffer too small for it.
+_ZX_MAX_SIDE = 160
+
+# DO NOT CACHE OPEN STACK FILE HANDLES HERE. It was tried and reverted.
+#
+# The appeal is real: hybe_zx_projection opens, reads and closes a stack
+# file on every call -- once per (cell, hybe), so 7,560 opens for one
+# measured 56-cell FOV of 135 hybes and of order 390,000 for a whole-
+# project run, each a NAS round trip. A worker revisits the same file once
+# per cell it holds, so the opens are pure repetition and an LRU of open
+# handles removes almost all of them.
+#
+# It also breaks ingestion, measured on this machine:
+#
+#     os.replace with no handle open      -> succeeded
+#     os.replace with a read handle open  -> PermissionError [WinError 5]
+#     os.replace after closing the handle -> succeeded
+#
+# Windows refuses to replace a file that anyone has open. Ingestion writes
+# every stack as a .part file and os.replace()s it -- the protocol that
+# exists because an interrupted overwrite once destroyed two stacks
+# silently (see CLAUDE.md). A cached read handle therefore does not merely
+# risk serving stale bytes after a swap; it makes the swap FAIL, and it
+# fails exactly in the case this pipeline is built for: an append run
+# alongside a still-running ingestion.
+#
+# Validating by (mtime, size) does not help -- the file cannot be replaced
+# in the first place. Any future attempt needs a handle opened with
+# FILE_SHARE_DELETE, which h5py does not expose.
+#
+# The allocation half of this problem is solved separately and safely, by
+# reusing the destination BUFFER rather than the handle: see below.
+
+
+def _read_zx_window(ds, ymin, ymax, xmin, xmax):
+    """The (h, w, depth) window of `ds`, read into a reused buffer.
+
+    Returns a VIEW of that buffer, valid until this thread's next call --
+    every caller here consumes it immediately (a max-projection) and keeps
+    nothing. Falls back to a plain fresh read for a crop larger than the
+    buffer, or if read_direct is unavailable for this dataset.
+    """
+    h, w = ymax - ymin, xmax - xmin
+    depth = ds.shape[2]
+    if h > _ZX_MAX_SIDE or w > _ZX_MAX_SIDE:
+        return ds[ymin:ymax, xmin:xmax, :]
+    key = (depth, ds.dtype.str)
+    buf = getattr(_ZX_BUFFERS, 'buf', None)
+    if buf is None or getattr(_ZX_BUFFERS, 'key', None) != key:
+        buf = np.empty((_ZX_MAX_SIDE, _ZX_MAX_SIDE, depth), dtype=ds.dtype)
+        _ZX_BUFFERS.buf, _ZX_BUFFERS.key = buf, key
+    try:
+        ds.read_direct(buf, np.s_[ymin:ymax, xmin:xmax, :], np.s_[0:h, 0:w, :])
+    except (TypeError, ValueError, OSError):
+        return ds[ymin:ymax, xmin:xmax, :]
+    return buf[:h, :w, :]
+
+
 def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     """
     A cell-region Z-stack crop, max-projected along the height (Y) axis to
@@ -1305,9 +1425,13 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     below (compute_cell_alignment) uses for its z-depth refinement.
     """
     h5path = paths.stack_path(storage_path, fov, hybe)
+    # Opened and CLOSED every call, deliberately -- see the block comment
+    # above _read_zx_window: a held handle makes ingestion's os.replace
+    # fail outright on Windows.
     with h5py.File(h5path, 'r') as f:
-        stack = f[f'/stack/ch{channel}'][ymin:ymax, xmin:xmax, :]
-    projection = stack.max(axis=0)  # (width, depth)
+        ds = f[f'/stack/ch{channel}']
+        stack = _read_zx_window(ds, ymin, ymax, xmin, xmax)
+        projection = stack.max(axis=0)      # (width, depth); a small array
     return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
 
 def pick_channel_by_type(record, channel_type):
