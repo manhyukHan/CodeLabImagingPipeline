@@ -215,6 +215,55 @@ def main():
     check('append fits only the missing (cell, hybe) pairs; complete cell skipped',
           fitted == [(2, ('H1', 'H2', 'H3'))], str(fitted))
 
+    # -- 5b. append asks the STORE, not the in-memory cell -------------------
+    #
+    # A run mutates the real ACell objects and only then writes the FOV, so a
+    # run stopped or killed between the two leaves matrices that exist in the
+    # process and nowhere else. Deciding from those made append call that work
+    # done and skip it permanently -- the failure is silent, and it is the one
+    # append exists to prevent. Observed on the real MAZ store: three
+    # consecutive append passes reported "3600 cell(s) already fully aligned"
+    # while every one of those cells had an empty matrices dict on disk, until
+    # the app was restarted.
+    def run_append(cells, persisted):
+        got = []
+        def prepare(cs, fov, passes_by_cell, channel_type, pad, z_max_shift):
+            for c in cs:
+                for p in passes_by_cell[c.id]:
+                    got.append((c.id, tuple(r['folder'] for r in p['hybe_records'])))
+            return {}, {}, []
+        w = CellAlignmentWorker([(7, cells, passes)], workers=1, append=True,
+                                persisted=persisted)
+        with mock.patch.object(chain, 'prepare_cell_passes', side_effect=prepare):
+            w.run()
+        return got, w.n_skipped
+
+    both = [cell_done, cell_part]
+    got, skipped = run_append(both, {7: {1: set(), 2: set()}})
+    check('a cell whose matrices exist ONLY in memory is fitted, not skipped',
+          got == [(1, ('H1', 'H2', 'H3')), (2, ('H1', 'H2', 'H3'))], str(got))
+    check('and nothing is reported as already aligned', skipped == 0, str(skipped))
+
+    on_disk = {('H1', 'DNA'), ('H2', 'DNA'), ('H3', 'DNA')}
+    got, skipped = run_append(both, {7: {1: on_disk, 2: {('H1', 'DNA')}}})
+    check('a cell complete ON DISK is skipped, whatever memory holds',
+          got == [(2, ('H1', 'H2', 'H3'))], str(got))
+    check('and it is the one counted as skipped', skipped == 1, str(skipped))
+
+    # A cell absent from a FOV that IS in the map has nothing persisted --
+    # that is the newly segmented cell, and it must be fitted, not treated
+    # as unknown and passed over.
+    got, _ = run_append(both, {7: {1: on_disk}})
+    check('a cell missing from the map is fitted (nothing persisted for it)',
+          got == [(2, ('H1', 'H2', 'H3'))], str(got))
+
+    # A FOV whose cells could not be read is ABSENT from the map, and that
+    # must fall back to the old in-memory behaviour rather than refit the
+    # whole project -- an unreadable store is not evidence of missing work.
+    got, _ = run_append(both, {})
+    check('an unreadable FOV falls back to the in-memory cell, not a refit',
+          got == [(2, ('H1', 'H2', 'H3'))], str(got))
+
     # -- 6. build_chromatin_trace_allele append semantics ---------------------
     allele = types.SimpleNamespace(coordinate=(5.0, 6.0, 7.0),
                                    fiducial_trace_adj={'R': (1, 2, 3), 'A': (1, 2, 3)},

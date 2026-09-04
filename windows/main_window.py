@@ -528,9 +528,18 @@ class CellAlignmentWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(list)  # [(fov, cells), ...]
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, channel_type='fiducial', pad=10, z_max_shift=None, workers=None, append=False):
+    def __init__(self, jobs, channel_type='fiducial', pad=10, z_max_shift=None, workers=None, append=False,
+                 persisted=None):
         super().__init__()
         self.jobs = jobs
+        # {fov: {cell_id: {(hybe, modality), ...}}} -- what is actually ON
+        # DISK, read fresh at run start. Append consults THIS, not the
+        # in-memory cell, to decide what is already done. See
+        # _resolve_passes for why that distinction is load-bearing.
+        # None (or a FOV absent from it) falls back to the in-memory cell,
+        # so a store that could not be read degrades to the old behaviour
+        # rather than refitting everything.
+        self.persisted = persisted
         self.channel_type = channel_type
         self.pad = pad
         # None defers to chain.MAX_CELL_Z_SHIFT_PLANES rather than hard-coding
@@ -567,12 +576,30 @@ class CellAlignmentWorker(QtCore.QThread):
         self.n_skipped = 0
         self.n_cells_fitted = 0
 
-    def _resolve_passes(self, cell, passes):
+    def _resolve_passes(self, cell, passes, persisted_keys=None):
         """
         The per-(cell, pass) resolution the serial loop always did, factored
         out so the dispatch receives ALREADY-RESOLVED passes -- the
         resolution logic stays here, in the code that has always owned it,
         and chain.prepare_cell_passes is just the loop body.
+
+        persisted_keys: the (hybe, modality) keys this cell has ON DISK, or
+        None to fall back to the in-memory cell.matrices.
+
+        WHY APPEND MUST NOT ASK THE IN-MEMORY CELL. A run mutates the real
+        ACell objects and only then writes the FOV, so a run that stops --
+        or dies -- between the two leaves cells carrying matrices that were
+        never persisted. Append reading those would call them done and skip
+        them forever: the work is not merely lost, it becomes invisible to
+        the mode whose whole job is to finish what is missing. That is not
+        hypothetical -- an append pass over this project reported "3600
+        cell(s) already fully aligned" while every one of those cells had
+        an empty matrices dict on disk, three times, until the app was
+        restarted.
+
+        Reading from disk also makes the answer honest in the other
+        direction: anything not written is unfinished, whatever memory
+        says, which is exactly the question append is asking.
         """
         resolved = []
         for p in passes:
@@ -594,9 +621,10 @@ class CellAlignmentWorker(QtCore.QThread):
                 # surviving record is the reference, so fully-aligned cells
                 # still skip without paying a pointless reference crop read.
                 ref = p['reference_hybe'] or cell.reference_hybe
+                have = cell.matrices if persisted_keys is None else persisted_keys
                 hybe_records = [r for r in hybe_records
                                 if r['folder'] == ref
-                                or (r['folder'], p['modality']) not in cell.matrices]
+                                or (r['folder'], p['modality']) not in have]
             # Resolved PER CELL, not once per pass: cell.reference_hybe
             # genuinely varies cell-to-cell under append-mode segmentation.
             # Resolved from the CELL's own reference_modality, not the
@@ -643,8 +671,18 @@ class CellAlignmentWorker(QtCore.QThread):
             skip_why = []
             for fov, cells, passes in self.jobs:
                 per_cell, todo = {}, []
+                # What this FOV has ON DISK. A FOV missing from the map
+                # (unreadable store, or no map at all) falls back to the
+                # in-memory cell; a CELL missing from a FOV that IS in the
+                # map has nothing persisted, which is an empty set, not a
+                # fallback -- that is the newly segmented cell, and it
+                # needs fitting.
+                fov_persisted = (self.persisted or {}).get(fov)
                 for cell in cells:
-                    resolved = self._resolve_passes(cell, passes)
+                    resolved = self._resolve_passes(
+                        cell, passes,
+                        None if fov_persisted is None
+                        else fov_persisted.get(cell.id, frozenset()))
                     if self.append:
                         # a pass counts as having work only if it carries a
                         # NON-reference record -- the reference is always
@@ -671,7 +709,10 @@ class CellAlignmentWorker(QtCore.QThread):
                             if len(skip_why) < 5:
                                 skip_why.append(
                                     f'FOV{fov:03d} cell {cell.id}: '
-                                    f'{len(cell.matrices)} matrix key(s) on the cell, '
+                                    f'{len(cell.matrices)} matrix key(s) in memory, '
+                                    + (f'{len(fov_persisted.get(cell.id, ()))} on disk, '
+                                       if fov_persisted is not None else 'disk not read, ')
+                                    + f'{len(passes)} raw pass(es) '
                                     f'{len(passes)} raw pass(es) '
                                     f'{[len(p.get("hybe_records") or ()) for p in passes]}h '
                                     f'-> resolved {[len(p["hybe_records"]) for p in resolved]}h, '
@@ -10877,6 +10918,39 @@ One PNG PER MODALITY: each modality has its own reference and its
                         other_reference_hybe, other_modality))
         return out
 
+    def _persisted_cell_matrix_keys(self, storage_path, fov_list):
+        """{fov: {cell_id: {(hybe, modality), ...}}} -- read from the STORE.
+
+        What append is entitled to call "already done". The in-memory cells
+        cannot answer that: a run mutates them and only then writes the
+        FOV, so anything stopped in between leaves matrices that exist in
+        this process and nowhere else. Append trusting those skips them
+        permanently -- see CellAlignmentWorker._resolve_passes for the run
+        where that reported 3600 cells done against an empty store.
+
+        A FOV whose cells cannot be read is OMITTED rather than recorded as
+        empty: absent means "ask the cell", present means "this is the
+        truth", and conflating them would turn an unreadable store into a
+        full refit. read_cells is mtime-cached, so this costs a real read
+        only where the file has changed since it was last seen.
+        """
+        out = {}
+        for fov in fov_list:
+            try:
+                cell_dicts, _modality = analysis_store.read_cells(storage_path, fov)
+            except Exception:
+                continue
+            if cell_dicts is None:
+                continue
+            by_cell = {}
+            for d in cell_dicts:
+                try:
+                    by_cell[int(d['id'])] = set((d.get('matrices') or {}).keys())
+                except (KeyError, TypeError, ValueError):
+                    continue
+            out[fov] = by_cell
+        return out
+
     def _cell_alignment_passes(self, cell_modality, storage_path, fov):
         """
         One compute_cell_alignment "pass" dict per configured modality --
@@ -11194,7 +11268,10 @@ One PNG PER MODALITY: each modality has its own reference and its
         self.statusBar().showMessage('Computing cell alignment...')
         worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
         self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad,
-                                                          z_max_shift=z_max_shift, append=(mode == 'append'))
+                                                          z_max_shift=z_max_shift, append=(mode == 'append'),
+                                                          persisted=(self._persisted_cell_matrix_keys(
+                                                              storage_path, [fov])
+                                                              if mode == 'append' else None))
         self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
         self._cell_alignment_worker.finished_ok.connect(
             lambda results: self._on_cell_alignment_finished(results, fov, container, storage_path,
@@ -11514,7 +11591,9 @@ One PNG PER MODALITY: each modality has its own reference and its
             self.log(f'cell alignment: could not summarise scope ({e})')
         self._cell_alignment_worker = CellAlignmentWorker(
             jobs, channel_type=channel_type, pad=pad, z_max_shift=z_max_shift,
-            append=(mode == 'append'))
+            append=(mode == 'append'),
+            persisted=(self._persisted_cell_matrix_keys(storage_path, sorted(cells_by_fov))
+                       if mode == 'append' else None))
         self._cell_alignment_worker.progress.connect(self._on_alignment_progress)
         self._cell_alignment_worker.fov_done.connect(
             lambda fov, cells: self._on_cell_alignment_fov_done(

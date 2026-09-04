@@ -116,7 +116,20 @@ def main():
     check('preparation does NOT run the GUI activation path', activated == [],
           str(activated))
     check('every FOV without resident cells is READ from the store instead',
-          read_fovs == [2], str(read_fovs))
+          read_fovs and read_fovs[0] == 2, str(read_fovs))
+    # ...and then EVERY FOV with cells is read again, because this run is in
+    # APPEND mode and append is no longer allowed to ask the in-memory cell
+    # what is already done. A run mutates cells and only then writes the
+    # FOV, so anything stopped in between leaves matrices that exist in the
+    # process and nowhere else; trusting those skipped the work permanently.
+    # These reads are mtime-cached (analysis_store._cached), and preparation
+    # has just read the same files, so they cost a real read only where the
+    # file changed.
+    check('append also reads the persisted state of every FOV with cells',
+          sorted(read_fovs[1:]) == [1, 3], str(read_fovs))
+    check('and the worker is given it',
+          isinstance(started.get('kw', {}).get('persisted'), dict),
+          str(type(started.get('kw', {}).get('persisted'))))
     check('the run started', started.get('started') is True)
     jobs = started.get('jobs', [])
     check('one job per FOV that has cells', [j[0] for j in jobs] == [1, 3], str([j[0] for j in jobs]))
