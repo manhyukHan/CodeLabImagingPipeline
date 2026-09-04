@@ -195,12 +195,20 @@ def main():
                'cellref_fov_matrices': {'DNA': fm}}]
     caw = CellAlignmentWorker([(7, [cell_done, cell_part], passes)], workers=1, append=True)
     fitted = []
-    def fake_cell_align(cell, sp, fov, hybe_records, fovm, **kw):
-        fitted.append((cell.id, tuple(r['folder'] for r in hybe_records)))
-    with mock.patch.object(chain, 'compute_cell_alignment', side_effect=fake_cell_align):
+    def fake_prepare(cells, fov, passes_by_cell, channel_type, pad, z_max_shift):
+        # The seam the worker actually calls since alignment went
+        # hybe-major: preparation happens in the parent, per (cell, pass),
+        # and the dispatch that follows works off what it returns. What is
+        # asserted below is unchanged -- WHICH cells and WHICH hybe records
+        # survive append's filter -- only where it is observed moved.
+        for c in cells:
+            for p in passes_by_cell[c.id]:
+                fitted.append((c.id, tuple(r['folder'] for r in p['hybe_records'])))
+        return {}, {}, []
+    with mock.patch.object(chain, 'prepare_cell_passes', side_effect=fake_prepare):
         caw.run()
     # The reference hybe (H1) ALWAYS rides along even though cell 2 already
-    # has its matrix: compute_cell_alignment raises without its anchor
+    # has its matrix: prepare_cell_alignment raises without its anchor
     # record -- filtering it out was the real "append stuck" bug. The
     # delta is the NON-reference records (H2, H3); the complete cell's
     # pass has only the reference left and is pruned entirely.

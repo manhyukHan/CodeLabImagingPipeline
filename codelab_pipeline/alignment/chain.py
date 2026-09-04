@@ -1,3 +1,4 @@
+import collections
 import multiprocessing
 import os
 import threading
@@ -890,26 +891,26 @@ def max_alignment_workers(hard_ceiling=32):
 
 # -- parallel cell-level residual alignment (see CellAlignmentWorker) ------
 #
-# One cell's residual fit is independent of every other cell's: it reads its
-# own crops out of shared read-only files and writes only its own matrices.
-# The loop was serial on a single QThread. Unlike the per-hybe FOV pool above
-# (pure CPU, near-linear), this workload is ~74% disk reads after the ref_zx
-# hoist and windowed-MIP fixes, so the pool's ceiling is the DRIVE, not the
-# core count: measured on the real E: store, concurrent windowed stack reads
-# scale 2.87x at 8 workers / 3.74x at 16 / 4.98x at 24 -- sublinear the whole
-# way. Expect roughly 4x, not core-count.
+# Each (cell, hybe) residual fit is independent of every other: it reads its
+# own crops out of shared read-only files and produces a value. The loop was
+# serial on a single QThread. Unlike the per-hybe FOV pool above (pure CPU,
+# near-linear), this workload is ~74% disk reads after the ref_zx hoist and
+# windowed-MIP fixes, so the pool's ceiling is the DRIVE, not the core count:
+# measured on the real E: store, concurrent windowed stack reads scale 2.87x
+# at 8 workers / 3.74x at 16 / 4.98x at 24 -- sublinear the whole way. Expect
+# roughly 4x, not core-count.
 #
-# The genuinely risky part is not memory (a worker holds a few ~82x75 crops
-# and ZX projections -- tens of MB) but the MUTATION CONTRACT:
-# compute_cell_alignment commits by mutating the cell in place, and in
-# automatic mode those are the real ACell objects. A child process mutates a
-# PICKLED COPY, so the parent must replace the real cell's three mutated
-# attributes with the child's end state. The child started from the same
-# pickled state the serial code would have mutated, so its end state IS the
-# serial end state -- wholesale replacement of exactly those three dicts
-# (matrices, matrix_anchors, matrix_provenance -- see compute_cell_alignment's
-# docstring for why it is these three and nothing else) is faithful, not
-# approximate.
+# THE MUTATION CONTRACT, and why the pool is no longer where cells are
+# mutated. This pool used to fan across CELLS, so a child mutated a PICKLED
+# COPY of a real ACell and shipped its three dicts home for wholesale
+# replacement. That worked, but it forced every worker to read every hybe --
+# see the hybe-major dispatch below for what that cost. Now the parent does
+# all of the mutation itself: prepare_cell_alignment writes the anchor and
+# clears this pass's stale keys before any child exists, and
+# commit_cell_alignment writes the fitted entries after the children are
+# done. The children never see an ACell at all -- they receive plain
+# picklable contexts and return plain per-hybe values -- so there is no copy
+# to reconcile and no way for a cell's dicts to be written by two hands.
 
 class CellOffFrameError(ValueError):
     """The cell's mask, projected into a pass's reference-hybe frame,
@@ -929,34 +930,50 @@ def _init_cell_align_worker():
     cv2.setNumThreads(1)
 
 
-def _align_one_cell(task):
+def prepare_cell_passes(cells, fov, passes_by_cell, channel_type, pad,
+                        z_max_shift):
     """
-    All passes for ONE cell, in a worker process.
+    Prepare every (cell, pass) of one FOV for the hybe-major dispatch.
 
-    `passes` arrive with hybe_records already filtered against fov_matrices
-    membership and cellref_matrix already resolved per cell -- that logic
-    stays in the parent (CellAlignmentWorker), which is the code that has
-    always owned it; this function is deliberately just the loop body.
+    IN THE PARENT, deliberately -- this is the loop _align_one_cell used to
+    run inside a pool child. Preparation reads only the REFERENCE hybe, so
+    doing it here costs one hybe's reads and buys three things: the real
+    ACell is mutated directly (no pickled copy to reconcile), the whole-pass
+    decisions stay whole-pass (the stale-key clear, the anchor, and
+    CellOffFrameError's identity residuals all land before any child
+    exists), and the children never need an ACell at all.
 
-    Returns the cell's three mutated dicts rather than the whole cell:
-    the parent already holds the real object, and shipping ~44 KB of mask
-    arrays back per cell would be pure overhead.
+    `passes_by_cell` arrives with hybe_records already filtered against
+    fov_matrices membership and cellref_matrix already resolved per cell --
+    that logic stays in CellAlignmentWorker, the code that has always owned
+    it.
+
+    Returns (work, plans, skipped):
+      work    {(cell.id, modality): (ctx, targets)}   -> run_hybe_tasks
+      plans   {(cell.id, modality): (cell, plan)}     -> commit_cell_alignment
+      skipped [(cell.id, 'modality: why'), ...]       -> the caller's log
     """
-    cell, fov, passes, channel_type, pad, z_max_shift = task
-    skipped = []
-    for p in passes:
-        try:
-            compute_cell_alignment(
-                cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
-                reference_hybe=p['reference_hybe'], channel_type=channel_type,
-                pad=pad, modality=p['modality'],
-                cell_reference_hybe_matrix=p['cellref_matrix'],
-                z_max_shift=z_max_shift)
-        except CellOffFrameError as e:
-            # skip THIS pass, keep the others (see the class docstring)
-            skipped.append(f"{p['modality']}: {e}")
-    return (fov, cell.id, cell.matrices, cell.matrix_anchors,
-            cell.matrix_provenance, skipped)
+    work, plans, skipped = {}, {}, []
+    for cell in cells:
+        for p in passes_by_cell[cell.id]:
+            key = (cell.id, p['modality'])
+            try:
+                ctx, targets, plan = prepare_cell_alignment(
+                    cell, p['storage_path'], fov, p['hybe_records'],
+                    p['fov_matrices'], reference_hybe=p['reference_hybe'],
+                    channel_type=channel_type, pad=pad, modality=p['modality'],
+                    cell_reference_hybe_matrix=p['cellref_matrix'],
+                    z_max_shift=z_max_shift)
+            except CellOffFrameError as e:
+                # skip THIS pass, keep the cell's others (see the class
+                # docstring). prepare_cell_alignment has already written the
+                # pass's identity residuals and provenance, so the skip is
+                # recorded in the cell, not merely logged.
+                skipped.append((cell.id, f"{p['modality']}: {e}"))
+                continue
+            work[key] = (ctx, targets)
+            plans[key] = (cell, plan)
+    return work, plans, skipped
 
 
 def max_cell_alignment_workers(hard_ceiling=16):
@@ -1416,10 +1433,25 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     # The overwrite path now stops readers first, which is why the cache
     # was safe enough to test -- but nothing bought it a reason to exist.
     with h5py.File(h5path, 'r') as f:
-        ds = f[f'/stack/ch{channel}']
-        stack = _read_zx_window(ds, ymin, ymax, xmin, xmax)
-        projection = stack.max(axis=0)      # (width, depth); a small array
-    return preprocess.normalize_to_uint8(projection, lb, ub) if normalize else projection.astype(np.float32)
+        return _zx_from_dataset(f[f'/stack/ch{channel}'],
+                                ymin, ymax, xmin, xmax, lb, ub, normalize)
+
+
+def _zx_from_dataset(ds, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
+    """hybe_zx_projection's body, given an ALREADY-OPEN dataset.
+
+    Split out so a hybe-major task can open one stack file and project
+    many cells' windows from it, WITHOUT changing hybe_zx_projection --
+    that function is a first-class GUI caller (the ZX row of the cell
+    alignment preview) and the last attempt to make it serve two masters
+    at once had to be reverted mid-session. The open/close policy lives
+    with the caller; the pixels live here, in one place, so the batch and
+    the preview cannot diverge.
+    """
+    stack = _read_zx_window(ds, ymin, ymax, xmin, xmax)
+    projection = stack.max(axis=0)          # (width, depth); a small array
+    return (preprocess.normalize_to_uint8(projection, lb, ub) if normalize
+            else projection.astype(np.float32))
 
 def pick_channel_by_type(record, channel_type):
     """Resolve a channel CHOICE to this hybe's actual channel.
@@ -1482,7 +1514,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
                            cell_reference_hybe_matrix=None, modality=None,
                            background_clip=None, fit_method='phase_correlation',
-                           integer_shift=False, z_max_shift=None, executor=None):
+                           integer_shift=False, z_max_shift=None):
     """
     Compute this cell's own per-hybe alignment correction (matrices['yx']
     and matrices['zx']), refining the already-established FOV-level matrix
@@ -1620,16 +1652,56 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     composition never needs the shared frame at all, since both sides
     already share this run's own reference_hybe by construction.
 
-    executor: None (default -- serial per-hybe loop, byte-identical to
-    the pre-refactor behavior) or a spawn-context ProcessPoolExecutor to
-    fan the per-hybe work (_cell_hybe_task: crop reads, fit, gates, Z
-    leg) across children. Measured on the real store, a cell's cost is
-    99.5% NAS I/O (2 file opens + 2 reads per hybe), so overlapping the
-    hybes is the whole win. THE ONE-AXIS RULE (per explicit design):
-    only the SINGLE-task path (Preview This Cell / a one-cell FOV) may
-    pass an executor -- CellAlignmentWorker's multi-cell batch already
-    parallelizes across cells and its pool children call this with
-    executor=None, so per-hybe and per-cell pooling can never stack.
+    SERIAL, always. This is now the one-cell convenience wrapper around
+    prepare_cell_alignment -> _cell_hybe_task -> commit_cell_alignment;
+    it took an `executor` to fan its own hybes, and no longer does,
+    because the pool it would have needed must be built around the ctx
+    that prepare_cell_alignment produces -- which does not exist until
+    this function is already running. Callers that want parallelism call
+    the three pieces directly (see run_hybe_tasks and
+    make_cell_hybe_pool); that is the SAME path the whole-FOV batch
+    takes, differing only in how many cells were prepared.
+    """
+    ctx, targets, plan = prepare_cell_alignment(
+        cell, storage_path, fov, hybe_records, fov_matrices,
+        reference_hybe=reference_hybe, channel_type=channel_type, pad=pad,
+        lb=lb, ub=ub, including_z=including_z,
+        cell_reference_hybe_matrix=cell_reference_hybe_matrix,
+        modality=modality, background_clip=background_clip,
+        fit_method=fit_method, integer_shift=integer_shift,
+        z_max_shift=z_max_shift)
+    # Through the SAME engine the whole-FOV batch uses -- a group of one
+    # cell. Not a shortcut around it: routing both through run_hybe_tasks
+    # is what keeps "preview this cell" and "align every cell" from
+    # drifting apart, which is the failure this refactor exists to make
+    # impossible.
+    key = (cell.id, plan['modality'])
+    by_cell = run_hybe_tasks({key: (ctx, targets)})
+    commit_cell_alignment(cell, plan, by_cell[key])
+    return
+
+
+def prepare_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
+                           reference_hybe=None, channel_type='readout',
+                           pad=10, lb=0.3, ub=0.9999, including_z=True,
+                           cell_reference_hybe_matrix=None, modality=None,
+                           background_clip=None, fit_method='phase_correlation',
+                           integer_shift=False, z_max_shift=None):
+    """
+    Everything compute_cell_alignment does BEFORE the per-hybe work, split
+    out so the hybe-major dispatch can do it for every cell of a FOV up
+    front and then fan the hybes.
+
+    Returns (ctx, targets, plan): the loop-invariant context every per-hybe
+    task reads, this cell's target hybe records, and what commit_cell_
+    alignment needs to merge the results back.
+
+    It MUTATES the cell exactly as the inline prologue always did -- sets
+    matrix_anchors[modality], clears this pass's stale matrices/provenance
+    keys -- and raises CellOffFrameError, after writing that error's
+    identity residuals, when the cell has no reference crop at all. Doing
+    this in the PARENT is a simplification, not a change: those writes used
+    to happen in a pool child and be shipped home wholesale.
     """
     height, width = cell.frame_shape
     reference_hybe = reference_hybe or cell.reference_hybe
@@ -1755,27 +1827,29 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         cell.matrix_provenance.pop(stale_key, None)
 
     targets = [r for r in hybe_records if r['folder'] != reference_hybe]
-    results_by_hybe = {}
-    if executor is not None and len(targets) > 1:
-        # Per-hybe fan-out across the caller's spawn pool -- the
-        # single-task path's ONE axis of parallelism (see `executor` in
-        # this function's docstring: the across-cells batch pool never
-        # passes one, so the two axes can never stack). Children receive
-        # pickled COPIES of ctx, so the reference Z projection is read
-        # once HERE rather than lazily (a lazy fill inside a child could
-        # never propagate back, and every child would pay its own read).
-        if including_z and ctx['ref_zx'] is None:
-            ctx['ref_zx'] = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
-                                               *ref_window, lb, ub)
-        futures = [executor.submit(_cell_hybe_task, ctx, r) for r in targets]
-        for future in as_completed(futures):
-            hybe_result, entry, provenance = future.result()
-            results_by_hybe[hybe_result] = (entry, provenance)
-    else:
-        for r in targets:
-            hybe_result, entry, provenance = _cell_hybe_task(ctx, r)
-            results_by_hybe[hybe_result] = (entry, provenance)
+    plan = {'hybe_records': hybe_records, 'modality': modality,
+            'reference_hybe': reference_hybe}
+    return ctx, targets, plan
 
+
+def commit_cell_alignment(cell, plan, results_by_hybe):
+    """
+    Write one cell's per-hybe results, in hybe_records order.
+
+    Separated from the fitting so the dispatch can be per-hybe while the
+    COMMIT stays per-cell and whole-pass: every key this pass owns is
+    written here, in one place, from results this run produced. Insertion
+    order follows hybe_records exactly as the inline loop did, so nothing
+    downstream can observe which dispatch ran.
+
+    results_by_hybe: {hybe: (entry, provenance)} for every target hybe.
+    A missing target is a bug in the dispatch, not a tolerable state --
+    it would leave the cell with a key this run cleared and never
+    refilled -- so it raises rather than silently omitting.
+    """
+    hybe_records = plan['hybe_records']
+    modality = plan['modality']
+    reference_hybe = plan['reference_hybe']
     # Merge in hybe_records order -- identical insertion order to the old
     # inline loop, pooled or not, so nothing downstream can observe which
     # dispatch ran.
@@ -1800,10 +1874,245 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
         entry, provenance = results_by_hybe[hybe]
         cell.matrices[key] = entry
         cell.matrix_provenance[key] = provenance
-    return
 
 
-def _cell_hybe_task(ctx, record):
+
+
+# ---------------------------------------------------------------------------
+# The hybe-major dispatch.
+#
+# WHY THE PARALLEL AXIS IS HYBES AND NOT CELLS. A cell needs every hybe, so
+# cell-major makes every worker read every hybe's MIP: with 6 children that
+# is the same 135 MIPs read and RETAINED six times over (~1.6 GB), which is
+# what drained this machine's free page list and slowed every process on it.
+# Hybe-major hands each hybe to one worker, so a hybe's MIP is read once and
+# is resident only while that task runs -- 6 in flight, ~12 MB.
+#
+# It also lets one task open a stack ONCE for many cells. That is worth
+# ~1.22x on the ZX read leg, measured on the real store with 58 real cell
+# windows: 1.96 s opening per cell, 1.61 s with the file held, the cells
+# visited in y order and the HDF5 chunk cache raised to hold a few chunk
+# rows. Holding the handle ALONE is worth nothing (measured 0.94x, see
+# hybe_zx_projection) -- it only pays with the sort and the chunk cache,
+# because neighbouring cells share chunks and nothing else makes HDF5 keep
+# an inflated chunk between reads.
+#
+# The unit is (hybe, cells), which is why the whole-FOV batch and the
+# single-cell preview run the SAME engine: a preview is simply a group of
+# one cell. Cells are chunked only when there are too few hybes to fill the
+# pool -- an append run that adds three hybes to already-aligned cells would
+# otherwise leave most workers idle.
+#
+# A group's stack handle lives exactly as long as its task. That bound is
+# what makes it safe: an overwrite ingestion stops every reader first
+# (MainWindow._clear_for_overwrite_ingestion), and Windows refuses to
+# os.replace a file anyone holds open.
+#
+# WHAT THE DISPATCH IS WORTH, and what the POOL is not. Measured on the
+# real MAZ store, single process, 12 hybes, cold FOVs in ABBA order so
+# drift cannot masquerade as an effect:
+#
+#     cell-major   791.4 / 838.1 ms per cell   (FOV 8, 11)
+#     hybe-major   419.8 / 432.3 ms per cell   (FOV 9, 10)   -> 1.85x
+#
+# and the fitted matrices are byte-identical (FOV 12, 696 entries, both
+# ways). But adding workers does NOT compound it. Sweeping 1-3-6-6-3-1
+# over six cold FOVs, normalised per cell:
+#
+#     1 worker    691 ms/cell        3 workers   615 ms/cell   (1.12x)
+#     6 workers   796 ms/cell  -- SLOWER THAN ONE
+#
+# The spread within each condition is 10-24%, so those ratios are soft;
+# the ORDERING is not, since every 6-worker run came out worse than every
+# 3-worker run. Read it as: this NAS is the bottleneck, and hybe-major's
+# locality already gets close to saturating it from one process. The pool
+# stays because it is one tuning knob away and other stores may differ --
+# but nobody should assume it is buying anything here. Measured at 12
+# hybes per FOV; the real FOVs carry 135.
+
+_HYBE_WORKER_CTXS = {}
+
+# One chunk here is 32x32x43x2 = 88 KB and a full chunk row is ~8.4 MB, so
+# this holds about seven rows -- enough for the sorted sweep to find its
+# neighbours' chunks still inflated. h5py's default is 1 MB, which cannot
+# hold even ONE cell window (48 chunks, ~4.2 MB) and so never hits.
+_ZX_CHUNK_CACHE_BYTES = 64 * 2 ** 20
+_ZX_CHUNK_CACHE_SLOTS = 50021           # prime, per HDF5's own guidance
+
+
+def _init_cell_hybe_worker(inner_init, ctxs):
+    """Load this FOV's contexts into the child ONCE, at pool startup.
+
+    The alternative is shipping them with every task, and the arithmetic
+    rules it out: a real FOV's 71 cells carry ~90 KB of context each (the
+    cell mask, the reference crop, the reference Z projection), so
+    71 x 135 hybe tasks would pickle ~865 MB per FOV. Sent once per child
+    it is ~6 MB.
+
+    This is why the pool is built per FOV rather than once per run --
+    measured at 1.20 s to bring up six spawn children, about 60 s across a
+    50-FOV run, against hours of fitting.
+    """
+    if inner_init is not None:
+        inner_init()
+    _HYBE_WORKER_CTXS.clear()
+    _HYBE_WORKER_CTXS.update(ctxs)
+
+
+def _hybe_group_task(task):
+    """Pool entry point: the contexts come from the child's own globals."""
+    folder, record, keys = task
+    return _run_hybe_group(_HYBE_WORKER_CTXS, folder, record, keys)
+
+
+def _run_hybe_group(ctxs, folder, record, keys):
+    """One hybe, many cells -- the stack opened once for all of them.
+
+    Returns (folder, {cell_key: (entry, provenance)}). Exceptions are NOT
+    caught: _cell_hybe_task returns an explicit entry for every outcome it
+    treats as normal (including a cell that does not overlap this hybe), so
+    anything raised here is a real failure and must abort the run exactly
+    as it always did.
+    """
+    items = [(k, ctxs[k]) for k in keys if k in ctxs]
+    if not items:
+        return folder, {}
+    # y-major, then x: neighbouring cells share chunks, and that sharing is
+    # the only thing the chunk cache below can turn into a saved read.
+    items.sort(key=lambda kc: tuple((kc[1]['ref_window'] or (0, 0, 0, 0))[0::2]))
+    first = items[0][1]
+    handle = None
+    if any(c['including_z'] for _k, c in items):
+        try:
+            handle = h5py.File(paths.stack_path(first['storage_path'],
+                                                first['fov'], folder), 'r',
+                               rdcc_nbytes=_ZX_CHUNK_CACHE_BYTES,
+                               rdcc_nslots=_ZX_CHUNK_CACHE_SLOTS)
+        except OSError:
+            # Missing or unreadable stack: fall back to the per-call open,
+            # which reports the absence exactly as it always did rather
+            # than turning it into a different error here.
+            handle = None
+    out = {}
+    try:
+        for key, ctx in items:
+            reader = None
+            if handle is not None:
+                def reader(channel, y0, y1, x0, x1, _c=ctx, _f=handle):
+                    return _zx_from_dataset(_f[f'/stack/ch{channel}'],
+                                            y0, y1, x0, x1, _c['lb'], _c['ub'])
+            _hybe, entry, provenance = _cell_hybe_task(ctx, record, zx_read=reader)
+            out[key] = (entry, provenance)
+    finally:
+        if handle is not None:
+            handle.close()
+    return folder, out
+
+
+def fill_reference_zx(work):
+    """Read every prepared cell's REFERENCE Z projection, in the parent.
+
+    A loop invariant per cell (it depends only on reference_hybe and the
+    reference window), and one the children cannot fill for themselves:
+    they receive their contexts at pool startup, so a lazy fill inside a
+    child reaches neither the parent nor the other children, and each would
+    pay the read again. Cells with no targets are left alone -- that keeps
+    the serial path's promise that a call with nothing to fit does no Z
+    read at all.
+    """
+    for (ctx, targets) in work.values():
+        if targets and ctx['including_z'] and ctx['ref_zx'] is None:
+            ctx['ref_zx'] = hybe_zx_projection(
+                ctx['storage_path'], ctx['fov'], ctx['reference_hybe'],
+                ctx['ref_channel'], *ctx['ref_window'], ctx['lb'], ctx['ub'])
+
+
+def hybe_groups(work):
+    """The dispatch plan: [(folder, record, [cell_key, ...]), ...].
+
+    One group per hybe, so one stack open serves every cell that needs it.
+
+    DELIBERATELY NOT SPLIT INTO CELL CHUNKS when the hybes are too few to
+    fill the pool. That shape is rarer than it first looks, and it is not
+    worth paying for. A whole-FOV run saves only when the FOV finishes, so
+    a run killed part way leaves its cells with NO matrices and they come
+    back needing every hybe -- 135 groups, pool full; the same when new
+    cells are segmented. The only shape that really collapses the hybe
+    axis is adding NEW HYBES to cells that are already aligned, which the
+    ingestion guard makes impossible during a normal run: it means
+    extending an experiment whose analysis is already done. Splitting
+    would cost an extra MIP read per chunk on every ordinary run to speed
+    up that one, and there it is fine to leave workers idle.
+    """
+    by_folder = collections.OrderedDict()
+    for key, (_ctx, targets) in work.items():
+        for record in targets:
+            slot = by_folder.setdefault(record['folder'], [record, []])
+            slot[1].append(key)
+    return [(folder, record, keys) for folder, (record, keys) in by_folder.items()]
+
+
+def run_hybe_tasks(work, executor=None, on_group=None):
+    """Fit every (cell, hybe) in `work`, hybe-major.
+
+    work: {cell_key: (ctx, targets)} from prepare_cell_alignment.
+    Returns {cell_key: {hybe: (entry, provenance)}}, ready for
+    commit_cell_alignment.
+
+    executor must have been built by make_cell_hybe_pool from THIS work --
+    its children hold these contexts and are addressed by key alone.
+    Passing any other pool is a programming error rather than a slow path:
+    the children would not find the keys and every cell would come back
+    empty.
+
+    on_group(folder, n_cells) is called as each group lands, for progress.
+    """
+    results = {key: {} for key in work}
+    groups = hybe_groups(work)
+    if executor is not None:
+        futures = [executor.submit(_hybe_group_task, g) for g in groups]
+        for future in as_completed(futures):
+            folder, out = future.result()
+            for key, value in out.items():
+                results[key][folder] = value
+            if on_group is not None:
+                on_group(folder, len(out))
+    else:
+        local = {k: c for k, (c, _t) in work.items()}
+        for group in groups:
+            folder, out = _run_hybe_group(local, *group)
+            for key, value in out.items():
+                results[key][folder] = value
+            if on_group is not None:
+                on_group(folder, len(out))
+    return results
+
+
+def make_cell_hybe_pool(work, n_workers, inner_init=None):
+    """A spawn pool whose children already hold `work`'s contexts.
+
+    Returns None when a pool is not worth it (one worker, or nothing to
+    fan) or cannot be created -- callers degrade to the serial branch of
+    run_hybe_tasks, which produces identical results.
+
+    Fills the reference Z projections FIRST: once the children exist it is
+    too late, since they were handed their contexts at startup.
+    """
+    fill_reference_zx(work)
+    groups = hybe_groups(work)
+    if n_workers <= 1 or len(groups) <= 1:
+        return None
+    ctxs = {key: ctx for key, (ctx, _targets) in work.items()}
+    try:
+        return ProcessPoolExecutor(
+            max_workers=min(n_workers, len(groups)),
+            mp_context=multiprocessing.get_context('spawn'),
+            initializer=partial(_init_cell_hybe_worker, inner_init, ctxs))
+    except Exception:
+        return None                 # degrade to serial, never fail here
+
+
+def _cell_hybe_task(ctx, record, zx_read=None):
         """
         The per-hybe body of compute_cell_alignment -- native crop,
         residual fit, three reject gates, Z leg -- returning (hybe,
@@ -2000,8 +2309,15 @@ def _cell_hybe_task(ctx, record):
                 ctx['ref_zx'] = hybe_zx_projection(storage_path, fov, reference_hybe, ref_channel,
                                                    rymin, rymax, rxmin, rxmax, lb, ub)
             ref_zx = ctx['ref_zx']
-            target_zx = hybe_zx_projection(storage_path, fov, hybe, target_channel,
-                                           cymin, cymax, cxmin, cxmax, lb, ub)
+            # zx_read, when given, is THIS hybe's stack already open (see
+            # _hybe_group_task): the hybe-major dispatch opens the file
+            # once and projects every cell's window from it, instead of
+            # once per (cell, hybe). Same pixels either way -- both go
+            # through _zx_from_dataset.
+            target_zx = (zx_read(target_channel, cymin, cymax, cxmin, cxmax)
+                         if zx_read is not None else
+                         hybe_zx_projection(storage_path, fov, hybe, target_channel,
+                                            cymin, cymax, cxmin, cxmax, lb, ub))
             # hybe_zx_projection returns (width, depth), not (height,
             # width) like every other crop in this module -- H2 (a YX-
             # plane matrix) can't be applied to it directly via

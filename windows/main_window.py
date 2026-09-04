@@ -570,9 +570,9 @@ class CellAlignmentWorker(QtCore.QThread):
     def _resolve_passes(self, cell, passes):
         """
         The per-(cell, pass) resolution the serial loop always did, factored
-        out so the pool path ships ALREADY-RESOLVED passes to the child --
-        the resolution logic stays here, in the code that has always owned
-        it, and _align_one_cell is just the loop body.
+        out so the dispatch receives ALREADY-RESOLVED passes -- the
+        resolution logic stays here, in the code that has always owned it,
+        and chain.prepare_cell_passes is just the loop body.
         """
         resolved = []
         for p in passes:
@@ -614,15 +614,34 @@ class CellAlignmentWorker(QtCore.QThread):
 
     def run(self):
         try:
+            # HYBE-MAJOR, ONE FOV AT A TIME.
+            #
+            # The parallel axis is hybes, not cells, because a cell needs
+            # every hybe: cell-major made all six children read and RETAIN
+            # all 135 of a FOV's MIPs (~1.6 GB), which is what drained this
+            # machine's free page list and slowed every process on it. Now
+            # a hybe belongs to one task, so its MIP is read once and is
+            # resident only while that task runs.
+            #
+            # FOVs stay serial, so this changes nothing about saving: a FOV
+            # is written when its own cells are all fitted, exactly as
+            # before. What did change is that the parent, not a pool child,
+            # owns every write to a cell -- preparation before the pool
+            # exists, the commit after it is gone (see chain's own
+            # "MUTATION CONTRACT" note).
+            #
+            # Preparation is also where the two entry points differ, and
+            # the ONLY place: Preview This Cell prepares one cell, a batch
+            # prepares a FOV's worth, and both then run the identical
+            # engine (chain.run_hybe_tasks).
             results = []
             done = 0
-
-            # One task per (fov, cell) -- a cell's passes stay together so its
-            # matrices dicts are only ever mutated by one child.
-            tasks = []
-            cell_by_key = {}
+            total = 0
             n_skipped = 0
+            plan_by_fov = []
+            done_fovs = []          # read by the failure handler below
             for fov, cells, passes in self.jobs:
+                per_cell, todo = {}, []
                 for cell in cells:
                     resolved = self._resolve_passes(cell, passes)
                     if self.append:
@@ -639,16 +658,11 @@ class CellAlignmentWorker(QtCore.QThread):
                         if not resolved:
                             n_skipped += 1
                             continue
-                    tasks.append((cell, fov, resolved,
-                                  self.channel_type, self.pad, self.z_max_shift))
-                    cell_by_key[(fov, cell.id)] = cell
-            total = max(sum(max(len(t[2]), 1) for t in tasks), 1)
-            # A FOV is finished when its last CELL lands, not when the
-            # run does: cells are dispatched as one flat list so they
-            # complete interleaved across FOVs, and only this count says
-            # which FOV just became safe to write.
-            job_cells = {fov: cells for fov, cells, _passes in self.jobs}
-            remaining = collections.Counter(t[1] for t in tasks)
+                    per_cell[cell.id] = resolved
+                    todo.append(cell)
+                    total += max(len(resolved), 1)
+                plan_by_fov.append((fov, cells, todo, per_cell))
+            total = max(total, 1)
             # What this run is actually GOING to fit, published for the
             # finish handler. Without it that handler cannot tell a run
             # that fitted 3600 cells from one that fitted none: in append
@@ -656,15 +670,26 @@ class CellAlignmentWorker(QtCore.QThread):
             # handler then queued a 50-FOV spot recast and 699 overlay
             # renders for work that never happened -- observed, twice in
             # one morning, at seven minutes of background rendering each.
-            self.fitted_fovs = set(remaining)
+            self.fitted_fovs = {fov for fov, _c, todo, _p in plan_by_fov if todo}
             self.n_skipped = n_skipped
-            self.n_cells_fitted = len(tasks)
+            self.n_cells_fitted = sum(len(todo) for _f, _c, todo, _p in plan_by_fov)
+            self.n_tasks = self.n_cells_fitted
             if n_skipped:
                 self.progress.emit(0, total,
                                    f'append: {n_skipped} cell(s) already fully aligned -- skipped')
 
-            n_workers = (alignment.max_cell_alignment_workers()
-                         if self.workers is None else max(1, int(self.workers)))
+            if self.workers is not None:
+                n_workers = max(1, int(self.workers))
+            elif self.n_cells_fitted <= 1:
+                # Sized WITHOUT the tuning override: this is what a
+                # single-cell preview runs on, and the override exists to
+                # throttle a batch run that is starving the GUI -- applying
+                # it here would throttle the GUI's own work instead. See
+                # chain.measured_cell_alignment_workers for the incident
+                # that makes this worth spelling out.
+                n_workers = alignment.measured_cell_alignment_workers()
+            else:
+                n_workers = alignment.max_cell_alignment_workers()
             # Pin the children's disk-queue priority BEFORE any pool exists:
             # under 'spawn' they inherit the environment as it stands at that
             # moment, so setting it later would reach nobody.
@@ -672,115 +697,74 @@ class CellAlignmentWorker(QtCore.QThread):
             # isolation: the per-child MIP cache is RETAINED memory, and a
             # pool with no total is what drained this machine's free page
             # list and slowed every process on it (see process_guard).
-            n_pool = min(n_workers, len(tasks)) if len(tasks) > 1 else n_workers
-            io_level, cache_gb, cache_note = tuning.apply_child_env(n_pool)
+            io_level, cache_gb, cache_note = tuning.apply_child_env(n_workers)
             self.progress.emit(0, total, f'MIP cache: {cache_note}')
-            self.n_tasks = len(tasks)
-            executor = None
-            if n_workers > 1 and len(tasks) > 1:
-                try:
-                    executor = ProcessPoolExecutor(
-                        max_workers=min(n_workers, len(tasks)),
-                        mp_context=multiprocessing.get_context('spawn'),
-                        initializer=partial(process_guard.child_initializer,
-                                            alignment._init_cell_align_worker))
-                except Exception:
-                    executor = None   # degrade to the serial loop, never fail here
-            if executor is not None:
-                self.pool_shape = (f'across-cells x{min(n_workers, len(tasks))} '
-                                   f'io={io_level}')
+            shapes = set()
 
-            if executor is not None:
-                try:
-                    futures = {executor.submit(alignment._align_one_cell, t): t for t in tasks}
-                    for future in as_completed(futures):
-                        (fov, cell_id, matrices, anchors, provenance,
-                         skipped) = future.result()
-                        # The commit. The child mutated a pickled copy that
-                        # started from this exact cell's state, so its end
-                        # state IS the serial end state -- replace the three
-                        # dicts compute_cell_alignment mutates (and nothing
-                        # else; area/nucleus/celltype were never touched).
-                        real = cell_by_key[(fov, cell_id)]
-                        real.matrices = matrices
-                        real.matrix_anchors = anchors
-                        real.matrix_provenance = provenance
-                        n_passes = len(futures[future][2])
-                        done += max(n_passes, 1)
-                        note = (' -- SKIPPED ' + '; '.join(skipped)
-                                if skipped else '')
-                        self.progress.emit(done, total,
-                                           f'FOV{fov:03d} cell {cell_id}: aligned '
-                                           f'({n_passes} pass(es)){note}')
-                        remaining[fov] -= 1
-                        if remaining[fov] == 0:
-                            self.fov_done.emit(fov, job_cells.get(fov, []))
-                finally:
-                    # cancel_futures so one cell's real failure (e.g. "cell
-                    # doesn't overlap reference hybe") aborts the run promptly
-                    # -- the serial loop's behavior -- instead of finishing
-                    # every other cell first and reporting minutes later.
-                    executor.shutdown(wait=True, cancel_futures=True)
-            else:
-                # SINGLE task (Preview This Cell, or a one-cell FOV): the
-                # across-cells pool above has nothing to fan, so the only
-                # available parallelism is per-HYBE inside the cell --
-                # measured 99.5% NAS I/O, so overlapping the hybes is the
-                # whole win. Exactly ONE axis is ever pooled, per explicit
-                # design: multi-task runs pool across cells with per-hybe
-                # serial children; a single task pools per-hybe here.
-                # Never both.
-                #
-                # Sized WITHOUT the tuning override: this is the pool a
-                # single-cell preview runs on, and the override exists to
-                # throttle a batch run that is starving the GUI -- applying
-                # it here would throttle the GUI's own work instead. See
-                # chain.measured_cell_alignment_workers for the incident
-                # that makes this worth spelling out.
-                hybe_workers = (alignment.measured_cell_alignment_workers()
-                                if self.workers is None else max(1, int(self.workers)))
-                hybe_pool = None
-                if (hybe_workers > 1 and len(tasks) == 1
-                        and sum(len(p['hybe_records']) for p in tasks[0][2]) > 1):
-                    try:
-                        hybe_pool = ProcessPoolExecutor(
-                            max_workers=hybe_workers,
-                            mp_context=multiprocessing.get_context('spawn'),
-                            initializer=partial(process_guard.child_initializer,
-                                                alignment._init_cell_align_worker))
-                    except Exception:
-                        hybe_pool = None   # degrade to serial, never fail here
-                self.pool_shape = (f'per-hybe x{hybe_workers} io={io_level}'
-                                   if hybe_pool is not None
-                                   else f'serial io={io_level}')
-                try:
-                    for cell, fov, passes, channel_type, pad, z_max_shift in tasks:
-                        for p in passes:
-                            try:
-                                alignment.compute_cell_alignment(
-                                    cell, p['storage_path'], fov, p['hybe_records'], p['fov_matrices'],
-                                    reference_hybe=p['reference_hybe'], channel_type=channel_type,
-                                    pad=pad, modality=p['modality'],
-                                    cell_reference_hybe_matrix=p['cellref_matrix'],
-                                    z_max_shift=z_max_shift, executor=hybe_pool)
-                                note = 'aligned'
-                            except alignment.CellOffFrameError as e:
-                                # off-frame in THIS pass's reference view:
-                                # skip the pass, keep the cell's others --
-                                # never abort the run (see the class
-                                # docstring; 2/1091 real cells, and the
-                                # abort cost the other 1089 their save)
-                                note = f'SKIPPED ({e})'
-                            done += 1
-                            self.progress.emit(done, total,
-                                               f"FOV{fov:03d} cell {cell.id} ({p['modality']}): {note}")
-                        remaining[fov] -= 1
-                        if remaining[fov] == 0:
-                            self.fov_done.emit(fov, job_cells.get(fov, []))
-                finally:
-                    if hybe_pool is not None:
-                        hybe_pool.shutdown(wait=True, cancel_futures=True)
+            for fov, cells, todo, per_cell in plan_by_fov:
+                if not todo:
+                    # Nothing to fit here, so nothing to save: a FOV whose
+                    # cells were all skipped never emitted fov_done before
+                    # either, and emitting it now would rewrite an
+                    # unchanged cells.h5 and trigger the whole downstream
+                    # recast for work that did not happen.
+                    continue
+                work, plans, skipped = alignment.prepare_cell_passes(
+                    todo, fov, per_cell, self.channel_type, self.pad,
+                    self.z_max_shift)
+                for cell_id, why in skipped:
+                    # off-frame in THIS pass's reference view: the pass's
+                    # identity residuals are already written, so this is a
+                    # log line, never an abort (see CellOffFrameError; 2 of
+                    # 1091 real cells, and aborting cost the other 1089
+                    # their save)
+                    self.progress.emit(done, total,
+                                       f'FOV{fov:03d} cell {cell_id}: SKIPPED ({why})')
+                pool = alignment.make_cell_hybe_pool(
+                    work, n_workers,
+                    partial(process_guard.child_initializer,
+                            alignment._init_cell_align_worker))
+                shapes.add(f'hybe-major x{min(n_workers, max(len(alignment.hybe_groups(work)), 1))} '
+                           f'io={io_level}' if pool is not None else f'serial io={io_level}')
+                fov_share = sum(max(len(per_cell[c.id]), 1) for c in todo)
+                n_groups = max(len(alignment.hybe_groups(work)), 1)
+                landed = [0]
 
+                def on_group(folder, n_cells, _fov=fov, _n=n_groups,
+                             _base=done, _share=fov_share):
+                    landed[0] += 1
+                    self.progress.emit(
+                        _base + int(_share * landed[0] / _n), total,
+                        f'FOV{_fov:03d} {folder}: {n_cells} cell(s) '
+                        f'({landed[0]}/{_n} hybes)')
+
+                try:
+                    if pool is None:
+                        # the pool fills these itself, before its children
+                        # are handed their contexts
+                        alignment.fill_reference_zx(work)
+                    fitted = alignment.run_hybe_tasks(work, executor=pool,
+                                                      on_group=on_group)
+                finally:
+                    if pool is not None:
+                        # cancel_futures so one real failure aborts the run
+                        # promptly -- the serial loop's behavior -- instead
+                        # of finishing every other hybe first and reporting
+                        # minutes later.
+                        pool.shutdown(wait=True, cancel_futures=True)
+                # THE COMMIT, in the parent, on the real ACell objects.
+                # Whole-pass and in hybe_records order, so cell.matrices
+                # carries exactly what this run fitted in exactly the order
+                # a cell-major run would have written it.
+                for key, (cell, plan) in plans.items():
+                    alignment.commit_cell_alignment(cell, plan, fitted[key])
+                done += fov_share
+                self.progress.emit(done, total,
+                                   f'FOV{fov:03d}: {len(todo)} cell(s) aligned')
+                self.fov_done.emit(fov, cells)
+                done_fovs.append(fov)
+
+            self.pool_shape = '; '.join(sorted(shapes)) if shapes else 'nothing to fit'
             for fov, cells, _passes in self.jobs:
                 results.append((fov, cells))
             self.finished_ok.emit(results)
@@ -799,9 +783,9 @@ class CellAlignmentWorker(QtCore.QThread):
             # NameError raised while reporting a failure would replace the
             # real cause with a lie about it.
             here = locals()
-            covered = sorted({t[1] for t in here.get('tasks') or []})
-            remaining_map = here.get('remaining') or {}
-            landed = sorted(f for f, n in remaining_map.items() if n == 0)
+            covered = sorted(f for f, _c, todo, _p in (here.get('plan_by_fov') or [])
+                             if todo)
+            landed = sorted(here.get('done_fovs') or [])
             self.failed.emit(
                 f'{type(e).__name__}: {e}\n\n'
                 f'{here.get("done", 0)}/{here.get("total", 0)} pass(es) done '
