@@ -92,6 +92,13 @@ def main():
             self.fov_done = mock.MagicMock()
             self.finished_ok = mock.MagicMock()
             self.failed = mock.MagicMock()
+            # QThread's own signal, which the real worker inherits and the
+            # run report connects to as its catch-all ending. The double
+            # has to carry it for the same reason it carries the other
+            # four: it stands in for a QThread, and a stand-in missing a
+            # signal the caller connects fails on wiring rather than on
+            # anything this test is about.
+            self.finished = mock.MagicMock()
 
         def start(self):
             started['started'] = True
@@ -220,6 +227,173 @@ def main():
               before - after <= mw.OVERLAY_RESOLVE_CHUNK, f'{before} -> {after}')
         check('a resolved batch is handed to the render pool',
               starter.called, 'pool never started')
+
+    # ---- a FOV whose ingestion is unfinished is excluded ENTIRELY ----
+    #
+    # Running cell alignment during ingestion used to record an IDENTITY
+    # residual for every not-yet-arrived hybe, with provenance reading
+    # "cell does not overlap this hybe's frame" -- the same message the
+    # genuinely-off-frame case gets, because _cell_native_crop returns a
+    # bare None for both. Append then treats the key's existence as done,
+    # so the hybe is permanently marked aligned and no later run revisits
+    # it; and since the fabricated entry has H2 = identity it scores 0.0 px
+    # on _cell_max_residual_shift, the lowest possible, so it is also the
+    # one entry guaranteed never to be flagged for review.
+    started.clear()
+    notices = []
+    ready_by_fov = {1: {'H0', 'H1'}, 3: {'H0'}}        # FOV3 is missing H1
+    with mock.patch.object(MW, 'CellAlignmentWorker', FakeWorker), \
+         mock.patch.object(mw, '_confirm_batch_mode', return_value='overwrite'), \
+         mock.patch.object(mw, '_ready_hybes',
+                           side_effect=lambda mod, fov: ready_by_fov.get(fov, set())), \
+         mock.patch.object(mw, '_cell_alignment_passes',
+                           side_effect=lambda mod, sp, fov: [
+                               {'modality': 'DNA', 'storage_path': sp,
+                                'hybe_records': [{'folder': 'H0'}, {'folder': 'H1'}],
+                                'fov_matrices': {}, 'reference_hybe': 'H0',
+                                'cellref_fov_matrices': {}}]), \
+         mock.patch.object(QtWidgets.QMessageBox, 'information',
+                           side_effect=lambda *a, **k: notices.append(a[2] if len(a) > 2 else '')), \
+         mock.patch.object(QtWidgets.QMessageBox, 'question',
+                           return_value=QtWidgets.QMessageBox.Yes):
+        mw._run_cell_alignment_all_fovs()
+    jobs = started.get('jobs', [])
+    check('a FOV with an un-ingested hybe never reaches the worker',
+          [j[0] for j in jobs] == [1], str([j[0] for j in jobs]))
+    check('and the user is told which FOV and why',
+          notices and 'FOV003' in notices[0] and 'not ingested' in notices[0],
+          str(notices[:1]))
+    check('the complete FOV still runs', bool(jobs))
+
+    # every FOV incomplete -> nothing starts at all
+    started.clear()
+    warned = []
+    with mock.patch.object(MW, 'CellAlignmentWorker', FakeWorker), \
+         mock.patch.object(mw, '_confirm_batch_mode', return_value='overwrite'), \
+         mock.patch.object(mw, '_ready_hybes', side_effect=lambda mod, fov: set()), \
+         mock.patch.object(mw, '_cell_alignment_passes',
+                           side_effect=lambda mod, sp, fov: [
+                               {'modality': 'DNA', 'storage_path': sp,
+                                'hybe_records': [{'folder': 'H0'}],
+                                'fov_matrices': {}, 'reference_hybe': 'H0',
+                                'cellref_fov_matrices': {}}]), \
+         mock.patch.object(QtWidgets.QMessageBox, 'information',
+                           side_effect=lambda *a, **k: None), \
+         mock.patch.object(QtWidgets.QMessageBox, 'warning',
+                           side_effect=lambda *a, **k: warned.append(a[2] if len(a) > 2 else '')), \
+         mock.patch.object(QtWidgets.QMessageBox, 'question',
+                           return_value=QtWidgets.QMessageBox.Yes):
+        mw._run_cell_alignment_all_fovs()
+    check('with every FOV incomplete the run never starts',
+          not started.get('started'), str(started.get('started')))
+    check('and it says so rather than reporting an empty success',
+          warned and 'unfinished ingestion' in warned[-1], str(warned[-1:]))
+
+    # ---- FOV-level matrices are read from the STORE, not just the session ----
+    #
+    # The confirmed cause of "Align All Cells in All FOVs only did one FOV",
+    # reported twice. _fov_matrices_for reads self.fov_matrices, which
+    # _activate_fov fills ONE FOV at a time; the bulk backfill in
+    # _refresh_params_from_vlinks skips the store's own modality, so on a
+    # single-modality project it never runs. Every unvisited FOV then ships
+    # hybe_records filtered to [], and append reports its cells as "already
+    # fully aligned" while overwrite raises -- both silently.
+    resident = set()                          # what self.fov_matrices holds
+    read_for = []
+
+    def run_once():
+        read_for.clear()
+
+        def _read(sp, fov, records):
+            read_for.append(fov)
+            return {('H0', 'DNA'): np.eye(3)}
+
+        with mock.patch.object(MW, 'CellAlignmentWorker', FakeWorker), \
+             mock.patch.object(mw, '_confirm_batch_mode', return_value='append'), \
+             mock.patch.object(mw, '_fov_matrices_for',
+                               side_effect=lambda sp, fov: {'H0': 1} if fov in resident else {}), \
+             mock.patch.object(mw, '_merge_fov_matrices',
+                               side_effect=lambda fov, m: resident.add(fov)), \
+             mock.patch.object(MW.alignment, 'read_same_modality_matrices',
+                               side_effect=_read), \
+             mock.patch.object(mw, '_hybe_records_for_storage_path',
+                               return_value=[{'folder': 'H0'}]):
+            mw._run_cell_alignment_all_fovs()
+
+    run_once()
+    check('matrices are read from the STORE for every FOV the session lacks',
+          sorted(read_for) == [1, 3], str(read_for))
+    check('and those FOVs are then resident', resident == {1, 3}, str(resident))
+
+    # A FOV already resident is NOT re-read: the session copy can hold
+    # in-session edits that the disk copy does not.
+    run_once()
+    check('a FOV already resident is not re-read from the store',
+          read_for == [], str(read_for))
+
+    # ---- an append run that fits NOTHING must do nothing downstream ----
+    #
+    # Observed twice in one morning on a fully-aligned 50-FOV project:
+    #   append: 3600 cell(s) already fully aligned -- skipped
+    #   ... | 0 passes in 0.3 s
+    #   Cell alignment complete -- 3600 cell(s) across 50 FOV(s) aligned and SAVED.
+    # followed by a 50-FOV spot recast and ~700 overlay PNGs, seven minutes
+    # of background rendering for work that never happened -- which is also
+    # the load that was starving the GUI's own redraws. The handler had no
+    # way to tell "every FOV was IN the run" from "every FOV was CHANGED by
+    # it"; the worker now publishes fitted_fovs, and this pins that it is
+    # honoured. The user's report was "only one FOV was calculated": in
+    # append mode that is the same failure seen from the other side.
+    events.clear()
+    mw._cell_align_saved_fovs = set()
+    mw._cell_align_pending_overlays = []
+    mw._overlay_pending, mw._overlay_ready, mw._overlay_total = [], [], 0
+    notices = []
+    mw._cell_alignment_worker = types.SimpleNamespace(
+        fitted_fovs=set(), n_skipped=3600, pool_shape='serial', n_cells_fitted=0)
+    with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
+                           side_effect=lambda paths, fov, cont: events.append(('save', fov))), \
+         mock.patch.object(MW.analysis_store, 'write_global_params'), \
+         mock.patch.object(mw, '_notify_complete',
+                           side_effect=lambda t, m, **k: notices.append(m)):
+        mw._on_cell_alignment_all_finished(
+            [(1, container.get_cells(1)), (3, container.get_cells(3))],
+            {1: container, 3: container}, '/store/DNA', 'H1', 'DNA', 'fiducial', 10)
+    check('a no-op append writes no cells',
+          [f for k, f in events if k == 'save'] == [],
+          str([f for k, f in events if k == 'save']))
+    check('a no-op append queues no spot recast',
+          [f for k, f in events if k == 'recast'] == [],
+          str([f for k, f in events if k == 'recast']))
+    check('a no-op append queues no overlays', mw._overlay_total == 0,
+          str(mw._overlay_total))
+    check('and it says nothing was refitted, not that it aligned',
+          notices and 'Nothing was refitted' in notices[0]
+          and 'aligned and SAVED' not in notices[0],
+          str(notices[:1]))
+    check('it names the way out (Overwrite)',
+          notices and 'Overwrite' in notices[0], str(notices[:1]))
+
+    # a PARTIAL append still processes exactly the FOVs that were fitted
+    events.clear()
+    mw._cell_align_saved_fovs = set()
+    mw._cell_align_pending_overlays = []
+    mw._overlay_pending, mw._overlay_ready, mw._overlay_total = [], [], 0
+    mw._cell_alignment_worker = types.SimpleNamespace(
+        fitted_fovs={3}, n_skipped=12, pool_shape='across-cells x4', n_cells_fitted=1)
+    with mock.patch.object(MW.analysis_store, 'mirror_write_cells',
+                           side_effect=lambda paths, fov, cont: events.append(('save', fov))), \
+         mock.patch.object(MW.analysis_store, 'write_global_params'):
+        mw._on_cell_alignment_all_finished(
+            [(1, container.get_cells(1)), (3, container.get_cells(3))],
+            {1: container, 3: container}, '/store/DNA', 'H1', 'DNA', 'fiducial', 10)
+    check('a partial append touches only the FOV it fitted',
+          [f for k, f in events if k == 'save'] == [3],
+          str([f for k, f in events if k == 'save']))
+    check('and recasts only that FOV',
+          [f for k, f in events if k == 'recast'] == [3],
+          str([f for k, f in events if k == 'recast']))
+    mw._cell_alignment_worker = None
 
     # quit reporting
     mw._overlay_pending = [(cell(1), 1)] * 5

@@ -18,6 +18,8 @@ from PyQt5 import QtWidgets, QtCore, QtGui
 
 from config import path as repo_path, config_name
 from ui.main_window_ui import MainWindowUI
+from windows import run_probe
+from windows import reader_service
 from canvas import pipeline_canvas
 from canvas.pipeline_canvas import PipelineCanvas, _sequential_color
 from canvas.cell_displayer import CellDisplayer
@@ -32,6 +34,7 @@ from canvas.cell_spot_status_displayer import CellSpotStatusDisplayer
 from canvas.alignment_preview_window import AlignmentPreviewWindow
 from canvas.chromatin_trace_grid_displayer import ChromatinTraceGridDisplayer
 from codelab_pipeline import process_guard
+from codelab_pipeline import tuning
 from codelab_pipeline.io import paths
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import analysis_store
@@ -547,6 +550,22 @@ class CellAlignmentWorker(QtCore.QThread):
         # ingestion), so mid-ingestion an un-ready hybe never reaches a
         # fit either way.
         self.append = append
+        # What the run ACTUALLY did, filled in by run() and read by the
+        # finish handler. Not the requested setting: a pool is capped by
+        # the task count, and -- more importantly -- which of the two
+        # topologies runs is decided at runtime by len(tasks), so the same
+        # button can produce an across-cells run or a per-hybe one. Two
+        # A/B arms that differ in topology are not two arms of the same
+        # experiment, so the topology has to be reported alongside the
+        # numbers rather than assumed constant.
+        self.pool_shape = 'not started'
+        self.n_tasks = 0
+        # Filled in by run() once it knows which cells actually need work;
+        # None here means "run() never got that far", which the finish
+        # handler must treat as "assume everything" rather than "nothing".
+        self.fitted_fovs = None
+        self.n_skipped = 0
+        self.n_cells_fitted = 0
 
     def _resolve_passes(self, cell, passes):
         """
@@ -630,12 +649,33 @@ class CellAlignmentWorker(QtCore.QThread):
             # which FOV just became safe to write.
             job_cells = {fov: cells for fov, cells, _passes in self.jobs}
             remaining = collections.Counter(t[1] for t in tasks)
+            # What this run is actually GOING to fit, published for the
+            # finish handler. Without it that handler cannot tell a run
+            # that fitted 3600 cells from one that fitted none: in append
+            # mode every already-aligned cell is skipped here, and the
+            # handler then queued a 50-FOV spot recast and 699 overlay
+            # renders for work that never happened -- observed, twice in
+            # one morning, at seven minutes of background rendering each.
+            self.fitted_fovs = set(remaining)
+            self.n_skipped = n_skipped
+            self.n_cells_fitted = len(tasks)
             if n_skipped:
                 self.progress.emit(0, total,
                                    f'append: {n_skipped} cell(s) already fully aligned -- skipped')
 
             n_workers = (alignment.max_cell_alignment_workers()
                          if self.workers is None else max(1, int(self.workers)))
+            # Pin the children's disk-queue priority BEFORE any pool exists:
+            # under 'spawn' they inherit the environment as it stands at that
+            # moment, so setting it later would reach nobody.
+            # Sized for the pool that is about to exist, not per child in
+            # isolation: the per-child MIP cache is RETAINED memory, and a
+            # pool with no total is what drained this machine's free page
+            # list and slowed every process on it (see process_guard).
+            n_pool = min(n_workers, len(tasks)) if len(tasks) > 1 else n_workers
+            io_level, cache_gb, cache_note = tuning.apply_child_env(n_pool)
+            self.progress.emit(0, total, f'MIP cache: {cache_note}')
+            self.n_tasks = len(tasks)
             executor = None
             if n_workers > 1 and len(tasks) > 1:
                 try:
@@ -646,6 +686,9 @@ class CellAlignmentWorker(QtCore.QThread):
                                             alignment._init_cell_align_worker))
                 except Exception:
                     executor = None   # degrade to the serial loop, never fail here
+            if executor is not None:
+                self.pool_shape = (f'across-cells x{min(n_workers, len(tasks))} '
+                                   f'io={io_level}')
 
             if executor is not None:
                 try:
@@ -687,17 +730,29 @@ class CellAlignmentWorker(QtCore.QThread):
                 # design: multi-task runs pool across cells with per-hybe
                 # serial children; a single task pools per-hybe here.
                 # Never both.
+                #
+                # Sized WITHOUT the tuning override: this is the pool a
+                # single-cell preview runs on, and the override exists to
+                # throttle a batch run that is starving the GUI -- applying
+                # it here would throttle the GUI's own work instead. See
+                # chain.measured_cell_alignment_workers for the incident
+                # that makes this worth spelling out.
+                hybe_workers = (alignment.measured_cell_alignment_workers()
+                                if self.workers is None else max(1, int(self.workers)))
                 hybe_pool = None
-                if (n_workers > 1 and len(tasks) == 1
+                if (hybe_workers > 1 and len(tasks) == 1
                         and sum(len(p['hybe_records']) for p in tasks[0][2]) > 1):
                     try:
                         hybe_pool = ProcessPoolExecutor(
-                            max_workers=n_workers,
+                            max_workers=hybe_workers,
                             mp_context=multiprocessing.get_context('spawn'),
                             initializer=partial(process_guard.child_initializer,
                                                 alignment._init_cell_align_worker))
                     except Exception:
                         hybe_pool = None   # degrade to serial, never fail here
+                self.pool_shape = (f'per-hybe x{hybe_workers} io={io_level}'
+                                   if hybe_pool is not None
+                                   else f'serial io={io_level}')
                 try:
                     for cell, fov, passes, channel_type, pad, z_max_shift in tasks:
                         for p in passes:
@@ -730,7 +785,29 @@ class CellAlignmentWorker(QtCore.QThread):
                 results.append((fov, cells))
             self.finished_ok.emit(results)
         except Exception as e:
-            self.failed.emit(str(e))
+            # WHERE it died, not just what was raised. One cell raising
+            # anything other than CellOffFrameError lands here, and the
+            # executor's finally has already cancelled every task that had
+            # not started -- so the FOVs after it simply never happen. With
+            # a bare str(e) that is indistinguishable from "the run only
+            # covered one FOV", which is exactly the report this failure
+            # arrived as, twice. The counts say how far it got; the
+            # traceback says why it stopped.
+            import traceback
+            # Every one of these may be unset if the failure came early, so
+            # they are read out of locals() rather than referenced -- a
+            # NameError raised while reporting a failure would replace the
+            # real cause with a lie about it.
+            here = locals()
+            covered = sorted({t[1] for t in here.get('tasks') or []})
+            remaining_map = here.get('remaining') or {}
+            landed = sorted(f for f, n in remaining_map.items() if n == 0)
+            self.failed.emit(
+                f'{type(e).__name__}: {e}\n\n'
+                f'{here.get("done", 0)}/{here.get("total", 0)} pass(es) done '
+                f'when it stopped; FOV(s) in the run: {covered}; '
+                f'FOV(s) that completed: {landed}.\n\n'
+                f'{traceback.format_exc()}')
 
 
 class CrossModalAlignmentWorker(QtCore.QThread):
@@ -1331,6 +1408,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # main window itself.
         self.log_window = LogWindow()
         self.log('CODE Lab Imaging Pipeline started.')
+        # Samples how late this thread's own event loop is running, which
+        # is what "Not Responding" actually means. Created here, on the GUI
+        # thread, because a monitor that does not share that thread's fate
+        # measures nothing -- the lesson of three external A/Bs that each
+        # answered a different question than the one asked (the reasoning
+        # is in windows/run_probe.py).
+        self._lag_probe = run_probe.EventLoopLag(self)
+        # The GUI's own reads live here, in ONE resident child. Nothing is
+        # spawned until the first image is asked for -- launch latency was
+        # cut from 8.3 s to 0.25 s by removing eager work of exactly this
+        # kind, and a user who never opens an image should not pay for a
+        # reader they never use.
+        self._store_reader = reader_service.StoreReader(self)
+        # Names the figure behind any paint slow enough to be felt. Costs
+        # nothing until one is (see install_slow_draw_logger).
+        run_probe.install_slow_draw_logger(self.log)
         self._quitting = False   # closeEvent re-entry guard (closeAllWindows below re-fires it)
 
         self._connect_signals()
@@ -1348,6 +1441,33 @@ class MainWindow(QtWidgets.QMainWindow):
         panel's own log box goes to the combined pop-up log window, which
         timestamps it. The panels carry no log boxes at all any more."""
         self.log_window.append(message)
+
+    def _notify_complete(self, title, message, seconds=20000):
+        """Say a long job finished WITHOUT taking the window hostage.
+
+        A modal QMessageBox blocks nothing that is already running -- its
+        nested event loop keeps delivering queued signals, so worker
+        threads and pool children carry on -- but it does block the
+        PERSON, and these dialogs appear at the end of runs nobody is
+        sitting in front of.
+
+        That cost is measured, not assumed. Sampling the live app at
+        100 Hz for ten minutes while cell alignment ran: 15.6% of the GUI
+        thread, about 93 seconds, was spent inside one
+        QMessageBox.information, against 0.5% for everything else the
+        window did. An earlier three-minute profile put a completion
+        dialog at 46.7%. In both, the window was unusable for as long as
+        nobody happened to be there to dismiss it.
+
+        The full text goes to the log window, which timestamps it and
+        keeps it; the status bar carries the headline. Errors and
+        anything needing a decision stay modal -- those are exactly the
+        cases where stopping the user is the point.
+        """
+        flat = ' '.join(str(message).split())
+        self.log(f'{title} -- {flat}')
+        head = flat.split('.')[0][:160]
+        self.statusBar().showMessage(f'{title}: {head}.', seconds)
 
     def show_log_window(self):
         self.log_window.show()
@@ -1426,6 +1546,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 killed = True
                 worker.terminate()
                 worker.wait(2000)
+        # The resident reader is not a QThread and so is not in that list,
+        # but it owns a live child that must not outlive the window. Shut
+        # down without waiting: a read in flight is at most one MIP, and
+        # nothing here is allowed to make quitting hang.
+        reader = getattr(self, '_store_reader', None)
+        if reader is not None:
+            reader.shutdown(wait=False)
         # Pool children (ingestion conversion, cell alignment, tracing) are
         # plain multiprocessing children of THIS process, so
         # active_children() sees them all. A terminated coordinator thread
@@ -3022,6 +3149,14 @@ class MainWindow(QtWidgets.QMainWindow):
         minutes for a 78-hybe FOV). Shared by the FOV, cross-modal and
         cell-alignment workers so all three land in one place.
         """
+        # How much a cell-alignment run got through, kept live so that a
+        # run the user STOPS mid-way still yields a comparable throughput
+        # number -- stopping between arms is the normal way to drive an
+        # A/B, and a report that only exists on clean completion would
+        # miss exactly those runs.
+        if getattr(self, '_cell_alignment_worker', None) is not None \
+                and self.sender() is self._cell_alignment_worker:
+            self._cell_align_passes_done = done
         ap = self.ui.AlignmentPanel
         ap.ProgressBar.setMaximum(max(total, 1))
         ap.ProgressBar.setValue(done)
@@ -5404,7 +5539,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._mip_then(storage_path, fov, hybe, channel,
                               lambda mip: self._render_spot_crop_display(
                                   mip, cell, hybe, channel, storage_path,
-                                  fov, pad, modality, keep_view))
+                                  fov, pad, modality, keep_view),
+                              slot='spot_crop')
 
     def _render_spot_crop_display(self, mip, cell, hybe, channel, storage_path,
                                   fov, pad, modality, keep_view=False):
@@ -5522,11 +5658,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     _MIP_CACHE_MAX = 8
 
-    def _mip_then(self, storage_path, fov, hybe, channel, render):
+    def _mip_then(self, storage_path, fov, hybe, channel, render, slot='mip'):
         """Hand `render` this hybe/channel's MIP -- from a small session
         cache when it is warm (SYNCHRONOUSLY, so the common path keeps
-        its old behaviour exactly), otherwise from a CHILD PROCESS,
-        calling `render` when it arrives.
+        its old behaviour exactly), otherwise from the resident READER
+        PROCESS, calling `render` when it arrives.
+
+        `slot` names the view being filled, and is what makes clicking
+        through hybes cheap: a second request for the same slot supersedes
+        the first, so five clicks read once instead of five times. Two
+        views must not share a slot or they would cancel each other.
 
         Why: the display path read the MIP on the GUI thread. Idle that
         is 0.12 s, but while cell alignment has 16 children streaming
@@ -5550,8 +5691,7 @@ class MainWindow(QtWidgets.QMainWindow):
             render(cache[key])
             return True
 
-        def _done(results):
-            mip = results[0]
+        def _done(mip):
             cache[key] = mip
             while len(cache) > self._MIP_CACHE_MAX:
                 cache.popitem(last=False)
@@ -5565,14 +5705,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage(
             f'Loading FOV{fov:03d} {hybe} ch{channel}...')
-        worker = ProcWorker([(analysis_store.read_hybe_mip,
-                              (storage_path, fov, hybe, channel))])
-        worker.finished_ok.connect(_done)
-        worker.failed.connect(_fail)
-        self._mip_workers = getattr(self, '_mip_workers', [])
-        self._mip_workers = [w for w in self._mip_workers if w.isRunning()]
-        self._mip_workers.append(worker)      # keep a reference
-        worker.start()
+        # One resident reader, not a pool per image. The old shape spawned
+        # a fresh interpreter per request, kept no warm cache between them,
+        # had no ceiling on how many could be alive at once, and ran every
+        # superseded click to completion against the same disk. See
+        # windows/reader_service.py.
+        self._store_reader.read(slot, analysis_store.read_hybe_mip,
+                                (storage_path, fov, hybe, channel),
+                                on_ok=_done, on_fail=_fail)
         return False
 
     def _load_fov_spot_display(self, keep_view=False):
@@ -5615,7 +5755,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._mip_then(storage_path, fov, hybe, channel,
                               lambda mip: self._render_fov_spot_display(
                                   mip, storage_path, fov, hybe, channel,
-                                  modality, keep_view))
+                                  modality, keep_view),
+                              slot='fov_spot')
 
     def _render_fov_spot_display(self, mip, storage_path, fov, hybe, channel,
                                  modality, keep_view=False):
@@ -9363,9 +9504,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for sp in specs:
             matrices = results.get(fov, {}).get(sp['modality'])
             if matrices:
-                self.preview_canvas.draw_fov_all_readouts_overlay(
-                    sp['storage_path'], fov, sp['hybe_records'], sp['reference_hybe'],
-                    matrices, channel_type=channel_type)
+                self._draw_fov_overlay_async(sp, fov, matrices, channel_type)
 
     def _on_fov_alignment_failed(self, message):
         self.ui.AlignmentPanel.RunFovAlignmentPushButton.setEnabled(True)
@@ -9494,6 +9633,7 @@ One PNG PER MODALITY: each modality has its own reference and its
         ap = self.ui.AlignmentPanel
         channel_type = ap.SameModalityChannelTypeComboBox.currentText()
         spec_by_modality = {sp['modality']: sp for sp in specs}
+        jobs = []
         for modality, matrices in per_modality.items():
             sp = spec_by_modality.get(modality)
             if sp is None or not matrices:
@@ -9507,16 +9647,21 @@ One PNG PER MODALITY: each modality has its own reference and its
                     merged = {h: H for (h, _m), H in persisted.items()}
                     merged.update(matrices)
                     matrices = merged
-                save_path = paths.figure_path(storage_path, 'alignment', fov,
-                                              'alignment_overlay.png')
-                self.preview_canvas.draw_fov_all_readouts_overlay(
-                    storage_path, fov, hybe_records, sp['reference_hybe'], matrices,
-                    save_path=save_path, channel_type=channel_type)
-                self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
-                self.log(f'FOV{fov:03d} ({modality}): overlay image saved.')
+                jobs.append((
+                    {'storage_path': storage_path, 'fov': fov,
+                     'hybe_records': hybe_records,
+                     'reference_hybe': sp['reference_hybe'],
+                     'matrices': pipeline_canvas._bare_hybe(matrices),
+                     'channel_type': channel_type,
+                     'save_path': paths.figure_path(storage_path, 'alignment', fov,
+                                                    'alignment_overlay.png')},
+                    f'FOV{fov:03d} ({modality})'))
             except Exception as e:
+                # Only the matrix READ above can raise here now -- the render
+                # itself reports through the worker's own failure path.
                 self.log(f'FOV{fov:03d} ({modality}): overlay image could not be saved '
                          f'({e}); matrices are unaffected.')
+        self._save_fov_overlay_jobs(jobs)
 
     def _on_fov_alignment_all_finished(self, results, specs):
         ap = self.ui.AlignmentPanel
@@ -9559,8 +9704,8 @@ One PNG PER MODALITY: each modality has its own reference and its
             except Exception as e:
                 self.statusBar().showMessage(f'spot reassignment after alignment failed for FOV{_fov}: {e}')
         n_overlays = getattr(self, '_fov_overlays_saved', 0)
-        QtWidgets.QMessageBox.information(
-            self, 'FOV alignment complete',
+        self._notify_complete(
+            'FOV alignment complete',
             f'{len(results)} FOV(s) aligned and saved; {n_overlays} overlay image(s) written.')
 
     def _on_fov_alignment_all_failed(self, message):
@@ -9582,6 +9727,7 @@ One PNG PER MODALITY: each modality has its own reference and its
             analysis_store.write_global_params(
                 storage_path, same_modality_reference_hybe=reference_hybe,
                 same_modality_channel_type=channel_type)
+        overlay_jobs = []
         for fov, by_modality in self._pending_same_modality_alignment.items():
             for modality, matrices in by_modality.items():
                 spec = spec_by_modality.get(modality)
@@ -9589,11 +9735,17 @@ One PNG PER MODALITY: each modality has its own reference and its
                     continue
                 _m, storage_path, reference_hybe, hybe_records = spec
                 alignment.write_same_modality_matrices(storage_path, fov, matrices, reference_hybe)
-                save_path = paths.figure_path(storage_path, 'alignment', fov,
-                                              'alignment_overlay.png')
-                self.preview_canvas.draw_fov_all_readouts_overlay(
-                    storage_path, fov, hybe_records, reference_hybe, matrices,
-                    save_path=save_path, channel_type=channel_type)
+                overlay_jobs.append((
+                    {'storage_path': storage_path, 'fov': fov,
+                     'hybe_records': hybe_records, 'reference_hybe': reference_hybe,
+                     'matrices': pipeline_canvas._bare_hybe(matrices),
+                     'channel_type': channel_type,
+                     'save_path': paths.figure_path(storage_path, 'alignment', fov,
+                                                    'alignment_overlay.png')},
+                    f'FOV{fov:03d} ({modality})'))
+        # Matrices are on disk before a single overlay starts rendering, so
+        # the accept is complete whatever happens to the pictures.
+        self._save_fov_overlay_jobs(overlay_jobs)
         # Capture the CHANGED FOV set before pending is nulled -- the
         # recast below is scoped to exactly these, per audit: recasting
         # every loaded FOV (34 at real scale) turned a one-FOV accept
@@ -9688,9 +9840,7 @@ One PNG PER MODALITY: each modality has its own reference and its
                 matrices = alignment.read_same_modality_matrices(storage_path, fov, hybe_records)
             if not matrices:
                 continue
-            self.preview_canvas.draw_fov_all_readouts_overlay(
-                storage_path, fov, hybe_records, sp['reference_hybe'], matrices,
-                channel_type=channel_type)
+            self._draw_fov_overlay_async(sp, fov, matrices, channel_type)
 
     # -- cross-modal alignment --
 
@@ -9987,8 +10137,8 @@ One PNG PER MODALITY: each modality has its own reference and its
                 except Exception as e:
                     self.statusBar().showMessage(f'spot reassignment after cross-modal failed for FOV{_fov}: {e}')
             n_overlays = getattr(self, '_cross_modal_overlays_saved', 0)
-            QtWidgets.QMessageBox.information(
-                self, 'Cross-modal alignment complete',
+            self._notify_complete(
+                'Cross-modal alignment complete',
                 f'{self._cross_modal_pairs_done} modality pair(s), '
                 f'{self._cross_modal_fovs_done} FOV result(s) aligned and saved; '
                 f'{n_overlays} overlay image(s) written.')
@@ -10951,6 +11101,122 @@ One PNG PER MODALITY: each modality has its own reference and its
                                           f'No storage path configured for {cell_modality}.')
             return
 
+        # A FOV whose ingestion is not finished is excluded from the run
+        # ENTIRELY, and the user is told which ones and why.
+        #
+        # Without this, a hybe whose MIP is not on disk yet reaches the fit,
+        # _cell_native_crop returns None, and _cell_hybe_task records an
+        # IDENTITY residual for it with provenance reading "cell does not
+        # overlap this hybe's frame". That string is written unconditionally
+        # -- the same None means both "off-frame forever" and "not ingested
+        # yet", and nothing downstream can tell them apart afterwards. Since
+        # append decides a hybe is done purely by the key existing, the
+        # not-yet-ingested hybe is then permanently marked aligned and no
+        # later run revisits it. Worse, a fabricated entry has H2 = identity,
+        # so _cell_max_residual_shift scores it 0.0 px -- the lowest possible
+        # -- and it is the one entry guaranteed never to be flagged for
+        # review.
+        #
+        # Readiness is per (modality, FOV) and is asked of _ready_hybes,
+        # which is one directory listing (MIP files are written atomically,
+        # so existence IS completeness -- see _ingested_hybes_for_fov) and
+        # answers from the in-memory registry while an ingestion is running,
+        # so this adds no NAS traffic to a live ingestion. Passes are built
+        # here rather than at job-assembly time so the confirmation dialog
+        # below counts what will really run.
+        passes_by_fov = {}
+        incomplete = {}
+        for fov in sorted(cells_by_fov):
+            fov_passes = self._cell_alignment_passes(cell_modality, storage_path, fov)
+            reasons = []
+            for p in fov_passes:
+                records = p.get('hybe_records') or []
+                try:
+                    ready = self._ready_hybes(p['modality'], fov)
+                except Exception:
+                    ready = None
+                if ready is None:
+                    continue
+                absent = [r['folder'] for r in records if r['folder'] not in ready]
+                if absent:
+                    reasons.append(f'{p["modality"]}: {len(absent)} of {len(records)} '
+                                   f'hybe(s) not ingested yet')
+            if reasons:
+                incomplete[fov] = reasons
+            else:
+                passes_by_fov[fov] = fov_passes
+
+        if incomplete:
+            for fov in incomplete:
+                cells_by_fov.pop(fov, None)
+                containers_by_fov.pop(fov, None)
+            detail = '; '.join(f'FOV{f:03d} ({", ".join(r)})'
+                               for f, r in sorted(incomplete.items())[:8])
+            more = '' if len(incomplete) <= 8 else f' (+{len(incomplete) - 8} more)'
+            self.log(f'cell alignment: EXCLUDING {len(incomplete)} FOV(s) whose '
+                     f'ingestion is unfinished -- {detail}{more}')
+            QtWidgets.QMessageBox.information(
+                self, 'Run Cell Alignment (all FOVs)',
+                f'{len(incomplete)} FOV(s) are excluded because their ingestion is '
+                f'not finished:\n\n{detail}{more}\n\n'
+                f'Aligning them now would record an identity matrix for every '
+                f'missing hybe, and append mode would then treat those hybes as '
+                f'done forever. Re-run once ingestion completes.')
+        if not cells_by_fov:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Cell Alignment (all FOVs)',
+                'Every FOV with cells still has unfinished ingestion -- nothing to align.')
+            return
+
+        # Every FOV's own FOV-level matrices, READ FROM THE STORE for any
+        # this session has not already loaded.
+        #
+        # This is the confirmed cause of "Align All Cells in All FOVs only
+        # did one FOV", reported twice. _fov_matrices_for reads
+        # self.fov_matrices, which is pure session state: it is filled one
+        # FOV at a time by _activate_fov, and by a FOV-alignment run. The
+        # backfill in _refresh_params_from_vlinks skips the store's OWN
+        # modality ("covered by _activate_fov" -- which covers exactly one
+        # FOV), so on a single-modality project, as this one is, that loop
+        # never runs at all.
+        #
+        # A FOV with no matrices ships hybe_records filtered down to []
+        # (see CellAlignmentWorker._resolve_passes), and then append counts
+        # its cells as "already fully aligned" while overwrite raises. Both
+        # are silent about the real reason. Cells are already read per FOV
+        # a few lines up; the matrices are the other half of the same job
+        # and belong in the same place.
+        try:
+            missing = [fov for fov in sorted(cells_by_fov)
+                       if not self._fov_matrices_for(storage_path, fov)]
+        except Exception as e:
+            # Preparation must never be the thing that stops a run: without
+            # this backfill the run still behaves exactly as it did before.
+            missing = []
+            self.log(f'cell alignment: could not check FOV-level matrices ({e})')
+        if missing:
+            records = self._hybe_records_for_storage_path(storage_path)
+            loaded, failed = 0, []
+            for fov in missing:
+                try:
+                    self._merge_fov_matrices(
+                        fov, alignment.read_same_modality_matrices(
+                            storage_path, fov, records))
+                    if self._fov_matrices_for(storage_path, fov):
+                        loaded += 1
+                    else:
+                        failed.append(fov)
+                except Exception as e:
+                    failed.append(fov)
+                    self.log(f'cell alignment: could not read FOV-level '
+                             f'matrices for FOV{fov:03d} ({e})')
+            self.log(f'cell alignment: loaded FOV-level matrices for '
+                     f'{loaded}/{len(missing)} FOV(s) not resident this session.')
+            if failed:
+                self.log(f'cell alignment: FOV(s) {failed} still have no '
+                         f'FOV-level matrices -- run FOV alignment for them '
+                         f'first, or their cells cannot be fitted.')
+
         channel_type = ap.CellChannelTypeComboBox.currentText()
         pad = ap.CellPadSpinBox.value()
         z_max_shift = ap.CellZMaxShiftSpinBox.value()
@@ -10987,14 +11253,58 @@ One PNG PER MODALITY: each modality has its own reference and its
         # One job per FOV, FOV-major inside the worker -- a FOV's cells
         # finish together, and the worker's own pool parallelises the
         # hybes within a cell.
-        jobs = [(fov, cells_by_fov[fov],
-                 self._cell_alignment_passes(cell_modality, storage_path, fov))
+        # passes_by_fov was built during preparation, alongside the
+        # ingestion-readiness check that decided which FOVs are in at all.
+        jobs = [(fov, cells_by_fov[fov], passes_by_fov[fov])
                 for fov in sorted(cells_by_fov)]
         # run-scoped: which FOVs this run has already written, and the
         # overlays they earned. Reset HERE, not in the finish handler --
         # a stopped run never reaches it.
         self._cell_align_saved_fovs = set()
         self._cell_align_pending_overlays = []
+        # The A/B stamp. Both knobs are resolved and LOGGED at the start of
+        # every run, whether or not anyone set them, because a number whose
+        # settings were recorded somewhere else -- or nowhere -- cannot be
+        # attributed to an arm afterwards. See codelab_pipeline/tuning.py.
+        self._cell_align_t0 = time.perf_counter()
+        self._cell_align_lag_token = self._lag_probe.mark()
+        self.log(f'cell alignment starting: {tuning.settings_label()} '
+                 f'(tuning file: {tuning.tuning_path()})')
+        # The scope this run ACTUALLY took, per FOV, before any of it runs.
+        #
+        # "Align All Cells in All FOVs" has now twice produced work for a
+        # single FOV, and the log said nothing that could distinguish the
+        # candidates: a short FOV list, cells that failed to load, or passes
+        # that came out empty. Each of those looks identical afterwards --
+        # a run that simply mentions one FOV. So state all three here.
+        # A per-FOV hybe count of 0 means that FOV's cells cannot be fitted
+        # at all: _resolve_passes keeps only hybes present in that FOV's own
+        # fov_matrices, and an empty result is silently skipped in append
+        # mode and fits nothing in overwrite mode.
+        # Tolerant of a pass shaped differently than expected: a diagnostic
+        # that can raise is a diagnostic that removes the run it was added
+        # to explain.
+        def _n_hybes(p):
+            try:
+                return len(p.get('hybe_records') or ())
+            except AttributeError:
+                return 0
+
+        try:
+            scope = [f'{fov}:{len(cells_by_fov[fov])}c/'
+                     + ('+'.join(str(_n_hybes(p)) for p in fov_passes) or '0') + 'h'
+                     for fov, _cells, fov_passes in jobs]
+            self.log(f'cell alignment scope ({mode}): FOV list {fov_list}; '
+                     f'{len(cells_by_fov)} FOV(s) with cells; per FOV '
+                     f'(cells/hybes-per-pass): {" ".join(scope)}')
+            starved = [fov for fov, _c, ps in jobs
+                       if not any(_n_hybes(p) for p in ps)]
+            if starved:
+                self.log(f'cell alignment: FOV(s) {starved} have cells but NO '
+                         f'hybes to fit against (no FOV-level matrices for '
+                         f'them) -- they will produce nothing.')
+        except Exception as e:
+            self.log(f'cell alignment: could not summarise scope ({e})')
         self._cell_alignment_worker = CellAlignmentWorker(
             jobs, channel_type=channel_type, pad=pad, z_max_shift=z_max_shift,
             append=(mode == 'append'))
@@ -11007,6 +11317,12 @@ One PNG PER MODALITY: each modality has its own reference and its
                 results, containers_by_fov, storage_path, cell_reference_hybe,
                 cell_modality, channel_type, pad))
         self._cell_alignment_worker.failed.connect(self._on_cell_alignment_all_failed)
+        # The catch-all. QThread.finished fires however run() ended, so a
+        # run that was stopped rather than completed still leaves its
+        # number in the log; _report_cell_align_run is idempotent, so the
+        # clean path's earlier, more precise call still wins.
+        self._cell_alignment_worker.finished.connect(
+            lambda: self._report_cell_align_run('stopped'))
         self._cell_alignment_worker.start()
 
     def _persist_cell_alignment_fov(self, fov, cells, containers_by_fov, threshold):
@@ -11059,9 +11375,48 @@ One PNG PER MODALITY: each modality has its own reference and its
             return
         self._cell_align_saved_fovs.add(fov)
         self._cell_align_pending_overlays.extend(overlays)
+        # To the LOG, not only the status bar. The status bar shows one
+        # message at a time and is overwritten seconds later, so after a run
+        # that "only did one FOV" there was no record of which FOVs actually
+        # finished and were written -- the single fact that separates a
+        # narrowed scope from a run that stopped early.
+        self.log(f'cell alignment: FOV{fov:03d} done and saved '
+                 f'({len(cells)} cell(s)); '
+                 f'{len(self._cell_align_saved_fovs)} FOV(s) saved so far.')
         self.statusBar().showMessage(
             f'FOV{fov:03d} saved ({len(cells)} cell(s)); '
             f'{len(self._cell_align_saved_fovs)} FOV(s) saved so far.')
+
+    def _report_cell_align_run(self, note=''):
+        """Log one comparable line for the cell-alignment run that just ended.
+
+        This is the whole point of the two tuning switches: four
+        combinations of (worker count, child I/O priority) can only be
+        judged against each other if every run states, in one place, what
+        it was set to, what the pool actually turned out to be, how much
+        work it got through, and how unresponsive the window was while it
+        did. Three earlier attempts to measure that from outside the app
+        each failed for a different reason (see windows/run_probe.py); this
+        one is inside it.
+
+        Fires at most once per run, from whichever ending actually
+        happens -- clean finish, failure, or the user stopping it to switch
+        arms, which is the common case and the one an ending-specific
+        report would miss.
+        """
+        t0 = getattr(self, '_cell_align_t0', None)
+        if t0 is None:
+            return                       # nothing running, or already reported
+        self._cell_align_t0 = None
+        worker = getattr(self, '_cell_alignment_worker', None)
+        shape = getattr(worker, 'pool_shape', 'unknown')
+        done = getattr(self, '_cell_align_passes_done', 0)
+        lag = self._lag_probe.since(getattr(self, '_cell_align_lag_token', None)
+                                    or time.perf_counter())
+        self.log(run_probe.summary_line(
+            'cell alignment' + (f' [{note}]' if note else ''),
+            f'{tuning.settings_label()} -> {shape}',
+            done, 'passes', time.perf_counter() - t0, lag))
 
     def _on_cell_alignment_all_finished(self, results, containers_by_fov, storage_path,
                                         cell_reference_hybe, cell_modality, channel_type, pad):
@@ -11078,6 +11433,13 @@ One PNG PER MODALITY: each modality has its own reference and its
         """
         ap = self.ui.AlignmentPanel
         ap.RunCellAlignmentAllPushButton.setEnabled(True)
+        # FIRST, before this handler does anything else. What follows it --
+        # the spot recast, the overlay pass whose per-cell argument
+        # resolution runs on THIS thread via a 0 ms timer, and a modal
+        # message box -- all block the event loop too, and folding their
+        # cost into the alignment's number would credit the arm with
+        # stalls it did not cause.
+        self._report_cell_align_run()
         storage_paths = self._all_analysis_storage_paths()
         cell_alignment_kwargs = ({f'cell_alignment_reference_hybe_{cell_modality}': cell_reference_hybe}
                                  if cell_modality else {})
@@ -11085,14 +11447,45 @@ One PNG PER MODALITY: each modality has its own reference and its
             analysis_store.write_global_params(path, cell_alignment_channel_type=channel_type,
                                                cell_alignment_pad=pad, **cell_alignment_kwargs)
 
+        # Only the FOVs this run actually fitted earn any of what follows.
+        # An append run over an already-aligned project fits NOTHING -- the
+        # worker skips every cell -- and the handler used to respond by
+        # recasting spots for all 50 FOVs and rendering ~700 overlay PNGs
+        # anyway, then reporting "3600 cell(s) across 50 FOV(s) aligned and
+        # SAVED". Measured: 0 passes in 0.3 s, followed by seven minutes of
+        # background rendering, twice. Both the waste and the false claim
+        # come from treating `results` (every FOV that was IN the run) as
+        # if it were every FOV that was CHANGED by it.
+        worker = getattr(self, '_cell_alignment_worker', None)
+        fitted = getattr(worker, 'fitted_fovs', None)
+        if fitted is None:                    # run() died before deciding
+            fitted = {fov for fov, _cells in results}
+        n_skipped = getattr(worker, 'n_skipped', 0)
+        changed = [(fov, cells) for fov, cells in results if fov in fitted]
+
         threshold = ap.CellOverlayAutoSaveThresholdSpinBox.value()
         pending_overlays = list(self._cell_align_pending_overlays)
-        n_cells = sum(len(cells) for _fov, cells in results)
-        for fov, cells in results:
+        n_cells = sum(len(cells) for _fov, cells in changed)
+        for fov, cells in changed:
             if fov in self._cell_align_saved_fovs:
                 continue
             pending_overlays.extend(self._persist_cell_alignment_fov(
                 fov, cells, containers_by_fov, threshold))
+
+        if not changed:
+            # Nothing was refitted, so nothing downstream is stale. Say what
+            # happened instead of claiming an alignment, and name the way
+            # out -- "already aligned" is the correct answer to append, but
+            # it is not what the user pressed the button expecting.
+            self._refresh_cell_fov_panels(ap.CellFovSpinBox.value())
+            self.statusBar().showMessage('Cell alignment: nothing to do.', 5000)
+            self._notify_complete(
+                'Cell alignment complete',
+                f'Nothing was refitted: all {n_skipped} cell(s) across '
+                f'{len(results)} FOV(s) already had matrices for every hybe, '
+                f'so append mode skipped them. No overlays and no spot recast '
+                f'were queued. Re-run with Overwrite to refit them.')
+            return
 
         # PASS 1b -- the spot recast, in the BACKGROUND (measured: ~1 s
         # of CPU plus several NAS round-trips per FOV, and it ran here on
@@ -11100,7 +11493,7 @@ One PNG PER MODALITY: each modality has its own reference and its
         # Segmentation crawl DURING an all-FOVs alignment). Matrices are
         # already on disk, so a recast that finishes later is still
         # correct -- it only refreshes DERIVED coordinates.
-        recast_fovs = [fov for fov, _cells in results]
+        recast_fovs = [fov for fov, _cells in changed]
         try:
             self._start_spot_recast(recast_fovs, 'cell alignment (all FOVs)')
         except Exception as e:
@@ -11109,20 +11502,107 @@ One PNG PER MODALITY: each modality has its own reference and its
 
         self._refresh_cell_fov_panels(self.ui.AlignmentPanel.CellFovSpinBox.value())
         self.statusBar().showMessage('Cell alignment computed for all FOVs.', 5000)
-        QtWidgets.QMessageBox.information(
-            self, 'Cell alignment complete',
-            f'{n_cells} cell(s) across {len(results)} FOV(s) aligned and SAVED.\n\n'
+        # PASS 2 -- overlays, entirely in the background, only after every
+        # matrix is on disk.
+        #
+        # BEFORE the dialog, not after it. A modal blocks nothing that is
+        # already running -- its nested event loop still delivers queued
+        # signals, so worker threads and pool children carry on -- but it
+        # does block the line that comes next, and this used to be that
+        # line. The dialog announced overlays as "rendering in the
+        # background" while they had not yet been queued: an all-FOVs run
+        # started before going home rendered nothing at all until somebody
+        # came back and clicked OK. Measured in the same session: a
+        # completion dialog held the window for 140 s of a 5-minute
+        # profile, and nobody is watching for the OK during an overnight
+        # run -- which is the whole point of an overnight run.
+        self._queue_cell_overlays(pending_overlays, storage_path, channel_type, pad,
+                                  cell_reference_hybe, cell_modality,
+                                  label='Cell alignment overlays (all FOVs)')
+        skipped_note = (f' {n_skipped} cell(s) were skipped as already aligned.'
+                        if n_skipped else '')
+        self._notify_complete(
+            'Cell alignment complete',
+            f'{n_cells} cell(s) across {len(changed)} FOV(s) aligned and SAVED.'
+            f'{skipped_note} '
             f'Spot coordinates are being recast for {len(recast_fovs)} FOV(s) and '
             f'{len(pending_overlays)} overlay image(s) will render -- both in the '
             f'background; the app stays usable, and quitting will warn if any are '
             f'still running.')
-        # PASS 2 -- overlays, entirely in the background, only after every
-        # matrix is on disk.
-        self._queue_cell_overlays(pending_overlays, storage_path, channel_type, pad,
-                                  cell_reference_hybe, cell_modality,
-                                  label='Cell alignment overlays (all FOVs)')
+
+    def _draw_fov_overlay_async(self, spec, fov, matrices, channel_type):
+        """Show one FOV/modality's all-readouts overlay without freezing.
+
+        The reading and compositing -- ~111 MIPs, about 220 MB, then the
+        composite that measured 82% of the overlay cost -- happen off the
+        GUI thread; only two finished RGB frames come back. Measured on the
+        real store, one FOV of 76 hybes takes 10.7 s. That used to run
+        here, on the GUI thread.
+
+        A ProcWorker and NOT the resident reader, even though this one is
+        displayed rather than saved. 10.7 s is not a click-latency job, and
+        the reader is a single process: parking a compose on it would put
+        every image the user asks for behind ten seconds of work. The
+        reader stays for reads that a person is waiting on.
+        """
+        def _ok(results):
+            before_rgb, after_rgb, title = results[0]
+            self.preview_canvas.draw_all_readouts_composited(before_rgb, after_rgb, title)
+
+        worker = ProcWorker([(pipeline_canvas.compose_fov_all_readouts,
+                              (spec['storage_path'], fov, spec['hybe_records'],
+                               spec['reference_hybe'],
+                               pipeline_canvas._bare_hybe(matrices), channel_type))])
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(lambda m: self.log(
+            f'FOV{fov:03d} ({spec["modality"]}): overlay could not be drawn ({m}).'))
+        self._fov_overlay_workers = [
+            w for w in getattr(self, '_fov_overlay_workers', []) if w.isRunning()]
+        self._fov_overlay_workers.append(worker)      # keep a reference
+        worker.start()
+
+    def _save_fov_overlay_jobs(self, jobs):
+        """Render all-readouts overlay PNGs off the GUI thread.
+
+        Deliberately a ProcWorker and NOT the resident reader. These are
+        batch renders -- an all-FOVs accept queues one per FOV per
+        modality, each tens of seconds -- and the reader is the thing that
+        answers clicks. Putting a 34-FOV render queue in front of it would
+        make every image the user asks for wait behind the batch, which is
+        the problem this whole line of work is about.
+        """
+        if not jobs:
+            return
+        worker = ProcWorker(
+            [(pipeline_canvas.render_fov_all_readouts_to_png, (args,))
+             for args, _label in jobs],
+            max_workers=min(2, len(jobs)))
+
+        def _ok(_results):
+            for _args, label in jobs:
+                self._fov_overlays_saved = getattr(self, '_fov_overlays_saved', 0) + 1
+                self.log(f'{label}: overlay image saved.')
+
+        def _fail(message):
+            for _args, label in jobs:
+                self.log(f'{label}: overlay image could not be saved '
+                         f'({message}); matrices are unaffected.')
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_fail)
+        self._fov_overlay_workers = [
+            w for w in getattr(self, '_fov_overlay_workers', []) if w.isRunning()]
+        self._fov_overlay_workers.append(worker)      # keep a reference
+        worker.start()
 
     def _on_cell_alignment_all_failed(self, message):
+        self._report_cell_align_run('failed')
+        # To the LOG first, in full. The dialog shows the same text but is
+        # dismissed and gone; a run that stopped after one FOV needs its
+        # traceback to still be there afterwards, which is the whole reason
+        # this failure was mistaken twice for "it only did one FOV".
+        self.log('cell alignment (all FOVs) FAILED -- ' + ' | '.join(
+            line for line in str(message).splitlines() if line.strip()))
         self.ui.AlignmentPanel.RunCellAlignmentAllPushButton.setEnabled(True)
         self.statusBar().clearMessage()
         QtWidgets.QMessageBox.critical(self, 'Cell alignment error', message)
@@ -11193,9 +11673,9 @@ One PNG PER MODALITY: each modality has its own reference and its
                           else f'shift > {auto_save_threshold}px')
         if jobs:
             self._start_cell_overlay_save_worker(jobs, 'Cell alignment overlays')
-        QtWidgets.QMessageBox.information(
-            self, 'Cell alignment complete',
-            f'{total_cells} cell(s) in FOV{fov:03d} aligned, saved to the analysis store.\n\n'
+        self._notify_complete(
+            'Cell alignment complete',
+            f'{total_cells} cell(s) in FOV{fov:03d} aligned, saved to the analysis store. '
             f'{len(jobs)} overlay image(s) ({threshold_text}) are rendering in the background '
             f'(~35s each) -- the window stays usable, and each one opens instantly from '
             f'"Results (per cell, overlay)" once written.')
