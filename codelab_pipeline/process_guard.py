@@ -215,6 +215,69 @@ def child_guard():
 # The lever there is the worker COUNT, not the per-worker budget.
 CHILD_MIP_CACHE_GB = 1.0
 
+# ...but per-child is only half a budget, and the missing half was measured
+# to hurt the WHOLE MACHINE.
+#
+# Windows serves a new allocation from its free+zero page list -- pages
+# already reclaimed and zeroed, ready to hand out. On this box that list
+# holds ~7.3 GB while "available memory" reads 168 GB, because the other
+# 167 GB is standby file cache that must be reclaimed and zeroed first,
+# under a lock. Drain the list and every process on the machine queues on
+# that refill path, in kernel state Waiting/Executive, consuming no CPU
+# and no disk.
+#
+# A cache is the worst shape of demand there is: it takes pages and does
+# not give them back. Measured, 6 children reading MIPs:
+#
+#     per-child cache   free+zero list      reads done
+#         1.0 GB          -5.89 GB             2512
+#         0.5 GB          -3.35 GB             2933
+#         0   (off)       -0.20 GB             3089
+#
+# The drain tracks children x budget almost exactly. At the default 16
+# workers, 1.0 GB each is 16 GB of retention against a 7.3 GB list -- and
+# the observed consequence was a GUI paint costing 469 ms of CPU taking
+# 23 s of wall, while an unrelated benchmark process on the same machine
+# dropped from 100% to 21% CPU.
+#
+# Note what is NOT the problem: churn. The same probe allocating and
+# freeing 945,959 times a second left the list at 7 GB, because freed
+# pages are recycled inside the process. Only retention reaches the
+# kernel.
+#
+# So the budget is TOTAL, and the per-child share is derived from it.
+TOTAL_MIP_CACHE_GB = 4.0
+
+# ...but not below the cliff. Measured per-cell sweep over a real FOV:
+# 4343 ms at 0.125 GB, 4061 ms at 0.25 GB, then 3.6 ms at 0.5 GB. A child
+# needs ONE FOV's MIPs resident (319 MB for 76 hybes, ~461 MB for 110) and
+# falling under that costs three orders of magnitude. When the floor and
+# the total disagree the floor wins and the caller is TOLD, because the
+# honest answer at that point is "use fewer workers", not "make every
+# worker slow".
+MIN_CHILD_MIP_CACHE_GB = 0.5
+
+
+def child_mip_cache_gb(n_children=None):
+    """(GB per child, one-line explanation) for a pool of `n_children`.
+
+    n_children=None means the caller does not know its own pool size; it
+    gets the old flat per-child number, which is what the code did before
+    a total existed.
+    """
+    if not n_children or n_children < 1:
+        return CHILD_MIP_CACHE_GB, f'{CHILD_MIP_CACHE_GB:.2f} GB (pool size unknown)'
+    share = TOTAL_MIP_CACHE_GB / float(n_children)
+    if share >= MIN_CHILD_MIP_CACHE_GB:
+        return share, (f'{share:.2f} GB each = {TOTAL_MIP_CACHE_GB:.1f} GB '
+                       f'total / {n_children} worker(s)')
+    over = MIN_CHILD_MIP_CACHE_GB * n_children
+    return MIN_CHILD_MIP_CACHE_GB, (
+        f'{MIN_CHILD_MIP_CACHE_GB:.2f} GB each (the floor) x {n_children} '
+        f'worker(s) = {over:.1f} GB, OVER the {TOTAL_MIP_CACHE_GB:.1f} GB '
+        f'budget -- {int(TOTAL_MIP_CACHE_GB // MIN_CHILD_MIP_CACHE_GB)} '
+        f'worker(s) would fit it; expect the machine to slow while this runs')
+
 
 def child_initializer(user_initializer=None, *user_args):
     """
@@ -227,9 +290,80 @@ def child_initializer(user_initializer=None, *user_args):
     under the 'spawn' start method -- a closure or a lambda would not.
     """
     child_guard()
-    # setdefault, so an explicit CODELAB_MIP_CACHE_GB in the environment
-    # (inherited from the parent) still wins -- including the 0 that
-    # turns the cache off.
-    os.environ.setdefault('CODELAB_MIP_CACHE_GB', str(CHILD_MIP_CACHE_GB))
+    # The parent pins this child's share of the TOTAL cache budget before
+    # the pool exists (tuning.apply_child_env), because only the parent
+    # knows how many children there will be. A separate variable from
+    # CODELAB_MIP_CACHE_GB on purpose: setting that one in the parent
+    # would also shrink the GUI's OWN cache, which is not a child and not
+    # part of the pool's budget.
+    from . import tuning
+    pinned = os.environ.get(tuning.MIP_CACHE_PIN_ENV)
+    if pinned:
+        os.environ['CODELAB_MIP_CACHE_GB'] = pinned
+    else:
+        # setdefault, so an explicit CODELAB_MIP_CACHE_GB in the environment
+        # (inherited from the parent) still wins -- including the 0 that
+        # turns the cache off.
+        os.environ.setdefault('CODELAB_MIP_CACHE_GB', str(CHILD_MIP_CACHE_GB))
+    lower_io_priority()
     if user_initializer is not None:
         user_initializer(*user_args)
+
+
+def lower_io_priority():
+    """Put this pool child at the back of the DISK queue.
+
+    MEASURED, on the live app while a cell alignment ran and the window
+    was Not Responding: the GUI process spent 0.89 s of CPU in 31 s
+    (35x starved) with 157 GB of RAM free and 123 page faults/s -- so it
+    was neither computing nor short of memory. It was, however, issuing
+    ~67 reads/s of ~9 KB and getting 0.6 MB/s: roughly 15 ms per read,
+    where an idle local disk answers a 9 KB read in well under 1 ms. The
+    GUI's small HDF5 chunk reads were queued behind the workers' 245 MB
+    streams.
+
+    An earlier diagnosis blamed memory pressure and the per-child MIP
+    cache was capped for it. That cap did remove the paging -- and the
+    stall survived it. Disk QUEUE POSITION is what is left.
+
+    I/O priority ONLY, deliberately not PROCESS_MODE_BACKGROUND_BEGIN:
+    that would also drop the child to IDLE cpu priority, and CPU is not
+    the contended resource here (64 cores, the GUI could not even use
+    2%). Lowering what is not contended would slow the fits for nothing.
+
+    WHETHER THIS ACTUALLY HELPS IS STILL UNMEASURED. Three attempts to A/B
+    it from outside the app each answered a different question than the one
+    asked (windows/run_probe.py records how each broke), and the last one
+    tied at 1.04x only because the load came from a build that predated this
+    function. So it is a switch, defaulting on, to be judged on numbers from
+    a real run -- not a fix to be assumed.
+
+    Best effort and silent: a platform without I/O priority, or a psutil
+    that cannot set it, simply keeps the default.
+
+    The level comes from the PIN that tuning.apply_child_env() writes just
+    before a pool is built, which fixes one value for the whole run. Absent
+    a pin the child resolves the setting itself, so pools that were never
+    taught about any of this still honour the tuning file. Either way the
+    value is validated by tuning, never taken raw from the environment: a
+    typo must fall back to the default loudly enough to be logged, not
+    quietly mean "off". 'verylow' (default), 'low', or 'normal' to disable.
+    """
+    from . import tuning
+    pinned = (os.environ.get(tuning.IO_PRIORITY_PIN_ENV) or '').strip().lower()
+    if pinned in tuning.IO_PRIORITY_CHOICES:
+        level = pinned
+    else:
+        level, _source = tuning.child_io_priority()
+    if level == 'normal':
+        return False
+    try:
+        import psutil
+        wanted = {'verylow': getattr(psutil, 'IOPRIO_VERYLOW', None),
+                  'low': getattr(psutil, 'IOPRIO_LOW', None)}.get(level)
+        if wanted is None:
+            return False
+        psutil.Process().ionice(wanted)
+        return True
+    except Exception:
+        return False

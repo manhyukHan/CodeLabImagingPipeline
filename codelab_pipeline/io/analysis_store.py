@@ -1270,8 +1270,27 @@ def read_hybe_mip(storage_path, fov, hybe, channel, window=None):
         if window is None or _mip_seen_before(key):
             frames = _load_mip_file(path)
             if frames is not None:
+                # WHICH channels to hold, not just which to return.
+                #
+                # The file is decoded in one pass either way, so holding
+                # every channel costs nothing in time -- but it doubles
+                # what the cache RETAINS, and retention is what drains the
+                # machine's free page list (see process_guard's cache
+                # budget note). Measured on the real store: 135 hybes x 2
+                # channels x 2 MB = 540 MB per worker, against 270 MB for
+                # the one channel a fit actually reads.
+                #
+                # A pool child fits one channel per hybe and never asks
+                # for the other, so it holds only what it asked for. The
+                # GUI does switch channels on the same frame -- that is
+                # what the all-channel hold was written for -- so it keeps
+                # the old behaviour. The pin is set by the parent for its
+                # children only (tuning.apply_child_env), which is exactly
+                # the distinction wanted here.
+                hold_all = not os.environ.get('CODELAB_CHILD_MIP_CACHE_GB_PINNED')
                 for k, held in frames.items():
-                    _mip_cache_put((key[0], k, key[2]), held)
+                    if hold_all or k == name:
+                        _mip_cache_put((key[0], k, key[2]), held)
                 frame = frames.get(name)
                 return None if frame is None else _crop(frame, window)
     try:

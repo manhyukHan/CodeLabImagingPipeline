@@ -1,0 +1,18 @@
+{
+  "_what": "Two knobs for the disk-contention A/B. Edit between runs; the app re-reads this file at the start of every cell alignment, so it does NOT need restarting. Every run logs which combination it used.",
+
+  "_cell_alignment_workers": "How many cells to fit at once. null = leave the measured default alone (cpu_count-2, capped at 16 -> 16 on this box). Ingestion on this same storage measured 117.6 MB/s at 12 workers against 66 MB/s at 36, so the interesting direction is DOWN. Currently set to 6 to test whether the GUI's 23 s paints (469 ms of CPU, thread Waiting in the kernel, machine otherwise at 5% CPU and 163 GB free) go away with fewer children.",
+  "cell_alignment_workers": 6,
+
+  "_child_io_priority": "Where pool children sit in the disk queue: 'verylow' (default), 'low', or 'normal' to switch it off. This one is GLOBAL -- it reaches every pool in the app, not just cell alignment -- so do not run an ingestion or a tracing job during an arm.",
+  "child_io_priority": "verylow",
+
+  "_the_four_arms": [
+    "1. {\"cell_alignment_workers\": null, \"child_io_priority\": \"normal\"}   <- the old behaviour, the control",
+    "2. {\"cell_alignment_workers\": null, \"child_io_priority\": \"verylow\"}  <- priority alone",
+    "3. {\"cell_alignment_workers\": 8,    \"child_io_priority\": \"normal\"}   <- fewer workers alone",
+    "4. {\"cell_alignment_workers\": 8,    \"child_io_priority\": \"verylow\"}  <- both"
+  ],
+
+  "_reading_the_log": "Each run logs one line: settings -> the pool actually built | N passes in T s (rate) | GUI blocked X% of the run, lag median/p95/worst. Compare 'rate' (did the alignment get slower?) against 'blocked %' (did the window get usable?). A run whose pool shape differs from the others -- 'per-hybe' instead of 'across-cells' -- is NOT a comparable arm; that happens when only one cell had work."
+}
