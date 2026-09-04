@@ -264,6 +264,17 @@ def main():
     check('an unreadable FOV falls back to the in-memory cell, not a refit',
           got == [(2, ('H1', 'H2', 'H3'))], str(got))
 
+    # A FOV that was NEVER WRITTEN is present with an empty map, not
+    # absent. read_cells returns the same (None, '') for "never written"
+    # and "there but unreadable", and those mean opposite things: the
+    # first is the strongest "unfinished" there is, and sending it to the
+    # in-memory fallback would ask the cell that claims to be done --
+    # the exact inversion this whole change exists to prevent.
+    got, skipped = run_append(both, {7: {}})
+    check('a FOV with nothing written at all fits every cell',
+          got == [(1, ('H1', 'H2', 'H3')), (2, ('H1', 'H2', 'H3'))], str(got))
+    check('and skips none of them', skipped == 0, str(skipped))
+
     # -- 6. build_chromatin_trace_allele append semantics ---------------------
     allele = types.SimpleNamespace(coordinate=(5.0, 6.0, 7.0),
                                    fiducial_trace_adj={'R': (1, 2, 3), 'A': (1, 2, 3)},

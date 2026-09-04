@@ -596,13 +596,29 @@ def write_cells(storage_path, fov, cell_container):
                      [cell.save() for cell in cell_container.get_cells(fov)])
 
 
+def cells_path(storage_path, fov):
+    """THE path of this FOV's cells.h5.
+
+    Public because read_cells collapses two different answers into the same
+    (None, ''): a FOV that has never been written, and one whose file is
+    there but unreadable. A caller that must tell them apart -- append,
+    deciding whether "nothing persisted" means "nothing done" or "ask the
+    cell" -- needs the path, and should not rebuild the layout to get it.
+    """
+    return os.path.join(_fov_dir(storage_path, fov), 'cells.h5')
+
+
 def read_cells(storage_path, fov):
     """
     (cell_dicts, '') -- ACell.save()-shaped dicts for
     CellContainer.load, or (None, '') if nothing persisted for this FOV
     yet. (The second element is the legacy modality slot, always ''.)
+
+    (None, '') does NOT distinguish "never written" from "there but
+    unreadable" -- both arrive through the same OSError. cells_path lets a
+    caller that cares ask.
     """
-    path = os.path.join(_fov_dir(storage_path, fov), 'cells.h5')
+    path = cells_path(storage_path, fov)
 
     def load():
         try:

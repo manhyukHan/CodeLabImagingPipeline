@@ -10945,8 +10945,18 @@ One PNG PER MODALITY: each modality has its own reference and its
             try:
                 cell_dicts, _modality = analysis_store.read_cells(storage_path, fov)
             except Exception:
-                continue
+                continue                       # unreadable -- ask the cell
             if cell_dicts is None:
+                # read_cells collapses "never written" and "there but
+                # unreadable" into the same (None, ''), and they mean
+                # OPPOSITE things here. A FOV with no cells.h5 has nothing
+                # persisted, which is the strongest possible "unfinished" --
+                # routing it to the in-memory fallback would ask the cell
+                # that claims to be done, the exact inversion this method
+                # exists to prevent. Only a file that IS there and would not
+                # open is grounds to defer to memory.
+                if not os.path.exists(analysis_store.cells_path(storage_path, fov)):
+                    out[fov] = {}
                 continue
             by_cell = {}
             for d in cell_dicts:
@@ -11614,8 +11624,11 @@ One PNG PER MODALITY: each modality has its own reference and its
             # in-memory cell, which is the exact behaviour this replaced --
             # so "which FOVs did it cover, and how many of their cells have
             # nothing stored" has to be visible without reading a skip line.
+            # A FOV with no stored cells at all ({}) counts here too -- it
+            # is the clearest "nothing done", and reporting only the
+            # non-empty ones would hide it.
             empty_fovs = sorted(f for f, by in persisted.items()
-                                if by and not any(by.values()))
+                                if not any(by.values()))
             self.log(f'cell alignment: persisted state read for '
                      f'{len(persisted)}/{len(cells_by_fov)} FOV(s); '
                      f'{len(empty_fovs)} of them have NO stored matrices '
