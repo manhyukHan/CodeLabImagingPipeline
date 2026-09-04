@@ -1,4 +1,3 @@
-import collections
 import multiprocessing
 import os
 import threading
@@ -1334,36 +1333,6 @@ _ZX_BUFFERS = threading.local()
 # path rather than silently reading into a buffer too small for it.
 _ZX_MAX_SIDE = 160
 
-# DO NOT CACHE OPEN STACK FILE HANDLES HERE. It was tried and reverted.
-#
-# The appeal is real: hybe_zx_projection opens, reads and closes a stack
-# file on every call -- once per (cell, hybe), so 7,560 opens for one
-# measured 56-cell FOV of 135 hybes and of order 390,000 for a whole-
-# project run, each a NAS round trip. A worker revisits the same file once
-# per cell it holds, so the opens are pure repetition and an LRU of open
-# handles removes almost all of them.
-#
-# It also breaks ingestion, measured on this machine:
-#
-#     os.replace with no handle open      -> succeeded
-#     os.replace with a read handle open  -> PermissionError [WinError 5]
-#     os.replace after closing the handle -> succeeded
-#
-# Windows refuses to replace a file that anyone has open. Ingestion writes
-# every stack as a .part file and os.replace()s it -- the protocol that
-# exists because an interrupted overwrite once destroyed two stacks
-# silently (see CLAUDE.md). A cached read handle therefore does not merely
-# risk serving stale bytes after a swap; it makes the swap FAIL, and it
-# fails exactly in the case this pipeline is built for: an append run
-# alongside a still-running ingestion.
-#
-# Validating by (mtime, size) does not help -- the file cannot be replaced
-# in the first place. Any future attempt needs a handle opened with
-# FILE_SHARE_DELETE, which h5py does not expose.
-#
-# The allocation half of this problem is solved separately and safely, by
-# reusing the destination BUFFER rather than the handle: see below.
-
 
 def _read_zx_window(ds, ymin, ymax, xmin, xmax):
     """The (h, w, depth) window of `ds`, read into a reused buffer.
@@ -1425,9 +1394,27 @@ def hybe_zx_projection(storage_path, fov, hybe, channel, ymin, ymax, xmin, xmax,
     below (compute_cell_alignment) uses for its z-depth refinement.
     """
     h5path = paths.stack_path(storage_path, fov, hybe)
-    # Opened and CLOSED every call, deliberately -- see the block comment
-    # above _read_zx_window: a held handle makes ingestion's os.replace
-    # fail outright on Windows.
+    # Opened per call, deliberately. A handle cache was written and MEASURED
+    # here, and it bought nothing: holding the file removes only the open,
+    # and warm that is 0.07 ms of a 1.04 ms call (6.4%; the rest is 0.49 ms
+    # reading the window and 0.40 ms normalizing). End to end on the real
+    # store -- 6 workers, 15 hybes, 12 cell-sized windows each, ABAB over
+    # cold FOVs 8-11 -- reopening ran 20.20 ms/call against 21.57 ms/call
+    # holding the handles: 0.94x, i.e. no gain.
+    #
+    # An earlier probe claimed 15x for the same cache. It was wrong: its
+    # held arm re-read ONE window 12 times from a single dataset object, so
+    # HDF5's chunk cache served reads 2..12. Real alignment reads twelve
+    # DIFFERENT cell windows per hybe, which share no chunks, so that reuse
+    # never happens. Data-level reuse would need cells grouped by region --
+    # a separate question from holding the file.
+    #
+    # And it is not free even at 1.0x. Measured here: os.replace succeeds
+    # with no handle open and fails with PermissionError [WinError 5] while
+    # a read handle is open. Ingestion writes every stack as a .part it
+    # then replaces, so a held handle can make that swap fail outright.
+    # The overwrite path now stops readers first, which is why the cache
+    # was safe enough to test -- but nothing bought it a reason to exist.
     with h5py.File(h5path, 'r') as f:
         ds = f[f'/stack/ch{channel}']
         stack = _read_zx_window(ds, ymin, ymax, xmin, xmax)

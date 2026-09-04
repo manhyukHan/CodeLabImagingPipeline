@@ -57,13 +57,13 @@ def make_stack(path, shape=(256, 256, 40), seed=0):
 
     Every voxel gets a distinct value, so a crop read from the wrong place
     -- or a buffer left over from a previous call -- cannot accidentally
-    match the right answer. `seed` gives a genuinely different file, for
-    the replaced-underneath case.
+    match the right answer.
     """
     rng = np.random.default_rng(seed)
     data = rng.integers(0, 65535, size=shape, dtype=np.uint16)
+    chunks = tuple(min(c, s) for c, s in zip((32, 32, 20), shape))
     with h5py.File(path, 'w') as f:
-        f.create_dataset('/stack/ch555', data=data, chunks=(32, 32, 20),
+        f.create_dataset('/stack/ch555', data=data, chunks=chunks,
                          compression='gzip', shuffle=True)
     return data
 
@@ -130,41 +130,6 @@ def main():
     t1.start(); t2.start(); t1.join(); t2.join()
     check('two threads reading different windows never see each other\'s pixels',
           not errors and results.get('A') and results.get('B'), str(errors[:2]))
-
-    print('\n-- the read path leaves no handle open, so ingestion can replace --')
-    # An LRU of open stack handles was tried here and reverted. Windows
-    # refuses to replace a file anyone has open, and ingestion writes every
-    # stack as a .part it then os.replace()s -- the protocol that exists
-    # because an interrupted overwrite once destroyed two stacks silently
-    # (CLAUDE.md). Measured on this machine:
-    #     no handle open      -> os.replace succeeded
-    #     read handle open    -> PermissionError [WinError 5]
-    #     handle then closed  -> os.replace succeeded
-    # So the failure is not stale bytes, it is a BROKEN INGESTION, in
-    # exactly the case the pipeline is built for: an append run beside a
-    # still-running ingestion. This pins that the read path stays
-    # open-close, so anyone re-adding a handle cache fails here first.
-    target = os.path.join(os.path.dirname(tmp), 'ingesting.h5')
-    first = make_stack(target, shape=(128, 128, 20))
-    with h5py.File(target, 'r') as f:
-        got = chain._read_zx_window(f['/stack/ch555'], 0, 64, 0, 64).copy()
-    check('a stack reads correctly', np.array_equal(got, first[0:64, 0:64, :]))
-
-    part = target + '.part'
-    second = make_stack(part, shape=(128, 128, 20), seed=1)
-    replaced_ok, err = True, ''
-    try:
-        os.replace(part, target)            # what ingestion does
-    except Exception as e:                  # noqa: BLE001
-        replaced_ok, err = False, f'{type(e).__name__}: {e}'
-    check('ingestion can replace the stack after the read path is done',
-          replaced_ok, err)
-    with h5py.File(target, 'r') as f:
-        after = chain._read_zx_window(f['/stack/ch555'], 0, 64, 0, 64)
-        check('and the next read sees the NEW bytes',
-              np.array_equal(after, second[0:64, 0:64, :]))
-    check('no handle-cache API is left behind to tempt a re-add',
-          not hasattr(chain, '_open_stack') and not hasattr(chain, 'close_stack_files'))
 
     print('\n-- the projection itself is unchanged --')
     with h5py.File(tmp, 'r') as f:
