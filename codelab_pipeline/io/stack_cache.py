@@ -8,9 +8,10 @@ The problem it solves, measured on the real NAS store
     focus_profile, 177 planes     24.7 s
 
 Both are dominated by decompression, not by the network. Stacks are
-written with chunks=(32, 32, 64) + gzip, so pulling a single full-frame
-z-plane touches 32x32 = 1024 chunks and inflates ~134 MB to hand back a
-2 MB plane. Scrolling the Z-plane spinbox therefore froze the GUI for
+written with chunks=(32, 32, z-slab) + gzip, so pulling a single
+full-frame z-plane touches 32x32 = 1024 chunks and inflates the whole
+slab -- ~134 MB at the 64-plane slab these stacks carry -- to hand back
+a 2 MB plane. Scrolling the Z-plane spinbox therefore froze the GUI for
 seconds PER TICK, and focus_profile re-inflated the same chunks once per
 plane.
 
@@ -19,8 +20,13 @@ inflates that plane's whole CHUNK SLAB anyway, so this module reads the
 full slab, caches it, and serves every other plane in it for free. On
 the real store that turns
 
-    plane scroll : 2.3 s per tick        -> 2.3 s once per 64-plane slab
-    focus_profile: 177 slab inflations   -> ceil(177/64) = 3
+    plane scroll : 2.3 s per tick        -> 2.3 s once per slab
+    focus_profile: 177 slab inflations   -> one per slab (3 here)
+
+The slab is READ FROM THE FILE (`ds.chunks[2]` below), never assumed:
+preprocess.stack_chunks now sizes slabs to divide the depth evenly, so
+a 129-plane stack carries 43-plane slabs rather than 64-plane ones, and
+this module follows whatever a given file was written with.
 
 Eviction is FIFO (first in, first out) under a byte budget, not LRU:
 the access pattern here is a sweep (scroll a plane range, profile a

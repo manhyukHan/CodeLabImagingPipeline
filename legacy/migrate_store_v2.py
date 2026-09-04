@@ -33,7 +33,7 @@ import h5py
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from codelab_pipeline.io import paths  # noqa: E402
+from codelab_pipeline.io import paths, preprocess  # noqa: E402
 
 
 def rewrite_stack_chunked(src, dst):
@@ -45,9 +45,8 @@ def rewrite_stack_chunked(src, dst):
             for name in gi.keys():
                 d = gi[name]
                 if group == 'stack' and d.ndim == 3:
-                    zslab = min(d.shape[-1], 64)
                     go.create_dataset(name, data=d[:], dtype=d.dtype,
-                                      chunks=(32, 32, zslab),
+                                      chunks=preprocess.stack_chunks(d.shape),
                                       compression='gzip', compression_opts=1, shuffle=True)
                 else:
                     go.create_dataset(name, data=d[:], dtype=d.dtype)

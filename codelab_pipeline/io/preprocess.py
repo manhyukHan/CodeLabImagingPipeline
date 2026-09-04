@@ -424,6 +424,43 @@ def _restore_missing_mip(storage_path, fov, folder, channels, fiducial_channel):
         return False
 
 
+def stack_chunks(shape):
+    """The (32, 32, z-slab) chunking for a (height, width, depth) stack.
+
+    THE ONE place the stack chunk shape is decided -- ingestion and the
+    v1->v2 migration both call this, so the two cannot drift.
+
+    The 32x32 face and the slab COUNT are Storage v2's own design (65a562f):
+    a small-XY/deep-Z crop costs one network read per z-chunk, which is what
+    took "a 17x17xZ crop from 289 scattered network reads to 3", and slabbing
+    the depth rather than chunking it whole is what keeps partial-Z access
+    affordable for the plane viewer.
+
+    What this adds is that the slabs are EVENLY sized instead of a fixed 64.
+    A fixed 64 leaves coverage waste whenever depth is not a multiple of it,
+    and the waste is worst just past a boundary: 129 planes -- the real MAZ
+    store -- needs 3 chunks of 64, which cover 192 planes to hold 129, so
+    EVERY full-depth read inflates 1.49x more than it returns. Three chunks
+    of 43 cover exactly 129.
+
+    Measured on one real 129-plane stack, same file size (138 vs 139 MB):
+
+        58 real cell windows, full depth   0.841 s -> 0.670 s   (1.26x)
+        one full-frame z-plane             553.7 ms -> 399.7 ms (1.39x)
+
+    Both directions improve, and that is not a coincidence: ceil(d/n) is
+    never larger than 64 when n = ceil(d/64), so this can only shrink a
+    chunk, never grow one. It cannot be worse than the fixed 64 it replaces.
+
+    Only newly written stacks are affected -- chunking is per dataset, and
+    existing files stay readable exactly as they are.
+    """
+    height, width, depth = shape[0], shape[1], shape[-1]
+    n_slabs = max(1, -(-depth // 64))            # ceil(depth / 64)
+    return (min(height, 32), min(width, 32),
+            max(1, -(-depth // n_slabs)))        # ceil(depth / n_slabs)
+
+
 def publish_stack(stack_h5name, attributes, channel_arrays, storage_path,
                   fov, folder, fiducial_channel):
     """The ONE stack-publishing door, shared by every ingestion path
@@ -447,8 +484,7 @@ def publish_stack(stack_h5name, attributes, channel_arrays, storage_path,
             for ch, dat in channel_arrays.items():
                 # the measured NAS-crop chunking, clamped to the data --
                 # h5py refuses a chunk larger than the dataset on any axis
-                chunks = (min(dat.shape[0], 32), min(dat.shape[1], 32),
-                          min(dat.shape[-1], 64))
+                chunks = stack_chunks(dat.shape)
                 stack_group.create_dataset(f'ch{ch}', data=dat, dtype='uint16',
                                            chunks=chunks,
                                            compression='gzip',
