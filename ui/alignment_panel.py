@@ -416,24 +416,54 @@ class AlignmentPanelUI(object):
             self.SameModalityReferenceHybeComboBoxes[name] = combo
             self.SameModalityReferenceHybeFormLayout.addRow(f'Reference hybe ({name}):', combo)
 
-    def populate_channel_choices(self, channels):
-        """Extend every channel-TYPE combo with the CONCRETE channels
-        (union across all modalities' records) -- 'fiducial'/'readout'
-        alone cannot name the second readout channel once hybes carry
-        three channels (reported). Selections survive repopulation;
-        pick_channel_by_type resolves a concrete value per hybe, with
-        the readout rule as its fallback for hybes lacking it."""
+    def populate_channel_choices(self, channels, default_readout=None,
+                                 default_fiducial=None):
+        """CONCRETE channels only -- both role words are gone.
+
+        A fit compares one wavelength against another, so the channel has
+        to be named. 'readout' could not name one: it meant "the first
+        non-fiducial in layout order", which differs between hybes of one
+        experiment -- 635 for a two-channel hybe, 475 for a three-channel
+        one -- and on the real MAZ store it selects 999, a genuinely
+        ingested BRIGHTFIELD channel, for Hyb_BF simply because that is
+        what the layout lists first. Runs were being fitted on it.
+
+        'fiducial' is gone for the same reason: there is nothing it can
+        say that the channel number does not say better. The layout
+        declares which channel is the fiducial, so the panel offers THAT
+        channel (555 on every store here) as the default and the settings
+        then record the wavelength the run actually used.
+
+        default_fiducial (chain.fiducial_channel_of) is where the FOV and
+        cell combos start -- the FOV one because its matrices are always
+        fitted fiducial-to-fiducial and it only picks what the overlay
+        draws, the cell one because that is what all twelve real configs
+        carry. default_readout (chain.dominant_readout_channel) is where
+        the cross-modal combo starts, since its two sides have no shared
+        fiducial signal.
+
+        Selections survive repopulation. Stored configs carrying either
+        role word are translated on load; see
+        MainWindow._apply_config_params.
+        """
+        listed = [str(c) for c in channels]
+        fallbacks = {
+            id(self.SameModalityChannelTypeComboBox): default_fiducial,
+            id(self.CellChannelTypeComboBox): default_fiducial,
+            id(self.ChannelTypeComboBox): default_readout,
+        }
         for combo in (self.SameModalityChannelTypeComboBox,
                       self.ChannelTypeComboBox,
                       self.CellChannelTypeComboBox):
             current = combo.currentText()
-            roles = ['fiducial', 'readout']
-            if combo is self.ChannelTypeComboBox:
-                roles = ['readout', 'fiducial']   # its historical default
             combo.blockSignals(True)
             combo.clear()
-            combo.addItems(roles + [str(c) for c in channels])
+            combo.addItems(listed)
             i = combo.findText(current)
+            if i < 0:
+                # was on a role word, or on a channel this experiment lacks
+                want = fallbacks.get(id(combo))
+                i = combo.findText(str(want)) if want is not None else -1
             if i >= 0:
                 combo.setCurrentIndex(i)
             combo.blockSignals(False)

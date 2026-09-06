@@ -162,7 +162,7 @@ class ChromatinTracingPanelUI(object):
         readoutRow = QtWidgets.QHBoxLayout()
         self.TraceReadoutChannelComboBox = QtWidgets.QComboBox()
         self.TraceReadoutChannelComboBox.addItem(
-            'auto (first non-fiducial)', 'auto')
+            'auto (most shared)', 'auto')
         readoutRow.addWidget(self.TraceReadoutChannelComboBox, stretch=1)
         self.ActivateReadoutChannelPushButton = QtWidgets.QPushButton(
             'Activate')
@@ -573,19 +573,34 @@ class ChromatinTracingPanelUI(object):
         self._active_readout_channel = value
         self.ActiveReadoutChannelLabel.setText(f'active: {value}')
 
-    def populate_readout_channel_choices(self, channels):
-        """'auto' + the concrete channels (union across modalities);
-        the ACTIVE choice survives repopulation."""
+    def populate_readout_channel_choices(self, channels, dominant=None):
+        """'auto' + the concrete channels; the ACTIVE choice survives.
+
+        'auto' now means THE MOST SHARED non-fiducial channel, and the item
+        says which one that is -- "auto (most shared: 635)". It used to mean
+        "the first non-fiducial in layout order", resolved per hybe, which
+        is a different wavelength in different hybes of one experiment and
+        on this project's own Hyb_BF is 999: a genuinely ingested
+        brightfield channel that merely sorts first. Naming one channel for
+        the whole run is what makes the traces comparable, and showing the
+        number is what lets an operator see the choice before pressing
+        Activate.
+        """
         combo = self.TraceReadoutChannelComboBox
         current = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem('auto (first non-fiducial)', 'auto')
+        combo.addItem(f'auto (most shared: {dominant})' if dominant is not None
+                      else 'auto (most shared)', 'auto')
         for ch in channels:
             combo.addItem(str(ch), str(ch))
         i = combo.findData(current)
         combo.setCurrentIndex(max(i, 0))
         combo.blockSignals(False)
+        if self._active_readout_channel == 'auto':
+            self.ActiveReadoutChannelLabel.setText(
+                f'active: auto ({dominant})' if dominant is not None
+                else 'active: auto')
 
     def populate_reference_hybe_choices(self, total_active_hybe_list):
         current = self.current_reference_hybe_key()

@@ -1,3 +1,5 @@
+import collections
+
 import numpy as np
 import cv2
 
@@ -68,11 +70,18 @@ def _gather_fov_all_readouts(storage_path, fov, hybe_records, reference_hybe,
     matrices = _bare_hybe(matrices)
     before_images = {reference_hybe: ref_mip}
     after_images = {reference_hybe: ref_mip}
+    # What each hybe was actually READ on. A role name does not fix a
+    # wavelength -- hybes carry different channel sets, so 'readout'
+    # resolves per hybe -- and this overlay composites all of them into one
+    # picture. If they are not the same channel the picture is comparing
+    # different signals, and the title is the only place that can say so.
+    used = {reference_hybe: ref_channel}
     for record in hybe_records:
         hybe = record['folder']
         if hybe == reference_hybe or hybe not in matrices:
             continue
         channel = alignment.pick_channel_by_type(record, channel_type)
+        used[hybe] = channel
         mip = _read_mip(storage_path, fov, hybe, channel)
         before_images[hybe] = mip
         after_images[hybe] = cv2.warpAffine(mip.astype(np.float32), as_cv2(matrices[hybe])[:2], (width, height))
@@ -81,8 +90,28 @@ def _gather_fov_all_readouts(storage_path, fov, hybe_records, reference_hybe,
     # this store's own modality, resolved once from its path
     modality = analysis_store.modality_of(storage_path)
     ref_label = f'{reference_hybe} ({modality})' if modality else reference_hybe
-    title = f'FOV{fov:03d}: all readouts vs {ref_label} (before/after)'
+    title = (f'FOV{fov:03d}: all readouts vs {ref_label} (before/after) '
+             f'-- {channel_summary(used, channel_type)}')
     return before_images, after_images, title
+
+
+def channel_summary(used, channel_type):
+    """"ch 635 (readout)", or the mixture when the hybes disagree.
+
+    Written for figure titles, where the question a reader has is "what am
+    I looking at" and the honest answer is sometimes "two wavelengths at
+    once". A role label alone cannot answer it: 'readout' means the first
+    non-fiducial in layout order, which is 635 for a two-channel hybe and
+    475 for a three-channel one in the same experiment.
+    """
+    channels = sorted({c for c in used.values() if c is not None}, key=str)
+    if not channels:
+        return f'ch ? ({channel_type})'
+    if len(channels) == 1:
+        return f'ch {channels[0]} ({channel_type})'
+    counts = collections.Counter(used.values())
+    parts = ', '.join(f'{c}x{counts[c]}' for c in channels)
+    return f'ch MIXED [{parts}] ({channel_type})'
 
 
 def compose_fov_all_readouts(storage_path, fov, hybe_records, reference_hybe,
@@ -1289,9 +1318,21 @@ class PipelineCanvas():
                       else moving_label)
         shared_tag = (f'{shared_modality}, {shared_label}' if shared_modality
                       else shared_label)
+        # Name the WAVELENGTH each side was read on, not just the role.
+        # The two sides are different acquisitions with different channel
+        # sets, so one 'readout' can be 635 on one and 475 on the other --
+        # and a cross-modal figure whose halves are different wavelengths
+        # is the one case where a reader most needs to be told.
+        moving_ch = analysis_store.resolved_channel(
+            dna_storage_path, fov, dna_reference_hybe, channel_type)
+        shared_ch = analysis_store.resolved_channel(
+            rna_storage_path, fov, rna_reference_hybe, channel_type)
+        channels = (f'ch {moving_ch} vs {shared_ch}' if moving_ch != shared_ch
+                    else f'ch {moving_ch}')
         self.draw_alignment_preview(rna_mip_corrected, dna_mip_corrected, H_across,
                                     f'{dna_reference_hybe} ({moving_tag}) -> '
-                                    f'{rna_reference_hybe} ({shared_tag}), {channel_type}',
+                                    f'{rna_reference_hybe} ({shared_tag}), '
+                                    f'{channels} ({channel_type})',
                                     save_path=save_path)
 
 

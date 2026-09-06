@@ -1544,6 +1544,58 @@ def resolve_channel(record, channel_type):
     return (readout[0] if readout else fiducial), False
 
 
+def dominant_readout_channel(records):
+    """The non-fiducial channel the MOST of `records` carry, or None.
+
+    THE replacement for the 'readout' role wherever something is about to
+    be FITTED. A role name has to be resolved per hybe, and per-hybe it
+    resolves to "the first non-fiducial in layout order", which is a
+    different wavelength in different hybes of one experiment and can be
+    something nobody would choose: on the real MAZ store Hyb_BF lists
+    999 first -- a genuinely ingested brightfield channel, 1024x1024 of
+    real data -- so 'readout' selects brightfield for it.
+
+    Picking ONE channel for the whole run and skipping the hybes that
+    lack it is what makes a run mean something: every pair compared is
+    the same wavelength, and the exceptions are named rather than
+    silently substituted.
+
+    Ties break on the lower channel number, so the answer does not depend
+    on dict order.
+    """
+    counts = collections.Counter()
+    for record in records or []:
+        fiducial = record.get('fiducial_channel')
+        for channel in (record.get('channels') or []):
+            if channel != fiducial:
+                counts[channel] += 1
+    if not counts:
+        return None
+    return sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+
+
+def fiducial_channel_of(records):
+    """The fiducial channel these records agree on, or the commonest.
+
+    The layout declares a fiducial per hybe, and in every real store here
+    they agree -- MAZ, MP58, JP and HoxA all declare 555 throughout. This
+    exists so the UI can offer that CHANNEL rather than the word
+    'fiducial': a fit compares wavelengths, and naming one is what lets a
+    reader of the settings, a log line or a stored config know which.
+
+    If hybes ever disagree the commonest wins, ties on the lower number,
+    same rule as dominant_readout_channel -- and the gate then names the
+    hybes that do not carry it, instead of quietly using a different
+    wavelength for them.
+    """
+    counts = collections.Counter(
+        record.get('fiducial_channel') for record in (records or [])
+        if record.get('fiducial_channel') is not None)
+    if not counts:
+        return None
+    return sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+
+
 def channel_coverage(records, channel_type):
     """Which of `records` cannot supply `channel_type`.
 

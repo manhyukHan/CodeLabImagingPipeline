@@ -1385,6 +1385,32 @@ def channel_mip(storage_path, fov, hybe, channel_choice):
     return readout_channel_mip(storage_path, fov, hybe)
 
 
+def resolved_channel(storage_path, fov, hybe, channel_choice):
+    """WHICH channel channel_mip would actually read, or None.
+
+    So a figure can name the wavelength it is showing instead of the role
+    it was asked for. A role does not fix a wavelength -- hybes carry
+    different channel sets, so 'readout' is the first non-fiducial in
+    layout order and that is 635 for a two-channel hybe and 475 for a
+    three-channel one in the same experiment. Kept beside channel_mip
+    because the two must agree; a caller reading one and labelling from
+    the other is the bug this exists to prevent.
+    """
+    meta = mip_meta(storage_path, fov, hybe)
+    if not meta or meta.get('fiducial') is None:
+        return None
+    fid = meta['fiducial']
+    if channel_choice == 'fiducial':
+        return fid
+    channels = meta.get('channels') or []
+    if channel_choice != 'readout':
+        for c in channels:
+            if str(c) == str(channel_choice):
+                return c
+    readout = [c for c in channels if c != fid]
+    return readout[0] if readout else fid
+
+
 def mip_channels_present(storage_path, fov, hybe):
     """{channel(str): True} for the channels this hybe's MIP holds, or
     None if never ingested. The MIP file is written atomically, so its

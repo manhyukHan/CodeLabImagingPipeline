@@ -167,6 +167,55 @@ def main():
     check('a hybe with only a fiducial yields no target',
           t is None and a == set(), f'{t} {a}')
 
+    print('\n-- the dominant channel is what a fit should default to --')
+    # Hyb_BF is the case that forced this: 999 is a REAL ingested channel
+    # (verified on the store -- ch999 exists in both the MIP and the stack,
+    # 1024x1024 of brightfield), and it sorts first, so 'readout' picked
+    # brightfield for that hybe. Counting across hybes picks 635 instead.
+    check('the channel most hybes share wins, not the one that sorts first',
+          chain.dominant_readout_channel([H071, H104, HBF]) == 635,
+          str(chain.dominant_readout_channel([H071, H104, HBF])))
+    check('a lone brightfield channel does not win on one hybe',
+          chain.dominant_readout_channel([HBF]) == 390,
+          str(chain.dominant_readout_channel([HBF])))
+    check('no records, no channel', chain.dominant_readout_channel([]) is None)
+    check('fiducial-only records yield nothing to fit on',
+          chain.dominant_readout_channel(
+              [{'folder': 'x', 'channels': [555], 'fiducial_channel': 555}]) is None)
+
+    print("\n-- 'readout' is no longer offered as a fit choice --")
+    mw0 = MainWindow()
+    ap = mw0.ui.AlignmentPanel
+    ap.populate_channel_choices([999, 475, 390, 555, 635],
+                                default_readout=635, default_fiducial=555)
+    combos = {'fov': ap.SameModalityChannelTypeComboBox,
+              'cross': ap.ChannelTypeComboBox,
+              'cell': ap.CellChannelTypeComboBox}
+    for name, combo in combos.items():
+        items = [combo.itemText(i) for i in range(combo.count())]
+        check(f'{name}: neither role word is offered',
+              'readout' not in items and 'fiducial' not in items, str(items))
+        check(f'{name}: concrete channels are listed', '635' in items)
+    check('the cross-modal combo, historically on "readout", lands on the '
+          'dominant channel', combos['cross'].currentText() == '635',
+          combos['cross'].currentText())
+    check('the FOV and cell combos start on the FIDUCIAL CHANNEL, not the word',
+          combos['fov'].currentText() == '555'
+          and combos['cell'].currentText() == '555',
+          f"{combos['fov'].currentText()} / {combos['cell'].currentText()}")
+
+    print('\n-- a stored "readout" is translated, not silently dropped --')
+    mw0._dominant_readout = 635
+    mw0._fiducial_channel = 555
+    combos['cross'].setCurrentText('475')
+    mw0._apply_config_params({'cross_modal_alignment': {'channel_type': 'readout'}})
+    check('a config saying "readout" now names the most-shared channel',
+          combos['cross'].currentText() == '635', combos['cross'].currentText())
+    combos['cell'].setCurrentText('475')
+    mw0._apply_config_params({'cell_alignment': {'channel_type': 'fiducial'}})
+    check('and one saying "fiducial" names the declared fiducial channel',
+          combos['cell'].currentText() == '555', combos['cell'].currentText())
+
     print('\n-- the FOV-alignment overlay setting is named for what it is --')
     # align_same_modality has no channel_type parameter at all; it reads
     # ref_record['fiducial_channel'] directly. The setting only chooses what
@@ -180,15 +229,20 @@ def main():
           'channel_type' not in sig, str(list(sig)[:6]))
 
     mw = MainWindow()
+    mw._fiducial_channel = 555
+    mw._dominant_readout = 635
     combo = mw.ui.AlignmentPanel.SameModalityChannelTypeComboBox
-    combo.setCurrentText('fiducial')
-    mw._apply_config_params({'fov_alignment': {'channel_type': 'readout'}})
-    check('a config written with the OLD key still lands',
-          combo.currentText() == 'readout', combo.currentText())
-    combo.setCurrentText('fiducial')
-    mw._apply_config_params({'fov_alignment': {'overlay_channel_type': 'readout'}})
+    mw.ui.AlignmentPanel.populate_channel_choices(
+        [475, 555, 635], default_readout=635, default_fiducial=555)
+    # A concrete value isolates the KEY routing from the value translation.
+    combo.setCurrentText('635')
+    mw._apply_config_params({'fov_alignment': {'channel_type': '475'}})
+    check('a config written with the OLD key still routes',
+          combo.currentText() == '475', combo.currentText())
+    combo.setCurrentText('635')
+    mw._apply_config_params({'fov_alignment': {'overlay_channel_type': '475'}})
     check('and so does one written with the new key',
-          combo.currentText() == 'readout', combo.currentText())
+          combo.currentText() == '475', combo.currentText())
     check('the map now carries the honest name',
           'overlay_channel_type' in MainWindow._CONFIG_PARAM_MAP['fov_alignment']
           and 'channel_type' not in MainWindow._CONFIG_PARAM_MAP['fov_alignment'])

@@ -2432,9 +2432,19 @@ class MainWindow(QtWidgets.QMainWindow):
             {ch for records in (self.hybe_records_by_modality or {}).values()
              for r in records for ch in r.get('channels', [])},
             key=str)
-        ap.populate_channel_choices(all_channels)
+        # The channel a fit should default to: the non-fiducial one most
+        # hybes share, across every modality's records. Alignment now names
+        # a wavelength the way chromatin tracing already did, instead of
+        # taking a role that resolved differently per hybe.
+        all_records = [r for records in (self.hybe_records_by_modality or {}).values()
+                       for r in records]
+        self._dominant_readout = alignment.dominant_readout_channel(all_records)
+        self._fiducial_channel = alignment.fiducial_channel_of(all_records)
+        ap.populate_channel_choices(all_channels,
+                                    default_readout=self._dominant_readout,
+                                    default_fiducial=self._fiducial_channel)
         self.ui.ChromatinTracingPanel.populate_readout_channel_choices(
-            all_channels)
+            all_channels, dominant=self._dominant_readout)
 
         chp = self.ui.ChromatinTracingPanel
         # The default check state now depends on the WHOLE list, not on each
@@ -7668,16 +7678,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         gated = [(record, modality) for record, modality in total_active_hybe_list
                  if modality == 'DNA' and record.get('datatype') in ('H', 'R', 'T')]
-        counts = collections.Counter()
-        for record, _modality in gated:
-            fiducial = record.get('fiducial_channel')
-            for channel in (record.get('channels') or []):
-                if channel != fiducial:
-                    counts[channel] += 1
-        target = None
-        if counts:
-            target = sorted(counts.items(),
-                            key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+        # Steps 2-3, shared with alignment: chain.dominant_readout_channel.
+        target = alignment.dominant_readout_channel([r for r, _m in gated])
         allowed = {(record['folder'], modality) for record, modality in gated
                    if target is not None
                    and target in (record.get('channels') or [])}
@@ -7745,23 +7747,29 @@ class MainWindow(QtWidgets.QMainWindow):
         # fiducial one -- independent of allele.anchor_channel entirely.
         hybe_readout_channels = {}
         # The ACTIVATED readout-channel choice (panel combo + Activate
-        # button; 'auto' = first non-fiducial). A concrete choice
-        # applies per hybe when that hybe carries it; a hybe lacking it
-        # falls back to the auto rule -- per-hybe channel lists differ.
+        # button). 'auto' resolves to ONE channel for the whole run -- the
+        # non-fiducial one the selected hybes most share -- not to "the
+        # first non-fiducial" per hybe, which is a different wavelength in
+        # different hybes and is 999, a real brightfield channel, on this
+        # project's own Hyb_BF.
         chosen = chp.active_readout_channel()
+        selected = [records_by_folder[f] for f in hybes if f in records_by_folder]
+        if chosen == 'auto':
+            chosen = alignment.dominant_readout_channel(selected)
+        # A hybe that does not carry the chosen channel is left OUT of the
+        # map. build_chromatin_trace_allele already treats a hybe with no
+        # readout channel as un-traceable and records the reason, which is
+        # the same "do what can be done, say what was not" this pipeline
+        # uses everywhere -- and is why the default hybe selection prefers
+        # hybes that share one channel in the first place.
         for folder in hybes:
             record = records_by_folder.get(folder)
             if record is None:
                 continue
             fiducial_channel = record['fiducial_channel']
-            readout = None
-            if chosen != 'auto':
-                readout = next((c for c in record.get('channels', [])
-                                if str(c) == chosen and c != fiducial_channel),
-                               None)
-            if readout is None:
-                readout = next((c for c in record.get('channels', [])
-                                if c != fiducial_channel), None)
+            readout = next((c for c in record.get('channels', [])
+                            if str(c) == str(chosen) and c != fiducial_channel),
+                           None)
             if readout is not None:
                 hybe_readout_channels[folder] = readout
         return hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe
@@ -13263,6 +13271,34 @@ One PNG PER MODALITY: each modality has its own reference and its
                     # renamed to overlay_channel_type. Twelve real configs
                     # carry the old key and must keep loading.
                     param = 'overlay_channel_type'
+                if (value in ('readout', 'fiducial')
+                        and section in ('fov_alignment', 'cross_modal_alignment',
+                                        'cell_alignment')
+                        and param in ('channel_type', 'overlay_channel_type')):
+                    # Neither role word is a choice any more. A fit compares
+                    # wavelengths, so the setting names one: 'fiducial'
+                    # becomes the channel the layout declares as fiducial,
+                    # and 'readout' becomes the non-fiducial channel most
+                    # hybes share -- it named no single wavelength at all,
+                    # resolving per hybe to whatever the layout listed first,
+                    # which on this project's own Hyb_BF is 999, a real
+                    # ingested brightfield channel.
+                    #
+                    # Translated and logged rather than dropped: the run this
+                    # config described is not the run that will happen now,
+                    # and that is worth one line in the log.
+                    picked = (getattr(self, '_fiducial_channel', None)
+                              if value == 'fiducial'
+                              else getattr(self, '_dominant_readout', None))
+                    self.log(
+                        f"config: {section}/{param} was '{value}', which no "
+                        f"longer names a channel"
+                        + (f' -- using {picked}.' if picked is not None
+                           else ' -- and no channel could be resolved; set it '
+                                'in the Alignment panel before running.'))
+                    if picked is None:
+                        continue
+                    value = str(picked)
                 if section == 'fov_alignment' and param.startswith('reference_hybe_'):
                     self.ui.AlignmentPanel.select_same_modality_reference_hybe(
                         param[len('reference_hybe_'):], value)
