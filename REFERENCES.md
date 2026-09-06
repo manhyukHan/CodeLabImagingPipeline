@@ -12,15 +12,22 @@ publisher's record before submission; the rest are stable citations.
 
 ## Segmentation
 
-**Cellpose** — the default nuclear/cell segmentation route. `cellpose.models`
-is imported lazily and the `cyto3` model is loaded on first use
-(`codelab_pipeline/segmentation/segment.py:18-21`). The environment pins
-`cellpose>=3.1,<4` because Cellpose 4 removed `models.Cellpose`
-(`requirements.txt:13-20`).
+**Cellpose** — the default nuclear/cell segmentation route. The model is
+loaded lazily on first use, and **which model that is depends on the
+installed Cellpose generation** (`segmentation/segment.py:15-80`):
 
-**Both papers belong in the manuscript, not just the first.** The 2021 paper
-is the method; `cyto3` is a model introduced by the Cellpose 3 paper, so
-naming the model without that citation attributes it to the wrong work.
+| installed | class | model | citation owed |
+|---|---|---|---|
+| 3.x | `models.Cellpose` | `cyto3` | 2021 **and** Cellpose 3 |
+| 4.x | `models.CellposeModel` | `cpsam` | 2021 **and** Cellpose-SAM |
+
+`requirements.txt` now asks for `cellpose>=4.2,<5`, so a fresh install
+segments with **cpsam**. `cellpose==3.1.1.3` still works with no code change
+and is how earlier, cyto3-segmented results are reproduced.
+
+**The method paper alone is not enough.** Stringer et al. 2021 is the
+Cellpose method, but neither model in the table above comes from it —
+naming a model without its own paper credits it to the wrong work.
 
 > Stringer, C., Wang, T., Michaelos, M. & Pachitariu, M. Cellpose: a
 > generalist algorithm for cellular segmentation. *Nat. Methods* **18**,
@@ -28,40 +35,67 @@ naming the model without that citation attributes it to the wrong work.
 
 > Stringer, C. & Pachitariu, M. Cellpose3: one-click image restoration for
 > improved cellular segmentation. *Nat. Methods* **22**, 592–599 (2025).
-> doi:10.1038/s41592-025-02595-5
+> doi:10.1038/s41592-025-02595-5 — introduces `cyto3`.
+
+> Pachitariu, M., Rariden, M. & Stringer, C. Cellpose-SAM: superhuman
+> generalization for cellular segmentation. *bioRxiv* (2025).
+> doi:10.1101/2025.04.28.651001 — introduces `cpsam`.
+
+⚠ verify — Cellpose-SAM was **still a preprint** when checked (2026-09-06);
+no journal version found. Moving the default to cpsam therefore means the
+protocol's segmentation model rests on a preprint citation, where cyto3
+rested on a Nature Methods paper. Re-check before submission: if it has been
+published by then, cite the journal version. If it has not, expect a
+reviewer to ask.
 
 ### The model weights are not in this repository
 
 Cellpose downloads them to `~/.cellpose/models/` on first use. They are
-neither versioned nor pinned, so "install `cellpose>=3.1,<4`" does **not**
-by itself specify the segmentation. Record the weights, not just the
+neither versioned nor pinned, so a version specifier does **not** by itself
+specify the segmentation — two machines honouring the same pin can hold
+different weights and neither would know. Record the weights, not just the
 package. Verified on the machine this protocol was developed on
 (2026-09-06), SHA-256:
 
 | file | bytes | sha256 |
 |---|---|---|
+| `cpsam` | 1,233,587,898 | `e1440429eb384f95afe32bcba6510f90d518eaedc917ede549bed6804004abe2` |
 | `cyto3` | 26,566,255 | `2dc3087a8abd7da46d1ab0ddd5824639933cc3ff63b382af3fa1939a392db93c` |
 | `size_cyto3.npy` | 3,627 | `87f91feb48019b4dfb0400e7bbb89aca5873368686815aa7b4431c0faee97fc5` |
 | `nucleitorch_0` | 26,563,614 | `89ca45e4a45048d5010d29621466b1274b91b3dcb9714dce9f9e90a9a8671303` |
 | `size_nucleitorch_0.npy` | 3,627 | `a79107c9f284b569dd65f3a7363014d613a3403241c062822f07b6f026b4d3ef` |
 
-`cyto3` is what `segment.py` loads; `nucleitorch_0` is the size/nuclei
-companion Cellpose fetches alongside it. Re-check these before submission
-— if they differ, the machine has a different `cyto3` than the one every
-number in this protocol was produced with, and that is worth knowing.
+`cpsam` is what a 4.x install loads and `cyto3` what a 3.x install loads;
+`nucleitorch_0` is the size/nuclei companion Cellpose 3 fetches alongside.
+Note the 46-fold size difference — cpsam is a ~1.2 GB SAM backbone, which is
+a real first-run download on a fresh machine. Re-check these hashes before
+submission; if they differ, the machine holds a different model than the one
+every number in this protocol was produced with.
+
+Cellpose 4.2 defaults to a newer checkpoint, `cpsam_v2`. `segment.py` names
+`cpsam` explicitly (`CELLPOSE4_MODEL`, `segment.py:29`) rather than taking
+whatever the default becomes — the same reasoning as pinning a package.
 
 ### Two caveats that belong in the manuscript
 
-- **Version.** The protocol was developed and validated against Cellpose
-  **3.1.1.3**. Cellpose 4 (Cellpose-SAM) is the actively developed line and
-  replaces `models.Cellpose`/`model_type='cyto3'` with `CellposeModel`/`cpsam`;
-  this pipeline has not been ported to it, so results here should not be
-  assumed to reproduce under 4.x.
+- **Version.** The pipeline supports Cellpose 3 and 4 and dispatches on
+  what is installed, but **they are different models, not two spellings of
+  one**: cell counts, boundaries and every trace downstream of them differ.
+  State which one produced the reported data. Everything measured in this
+  repository before 2026-09-06 was `cyto3` under 3.1.1.3.
 - **Device.** Segmentation runs on GPU when one is present and falls back to
   a fresh CPU model if the GPU path raises
-  (`segmentation/segment.py:57-65`). The fallback exists for PyTorch MPS on
-  macOS, which is less mature than CUDA. Masks are therefore not guaranteed
-  bit-identical across machines.
+  (`segmentation/segment.py:124-131`). The fallback exists for PyTorch MPS
+  on macOS, which is less mature than CUDA. Masks are therefore not
+  guaranteed bit-identical across machines.
+
+One further difference is a change of *method*, not just of model:
+Cellpose 3's nucleus-seeded cytoplasm mode is driven by `channels=[cyto,
+nuc]`, and **Cellpose 4 ignores that argument entirely**. Under 4.x the
+synthetic nuclear channel is still supplied but the model is never told
+which plane is which (`segment.py:406-436`). That route has never run on
+persisted production data under either version, so it is a documented
+difference rather than a measured one.
 
 **Watershed** — the classical segmentation route, via
 `skimage.segmentation.watershed` (`segmentation/segment.py`, 3 call sites),

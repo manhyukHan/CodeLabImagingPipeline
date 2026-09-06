@@ -12,14 +12,81 @@ from ..io import stack_cache
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cellpose")
 
+# Cellpose 4 (Cellpose-SAM) deleted the `models.Cellpose` class and the
+# cyto3 weights along with it; 4.x offers `models.CellposeModel` and a
+# SAM-backed checkpoint instead. Rather than pin this project to the
+# superseded line, both are supported and the installed version decides.
+# MEASURED against cellpose 4.2.1.1 + torch 2.7.1+cu118 on an RTX 3070
+# (scratchpad probe, 2026-09-06): models.Cellpose is absent, CellposeModel
+# loads in 16.3 s, uses 0.57 GiB of VRAM, and segments a 512x512 uint16
+# field 25/25 correctly.
+#
+# 'cpsam' rather than the 4.2 default 'cpsam_v2': cpsam is the one name
+# present in MODEL_NAMES across the whole 4.x line, and it is the
+# checkpoint the behaviour above was actually verified on. Change it here,
+# in one place, if a newer default is adopted -- and re-measure when you do,
+# because it is a different model, not a faster one.
+CELLPOSE4_MODEL = 'cpsam'
+
+_cellpose_major_cached = None
+
+
+def cellpose_major():
+    """Major version of the installed Cellpose. Cached; the import is lazy.
+
+    Cellpose costs seconds to import and pulls torch with it, so nothing
+    here runs at module import time -- same reason the models themselves
+    are lazy singletons.
+    """
+    global _cellpose_major_cached
+    if _cellpose_major_cached is None:
+        import cellpose
+        _cellpose_major_cached = int(str(cellpose.version).split('.')[0])
+    return _cellpose_major_cached
+
+
+def make_cellpose_model(gpu=True):
+    """Build a segmentation model from whichever Cellpose generation is installed.
+
+    3.x -> models.Cellpose(model_type='cyto3'), the model every segmentation
+           number recorded in this repository was measured with.
+    4.x -> models.CellposeModel(pretrained_model=CELLPOSE4_MODEL).
+
+    These are DIFFERENT MODELS, not two spellings of one. Masks, cell counts
+    and therefore every downstream trace will differ between them. Which one
+    ran is worth recording beside any result you intend to publish.
+    """
+    import cellpose.models
+    if cellpose_major() >= 4:
+        return cellpose.models.CellposeModel(gpu=gpu, pretrained_model=CELLPOSE4_MODEL)
+    return cellpose.models.Cellpose(gpu=gpu, model_type='cyto3')
+
+
+def cellpose_eval(model, images, diameter, channels):
+    """eval() across both generations, returning the raw result tuple.
+
+    `channels` selects the cytoplasm/nucleus planes in 3.x. Cellpose 4 takes
+    images with arbitrary channel order and IGNORES the argument -- passing
+    it earns one deprecation warning per call and nothing else, so it is
+    dropped there rather than passed and swallowed. MEASURED on 4.2.1.1: the
+    masks are bit-identical with and without it.
+
+    The caller reads masks by POSITION (`result[0]`) because the tuple
+    length differs -- 4 elements from 3.x's Cellpose, 3 from CellposeModel,
+    the fourth being the estimated diameters 4.x no longer produces.
+    """
+    if cellpose_major() >= 4:
+        return model.eval(images, diameter=diameter, do_3D=False)
+    return model.eval(images, diameter=diameter, channels=channels, do_3D=False)
+
+
 _model_cyto = None
 
 def get_model_cyto():
-    """Lazily load the Cellpose cyto3 model on first use, not at import time."""
+    """Lazily load the segmentation model on first use, not at import time."""
     global _model_cyto
     if _model_cyto is None:
-        import cellpose.models
-        _model_cyto = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
+        _model_cyto = make_cellpose_model(gpu=True)
     return _model_cyto
 
 def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_size=1000, max_size=10000,
@@ -50,10 +117,10 @@ def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_siz
 
     # eval()'s return tuple length varies by cellpose version/model class
     # (3-tuple for CellposeModel/cpsam, 4-tuple for the classical
-    # Cellpose/cyto3 class used here) -- take masks by position only,
-    # matching CellClassifier/utils/cellpose_segmentation.py's approach.
+    # Cellpose/cyto3 class) -- take masks by position only, matching
+    # CellClassifier/utils/cellpose_segmentation.py's approach.
     try:
-        result = get_model_cyto().eval([reference_image], diameter=diameter, channels=[0, 0], do_3D=False)
+        result = cellpose_eval(get_model_cyto(), [reference_image], diameter, [0, 0])
     except Exception:
         # masks_to_flows_gpu's boundary IndexError (MouseLand/cellpose#1004
         # and others) -- MPS in particular is a much less mature PyTorch
@@ -61,9 +128,8 @@ def segment_fov(storage_path, fov, reference_hybe, channel, diameter=40, min_siz
         # CellClassifier/utils/cellpose_segmentation.py. Retry on CPU with a
         # fresh model instance rather than propagating; doesn't touch the
         # cached GPU singleton, so later calls still try GPU first.
-        import cellpose.models
-        cpu_model = cellpose.models.Cellpose(gpu=False, model_type='cyto3')
-        result = cpu_model.eval([reference_image], diameter=diameter, channels=[0, 0], do_3D=False)
+        cpu_model = make_cellpose_model(gpu=False)
+        result = cellpose_eval(cpu_model, [reference_image], diameter, [0, 0])
     masks = result[0]
     mask = masks[0].astype(float)
     mask = _filter_and_relabel(mask, min_size, max_size)
@@ -327,15 +393,13 @@ _model_cyto_nuc = None
 
 def get_model_cyto_nuclear():
     """
-    Lazily load a Cellpose cyto3 model for NUCLEUS-SEEDED cytoplasm
-    segmentation. Separate singleton from get_model_cyto() only so the two
-    call paths can't fight over one instance's internal state; the weights
-    are the same cyto3 model.
+    Lazily load a model for NUCLEUS-SEEDED cytoplasm segmentation. Separate
+    singleton from get_model_cyto() only so the two call paths can't fight
+    over one instance's internal state; the weights are the same.
     """
     global _model_cyto_nuc
     if _model_cyto_nuc is None:
-        import cellpose.models
-        _model_cyto_nuc = cellpose.models.Cellpose(gpu=True, model_type='cyto3')
+        _model_cyto_nuc = make_cellpose_model(gpu=True)
     return _model_cyto_nuc
 
 
@@ -356,6 +420,16 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
     array -- cellpose's channel indices are 1-based into RGB, and the
     (H,W,2) form is ambiguous across versions.
 
+    ON CELLPOSE 4 THE SEEDING IS WEAKER, and this is the one place the
+    version actually changes the method rather than the spelling. 4.x
+    ignores `channels`, so it is never told which plane is cytoplasm and
+    which is nucleus -- it takes the 3-channel image and infers. The array
+    is built the same way and 4.x segments it (MEASURED: a 3-channel field
+    returns labels normally), but "nucleus-assisted mode" is 3.x
+    terminology and there is no 4.x equivalent to switch on. This route has
+    never run on persisted production data under EITHER version, so nothing
+    here has been validated against a real cytoplasm.
+
     Returns cellpose's own raw labels, deliberately NOT relabeled: the
     caller has to match them back to real nucleus ids (see
     incorporate_cytoplasm), and _filter_and_relabel's renumbering would
@@ -371,12 +445,11 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
     rgb[..., 1] = nuc
 
     try:
-        result = get_model_cyto_nuclear().eval([rgb], diameter=diameter, channels=[1, 2], do_3D=False)
+        result = cellpose_eval(get_model_cyto_nuclear(), [rgb], diameter, [1, 2])
     except Exception:
         # Same GPU-backend fallback rationale as segment_fov's own retry.
-        import cellpose.models
-        cpu_model = cellpose.models.Cellpose(gpu=False, model_type='cyto3')
-        result = cpu_model.eval([rgb], diameter=diameter, channels=[1, 2], do_3D=False)
+        cpu_model = make_cellpose_model(gpu=False)
+        result = cellpose_eval(cpu_model, [rgb], diameter, [1, 2])
 
     labels = np.asarray(result[0][0]).astype(np.int32)
     return _drop_labels_by_size(labels, min_size, max_size)
