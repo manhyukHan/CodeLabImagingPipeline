@@ -441,16 +441,24 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
       cyto3, WITH nucleus       0       0    1.000       2766 px
 
     (a whole cell is ~2827 px, a bare nucleus ~531 px, so the perfect arms
-    are returning cells, not nuclei.) Both versions go from broken to
-    exact when handed the nuclear plane. Note also which way each FAILS
-    without it: cyto3 under-segments, keeping nuclei intact inside merged
-    cells, while cpsam draws boundaries THROUGH 17 of 40 nuclei -- the
-    worse error here, since cell identity in this pipeline is nucleus-
-    bound.
+    are returning cells, not nuclei.) Both versions go from broken to exact
+    when handed the nuclear plane.
 
-    Synthetic, though. This route has never run on persisted production
-    data under EITHER version, so nothing here is validated against a real
-    cytoplasm.
+    The "no nucleus" rows are a CONTROL, not a scenario. They exist to show
+    the plane is what makes the difference; this function cannot reach that
+    state, because `nucleus_seed_image` is required and the array is always
+    built with it. Do not read them as a risk of running on 4.x.
+
+    The real-world analogue of a bad seed is not an absent nuclear plane
+    but a MISREGISTERED one -- the nucleus is projected in from its own
+    hybe, which is often a different modality, so drift between that hybe
+    and the cytoplasm hybe puts the seed in the wrong place. That is a
+    property of the projection, not of the Cellpose version, and it is
+    unmeasured.
+
+    All of the above is synthetic besides. This route has never run on
+    persisted production data under EITHER version, so nothing here is
+    validated against a real cytoplasm.
 
     Returns cellpose's own raw labels, deliberately NOT relabeled: the
     caller has to match them back to real nucleus ids (see

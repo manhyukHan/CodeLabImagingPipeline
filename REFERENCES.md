@@ -115,11 +115,17 @@ returning **cells, not nuclei**. Both versions go from broken to exact when
 handed the nuclear plane, so the seeding survives the version change and
 must not be "simplified away" on 4.x (`segment.py:406-477`).
 
-Worth noting which way each *fails* without the nuclear plane: cyto3
-under-segments, leaving nuclei intact inside merged cells, while cpsam draws
-boundaries **through 17 of 40 nuclei**. For this pipeline that is the worse
-error, because cell identity is nucleus-bound — a split nucleus divides one
-cell's signal between two ids. Synthetic, though; see the caveat below.
+The "no nucleus" rows are a **control, not a scenario.** They are there to
+show that the nuclear plane is what makes the difference; the code cannot
+reach that state, because `segment_cytoplasm` requires
+`nucleus_seed_image` and always builds the three-channel array with it. They
+are not a reason to avoid Cellpose 4.
+
+The real-world analogue of a bad seed is not an absent nuclear plane but a
+**misregistered** one: each cell's nucleus is projected in from its own
+`nucleus_hybe`, often a different modality, so drift between that hybe and
+the cytoplasm hybe lands the seed in the wrong place. That is a property of
+the projection rather than of the Cellpose version, and it is unmeasured.
 
 **The production path is unaffected either way.** `segment_fov` — the route
 every persisted cell in every store came through — passes a single grayscale
