@@ -27,3 +27,11 @@ codelab_launch_*.log
 # committed one is broken for everyone but its author -- run the script
 # once per checkout instead.
 *.lnk
+
+# Documentation is kept locally, not versioned (per explicit decision
+# 2026-09-06). The Sphinx tree, the analysis notes and the manuscript
+# source material all live here and all stay on disk -- `git rm -r --cached
+# docs` removed them from tracking, it did not delete them. Anything in
+# here that a reader of the repository needs must therefore be stated in
+# code comments, in README.md, or in a commit message instead.
+docs/
