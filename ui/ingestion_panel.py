@@ -205,7 +205,15 @@ class IngestionPanelUI(object):
         # batch-toggle them via the two buttons below instead of clicking
         # each checkbox individually.
         self.HybeListWidget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        layout.addWidget(self.HybeListWidget)
+        # A real experiment lists 76-135 hybes here, and this is the widget
+        # the operator actually works in -- checking rows, drag-selecting,
+        # reading the [modality] tags. With no minimum it collapsed to a few
+        # rows, because the trailing addStretch below took every spare
+        # pixel: the list scrolled while the panel had empty space under it.
+        # The stretch factor makes this and the job queue the two things
+        # that grow when the window does.
+        self.HybeListWidget.setMinimumHeight(240)
+        layout.addWidget(self.HybeListWidget, 3)
 
         hybeCheckButtonsRow = QtWidgets.QWidget()
         hybeCheckButtonsLayout = QtWidgets.QHBoxLayout(hybeCheckButtonsRow)
@@ -306,15 +314,19 @@ class IngestionPanelUI(object):
 
         self.JobQueueListWidget = QtWidgets.QListWidget()
         self.JobQueueListWidget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        layout.addWidget(self.JobQueueListWidget)
+        self.JobQueueListWidget.setMinimumHeight(110)
+        layout.addWidget(self.JobQueueListWidget, 1)
 
         self.ProgressBar = QtWidgets.QProgressBar()
         layout.addWidget(self.ProgressBar)
 
         # The panel log boxes moved into the one combined log window (see
-        # ui/log_window.py) -- the stretch keeps the controls top-anchored
-        # where the log box used to soak up the leftover height.
-        layout.addStretch(1)
+        # ui/log_window.py). This was addStretch(1), which soaked up the
+        # leftover height and left both list widgets at their default size
+        # hint -- a handful of rows for a 135-hybe experiment. The lists
+        # carry the stretch now; this only keeps the controls top-anchored
+        # when there is more height than even they want.
+        layout.addStretch(0)
 
     def _path_row(self, dialog_title, is_file, name_filter='All files (*)'):
         row = QtWidgets.QWidget()

@@ -162,13 +162,22 @@ class AnalysisPanelUI(object):
             'spots in the store -- the simple default start.')
         srcBtnRow.addWidget(self.CheckSpotSourcesPushButton)
         popLayout.addRow('', srcBtnRow)
-        self.MaskIntensityCheckBox = QtWidgets.QCheckBox(
-            'mask-based intensity (median MIP over each cell mask; slower)')
+        # The label carries the name; the explanation carries a tooltip.
+        # These two checkboxes were 1062 and 1827 px wide on their own,
+        # which is what set the Population group's width and, through it,
+        # the whole tab's.
+        self.MaskIntensityCheckBox = QtWidgets.QCheckBox('mask-based intensity')
+        self.MaskIntensityCheckBox.setToolTip(
+            'Median MIP over each cell mask, rather than a summary read '
+            'from the store. Slower.')
         self.MaskIntensityCheckBox.setChecked(True)
         popLayout.addRow('', self.MaskIntensityCheckBox)
         self.OverwriteCacheCheckBox = QtWidgets.QCheckBox(
-            'overwrite cached cell attributes (recompute already-built '
-            'sources; use after re-detection or re-alignment)')
+            'overwrite cached cell attributes')
+        self.OverwriteCacheCheckBox.setToolTip(
+            'Recomputes sources that are already built. '
+            'Use after re-detection or re-alignment, when the cached '
+            'values no longer match the data.')
         popLayout.addRow('', self.OverwriteCacheCheckBox)
         self.BuildPopulationPushButton = QtWidgets.QPushButton(
             'Build / Refresh Population')
@@ -208,21 +217,39 @@ class AnalysisPanelUI(object):
         self.QcMinTracedSpinBox.setValue(2)
         qcForm.addWidget(self.QcMinTracedSpinBox, 1, 4)
         qcLayout.addLayout(qcForm)
+        # TWO rows, not one. Seven controls with sentence-length labels made
+        # this layout 3081 px wide on its own, which set the whole Analysis
+        # tab's natural width to 3123 -- against 2019 for the next widest
+        # panel and 849 for the narrowest, so the window had to open wide
+        # enough for this one row and every other tab then sat in dead
+        # space. The long explanations move to tooltips, where the rest of
+        # this panel already keeps them.
         qcRow = QtWidgets.QHBoxLayout()
-        self.DeriveQcPushButton = QtWidgets.QPushButton(
-            'Derive Thresholds (quantiles of this population)')
+        self.DeriveQcPushButton = QtWidgets.QPushButton('Derive Thresholds')
+        self.DeriveQcPushButton.setToolTip(
+            'Sets each threshold from the quantiles of this population.')
         qcRow.addWidget(self.DeriveQcPushButton)
-        self.PreviewQcPushButton = QtWidgets.QPushButton(
-            'Preview QC (histograms + efficacy/completeness)')
+        self.PreviewQcPushButton = QtWidgets.QPushButton('Preview QC')
+        self.PreviewQcPushButton.setToolTip(
+            'Histograms, plus efficacy and completeness for the current '
+            'thresholds.')
         qcRow.addWidget(self.PreviewQcPushButton)
         # repeat/toe QC lives HERE with the other polymer-quality views
         # (it reads the traces, not the gated population), per request
         self.RepeatToeQcPushButton = QtWidgets.QPushButton('Repeat / Toe QC')
         qcRow.addWidget(self.RepeatToeQcPushButton)
-        self.ApplyQcCheckBox = QtWidgets.QCheckBox(
-            'apply QC to all views and gates')
+        qcRow.addStretch(1)
+        qcLayout.addLayout(qcRow)
+
+        # Second row: the two controls that change the NUMBERS rather than
+        # which figure is drawn.
+        qcScopeRow = QtWidgets.QHBoxLayout()
+        self.ApplyQcCheckBox = QtWidgets.QCheckBox('apply QC to all views')
+        self.ApplyQcCheckBox.setToolTip(
+            'Applies the derived thresholds to every view and gate in this '
+            'tab.')
         self.ApplyQcCheckBox.setChecked(True)
-        qcRow.addWidget(self.ApplyQcCheckBox)
+        qcScopeRow.addWidget(self.ApplyQcCheckBox)
         # DIMENSIONALITY sits here, beside "apply QC to all views and
         # gates", because it has the same scope and the same character:
         # it changes the NUMBERS, not the presentation. It deliberately
@@ -230,7 +257,7 @@ class AnalysisPanelUI(object):
         # multiply figures and never re-gate -- a control there reads as
         # display-only, which is the wrong mental model for something
         # that changes every distance in the tab.
-        qcRow.addWidget(QtWidgets.QLabel('distance:'))
+        qcScopeRow.addWidget(QtWidgets.QLabel('distance:'))
         self.DistanceDimsComboBox = QtWidgets.QComboBox()
         self.DistanceDimsComboBox.addItem('XYZ (3D)', 'xyz')
         self.DistanceDimsComboBox.addItem('XY (in-plane)', 'xy')
@@ -241,15 +268,16 @@ class AnalysisPanelUI(object):
             'than the 3D one\nby ~0.82x even for perfectly isotropic data, '
             'so bounds and thresholds do not\ncarry across. Use the '
             'Isotropy QC to decide whether Z is trustworthy.')
-        qcRow.addWidget(self.DistanceDimsComboBox)
+        qcScopeRow.addWidget(self.DistanceDimsComboBox)
         self.IsotropyQcPushButton = QtWidgets.QPushButton('Isotropy QC')
         self.IsotropyQcPushButton.setToolTip(
             'Is Z as trustworthy as X and Y? Compares every pair measured '
             'in-plane against\nthe same pair measured in 3D. Always uses '
             'BOTH -- it never follows the\ndistance selector, or it would '
             'compare XY against XY and certify isotropy.')
-        qcRow.addWidget(self.IsotropyQcPushButton)
-        qcLayout.addLayout(qcRow)
+        qcScopeRow.addWidget(self.IsotropyQcPushButton)
+        qcScopeRow.addStretch(1)
+        qcLayout.addLayout(qcScopeRow)
         self.QcStatusLabel = QtWidgets.QLabel('QC not derived')
         self.QcStatusLabel.setWordWrap(True)
         self.QcStatusLabel.setStyleSheet('font-family: monospace')
@@ -292,13 +320,17 @@ class AnalysisPanelUI(object):
         self.ValuesLineEdit.setPlaceholderText(
             'celltypes / FOVs / barcode hybes, comma-separated')
         form.addRow('Values:', self.ValuesLineEdit)
-        self.AbsentCheckBox = QtWidgets.QCheckBox(
-            'ABSENT (barcodes must be missing from the allele)')
+        self.AbsentCheckBox = QtWidgets.QCheckBox('ABSENT')
+        self.AbsentCheckBox.setToolTip(
+            'Inverts the match: the barcodes must be MISSING from the '
+            'allele.')
         form.addRow('', self.AbsentCheckBox)
         condLayout.addLayout(form)
         row = QtWidgets.QHBoxLayout()
         self.PreviewHistogramPushButton = QtWidgets.QPushButton(
-            'Preview Histogram (shows the range on the distribution)')
+            'Preview Histogram')
+        self.PreviewHistogramPushButton.setToolTip(
+            'Draws the distribution with the current range marked on it.')
         row.addWidget(self.PreviewHistogramPushButton)
         self.AddConditionPushButton = QtWidgets.QPushButton('Add Condition')
         row.addWidget(self.AddConditionPushButton)
@@ -340,17 +372,25 @@ class AnalysisPanelUI(object):
         self.MinNSpinBox.setRange(0, 10000)
         self.MinNSpinBox.setValue(5)
         flagRow.addWidget(self.MinNSpinBox)
-        flagRow.addWidget(QtWidgets.QLabel('allele gate mode:'))
+        flagRow.addStretch(1)
+        viewLayout.addLayout(flagRow)
+
+        # Second row, for the same reason the QC block has one: six controls
+        # with sentence-length labels on one line made this 2328 px wide.
+        flagRow2 = QtWidgets.QHBoxLayout()
+        flagRow2.addWidget(QtWidgets.QLabel('allele gate mode:'))
         self.AlleleModeComboBox = QtWidgets.QComboBox()
         self.AlleleModeComboBox.addItems(
             ['All (pool gated cells)', 'Presence vs Absence',
              'Full decompose (3 groups)'])
-        flagRow.addWidget(self.AlleleModeComboBox)
-        self.ShowFovMapsCheckBox = QtWidgets.QCheckBox(
-            'FOV consistency: show per-FOV maps')
-        flagRow.addWidget(self.ShowFovMapsCheckBox)
-        flagRow.addStretch(1)
-        viewLayout.addLayout(flagRow)
+        flagRow2.addWidget(self.AlleleModeComboBox)
+        self.ShowFovMapsCheckBox = QtWidgets.QCheckBox('per-FOV maps')
+        self.ShowFovMapsCheckBox.setToolTip(
+            'FOV consistency: draw one map per FOV instead of the collapsed '
+            'histogram rows.')
+        flagRow2.addWidget(self.ShowFovMapsCheckBox)
+        flagRow2.addStretch(1)
+        viewLayout.addLayout(flagRow2)
         # the views' OWN inputs, per explicit decision: expression and
         # distance histograms are final-layer callers like the ensemble
         # map; they read the GATED cells but never the condition form.
