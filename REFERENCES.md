@@ -89,35 +89,45 @@ whatever the default becomes — the same reasoning as pinning a package.
   on macOS, which is less mature than CUDA. Masks are therefore not
   guaranteed bit-identical across machines.
 
-One further difference is a change of *method*, not just of model:
-Cellpose 3's nucleus-seeded cytoplasm mode is driven by `channels=[cyto,
-nuc]`, and **Cellpose 4 ignores that argument entirely**.
+**Cellpose 4 ignores `channels` but still uses the nuclear plane.** Cellpose
+3's nucleus-seeded cytoplasm mode is driven by `channels=[cyto, nuc]` and
+4.x discards that argument, which reads like a loss of capability. Measured,
+it is not: what 4.x drops is the *role declaration*, not the information.
+cyto3 has a dedicated nuclear input slot that `channels` fills; cpsam takes
+up to three channels in arbitrary order and infers what they are.
 
-What is lost is the *role declaration*, not multi-channel input. Both
-versions accept a stacked image and segment it — MEASURED, 1024×1024,
-90/90 blobs from both a 2-channel `(H,W,2)` and a 3-channel `(H,W,3)`
-array under 3.1.1.3 and 4.2.1.1 alike. The difference is that cyto3 has a
-dedicated nuclear input slot and `channels` says which plane fills it,
-whereas cpsam takes up to three channels in arbitrary order with no
-notion of a nuclear one. So under 4.x the synthetic nuclear plane is still
-handed over; the model is simply never told that is what it is
-(`segment.py:406-436`).
+Judged by **mask overlap** rather than label count — a count cannot
+distinguish 40 correct cells from 40 wrong ones. Synthetic field at this
+pipeline's own scale (cell d=60 px bodies overlapping so heavily that the
+cytoplasm channel alone cannot separate them; nuclei d=26 px clearly apart;
+40 nuclei in 20 fused pairs), scoring nuclei that straddle two predicted
+masks and masks that hold two nuclei:
 
-**The production path is not affected by this at all.** `segment_fov` — the
-route every persisted cell in every store came through — passes a single
-grayscale plane with `channels=[0, 0]`, which declares no nuclear channel in
-the first place. There is nothing for Cellpose 4 to stop honouring. Only
-`segment_cytoplasm` supplies a real nuclear plane, and it has never run on
-persisted production data under either version.
+| | split nuclei | merged cells | purity | median mask area |
+|---|---|---|---|---|
+| cpsam, no nucleus | 17 | 19 | 0.948 | 2590 px |
+| **cpsam, with nucleus** | **0** | **0** | **1.000** | 2584 px |
+| cyto3, no nucleus | 7 | 20 | 0.963 | 3137 px |
+| **cyto3, with nucleus** | **0** | **0** | **1.000** | 2766 px |
 
-Whether cpsam benefits from a nuclear channel is UNRESOLVED. Probing it on
-synthetic fused-cell fields did not settle it: both models read the extra
-plane (zeroing it changes the mask), but on 28 heavily overlapped pairs
-cpsam returned 28 labels with the nuclear plane and 28 without, while cyto3
-went from 42 labels to 32 when given one — i.e. the seed made cyto3 *worse*
-there. Synthetic nuclei that small relative to `diameter` are not a fair
-proxy for real ones, so the honest statement is that the question is open,
-not that the nuclear channel is useless.
+A whole cell is ~2827 px and a bare nucleus ~531 px, so the perfect arms are
+returning **cells, not nuclei**. Both versions go from broken to exact when
+handed the nuclear plane, so the seeding survives the version change and
+must not be "simplified away" on 4.x (`segment.py:406-477`).
+
+Worth noting which way each *fails* without the nuclear plane: cyto3
+under-segments, leaving nuclei intact inside merged cells, while cpsam draws
+boundaries **through 17 of 40 nuclei**. For this pipeline that is the worse
+error, because cell identity is nucleus-bound — a split nucleus divides one
+cell's signal between two ids. Synthetic, though; see the caveat below.
+
+**The production path is unaffected either way.** `segment_fov` — the route
+every persisted cell in every store came through — passes a single grayscale
+plane with `channels=[0, 0]`, declaring no nuclear channel at all. There is
+nothing for Cellpose 4 to stop honouring. Only `segment_cytoplasm` supplies
+a real nuclear plane, and that route has never run on persisted production
+data under either version, so none of the table above is validated against a
+real cytoplasm.
 
 **Watershed** — the classical segmentation route, via
 `skimage.segmentation.watershed` (`segmentation/segment.py`, 3 call sites),

@@ -420,21 +420,37 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
     array -- cellpose's channel indices are 1-based into RGB, and the
     (H,W,2) form is ambiguous across versions.
 
-    ON CELLPOSE 4 THE SEEDING IS WEAKER, and this is the one place the
-    version changes the method rather than the spelling. What 4.x drops is
-    the ROLE DECLARATION, not multi-channel input: it ignores `channels`,
-    so it is never told which plane is cytoplasm and which is nucleus.
-    cyto3 has a dedicated nuclear input slot that `channels` fills; cpsam
-    takes up to three channels in arbitrary order and has no nuclear slot
-    at all, so "nucleus-assisted mode" is 3.x terminology with no 4.x
-    equivalent to switch on.
+    CELLPOSE 4 IGNORES `channels` BUT STILL USES THE NUCLEAR PLANE. What
+    4.x drops is the ROLE DECLARATION, not the information: cyto3 has a
+    dedicated nuclear input slot that `channels` fills, while cpsam takes
+    up to three channels in arbitrary order and infers what they are. The
+    array below is therefore built identically for both, and the seeding
+    survives the version change -- do not "simplify" it away on 4.x.
 
-    The array below is therefore built identically for both, and both
-    segment it -- MEASURED at 1024x1024, 90/90 planted blobs recovered from
-    a (H,W,2) and a (H,W,3) array under 3.1.1.3 and 4.2.1.1 alike. Whether
-    cpsam exploits the nuclear plane without being told is untested. This
-    route has never run on persisted production data under EITHER version,
-    so nothing here has been validated against a real cytoplasm.
+    MEASURED, and by mask overlap rather than label count, because a label
+    count cannot tell 40 correct cells from 40 wrong ones. Synthetic field
+    at this function's own scale: cell d=60 px bodies overlapping so
+    heavily that the cytoplasm channel alone cannot separate them, nuclei
+    d=26 px clearly apart, 40 nuclei in 20 fused pairs. Scored as nuclei
+    straddling two predicted masks / masks holding two nuclei:
+
+                             split  merged  purity   median mask area
+      cpsam, no nucleus        17      19    0.948       2590 px
+      cpsam, WITH nucleus       0       0    1.000       2584 px
+      cyto3, no nucleus         7      20    0.963       3137 px
+      cyto3, WITH nucleus       0       0    1.000       2766 px
+
+    (a whole cell is ~2827 px, a bare nucleus ~531 px, so the perfect arms
+    are returning cells, not nuclei.) Both versions go from broken to
+    exact when handed the nuclear plane. Note also which way each FAILS
+    without it: cyto3 under-segments, keeping nuclei intact inside merged
+    cells, while cpsam draws boundaries THROUGH 17 of 40 nuclei -- the
+    worse error here, since cell identity in this pipeline is nucleus-
+    bound.
+
+    Synthetic, though. This route has never run on persisted production
+    data under EITHER version, so nothing here is validated against a real
+    cytoplasm.
 
     Returns cellpose's own raw labels, deliberately NOT relabeled: the
     caller has to match them back to real nucleus ids (see
