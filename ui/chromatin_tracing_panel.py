@@ -477,6 +477,13 @@ class ChromatinTracingPanelUI(object):
             'and overwrite semantics as Fit All FOVs -- useful while '
             'ingestion is still running, since a FOV whose hybes have not '
             'all landed is skipped in append mode.')
+        # Per-FOV above whole-project: it is the narrower action, and its
+        # tooltip's case -- tracing while ingestion is still running -- is
+        # the one an operator reaches for first. It was created, tooltipped
+        # and connected (main_window.py, _run_chromatin_tracing_fit_this_fov)
+        # but never added to a layout, so it had no parent and rendered
+        # nowhere. The handler behind it was always live.
+        fitAllLayout.addWidget(self.FitThisFovPushButton)
         self.FitAllFovsPushButton = QtWidgets.QPushButton('Fit All FOVs')
         fitAllLayout.addWidget(self.FitAllFovsPushButton)
         self.ProgressBar = QtWidgets.QProgressBar()
@@ -1026,6 +1033,10 @@ class ChromatinTracingPanelUI(object):
         self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
         self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
         self.MaxFiducialDriftSpinBox.setValue(CROSS_MODE_DEFAULTS['max_fiducial_drift'])
+        # The axial twin was missing here, so "Reset to Defaults" left the
+        # Z drift gate at whatever the last run set it to -- the one gate a
+        # reset would not reset.
+        self.MaxFiducialDriftZSpinBox.setValue(CROSS_MODE_DEFAULTS['max_fiducial_drift_z'])
         for column_name, boxes in (('fiducial', self.FiducialSpinBoxes), ('readout', self.ReadoutSpinBoxes)):
             for key, widget in boxes.items():
                 default = DEFAULT_PARAMS[column_name][key]

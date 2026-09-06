@@ -513,10 +513,20 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
     channel/readout/datatype-aware per parse_experiment_layout. Only the
     channels actually listed for this hybe get a dataset -- e.g. this real
     dataset is always [555, 635], so no empty 405/488 containers are made.
-    Note: DAX-sourced /stack/ch{ch} is (height, width, depth) -- depth last,
-    since that's what read_dax naturally produces -- unlike the TIFF path
-    above, which is (depth, height, width). Any future unified reader needs
-    to know which ingestion path produced a given file.
+    AXIS ORDER, and it is the SAME whatever produced the file. Every stored
+    /stack/ch{ch} is (height, width, depth) -- depth LAST. DAX arrives that
+    way, since it is what read_dax naturally produces; TIFF pages arrive
+    depth-FIRST and tiff_ingestion transposes them on the way in
+    (tiff_ingestion.py, "z-FIRST off the TIFF; this store is z-LAST
+    everywhere"). A reader therefore never has to ask which ingestion path
+    wrote a given file, and must not branch on it.
+
+    This docstring used to claim the opposite -- that TIFF-sourced stacks
+    were stored (depth, height, width) and that "any future unified reader
+    needs to know which ingestion path produced a given file". That was
+    wrong about the stored result, and wrong in the direction that costs
+    most: anyone reproducing the format from the documentation, rather than
+    from the data, would transpose a volume that was already correct.
     """
     folder = hybe_record['folder']
     channels = hybe_record['channels']
