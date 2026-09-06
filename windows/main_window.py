@@ -10294,6 +10294,43 @@ One PNG PER MODALITY: each modality has its own reference and its
         pairs = self._cross_modal_pairs('Run Cross-Modal Alignment')
         if not pairs:
             return
+        # A bridge hybe that does not carry the chosen channel takes its
+        # PAIR out, not the run: with more than one moving modality the
+        # others are still computable, and stopping all of them for one
+        # is the behaviour this gate exists to avoid. Both sides are
+        # checked -- the fit compares one against the other, so either
+        # side lacking the channel makes the pair meaningless.
+        _cm_channel = ap.ChannelTypeComboBox.currentText()
+
+        def _bridge_record(modality, folder):
+            for r in self._active_hybe_records_for_modality(modality) or []:
+                if r.get('folder') == folder:
+                    return r
+            return None
+
+        _usable = []
+        for _pair in pairs:
+            _sides = [(_pair['shared_modality'], _pair['shared_reference_hybe']),
+                      (_pair['moving_modality'], _pair['moving_reference_hybe'])]
+            _records = [(m, h, _bridge_record(m, h)) for m, h in _sides]
+            _gaps = [f'{m}/{h}' for m, h, rec in _records
+                     if rec is not None
+                     and alignment.resolve_channel(rec, _cm_channel)[1]]
+            if _gaps:
+                self.log(f"Cross-modal: SKIPPING {_pair['moving_modality']} -- "
+                         f"channel {_cm_channel} is not in {', '.join(_gaps)}. "
+                         f"Its bridge cannot be fitted on that channel.")
+                continue
+            _usable.append(_pair)
+        if not _usable:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Cross-Modal Alignment',
+                f'No modality pair has channel {_cm_channel} on both bridge '
+                f'hybes, so there is nothing to fit.\n\nChoose a channel the '
+                f'bridge hybes share.')
+            return
+        pairs = _usable
+
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
         if not fov_list:
             QtWidgets.QMessageBox.warning(self, 'Run Cross-Modal Alignment',
@@ -13003,7 +13040,16 @@ One PNG PER MODALITY: each modality has its own reference and its
             # reference_hybe is per-modality now (reference_hybe_{name}),
             # written/read alongside cell_alignment's own -- see
             # _collect_config_params / _apply_config_params.
-            'channel_type': ('AlignmentPanel', 'SameModalityChannelTypeComboBox'),
+            # overlay_channel_type, NOT channel_type. FOV-level matrices are
+            # always fitted fiducial-to-fiducial -- align_same_modality has
+            # no channel_type parameter at all and reads
+            # ref_record['fiducial_channel'] directly -- so this setting only
+            # chooses what the before/after overlay DRAWS. Under the old name
+            # it read like a fit parameter that had been recorded with the
+            # run, which is exactly how an audit of this repository read it.
+            # Configs written before the rename still load; see the alias in
+            # _apply_config_params.
+            'overlay_channel_type': ('AlignmentPanel', 'SameModalityChannelTypeComboBox'),
             'border_trim': ('AlignmentPanel', 'SameModalityBorderTrimSpinBox'),
             'max_shift': ('AlignmentPanel', 'SameModalityMaxShiftSpinBox'),
         },
@@ -13212,6 +13258,11 @@ One PNG PER MODALITY: each modality has its own reference and its
         for section, fields in params.items():
             entries = self._CONFIG_PARAM_MAP.get(section, {})
             for param, value in fields.items():
+                if section == 'fov_alignment' and param == 'channel_type':
+                    # Read-side alias for configs written before this was
+                    # renamed to overlay_channel_type. Twelve real configs
+                    # carry the old key and must keep loading.
+                    param = 'overlay_channel_type'
                 if section == 'fov_alignment' and param.startswith('reference_hybe_'):
                     self.ui.AlignmentPanel.select_same_modality_reference_hybe(
                         param[len('reference_hybe_'):], value)

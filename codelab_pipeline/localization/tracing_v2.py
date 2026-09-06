@@ -1194,6 +1194,16 @@ def allele_task(payload):
         # was its reference -- and which modality frame its hybes name.
         'reference_hybe': reference_hybe,
         'modality': modality,
+        # WHICH CHANNELS this trace was actually fitted on, per hybe.
+        # Nothing recorded it before, and "readout" does not name one
+        # wavelength: hybes in an experiment carry different channel sets,
+        # so the auto rule resolves to 635 for a two-channel hybe and 475
+        # for a three-channel one. Without this a stored trace cannot be
+        # told from one fitted on a different channel. Sorted for a stable
+        # diff between runs; old alleles simply lack the keys, the same way
+        # the provenance column itself was introduced.
+        'fiducial_channels': {h: fid_ch[h] for h in sorted(fid_ch or {})},
+        'readout_channels': {h: read_ch[h] for h in sorted(read_ch or {})},
     }
     build_chromatin_trace_allele(
         allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,
@@ -1291,6 +1301,16 @@ def allele_task_with_debug(payload):
         # was its reference -- and which modality frame its hybes name.
         'reference_hybe': reference_hybe,
         'modality': modality,
+        # WHICH CHANNELS this trace was actually fitted on, per hybe.
+        # Nothing recorded it before, and "readout" does not name one
+        # wavelength: hybes in an experiment carry different channel sets,
+        # so the auto rule resolves to 635 for a two-channel hybe and 475
+        # for a three-channel one. Without this a stored trace cannot be
+        # told from one fitted on a different channel. Sorted for a stable
+        # diff between runs; old alleles simply lack the keys, the same way
+        # the provenance column itself was introduced.
+        'fiducial_channels': {h: fid_ch[h] for h in sorted(fid_ch or {})},
+        'readout_channels': {h: read_ch[h] for h in sorted(read_ch or {})},
     }
     _a, debug = build_chromatin_trace_allele(
         allele, hybes, reference_hybe, fid_ch, read_ch, storage_path, fov,

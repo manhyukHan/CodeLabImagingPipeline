@@ -167,6 +167,32 @@ def main():
     check('a hybe with only a fiducial yields no target',
           t is None and a == set(), f'{t} {a}')
 
+    print('\n-- the FOV-alignment overlay setting is named for what it is --')
+    # align_same_modality has no channel_type parameter at all; it reads
+    # ref_record['fiducial_channel'] directly. The setting only chooses what
+    # the before/after overlay DRAWS, and under the old config key
+    # 'channel_type' it read like a fit parameter recorded with the run --
+    # which is how an audit of this repository read it. Renamed, with the
+    # old key still accepted because twelve real configs carry it.
+    import inspect
+    sig = inspect.signature(chain.align_same_modality).parameters
+    check('align_same_modality really has no channel_type parameter',
+          'channel_type' not in sig, str(list(sig)[:6]))
+
+    mw = MainWindow()
+    combo = mw.ui.AlignmentPanel.SameModalityChannelTypeComboBox
+    combo.setCurrentText('fiducial')
+    mw._apply_config_params({'fov_alignment': {'channel_type': 'readout'}})
+    check('a config written with the OLD key still lands',
+          combo.currentText() == 'readout', combo.currentText())
+    combo.setCurrentText('fiducial')
+    mw._apply_config_params({'fov_alignment': {'overlay_channel_type': 'readout'}})
+    check('and so does one written with the new key',
+          combo.currentText() == 'readout', combo.currentText())
+    check('the map now carries the honest name',
+          'overlay_channel_type' in MainWindow._CONFIG_PARAM_MAP['fov_alignment']
+          and 'channel_type' not in MainWindow._CONFIG_PARAM_MAP['fov_alignment'])
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         for f in FAIL:
