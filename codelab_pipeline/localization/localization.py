@@ -477,9 +477,9 @@ def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
 
 def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modality=None,
                   spad=5, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
-                  min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
+                  min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.15, min_ah_ratio=0.15, max_uncert=2.0,
                   min_sep=3.0, component_threshold=0.3, max_components=3, claimed_positions=None,
-                  use_mixture=True, z_window=15, fov_matrices=None, resolver=None):
+                  use_mixture=False, z_window=15, fov_matrices=None, resolver=None):
     """
     Adds/refines Z on a spot that's ALREADY PLACED (2D auto-detect or a
     manual click, so spot.raw_coordinate's own x,y are already known and
@@ -493,8 +493,11 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     coarse Z as the crop's own single brightest voxel (no separate 2D
     peak search needed, x,y are already trusted).
 
-    use_mixture (default True, no behavior change for existing callers
-    that don't pass it): when False, skips find_local_peaks_3d and the
+    use_mixture (default False, matching the 3D-localization popup's own
+    MultiModeCheckBox, which ships unchecked -- this signature used to
+    default True, so a headless caller silently ran the slower
+    multi-component path the UI deliberately made opt-in): when False,
+    skips find_local_peaks_3d and the
     multi-Gaussian mixture path ENTIRELY -- always a single fit_gaussian_3d
     at the original (x0,y0,z0) seed, regardless of how many real blobs the
     crop might actually contain. Per explicit request: the mixture fit
@@ -866,7 +869,7 @@ def _z_boundary_offset(depth, z_boundary_trim, min_fit_depth=9):
 def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov, modality, cell, fov_matrices,
                             spad=8, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                             min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
-                            z_boundary_trim=0, resolver=None):
+                            z_boundary_trim=10, resolver=None):
     """
     Crops+fits ONE hybe's fiducial channel around an allele's already-known
     shared-frame (x,y). Always single-component (fit_gaussian_3d) -- no
@@ -935,10 +938,10 @@ def _localize_fiducial_hybe(shared_xy, hybe, fiducial_channel, storage_path, fov
 
 
 def _localize_readout_hybe(shared_xy, hybe, readout_channel, storage_path, fov, modality, cell, fov_matrices, delta,
-                           spad=8, use_mixture=True, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
+                           spad=8, use_mixture=False, peak_bound=2.0, init_sigma_xy=1.25, init_sigma_z=2.5,
                            min_sigma=0.1, max_sigma=2.5, min_hb_ratio=1.2, min_ah_ratio=0.25, max_uncert=2.0,
                            min_sep=3.0, component_threshold=0.3, max_components=3, z_window=15,
-                           z_boundary_trim=0, resolver=None):
+                           z_boundary_trim=10, resolver=None):
     """
     Crops+fits ONE hybe's readout channel around the same allele anchor,
     mixture-capable (find_local_peaks_3d + fit_gaussian_mixture_3d, same
@@ -1091,10 +1094,10 @@ def max_tracing_workers(hard_ceiling=32):
 
 
 def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
-                                 storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=5.0,
-                                 max_fiducial_drift_z=10.0,
+                                 storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=7.0,
+                                 max_fiducial_drift_z=15.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
-                                 collect_debug=False, resolver=None, z_boundary_trim=0, executor=None,
+                                 collect_debug=False, resolver=None, z_boundary_trim=10, executor=None,
                                  append=False):
     """
     Fills in allele.fiducial_trace_adj/polymer_adj/rejected_hybes for every hybe in

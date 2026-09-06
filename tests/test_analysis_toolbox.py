@@ -88,9 +88,13 @@ dm = np.full((4, 3, 3), np.nan)
 for i, v in enumerate((1.0, 2.0, 3.0, 100.0)):
     dm[i] = v
     np.fill_diagonal(dm[i], 0)
-m, counts = ensemble.ensemble_map(dm, reducer='median')
+# min_n=1 EXPLICITLY: these two check the reducer and the mask, not the
+# under-observation gate, and four synthetic alleles are fewer than the
+# gate's own default of 5 (which matches the panel's MinNSpinBox). The
+# gate has its own check below.
+m, counts = ensemble.ensemble_map(dm, reducer='median', min_n=1)
 check('median ensemble', m[0, 1] == 2.5, m[0, 1])
-m2, _ = ensemble.ensemble_map(dm, mask=np.array([1, 1, 1, 0], bool))
+m2, _ = ensemble.ensemble_map(dm, mask=np.array([1, 1, 1, 0], bool), min_n=1)
 check('the mask gates alleles', m2[0, 1] == 2.0)
 dm[2:, 0, 1] = dm[2:, 1, 0] = np.nan
 m3, c3 = ensemble.ensemble_map(dm, min_n=3)

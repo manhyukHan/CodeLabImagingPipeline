@@ -247,7 +247,7 @@ class Population:
     @classmethod
     def build(cls, storage_path, fovs, records=None, hybes=None,
               sources=None, spot_sources=None, voxel_um=DEFAULT_VOXEL_UM,
-              mask_intensity=False, resolvers=None, jobs=None,
+              mask_intensity=True, resolvers=None, jobs=None,
               on_done=None, overwrite_cache=False, modality=None):
         """Assemble a Population from the store, headless.
 

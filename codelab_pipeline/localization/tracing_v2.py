@@ -788,8 +788,8 @@ def qc_shift(reference_cube, cube, z_ref, z_here, half=15):
 def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                  hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices,
-                                 params=None, max_fiducial_drift=5.0,
-                                 max_fiducial_drift_z=10.0, spad=8,
+                                 params=None, max_fiducial_drift=7.0,
+                                 max_fiducial_drift_z=15.0, spad=8,
                                  collect_debug=False, resolver=None):
     """
     v2's counterpart to localization.build_chromatin_trace_allele, filling
@@ -1332,10 +1332,10 @@ def is_v2(engine):
 
 def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
                  hybe_readout_channels, storage_path, fov, modality, cell,
-                 fov_matrices, v2_params=None, max_fiducial_drift=5.0,
-                 max_fiducial_drift_z=10.0, spad=8, z_window=15,
+                 fov_matrices, v2_params=None, max_fiducial_drift=7.0,
+                 max_fiducial_drift_z=15.0, spad=8, z_window=15,
                  fiducial_params=None, readout_params=None, collect_debug=False,
-                 resolver=None, z_boundary_trim=0, executor=None):
+                 resolver=None, z_boundary_trim=10, executor=None):
     """
     Route one allele to the chosen engine. The ONE place the choice is
     made, so the preview and the batch run cannot diverge -- they took

@@ -120,7 +120,7 @@ class IngestionWorker(QtCore.QThread):
     # span several modalities at once.
     task_done = QtCore.pyqtSignal(int, str, str, bool)
 
-    def __init__(self, jobs, overwrite=True, max_workers=4):
+    def __init__(self, jobs, overwrite=False, max_workers=4):
         super().__init__()
         self.max_workers = max(1, int(max_workers))
         self.jobs = jobs

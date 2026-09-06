@@ -66,7 +66,7 @@ def _dmap_ax(ax, m, title, vmin=None, vmax=None, ids=None):
 
 
 def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
-                 min_n=1, group_masks=None, bin_ids=None):
+                 min_n=5, group_masks=None, bin_ids=None):
     """One ensemble map, optionally decomposed by named group masks
     (the FLAG axis: groups split the gated stack, they never re-gate)."""
     groups = [('all', mask)] if not group_masks else list(group_masks.items())
@@ -86,8 +86,8 @@ def fig_ensemble(dmaps, mask=None, title='ensemble', reducer='median',
     return fig
 
 
-def fig_fov_consistency(dmaps, fovs, mask=None, min_n=1, group_masks=None,
-                        show_maps=True, bin_ids=None):
+def fig_fov_consistency(dmaps, fovs, mask=None, min_n=5, group_masks=None,
+                        show_maps=False, bin_ids=None):
     """FOV-level QC: the MSD test, optionally with the per-FOV maps.
 
     SCC is GONE, per explicit decision -- one correlation between two

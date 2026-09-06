@@ -18,7 +18,7 @@ differences" can never change which cells are in the analysis.
 import numpy as np
 
 
-def ensemble_map(dmaps, mask=None, reducer='median', min_n=1):
+def ensemble_map(dmaps, mask=None, reducer='median', min_n=5):
     """(map (n_bins, n_bins), counts (n_bins, n_bins) int).
 
     dmaps: (n_alleles, n_bins, n_bins); mask: boolean (n_alleles,) gate
@@ -35,7 +35,7 @@ def ensemble_map(dmaps, mask=None, reducer='median', min_n=1):
     return m, counts
 
 
-def subtraction_map(dmaps, mask_a, mask_b, reducer='median', min_n=1):
+def subtraction_map(dmaps, mask_a, mask_b, reducer='median', min_n=5):
     """map(A) - map(B), NaN wherever EITHER group is under-observed."""
     ma, ca = ensemble_map(dmaps, mask_a, reducer, min_n)
     mb, cb = ensemble_map(dmaps, mask_b, reducer, min_n)
@@ -88,7 +88,7 @@ def _nanbox(m, h):
     return out2
 
 
-def fov_consistency(dmaps, fovs, mask=None, reducer='median', min_n=1, h=1):
+def fov_consistency(dmaps, fovs, mask=None, reducer='median', min_n=5, h=1):
     """Per-FOV ensembles and their pairwise SCC matrix.
 
     Returns {'fovs': [int], 'maps': {fov: map}, 'counts': {fov: counts},

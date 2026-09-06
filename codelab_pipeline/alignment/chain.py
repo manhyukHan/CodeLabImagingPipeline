@@ -1127,7 +1127,7 @@ def align_same_modality(storage_path, fov, hybe_records, reference_hybe, lb=0.3,
 
 def link_cross_modal(rna_storage_path, dna_storage_path, fov,
                       rna_fov_matrices, dna_fov_matrices,
-                      rna_reference_hybe='Hyb_500', dna_reference_hybe='Hyb_400',
+                      rna_reference_hybe=None, dna_reference_hybe=None,
                       channel_type='readout', lb=0.3, ub=0.9999,
                       border_trim=0, max_shift=None, with_residuals=False):
     """
@@ -1185,8 +1185,25 @@ def link_cross_modal(rna_storage_path, dna_storage_path, fov,
     quality), per explicit request: the status viewer must be able to
     report the bridge's fit quality, not just its dx/dy/angle.
     """
+    # The bridge hybes have NO default, matching the GUI, which offers no
+    # fixed choice and always passes both explicitly. They used to default
+    # to 'Hyb_500'/'Hyb_400' -- literals from one early experiment that no
+    # config in the repository uses -- while this function's own docstring
+    # already said they are "always an explicit input, never inferred".
+    # A headless caller taking those got a missing-MIP error on most
+    # stores, or, worse, silently aligned against a hybe that happened to
+    # exist and was not the bridge.
+    for _name, _value in (('rna_reference_hybe', rna_reference_hybe),
+                          ('dna_reference_hybe', dna_reference_hybe)):
+        if not _value:
+            raise ValueError(
+                f'link_cross_modal requires {_name}: the bridge hybe of each '
+                f'modality is an explicit input, never inferred. Pass the '
+                f'hybe imaged in BOTH experiments (the barcode round, or '
+                f'whatever this experiment shares).')
+
     # Cross-modality alignment is not one of the 3D exceptions -- reads
-    # vlinks.h5's real MIP copies, never the raw stack file. channel_mip
+    # the store's real MIP copies, never the raw stack file. channel_mip
     # resolves 'fiducial'/'readout'/a CONCRETE channel value alike (the
     # old either/or branch silently read the readout MIP for a concrete
     # choice -- exactly the second-readout channel it was picked FOR).
@@ -1510,7 +1527,7 @@ def _cell_native_crop(ctx, hybe, channel):
 
 
 def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
-                           reference_hybe=None, channel_type='readout',
+                           reference_hybe=None, channel_type='fiducial',
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
                            cell_reference_hybe_matrix=None, modality=None,
                            background_clip=None, fit_method='phase_correlation',
@@ -1535,8 +1552,16 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
     needs its own reference hybe + channel, defaulting to the readout
     channel -- actual signal correlates with real per-cell content better
     than fiducial does for this residual). reference_hybe=None keeps the
-    old default (cell.reference_hybe); channel_type='readout' is the new
-    default, 'fiducial' restores the old channel choice.
+    old default (cell.reference_hybe).
+
+    channel_type defaults to 'fiducial', which is what the application
+    actually runs: the panel's combo is fiducial-first and every one of the
+    12 real configs carries it. The signature used to default to 'readout'
+    and nothing warned, so a headless caller reproducing a GUI run fitted
+    the residual between crops of DIFFERENT biological content per hybe,
+    where a real signal change is indistinguishable from misregistration.
+    'readout' remains selectable and is the better choice where the readout
+    genuinely is comparable across the hybes being fitted.
 
     When reference_hybe differs from cell.reference_hybe, that hybe's own
     native-frame crop is derived the exact same way every OTHER hybe's is
@@ -1682,7 +1707,7 @@ def compute_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
 
 
 def prepare_cell_alignment(cell, storage_path, fov, hybe_records, fov_matrices,
-                           reference_hybe=None, channel_type='readout',
+                           reference_hybe=None, channel_type='fiducial',
                            pad=10, lb=0.3, ub=0.9999, including_z=True,
                            cell_reference_hybe_matrix=None, modality=None,
                            background_clip=None, fit_method='phase_correlation',

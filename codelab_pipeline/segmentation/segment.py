@@ -91,7 +91,7 @@ def _filter_and_relabel(mask, min_size, max_size):
 
 
 def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='otsu',
-                          absolute_cutoff=None, min_distance=7, min_size=1000, max_size=10000,
+                          absolute_cutoff=None, min_distance=7, min_size=500, max_size=10000,
                           projection_mode='MIP (stored)', z_plane=None, z_range=None):
     """
     Bulk (non-interactive) classical threshold+watershed cell segmentation
