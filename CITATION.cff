@@ -1,0 +1,68 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: CodeLabImagingPipeline
+abstract: >-
+  Desktop analysis pipeline for sequential DNA-FISH chromatin tracing:
+  ingestion of DAX or TIFF acquisitions into a chunked per-FOV store,
+  nuclear segmentation, three-level image alignment (per-FOV, cross-modal
+  and per-cell residual), 3D spot localisation, and chromatin trace
+  reconstruction.
+type: software
+repository-code: "https://github.com/manhyukHan/CodeLabImagingPipeline"
+
+authors:
+  - family-names: Han
+    given-names: Manhyuk
+    email: msci3257@gmail.com
+    # TODO affiliation, and orcid if you have one:
+    # affiliation: ""
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+  # TODO add every other author the manuscript will carry.
+
+license: MIT
+
+# TODO before submission — these cannot be filled in from the repository,
+# and a journal will ask for all three.
+#
+#   version:        no git tag exists yet (`git tag` returns nothing).
+#                   Tag the commit the paper describes, and put it here.
+#   date-released:  the date of that tag.
+#   doi:            mint one (Zenodo archives a GitHub release and issues a
+#                   DOI; the tag above is what it archives).
+#
+# Also confirm the LICENSE file's copyright holder. It currently names the
+# author; if the institution holds copyright in the work, that line is
+# theirs to set.
+#
+# version: 1.0.0
+# date-released: "YYYY-MM-DD"
+# doi: "10.5281/zenodo.XXXXXXX"
+
+keywords:
+  - chromatin tracing
+  - DNA-FISH
+  - image registration
+  - single-cell imaging
+  - microscopy
+
+references:
+  - type: article
+    title: "Cellpose: a generalist algorithm for cellular segmentation"
+    authors:
+      - family-names: Stringer
+        given-names: Carsen
+      - family-names: Wang
+        given-names: Tim
+      - family-names: Michaelos
+        given-names: Michalis
+      - family-names: Pachitariu
+        given-names: Marius
+    journal: Nature Methods
+    volume: 18
+    start: 100
+    end: 106
+    year: 2021
+    doi: 10.1038/s41592-020-01018-x
+    notes: >-
+      Used for nuclear and cell segmentation (cyto3 model). See REFERENCES.md
+      for the full method-by-method citation list and the code sites.
