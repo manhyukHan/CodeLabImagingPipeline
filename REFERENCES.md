@@ -101,9 +101,23 @@ dedicated nuclear input slot and `channels` says which plane fills it,
 whereas cpsam takes up to three channels in arbitrary order with no
 notion of a nuclear one. So under 4.x the synthetic nuclear plane is still
 handed over; the model is simply never told that is what it is
-(`segment.py:406-436`). Whether cpsam exploits it anyway is untested. That
-route has never run on persisted production data under either version, so
-this is a documented difference, not a measured one.
+(`segment.py:406-436`).
+
+**The production path is not affected by this at all.** `segment_fov` — the
+route every persisted cell in every store came through — passes a single
+grayscale plane with `channels=[0, 0]`, which declares no nuclear channel in
+the first place. There is nothing for Cellpose 4 to stop honouring. Only
+`segment_cytoplasm` supplies a real nuclear plane, and it has never run on
+persisted production data under either version.
+
+Whether cpsam benefits from a nuclear channel is UNRESOLVED. Probing it on
+synthetic fused-cell fields did not settle it: both models read the extra
+plane (zeroing it changes the mask), but on 28 heavily overlapped pairs
+cpsam returned 28 labels with the nuclear plane and 28 without, while cyto3
+went from 42 labels to 32 when given one — i.e. the seed made cyto3 *worse*
+there. Synthetic nuclei that small relative to `diameter` are not a fair
+proxy for real ones, so the honest statement is that the question is open,
+not that the nuclear channel is useless.
 
 **Watershed** — the classical segmentation route, via
 `skimage.segmentation.watershed` (`segmentation/segment.py`, 3 call sites),
