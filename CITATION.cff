@@ -64,5 +64,26 @@ references:
     year: 2021
     doi: 10.1038/s41592-020-01018-x
     notes: >-
-      Used for nuclear and cell segmentation (cyto3 model). See REFERENCES.md
-      for the full method-by-method citation list and the code sites.
+      The segmentation method itself. See REFERENCES.md for the full
+      method-by-method citation list and the code sites.
+
+  - type: article
+    title: "Cellpose3: one-click image restoration for improved cellular segmentation"
+    authors:
+      - family-names: Stringer
+        given-names: Carsen
+      - family-names: Pachitariu
+        given-names: Marius
+    journal: Nature Methods
+    volume: 22
+    start: 592
+    end: 599
+    year: 2025
+    doi: 10.1038/s41592-025-02595-5
+    notes: >-
+      Introduces the cyto3 model this pipeline loads
+      (segmentation/segment.py). Cited alongside the 2021 paper because
+      naming the model without it attributes cyto3 to the wrong work.
+      Runtime pinned to cellpose 3.1.x; model weights are downloaded at
+      first use and are not versioned by the package pin -- REFERENCES.md
+      records their SHA-256.

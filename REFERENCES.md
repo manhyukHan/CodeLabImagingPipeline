@@ -18,14 +18,50 @@ is imported lazily and the `cyto3` model is loaded on first use
 `cellpose>=3.1,<4` because Cellpose 4 removed `models.Cellpose`
 (`requirements.txt:13-20`).
 
+**Both papers belong in the manuscript, not just the first.** The 2021 paper
+is the method; `cyto3` is a model introduced by the Cellpose 3 paper, so
+naming the model without that citation attributes it to the wrong work.
+
 > Stringer, C., Wang, T., Michaelos, M. & Pachitariu, M. Cellpose: a
 > generalist algorithm for cellular segmentation. *Nat. Methods* **18**,
-> 100–106 (2021).
+> 100–106 (2021). doi:10.1038/s41592-020-01018-x
 
-⚠ verify — the pinned runtime is Cellpose **3.1.x**, and the `cyto3` model
-is introduced by the Cellpose 3 paper rather than the 2021 one. If the
-manuscript reports the model by name, cite the Cellpose 3 paper alongside
-the original. Confirm its final volume/year before use.
+> Stringer, C. & Pachitariu, M. Cellpose3: one-click image restoration for
+> improved cellular segmentation. *Nat. Methods* **22**, 592–599 (2025).
+> doi:10.1038/s41592-025-02595-5
+
+### The model weights are not in this repository
+
+Cellpose downloads them to `~/.cellpose/models/` on first use. They are
+neither versioned nor pinned, so "install `cellpose>=3.1,<4`" does **not**
+by itself specify the segmentation. Record the weights, not just the
+package. Verified on the machine this protocol was developed on
+(2026-09-06), SHA-256:
+
+| file | bytes | sha256 |
+|---|---|---|
+| `cyto3` | 26,566,255 | `2dc3087a8abd7da46d1ab0ddd5824639933cc3ff63b382af3fa1939a392db93c` |
+| `size_cyto3.npy` | 3,627 | `87f91feb48019b4dfb0400e7bbb89aca5873368686815aa7b4431c0faee97fc5` |
+| `nucleitorch_0` | 26,563,614 | `89ca45e4a45048d5010d29621466b1274b91b3dcb9714dce9f9e90a9a8671303` |
+| `size_nucleitorch_0.npy` | 3,627 | `a79107c9f284b569dd65f3a7363014d613a3403241c062822f07b6f026b4d3ef` |
+
+`cyto3` is what `segment.py` loads; `nucleitorch_0` is the size/nuclei
+companion Cellpose fetches alongside it. Re-check these before submission
+— if they differ, the machine has a different `cyto3` than the one every
+number in this protocol was produced with, and that is worth knowing.
+
+### Two caveats that belong in the manuscript
+
+- **Version.** The protocol was developed and validated against Cellpose
+  **3.1.1.3**. Cellpose 4 (Cellpose-SAM) is the actively developed line and
+  replaces `models.Cellpose`/`model_type='cyto3'` with `CellposeModel`/`cpsam`;
+  this pipeline has not been ported to it, so results here should not be
+  assumed to reproduce under 4.x.
+- **Device.** Segmentation runs on GPU when one is present and falls back to
+  a fresh CPU model if the GPU path raises
+  (`segmentation/segment.py:57-65`). The fallback exists for PyTorch MPS on
+  macOS, which is less mature than CUDA. Masks are therefore not guaranteed
+  bit-identical across machines.
 
 **Watershed** — the classical segmentation route, via
 `skimage.segmentation.watershed` (`segmentation/segment.py`, 3 call sites),
