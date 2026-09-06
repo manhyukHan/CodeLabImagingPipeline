@@ -2437,7 +2437,29 @@ class MainWindow(QtWidgets.QMainWindow):
             all_channels)
 
         chp = self.ui.ChromatinTracingPanel
-        chp.populate_hybe_list(self.total_active_hybe_list, default_checked=self._default_chromatin_tracing_hybes)
+        # The default check state now depends on the WHOLE list, not on each
+        # record alone: the target readout channel is the non-fiducial
+        # channel the most gated hybes share, and only the hybes carrying it
+        # are proposed. See _default_chromatin_tracing_hybes.
+        _target, _allowed, _n_gated = self._default_chromatin_tracing_hybes(
+            self.total_active_hybe_list)
+        chp.populate_hybe_list(
+            self.total_active_hybe_list,
+            default_checked=lambda record, modality:
+                (record['folder'], modality) in _allowed)
+        if _n_gated and _target is not None:
+            dropped = _n_gated - len(_allowed)
+            # Activate it too. The checked hybes were chosen BECAUSE they
+            # carry this channel, so leaving the combo on 'auto' would let
+            # the per-hybe fallback pick a different wavelength for some of
+            # them -- the exact thing this default exists to prevent.
+            if chp.active_readout_channel() == 'auto':
+                chp.set_active_readout_channel(str(_target))
+            self.log(
+                f'chromatin tracing: default readout channel {_target} -- '
+                f'present in {len(_allowed)} of {_n_gated} DNA H/R/T hybe(s)'
+                + (f'; {dropped} checked off for lacking it' if dropped else '')
+                + '.')
         chp.populate_reference_hybe_choices(self.total_active_hybe_list)
         self._refresh_chromatin_allele_hybe_choices()
 
@@ -3540,6 +3562,43 @@ class MainWindow(QtWidgets.QMainWindow):
             f'not finished:\n\n{detail}\n\n{consequence}\n\n'
             f'Re-run once ingestion completes.')
         return detail
+
+    def _channel_skip(self, title, records, channel_type):
+        """Drop the hybes that cannot supply the working channel, and say so.
+
+        Returns the records that CAN. Per explicit decision this skips
+        rather than refuses: one hybe acquired without the shared channel
+        should not stop an analysis, and chromatin tracing already works
+        this way -- fit what can be fitted, record what was not.
+
+        What it prevents is the silent substitution the old resolver did.
+        A hybe lacking the requested wavelength used to be fitted against
+        whatever its first non-fiducial channel happened to be, and the
+        result was stored as if it were the channel the operator chose.
+        'readout' does the same even when nothing was asked for: on the
+        real MAZ layout it resolves to 635 for a two-channel hybe and 475
+        for a three-channel one, so a single run compared different
+        wavelengths across hybes and recorded nothing about it.
+        """
+        if not records:
+            return records
+        _resolved, missing = alignment.channel_coverage(records, channel_type)
+        if not missing:
+            return records
+        shown = ', '.join(missing[:10])
+        if len(missing) > 10:
+            shown += f' (+{len(missing) - 10} more)'
+        kept = [r for r in records if r.get('folder') not in set(missing)]
+        self.log(f'{title}: SKIPPING {len(missing)} of {len(records)} hybe(s) '
+                 f'that do not carry channel {channel_type} -- {shown}. '
+                 f'Fitting the remaining {len(kept)}.')
+        if not kept:
+            QtWidgets.QMessageBox.warning(
+                self, title,
+                f'None of the {len(records)} hybe(s) carry channel '
+                f'{channel_type}, so there is nothing to fit.\n\n'
+                f'Choose a channel these hybes actually have.')
+        return kept
 
     def _ingestion_paths_in_flight(self, include_queued=True):
         """
@@ -7578,18 +7637,51 @@ class MainWindow(QtWidgets.QMainWindow):
     # step" convention Spot Localization's own Save Current Spots follows.
 
     @staticmethod
-    def _default_chromatin_tracing_hybes(record, modality):
+    def _default_chromatin_tracing_hybes(total_active_hybe_list):
         """
-        Default-checked state for the Hybes Involved list: modality=='DNA'
-        and datatype in ('H','R','T') -- H is the main genomic-locus
-        hybridization round, R/T are repeat/toehold QC rounds; B (barcode/
-        cell-identity rounds) is deliberately excluded, per explicit
-        request. Confirmed against this repo's own real ExperimentLayout.
-        xlsx files (DNA: 90xH/8xR/4xB/1xT; RNA also carries H-type rows, so
-        the modality check matters -- datatype alone isn't enough to keep
-        RNA's own H rounds out).
+        (target_channel, allowed_keys, n_gated) for the Hybes Involved list.
+
+        Five steps, per explicit specification:
+
+          1. gate on modality/datatype -- modality=='DNA' and datatype in
+             ('H','R','T'). H is the main genomic-locus round, R/T are
+             repeat/toehold QC rounds; B (barcode / cell-identity) is
+             deliberately excluded. The modality half matters on its own:
+             RNA carries H-type rows too, so datatype alone would pull
+             RNA's own H rounds in (real layouts: DNA 90xH/8xR/4xB/1xT).
+          2. within that list, separate fiducial from non-fiducial.
+          3. the non-fiducial channel present in the MOST of those hybes
+             becomes the target readout channel.
+          4. drop the hybes that do not carry it.
+          5. what remains is what gets checked.
+
+        Step 3 is the part that was missing, and it is why the list used to
+        default to hybes that could not be traced with one channel. Hybes
+        in one experiment do not carry the same channels -- on the real MAZ
+        layout, some are [555, 635] and others [475, 555, 635, 640] -- so
+        "the first non-fiducial" is a different wavelength per hybe, and a
+        default built from modality and datatype alone quietly proposed
+        tracing them against each other.
+
+        Ties break on the lower channel number so the choice is stable
+        across runs rather than depending on dict order.
         """
-        return modality == 'DNA' and record.get('datatype') in ('H', 'R', 'T')
+        gated = [(record, modality) for record, modality in total_active_hybe_list
+                 if modality == 'DNA' and record.get('datatype') in ('H', 'R', 'T')]
+        counts = collections.Counter()
+        for record, _modality in gated:
+            fiducial = record.get('fiducial_channel')
+            for channel in (record.get('channels') or []):
+                if channel != fiducial:
+                    counts[channel] += 1
+        target = None
+        if counts:
+            target = sorted(counts.items(),
+                            key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+        allowed = {(record['folder'], modality) for record, modality in gated
+                   if target is not None
+                   and target in (record.get('channels') or [])}
+        return target, allowed, len(gated)
 
     @staticmethod
     def _chromatin_channel_params(full_params):
@@ -11276,13 +11368,21 @@ One PNG PER MODALITY: each modality has its own reference and its
         # explicit decision -- re-runnable as ingestion/FOV alignment
         # advances; the worker's own pass resolution already gates on
         # FOV-level matrices, so un-ready hybes never reach a fit).
+        worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
+        # Before the mode dialog, so the count the dialog quotes is the
+        # count that will actually be fitted.
+        for _p in worker_jobs[0][2]:
+            _p['hybe_records'] = self._channel_skip(
+                'Run Cell Alignment', _p.get('hybe_records') or [], channel_type)
+        if not any(p.get('hybe_records') for p in worker_jobs[0][2]):
+            return
+
         mode = self._confirm_batch_mode('Run Cell Alignment', 'per-cell residual matrices')
         if mode is None:
             return
 
         ap.RunCellAlignmentPushButton.setEnabled(False)
         self.statusBar().showMessage('Computing cell alignment...')
-        worker_jobs = [(fov, real_cells, self._cell_alignment_passes(cell_modality, storage_path, fov))]
         self._cell_alignment_worker = CellAlignmentWorker(worker_jobs, channel_type=channel_type, pad=pad,
                                                           z_max_shift=z_max_shift, append=(mode == 'append'),
                                                           persisted=(self._persisted_cell_matrix_keys(
@@ -11503,6 +11603,16 @@ One PNG PER MODALITY: each modality has its own reference and its
         # below counts what will really run.
         passes_by_fov = {fov: self._cell_alignment_passes(cell_modality, storage_path, fov)
                          for fov in sorted(cells_by_fov)}
+        # Hybes that cannot supply the working channel are dropped here, per
+        # FOV, before the readiness check counts what is left. Logged once
+        # per FOV rather than once per pass so a 50-FOV run does not print
+        # the same sentence a hundred times.
+        _channel_type = ap.CellChannelTypeComboBox.currentText()
+        for _fov, _fov_passes in passes_by_fov.items():
+            for _p in _fov_passes:
+                _p['hybe_records'] = self._channel_skip(
+                    f'Run Cell Alignment (all FOVs), FOV{_fov:03d}',
+                    _p.get('hybe_records') or [], _channel_type)
         incomplete = {}
         for fov, fov_passes in passes_by_fov.items():
             found = self._incomplete_fovs(

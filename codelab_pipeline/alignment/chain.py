@@ -1470,26 +1470,111 @@ def _zx_from_dataset(ds, ymin, ymax, xmin, xmax, lb, ub, normalize=True):
     return (preprocess.normalize_to_uint8(projection, lb, ub) if normalize
             else projection.astype(np.float32))
 
-def pick_channel_by_type(record, channel_type):
-    """Resolve a channel CHOICE to this hybe's actual channel.
+def channel_label(record, channel_type):
+    """How a channel choice should READ to an operator: "555 (fiducial)".
 
-    'fiducial' -> always the fiducial; 'readout' -> the FIRST
-    non-fiducial in the layout's channel order (falls back to fiducial
-    if a hybe genuinely has none). Any other value is a CONCRETE
-    channel (e.g. '488' -- the generalization the two role labels
-    could not express once hybes carry more than one readout channel,
-    per report): used when this hybe has it, else the readout rule --
-    per-hybe channel lists differ, and a hybe lacking the requested
-    wavelength still needs SOME same-role crop to align."""
-    fiducial = record['fiducial_channel']
+    A role name alone does not say which wavelength it resolved to, and on
+    this data that is the whole difficulty -- see resolve_channel. Every
+    label the operator sees names the actual channel and, where it came
+    from a role, the role in parentheses.
+    """
+    channel, missing = resolve_channel(record, channel_type)
+    if missing:
+        # Name the substitute too. "640 (not in this hybe)" alone leaves an
+        # operator to wonder what was used instead, which is the question
+        # the old silent fallback made unanswerable.
+        return f'{channel_type} (not in this hybe; would use {channel})'
+    if channel is None:
+        return f'{channel_type} (unknown)'
+    if str(channel_type) == 'fiducial':
+        return f'{channel} (fiducial)'
+    if str(channel_type) == 'readout':
+        return f'{channel} (readout, auto)'
+    return str(channel)
+
+
+def resolve_channel(record, channel_type):
+    """(channel, missing) for one hybe -- the honest resolver.
+
+    `missing` is True when a CONCRETE channel was asked for and this hybe
+    does not carry it. The channel returned in that case is the auto
+    fallback, so a renderer still has something to draw; anything that
+    FITS must consult `missing` and refuse, which is what
+    channel_coverage below exists to make easy.
+
+    'fiducial' resolves from the ExperimentLayout and is always right.
+
+    'readout' is NOT a channel. It is the collective noun for every
+    non-fiducial channel, and resolving it to one means picking the first
+    in layout order -- which is not even stable within an experiment. On
+    the real MAZ layout, with fiducial 555:
+
+        Hyb_071  [555, 635]                 -> 635
+        Hyb_104  [475, 555, 635]            -> 475
+        Hyb_007  [475, 555, 635, 640]       -> 475   (635, 640 unreachable)
+        Hyb_BF   [999, 475, 390, 555, 635]  -> 999   (a brightfield slot)
+
+    So a run that resolves 'readout' per hybe compares 635 against 475
+    across hybes of one experiment and records nothing about having done
+    so. 'readout' therefore survives here only to keep stored configs and
+    the overlay renderers working; the operator picks a concrete channel,
+    and the run gates on every target hybe actually carrying it.
+    """
+    # `missing` means POSITIVE evidence that this hybe cannot supply the
+    # channel -- a channel list that exists and does not contain it. A
+    # record with no channel list at all is unknown, not absent, and is
+    # left alone: the ingestion-readiness gate is what decides whether a
+    # hybe is usable, and a channel check that also rejected incomplete
+    # metadata would take that decision away from it.
+    #
+    # .get rather than [] for the same reason. This resolver sits on the
+    # gating path, and a gate that raises on a malformed record removes
+    # the run it exists to protect.
+    fiducial = record.get('fiducial_channel')
     if channel_type == 'fiducial':
-        return fiducial
+        return fiducial, False
+    channels = record.get('channels') or []
     if channel_type != 'readout':
-        for c in record['channels']:
+        for c in channels:
             if str(c) == str(channel_type):
-                return c
-    readout = [c for c in record['channels'] if c != fiducial]
-    return readout[0] if readout else fiducial
+                return c, False
+        readout = [c for c in channels if c != fiducial]
+        return (readout[0] if readout else fiducial), bool(channels)
+    readout = [c for c in channels if c != fiducial]
+    return (readout[0] if readout else fiducial), False
+
+
+def channel_coverage(records, channel_type):
+    """Which of `records` cannot supply `channel_type`.
+
+    Returns {hybe: resolved_channel} for the ones that can, and a sorted
+    list of the folder names that cannot. A caller about to FIT checks the
+    second and refuses before starting, rather than fitting some hybes
+    against a wavelength the operator did not choose -- per explicit
+    decision, the run stops and names the hybes instead of substituting.
+    """
+    resolved, missing = {}, []
+    for record in records:
+        folder = record.get('folder')
+        channel, gap = resolve_channel(record, channel_type)
+        if gap:
+            missing.append(folder)
+        else:
+            resolved[folder] = channel
+    return resolved, sorted(m for m in missing if m)
+
+
+def pick_channel_by_type(record, channel_type):
+    """The channel to USE for this hybe, substituting when it must.
+
+    Kept for the render paths, which need something to draw even for a
+    hybe that lacks the requested wavelength. Anything that FITS should
+    call resolve_channel or channel_coverage and refuse instead -- see
+    resolve_channel for why 'readout' cannot be trusted to name one
+    wavelength across an experiment.
+    """
+    channel, _missing = resolve_channel(record, channel_type)
+    return channel
 
 
 def _cell_native_crop(ctx, hybe, channel):
