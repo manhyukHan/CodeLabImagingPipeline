@@ -421,14 +421,20 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
     (H,W,2) form is ambiguous across versions.
 
     ON CELLPOSE 4 THE SEEDING IS WEAKER, and this is the one place the
-    version actually changes the method rather than the spelling. 4.x
-    ignores `channels`, so it is never told which plane is cytoplasm and
-    which is nucleus -- it takes the 3-channel image and infers. The array
-    is built the same way and 4.x segments it (MEASURED: a 3-channel field
-    returns labels normally), but "nucleus-assisted mode" is 3.x
-    terminology and there is no 4.x equivalent to switch on. This route has
-    never run on persisted production data under EITHER version, so nothing
-    here has been validated against a real cytoplasm.
+    version changes the method rather than the spelling. What 4.x drops is
+    the ROLE DECLARATION, not multi-channel input: it ignores `channels`,
+    so it is never told which plane is cytoplasm and which is nucleus.
+    cyto3 has a dedicated nuclear input slot that `channels` fills; cpsam
+    takes up to three channels in arbitrary order and has no nuclear slot
+    at all, so "nucleus-assisted mode" is 3.x terminology with no 4.x
+    equivalent to switch on.
+
+    The array below is therefore built identically for both, and both
+    segment it -- MEASURED at 1024x1024, 90/90 planted blobs recovered from
+    a (H,W,2) and a (H,W,3) array under 3.1.1.3 and 4.2.1.1 alike. Whether
+    cpsam exploits the nuclear plane without being told is untested. This
+    route has never run on persisted production data under EITHER version,
+    so nothing here has been validated against a real cytoplasm.
 
     Returns cellpose's own raw labels, deliberately NOT relabeled: the
     caller has to match them back to real nucleus ids (see

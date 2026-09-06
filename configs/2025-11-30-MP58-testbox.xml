@@ -11,7 +11,7 @@
     voxel_z_um="0.2" />
   <cell_segmentation
     reference_hybe="Hyb_015 (DNA)"
-    channel="635"
+    channel="555"
     method="Cellpose"
     diameter="40"
     min_size="1000"
@@ -21,7 +21,7 @@
     classical_min_distance="7"
     classical_min_size="500"
     classical_max_size="10000"
-    append_mode="0"
+    append_mode="1"
     projection="MIP (stored)"
     z_plane="0"
     z_start="0"
@@ -93,5 +93,19 @@
     readout_min_ah_ratio="0.25"
     readout_min_sep="3.0"
     multi_component_fit="0"
-    hybes="Hyb_015|DNA,Hyb_016|DNA,Hyb_017|DNA,Hyb_018|DNA,Hyb_019|DNA,Hyb_020|DNA,Hyb_021|DNA,Hyb_022|DNA,Hyb_023|DNA,Hyb_024|DNA,Hyb_025|DNA,Hyb_026|DNA,Hyb_027|DNA,Hyb_028|DNA,Hyb_029|DNA,Hyb_030|DNA,Hyb_031|DNA,Hyb_032|DNA,Hyb_033|DNA,Hyb_034|DNA,Hyb_035|DNA,Hyb_036|DNA,Hyb_037|DNA,Hyb_038|DNA,Hyb_039|DNA,Hyb_040|DNA,Hyb_081|DNA,Hyb_041|DNA,Hyb_042|DNA,Hyb_043|DNA,Hyb_044|DNA,Hyb_045|DNA,Hyb_046|DNA,Hyb_047|DNA,Hyb_048|DNA,Hyb_049|DNA,Hyb_050|DNA,Hyb_051|DNA,Hyb_052|DNA,Hyb_053|DNA,Hyb_054|DNA,Hyb_055|DNA,Hyb_056|DNA,Hyb_057|DNA,Hyb_058|DNA,Hyb_059|DNA,Hyb_060|DNA,Hyb_061|DNA,Hyb_062|DNA,Hyb_063|DNA,Hyb_064|DNA,Hyb_065|DNA,Hyb_066|DNA,Hyb_067|DNA,Hyb_068|DNA,Hyb_069|DNA,Hyb_070|DNA,Hyb_071|DNA,Hyb_072|DNA,Hyb_073|DNA,Hyb_074|DNA,Hyb_075|DNA,Toe_015|DNA,Toe_032|DNA,Toe_050|DNA,Toe_060|DNA,Rep_023|DNA,Rep_032|DNA,Rep_037|DNA,Rep_040|DNA,Rep_042|DNA,Rep_070|DNA,Rep_081|DNA" />
+    hybes="Hyb_015|DNA,Hyb_016|DNA,Hyb_017|DNA,Hyb_018|DNA,Hyb_019|DNA,Hyb_020|DNA,Hyb_021|DNA,Hyb_022|DNA,Hyb_023|DNA,Hyb_024|DNA,Hyb_025|DNA,Hyb_026|DNA,Hyb_027|DNA,Hyb_028|DNA,Hyb_029|DNA,Hyb_030|DNA,Hyb_031|DNA,Hyb_032|DNA,Hyb_033|DNA,Hyb_034|DNA,Hyb_035|DNA,Hyb_036|DNA,Hyb_037|DNA,Hyb_038|DNA,Hyb_039|DNA,Hyb_040|DNA,Hyb_081|DNA,Hyb_041|DNA,Hyb_042|DNA,Hyb_043|DNA,Hyb_044|DNA,Hyb_045|DNA,Hyb_046|DNA,Hyb_047|DNA,Hyb_048|DNA,Hyb_049|DNA,Hyb_050|DNA,Hyb_051|DNA,Hyb_052|DNA,Hyb_053|DNA,Hyb_054|DNA,Hyb_055|DNA,Hyb_056|DNA,Hyb_057|DNA,Hyb_058|DNA,Hyb_059|DNA,Hyb_060|DNA,Hyb_061|DNA,Hyb_062|DNA,Hyb_063|DNA,Hyb_064|DNA,Hyb_065|DNA,Hyb_066|DNA,Hyb_067|DNA,Hyb_068|DNA,Hyb_069|DNA,Hyb_070|DNA,Hyb_071|DNA,Hyb_072|DNA,Hyb_073|DNA,Hyb_074|DNA,Hyb_075|DNA,Toe_015|DNA,Toe_032|DNA,Toe_050|DNA,Toe_060|DNA,Rep_023|DNA,Rep_032|DNA,Rep_037|DNA,Rep_040|DNA,Rep_042|DNA,Rep_070|DNA,Rep_081|DNA"
+    readout_channel="635" />
+  <analysis_population
+    fov_list=""
+    mask_intensity="1"
+    sources="DNA|Hyb_015|555,DNA|Hyb_016|555,DNA|Hyb_016|635,DNA|Hyb_023|555,DNA|Hyb_039|635,RNA|Hyb_101|635,RNA|Hyb_103|555,RNA|Hyb_103|635,RNA|Hyb_105|555,RNA|Hyb_105|635,RNA|Hyb_107|555,RNA|Hyb_107|635,RNA|Hyb_109|555,RNA|Hyb_109|635,RNA|Hyb_111|555,RNA|Hyb_111|635,RNA|Hyb_113|555,RNA|Hyb_113|635,RNA|Hyb_115|555,RNA|Hyb_115|635,RNA|Hyb_116|555,RNA|Hyb_116|635,RNA|Hyb_118|555,RNA|Hyb_118|635,RNA|Hyb_133|555,RNA|Hyb_133|635,RNA|Toe_133|555,RNA|Toe_133|635" />
+  <analysis_polymer_qc
+    min_traced="2"
+    apply_qc="1"
+    min_brightness="173.1"
+    max_brightness="1258"
+    max_jump_um="0.8974"
+    max_dist_um="1.671" />
+  <analysis_gate
+    condition='{"clauses": [[{"hi": 2.0, "kind": "expression_range", "lo": 1.51, "metric": "mask_median", "normalize": ["by_source", ["RNA", "Toe_133", 635]], "source": ["RNA", "Hyb_107", 635]}]]}' />
 </settings>

@@ -91,11 +91,19 @@ whatever the default becomes — the same reasoning as pinning a package.
 
 One further difference is a change of *method*, not just of model:
 Cellpose 3's nucleus-seeded cytoplasm mode is driven by `channels=[cyto,
-nuc]`, and **Cellpose 4 ignores that argument entirely**. Under 4.x the
-synthetic nuclear channel is still supplied but the model is never told
-which plane is which (`segment.py:406-436`). That route has never run on
-persisted production data under either version, so it is a documented
-difference rather than a measured one.
+nuc]`, and **Cellpose 4 ignores that argument entirely**.
+
+What is lost is the *role declaration*, not multi-channel input. Both
+versions accept a stacked image and segment it — MEASURED, 1024×1024,
+90/90 blobs from both a 2-channel `(H,W,2)` and a 3-channel `(H,W,3)`
+array under 3.1.1.3 and 4.2.1.1 alike. The difference is that cyto3 has a
+dedicated nuclear input slot and `channels` says which plane fills it,
+whereas cpsam takes up to three channels in arbitrary order with no
+notion of a nuclear one. So under 4.x the synthetic nuclear plane is still
+handed over; the model is simply never told that is what it is
+(`segment.py:406-436`). Whether cpsam exploits it anyway is untested. That
+route has never run on persisted production data under either version, so
+this is a documented difference, not a measured one.
 
 **Watershed** — the classical segmentation route, via
 `skimage.segmentation.watershed` (`segmentation/segment.py`, 3 call sites),
