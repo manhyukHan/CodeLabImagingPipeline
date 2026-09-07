@@ -278,6 +278,34 @@ def anchor_candidates(stack, n_max=8, min_distance=3, mode_k=None,
     return out
 
 
+def dedupe(items, key=lambda s: s, min_sep=2.0):
+    """Drop fits that landed on the same emitter, keeping the best p.
+
+    A generous anchor uses min_distance=2, so two anchors 2 px apart are
+    both proposed -- and a real emitter is ~1.3 px wide, so both fits
+    converge on it and return nearly the same point. MEASURED on real
+    data: candidates like (50.6, 65.0, p=0.450) and (50.6, 64.9, p=0.449)
+    in the same crop, which are one spot reported twice.
+
+    That matters more here than it would in production. A duplicate is a
+    review a person has to make twice, and if the two copies are judged
+    differently the training set contains a direct contradiction about
+    one piece of pixel data.
+
+    Lateral only. Two emitters genuinely stacked in z within 2 px
+    laterally cannot be told apart by this fit anyway, so pretending the
+    z separation resolves them would be inventing a distinction.
+    """
+    kept = []
+    for it in sorted(items, key=lambda t: -key(t).p):
+        s = key(it)
+        if any((s.y - key(k).y) ** 2 + (s.x - key(k).x) ** 2 < min_sep ** 2
+               for k in kept):
+            continue
+        kept.append(it)
+    return kept
+
+
 class AnchorFitEngine(LocalizeEngine):
     """Anchor on the MIP, then fit each anchor in 3D -- v1 Gaussian.
 
@@ -296,8 +324,9 @@ class AnchorFitEngine(LocalizeEngine):
 
     name = 'anchor-v1'
 
-    def __init__(self, anchor=None, **fit_params):
+    def __init__(self, anchor=None, dedup_px=2.0, **fit_params):
         self.anchor = dict(anchor or {})
+        self.dedup_px = float(dedup_px)
         self.fit = GaussianLocalizeEngine(**fit_params)
 
     def localize(self, stack, seed_yxz=None, n_max=1):
@@ -310,6 +339,7 @@ class AnchorFitEngine(LocalizeEngine):
                 denom = amp + off
                 p = float(amp / denom) if denom > 0 else 0.0
                 out.append(sp._replace(p=max(min(p, 1.0), 1e-6)))
+        out = dedupe(out, min_sep=self.dedup_px)
         out.sort(key=lambda s: -s.p)
         return out[:n_max]
 
@@ -359,7 +389,7 @@ class AnchorFitV2Engine(LocalizeEngine):
     REF_CI_Z_NM = 453.0
 
     def __init__(self, anchor=None, params=None, fit_radius=8, keep_top=None,
-                 ref_ci_xy_nm=None, ref_ci_z_nm=None):
+                 ref_ci_xy_nm=None, ref_ci_z_nm=None, dedup_px=2.0):
         self.anchor = dict(anchor or {})
         self.params = params
         self.fit_radius = int(fit_radius)
@@ -373,18 +403,34 @@ class AnchorFitV2Engine(LocalizeEngine):
                                   else self.REF_CI_XY_NM)
         self.ref_ci_z_nm = float(ref_ci_z_nm if ref_ci_z_nm is not None
                                  else self.REF_CI_Z_NM)
+        self.dedup_px = float(dedup_px)
 
     def _params(self):
         from . import tracing_v2 as V2
         return self.params if self.params is not None else V2.V2Params()
 
-    def localize(self, stack, seed_yxz=None, n_max=1):
+    def localize_detailed(self, stack, seed_yxz=None, n_max=1, seeds=None):
+        """[(LocalizedSpot, gate_pass, reason), ...], best-p first.
+
+        The richer return `localize` throws away. gate_pass is the REAL
+        production verdict -- tracing_v2.gate against SPOT_V2_GATES on
+        this fit and this cube -- not a threshold on p. p is a composite
+        ranking and comparing it to an occupancy threshold, as an earlier
+        version did, produced sentences like "p 0.39 below 0.40" that
+        named a gate the number had nothing to do with.
+
+        `seeds` lets a caller supply anchors it has already computed, so
+        the anchor step runs ONCE per crop rather than once here and once
+        in the caller. reason is '' when the gate passed.
+        """
         from . import tracing_v2 as V2
+        from .localization import SPOT_V2_GATES
         if stack is None or stack.size == 0 or not np.isfinite(stack).any():
             return []
         p = self._params()
-        seeds = ([seed_yxz] if seed_yxz is not None
-                 else anchor_candidates(stack, n_max=n_max, **self.anchor))
+        if seeds is None:
+            seeds = ([seed_yxz] if seed_yxz is not None
+                     else anchor_candidates(stack, n_max=n_max, **self.anchor))
         r = self.fit_radius
         out = []
         for (sy, sx, sz) in seeds:
@@ -407,14 +453,21 @@ class AnchorFitV2Engine(LocalizeEngine):
                 railed = (railed,)
             if any(n in ('y', 'x', 'z') for n in railed):
                 score *= 0.25
-            out.append(_spot(y=fit.y + y0, x=fit.x + x0, z=fit.z,
-                             p=max(min(score, 1.0), 1e-6),
-                             amplitude=fit.amplitude, offset=fit.offset,
-                             sigma_y=fit.sigma_y_um, sigma_x=fit.sigma_x_um,
-                             sigma_z=fit.sigma_z_um))
-        out.sort(key=lambda s: -s.p)
+            ok, why = V2.gate(fit, cube, SPOT_V2_GATES, p.voxel_um)
+            out.append((_spot(y=fit.y + y0, x=fit.x + x0, z=fit.z,
+                              p=max(min(score, 1.0), 1e-6),
+                              amplitude=fit.amplitude, offset=fit.offset,
+                              sigma_y=fit.sigma_y_um, sigma_x=fit.sigma_x_um,
+                              sigma_z=fit.sigma_z_um),
+                        bool(ok), '' if ok else str(why or 'gate rejected')))
+        out = dedupe(out, key=lambda t: t[0], min_sep=self.dedup_px)
+        out.sort(key=lambda t: -t[0].p)
         cap = min(n_max, self.keep_top) if self.keep_top else n_max
         return out[:cap]
+
+    def localize(self, stack, seed_yxz=None, n_max=1):
+        return [s for (s, _ok, _why)
+                in self.localize_detailed(stack, seed_yxz=seed_yxz, n_max=n_max)]
 
 
 ENGINES = {
