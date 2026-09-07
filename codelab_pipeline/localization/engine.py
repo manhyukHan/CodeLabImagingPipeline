@@ -158,28 +158,66 @@ class GaussianLocalizeEngine(LocalizeEngine):
         return spots[:n_max]
 
 
-GENEROUS_ANCHOR = dict(min_distance=2, threshold_rel=0.12,
-                       max_to_background=1.25, background_quantile=0.5)
+def background_mode(img):
+    """(mode, sigma) of the background in a cell projection.
+
+    On a cell crop the background IS the mode: spots are a thin bright
+    tail over a broad flat floor, so the most common intensity bin is the
+    floor. The median is not -- MEASURED over 40 real (fov, hybe, cell)
+    crops from the MAZ store, `2.0 * median` sits at 947 counts where
+    `mode + 1 sigma` sits at 545, and the median-based threshold finds
+    NOTHING on 39 of 40 cells.
+
+    Binning to 100 counts (`round(-2)`) is what makes the mode findable at
+    all on 16-bit data -- unbinned, every value is nearly unique and the
+    argmax of the histogram is noise.
+
+    sigma comes from the BELOW-mode half only. For a background that is
+    locally normal, E[(x - mode)^2 | x <= mode] = sigma^2, and taking only
+    that half means the spots -- which are all on the bright side -- cannot
+    inflate the very width used to decide what counts as a spot.
+    """
+    f = img[np.isfinite(img)]
+    if f.size == 0:
+        return float('nan'), float('nan')
+    v, c = np.unique(f.round(-2), return_counts=True)
+    mode = float(v[c.argmax()])
+    below = f[f <= mode]
+    sigma = float(np.sqrt(np.mean((below - mode) ** 2))) if below.size else float('nan')
+    return mode, sigma
+
+
+GENEROUS_ANCHOR = dict(min_distance=2, mode_k=1.0, threshold_rel=0.0,
+                       max_to_background=0.0)
 """Anchor settings for BUILDING A TRAINING SET, not for production.
 
-Production anchoring is tuned so that what it returns is mostly real; a
-training run wants the opposite, because a person is going to look at
-every candidate anyway and a rejected one is a labelled hard negative --
-the more informative half of the set. A candidate never proposed is a
-label that can never be collected, so recall here is worth far more than
-precision.
+Production anchoring is tuned so that what it returns is mostly real. A
+training run wants the opposite: a person looks at every candidate
+anyway, and a rejected one is a labelled hard negative -- the more
+informative half of the set. A candidate never proposed is a label that
+can never be collected, so recall here is worth more than precision.
 
-MEASURED on a synthetic field of three emitters at amplitude 9000/5000/
-2500 over background 300: the production defaults (threshold_rel 0.5,
-max_to_background 2.0) find TWO -- the 2500 spot sits under 0.5x the
-brightest peak and is never proposed. These settings find all three.
-Do not "clean up" a training run by tightening them.
+MEASURED, 40 real cell crops, MAZ store, candidates per cell:
+
+    production defaults      median  0.0   39/40 cells yield NOTHING
+    mode + 3.0 sigma         median  0.0   26/40 empty
+    mode + 2.0 sigma         median  1.5   17/40 empty
+    mode + 1.5 sigma         median  6.5   10/40 empty
+    mode + 1.0 sigma         median 21.0    3/40 empty   <- this
+
+THRESHOLD ALONE CANNOT CONTROL REVIEW EFFORT, and that is why there is a
+cap elsewhere rather than a higher k here. At k=1.0 the median cell gives
+21 candidates but the worst gives 156; the spread across cells is larger
+than the spread across k. So this stays low for recall, `n_max` bounds
+the fitting, and the engine keeps only its best `keep_top` by p for a
+person to look at. Raising k to make the list shorter throws away dim
+real spots -- exactly the ones a learned detector is being built to find.
 """
 
 
-def anchor_candidates(stack, n_max=8, min_distance=3, threshold_rel=0.5,
-                      absolute_threshold=0.0, background_quantile=0.5,
-                      max_to_background=2.0):
+def anchor_candidates(stack, n_max=8, min_distance=3, mode_k=None,
+                      threshold_rel=0.5, absolute_threshold=0.0,
+                      background_quantile=0.5, max_to_background=2.0):
     """THE anchor step, alone: (h, w, depth) stack -> [(y, x, z), ...].
 
     This is the auto half of a slot with exactly two occupants. The other
@@ -214,8 +252,16 @@ def anchor_candidates(stack, n_max=8, min_distance=3, threshold_rel=0.5,
         peak = np.nanmax(mip)
     if not np.isfinite(peak):
         return []
+    # Every enabled policy is a floor, and the highest wins. A term is off
+    # at 0, so a caller picks its policy by which numbers it passes rather
+    # than by a mode flag -- GENEROUS_ANCHOR zeroes the two production
+    # terms and sets mode_k, production leaves mode_k None.
     cutoff = max(max_to_background * (floor if np.isfinite(floor) else 0.0),
                  absolute_threshold, threshold_rel * peak)
+    if mode_k is not None:
+        mode, sigma = background_mode(mip)
+        if np.isfinite(mode) and np.isfinite(sigma):
+            cutoff = max(cutoff, mode + mode_k * sigma)
     flat = np.where(np.isfinite(mip), mip, -np.inf)
     yx = peak_local_max(flat, min_distance=min_distance, exclude_border=1,
                         threshold_abs=cutoff)
@@ -288,16 +334,45 @@ class AnchorFitV2Engine(LocalizeEngine):
     throwing it away here is throwing away the more informative half of
     the training set. Callers that want the production gate can still
     call tracing_v2.gate themselves.
+
+    The two reference constants are MEASURED, not chosen. They are the
+    MEDIAN CI of a real generous-candidate population -- 101 fits over 40
+    real cell crops from the MAZ store -- so each term is 0.5 at the
+    median candidate and the score spreads over the range that actually
+    occurs:
+
+        ci_xy nm   p25  130   MEDIAN  355   p75  859   p90 2402
+        ci_z  nm   p25  280   MEDIAN  453   p75  872   p90 1675
+        occupancy  p25  0.1   MEDIAN  0.3   p75  0.5   p90  0.9
+        at a position bound: 36 of 101
+
+    An earlier version used 100 and 300 nm, which were invented. At 100 nm
+    the lateral term is 0.22 for a MEDIAN candidate and the whole score
+    compresses into a band near zero, which ranks nothing. Note also that
+    the median generous candidate has occupancy 0.3 against a production
+    gate of 0.40 -- i.e. most of this population would be rejected in
+    production. That is the intended shape of a training set, not a fault.
     """
 
     name = 'anchor-v2'
-    REF_CI_XY_NM = 100.0
-    REF_CI_Z_NM = 300.0
+    REF_CI_XY_NM = 355.0
+    REF_CI_Z_NM = 453.0
 
-    def __init__(self, anchor=None, params=None, fit_radius=8):
+    def __init__(self, anchor=None, params=None, fit_radius=8, keep_top=None,
+                 ref_ci_xy_nm=None, ref_ci_z_nm=None):
         self.anchor = dict(anchor or {})
         self.params = params
         self.fit_radius = int(fit_radius)
+        # THE review-effort control, and the reason the threshold can stay
+        # low. Candidate counts per cell are heavy-tailed -- MEASURED
+        # median 21, max 156 at mode+1sigma -- so no threshold both keeps
+        # the dim spots and bounds what a person is shown. Anchor
+        # generously, fit, then hand over only the best keep_top by p.
+        self.keep_top = keep_top
+        self.ref_ci_xy_nm = float(ref_ci_xy_nm if ref_ci_xy_nm is not None
+                                  else self.REF_CI_XY_NM)
+        self.ref_ci_z_nm = float(ref_ci_z_nm if ref_ci_z_nm is not None
+                                 else self.REF_CI_Z_NM)
 
     def _params(self):
         from . import tracing_v2 as V2
@@ -323,9 +398,10 @@ class AnchorFitV2Engine(LocalizeEngine):
                 continue
             occ = V2.occupancy(cube, fit, p.voxel_um)
             ci_xy, ci_z = V2.uncertainty_nm(fit)
+            rxy, rz = self.ref_ci_xy_nm, self.ref_ci_z_nm
             score = (max(0.0, occ if np.isfinite(occ) else 0.0)
-                     * self.REF_CI_XY_NM / (self.REF_CI_XY_NM + (ci_xy if np.isfinite(ci_xy) else 1e6))
-                     * self.REF_CI_Z_NM / (self.REF_CI_Z_NM + (ci_z if np.isfinite(ci_z) else 1e6)))
+                     * rxy / (rxy + (ci_xy if np.isfinite(ci_xy) else 1e6))
+                     * rz / (rz + (ci_z if np.isfinite(ci_z) else 1e6)))
             railed = getattr(fit, 'at_bound', None) or ()
             if isinstance(railed, str):
                 railed = (railed,)
@@ -337,7 +413,8 @@ class AnchorFitV2Engine(LocalizeEngine):
                              sigma_y=fit.sigma_y_um, sigma_x=fit.sigma_x_um,
                              sigma_z=fit.sigma_z_um))
         out.sort(key=lambda s: -s.p)
-        return out[:n_max]
+        cap = min(n_max, self.keep_top) if self.keep_top else n_max
+        return out[:cap]
 
 
 ENGINES = {
