@@ -42,15 +42,111 @@ import sys
 import time
 
 import numpy as np
+import matplotlib
 from PyQt5 import QtCore, QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+
+# Glyph rasterization is the single largest cost in this window --
+# MEASURED 0.48 ms per glyph, 65% of a full page draw. Unhinted glyphs
+# cost 0.32 ms. This is an application, so setting it process-wide is
+# ours to do; the library modules leave rcParams alone.
+matplotlib.rcParams['text.hinting'] = 'none'
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from codelab_pipeline.training import bundle as B          # noqa: E402
 from codelab_pipeline.training import verdicts as V        # noqa: E402
 from codelab_pipeline.training import view as VIEW         # noqa: E402
+
+
+# How close a click has to land to count as "that candidate" rather than
+# a new spot. A real emitter is ~1.3 px wide and the drawn circle has
+# radius 3.8, so anything inside the circle a person was aiming at snaps.
+ADD_SNAP_PX = 4.0
+
+# How many candidates per cell a reviewer is asked to judge, by default.
+#
+# NOT a review budget -- a judgement about where the LEARNING is. A cell
+# that reliably shows dozens of spots teaches little from its 200th
+# candidate; what a detector needs is the boundary, and the bundle's own
+# ordering (gate-pass, then fitted, then by p) puts the boundary right
+# after the confident yeses. MEASURED over all 2264 non-empty crops of
+# the MP58 bundle, the top 16 contains on average:
+#
+#     2.5  gate-pass            the confident yes
+#    12.5  fitted, not passed   THE GRAY AREA -- most of what is shown
+#     0.2  anchor, no fit
+#
+# and it cannot clip the confident ones: gate-pass per crop is median 2,
+# max 13, and NO crop has more than 16. Only 3 crops of 2264 fill their
+# 16 with gate-passes alone.
+#
+# The bundle keeps every candidate regardless. This bounds the view, so
+# raising it later is a flag rather than a re-extraction -- candidate
+# rows are 19 bytes against 1.58 GiB of pixels, and truncating at write
+# time would buy 0.6% and cost the option.
+DEFAULT_MAX_PER_CROP = 16
+
+
+def ask_session(bundle_dir=None, reviewer=None, parent=None):
+    """(bundle_dir, reviewer) -- prompting for whatever was not given.
+
+    The reviewer NAMES THE VERDICT FILE, so the same program writes to a
+    different place per person and ten of them share one bundle folder
+    without colliding. Getting it as a Qt dialog rather than only as a
+    command-line flag is what makes the app double-clickable, and it
+    removes the shell prompts a .bat was doing badly.
+
+    A name typed differently on the second day starts a FRESH queue and
+    re-reviews everything already done, so the field is pre-filled with
+    the last one used and the answer is remembered.
+    """
+    from PyQt5 import QtWidgets as W
+    remembered = _remembered()
+    if not bundle_dir:
+        bundle_dir = W.QFileDialog.getExistingDirectory(
+            parent, 'Choose the review bundle folder',
+            remembered.get('bundle', ''))
+        if not bundle_dir:
+            return None, None
+    if not reviewer:
+        reviewer, ok = W.QInputDialog.getText(
+            parent, 'Spot Check',
+            'Your name or initials.\n\n'
+            'It names your verdict file, so several people can share one\n'
+            'bundle folder. Use the SAME spelling every session -- a new\n'
+            'name starts a fresh queue and re-reviews what you have done.',
+            text=remembered.get('reviewer', ''))
+        if not ok or not str(reviewer).strip():
+            return None, None
+        reviewer = str(reviewer).strip()
+    _remember(bundle_dir, reviewer)
+    return bundle_dir, reviewer
+
+
+def _remember_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        'last_session.json')
+
+
+def _remembered():
+    import json
+    try:
+        with open(_remember_path(), encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+def _remember(bundle_dir, reviewer):
+    import json
+    try:
+        with open(_remember_path(), 'w', encoding='utf-8') as f:
+            json.dump({'bundle': str(bundle_dir),
+                       'reviewer': str(reviewer)}, f)
+    except Exception:                                       # noqa: BLE001
+        pass          # remembering is a convenience, never a requirement
 
 
 class KeyPassingCanvas(FigureCanvasQTAgg):
@@ -86,7 +182,8 @@ class Queue:
     few gigabytes.
     """
 
-    def __init__(self, bundle_dir, log, per_page=VIEW.PER_PAGE):
+    def __init__(self, bundle_dir, log, per_page=VIEW.PER_PAGE,
+                 max_per_crop=None):
         self.dir = str(bundle_dir)
         self.log = log
         self.items = []
@@ -96,6 +193,14 @@ class Queue:
                 n = int(row['n_candidates'])
                 if n == 0:
                     continue          # nothing to judge, not a skipped page
+                # THE REVIEW BUDGET, and it lives here rather than in the
+                # bundle. The extractor keeps every candidate the data
+                # produced; how many of them a person is asked to judge is
+                # a per-session choice, and applying it here costs nothing
+                # and destroys nothing. Candidates are stored gate-pass
+                # first, so a cap always keeps the informative ones.
+                if max_per_crop:
+                    n = min(n, int(max_per_crop))
                 for pi, ix in enumerate(VIEW.pages_of(n, per_page)):
                     if (row['key'], pi) in done:
                         continue
@@ -124,18 +229,30 @@ class Queue:
 
 class SpotCheck(QtWidgets.QMainWindow):
 
-    def __init__(self, bundle_dir, reviewer, per_page=VIEW.PER_PAGE):
+    def __init__(self, bundle_dir, reviewer, per_page=VIEW.PER_PAGE,
+                 max_per_crop=None):
         super().__init__()
         self.bundle_dir = str(bundle_dir)
         self.per_page = int(per_page)
         self.log = V.VerdictLog(self.bundle_dir, reviewer)
-        self.queue = Queue(self.bundle_dir, self.log, self.per_page)
+        self.max_per_crop = max_per_crop
+        self.queue = Queue(self.bundle_dir, self.log, self.per_page,
+                           max_per_crop=max_per_crop)
 
         self.setWindowTitle(f'Spot Check — {reviewer} — {self.bundle_dir}')
         self.resize(1750, 780)
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         lay = QtWidgets.QVBoxLayout(central)
+
+        # WHAT THE PAGE IS, in Qt rather than in the figure. Matplotlib
+        # charges ~0.48 ms per glyph to rasterize text here, so this line
+        # cost ~65 ms of every repaint while it was an axes title.
+        self.header = QtWidgets.QLabel()
+        self.header.setStyleSheet(
+            'font-family: monospace; font-size: 12px; font-weight: bold;'
+            ' padding: 4px 3px 1px 3px;')
+        lay.addWidget(self.header)
 
         self.fig = Figure(figsize=(15.0, 5.6), dpi=110)
         self.canvas = KeyPassingCanvas(self.fig)
@@ -155,8 +272,12 @@ class SpotCheck(QtWidgets.QMainWindow):
         lay.addWidget(self.help)
 
         self.canvas.mpl_connect('button_press_event', self._on_click)
+        self.canvas.mpl_connect('draw_event', self._on_draw)
         self._state = None
         self._adding = False
+        self._snapped = None
+        self._art = None
+        self._bg = None
         self._t0 = time.time()
         self._load()
 
@@ -172,7 +293,17 @@ class SpotCheck(QtWidgets.QMainWindow):
         rows = [(float(c['y']), float(c['x']), float(c['z']), float(c['p']),
                  int(c['fit_ok']), int(c['gate_pass']), w)
                 for c, w in zip(cands, words)]
-        npage = len(VIEW.pages_of(len(rows), self.per_page))
+        shown_n = (min(len(rows), int(self.max_per_crop))
+                   if self.max_per_crop else len(rows))
+        # THE OVERVIEW SHOWS WHAT CAN BE JUDGED, and nothing else. It used
+        # to draw every candidate in the crop, so a busy cell put 338
+        # circles and 338 numbers on the image when only the top 16 were
+        # ever reachable by a keystroke -- 322 marks the reviewer cannot
+        # act on, and MEASURED 1730 ms a page against 640 ms for a cell of
+        # the same size with a normal candidate count.
+        n_total = len(rows)
+        rows = rows[:shown_n]
+        npage = len(VIEW.pages_of(shown_n, self.per_page))
         # What this reviewer already recorded for THIS page, if anything.
         # Without it, stepping back with Backspace showed a committed page
         # with every keep wiped from the screen -- the display contradicting
@@ -186,27 +317,104 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._state = dict(shard=shard, row=row, page=page, ix=ix,
                            stack=stack, mask=mask, cands=rows, npage=npage,
                            store=meta.get('storage_path'),
+                           n_total=n_total,
                            accepted=set(prior['accepted']) if prior else set(),
                            added=list(prior['added']) if prior else [],
                            revisited=bool(prior))
         self._adding = False
+        self._art = None
+        self._bg = None
         self._t0 = time.time()
         self._draw()
 
-    def _draw(self):
-        s = self._state
+    def _draw(self, restyle_only=False):
+        """Repaint the page.
+
+        A KEEP-TOGGLE DOES NOT REDRAW THE IMAGES. Pressing 1-4 changes
+        circle colours and nothing else, yet matplotlib rasterizes the
+        whole figure for any change -- MEASURED 542 ms, against 0.1 ms to
+        actually restyle the artists. Over an 870-page assignment that is
+        twelve minutes spent watching nine identical images be painted
+        again.
+
+        So the toggle path BLITS. Everything restyle() can touch is
+        marked animated, which takes it out of the normal draw; the
+        rasterized page underneath is cached on the draw_event that
+        follows, and a toggle restores that cache and redraws only the
+        ~50 changed artists. Any failure falls back to a real draw,
+        because a stale blit is a screen that lies about what is
+        recorded.
+        """
+        s = dict(self._state)
+        s['snapped'] = self._snapped
         row = s['row']
-        header = (f"FOV{int(row['fov']):03d}   {row['hybe']}   "
-                  f"ch{int(row['channel'])}   cell {int(row['cell'])}")
-        VIEW.draw_page(self.fig, s['stack'], s['mask'], s['cands'], s['ix'],
-                       header=header, accepted=s['accepted'],
-                       added=s['added'], page=s['page'], npage=s['npage'],
-                       per_page=self.per_page)
-        self.canvas.draw_idle()
+        if restyle_only and self._art is not None:
+            VIEW.restyle(self._art, s['accepted'], s['added'])
+            if not self._blit():
+                self.canvas.draw_idle()
+        else:
+            header = (f"FOV{int(row['fov']):03d}   {row['hybe']}   "
+                      f"ch{int(row['channel'])}   cell {int(row['cell'])}")
+            self._art = VIEW.draw_page(
+                self.fig, s['stack'], s['mask'], s['cands'], s['ix'],
+                header=header, accepted=s['accepted'], added=s['added'],
+                page=s['page'], npage=s['npage'], per_page=self.per_page,
+                n_total=s['n_total'])
+            for a in VIEW.mutable_artists(self._art):
+                a.set_animated(True)
+            self._bg = None              # invalid until the next draw lands
+            self.canvas.draw_idle()
+        self._set_status(s)
+
+    def _on_draw(self, _event):
+        """Cache the rasterized page as the blit background.
+
+        Fires at the end of every real draw, including the ones Qt does
+        on its own for a resize or an expose -- which is exactly when the
+        old cache stopped matching the screen.
+        """
+        if self._art is None:
+            return
+        try:
+            self._bg = self.canvas.copy_from_bbox(self.fig.bbox)
+            self._draw_mutable()
+        except Exception:                                   # noqa: BLE001
+            self._bg = None
+
+    def _draw_mutable(self):
+        for a in VIEW.mutable_artists(self._art):
+            self.fig.draw_artist(a)
+
+    def _blit(self):
+        """Restore the cached page and repaint only the changed artists.
+
+        Returns False -- meaning "do a real draw instead" -- whenever the
+        cache is missing or anything goes wrong.
+        """
+        if self._bg is None or self._art is None:
+            return False
+        try:
+            self.canvas.restore_region(self._bg)
+            self._draw_mutable()
+            self.canvas.blit(self.fig.bbox)
+            return True
+        except Exception:                                   # noqa: BLE001
+            self._bg = None
+            return False
+
+    def _set_status(self, s):
         kept = ', '.join(f'#{i + 1}' for i in sorted(s['accepted'])) or 'none'
+        if self._art is not None:
+            self.header.setText(
+                self._art['header_text']
+                + f'   |   accepted so far: {len(s["accepted"])}'
+                + (f' (+{len(s["added"])} added)' if s['added'] else ''))
         self.status.setText(
             ('RE-VISITING a page you already judged -- Space re-commits it   |  '
              if s.get('revisited') else '')
+            + (f'clicked ON candidate #{s["snapped"] + 1} -- kept it '
+               f'instead of adding a duplicate   |  '
+               if s.get('snapped') is not None else '')
             + f'queue {self.queue.i + 1}/{len(self.queue)}   '
             f'|  keeping: {kept}   '
             f'|  added: {len(s["added"])}   '
@@ -221,6 +429,9 @@ class SpotCheck(QtWidgets.QMainWindow):
         # Every key handler below returns early on _state is None.
         self._state = None
         self._adding = False
+        self._art = None
+        self._bg = None
+        self.header.setText('')
         self.fig.clear()
         ax = self.fig.add_subplot(111); ax.axis('off')
         ax.text(0.5, 0.5, 'Nothing left to review in this bundle.\n'
@@ -240,7 +451,25 @@ class SpotCheck(QtWidgets.QMainWindow):
         # the verdict is recorded in.
         if ev.inaxes is not self.fig.axes[0]:
             return
-        self._state['added'].append((float(ev.ydata), float(ev.xdata)))
+        y, x = float(ev.ydata), float(ev.xdata)
+        # A CLICK ON AN EXISTING CANDIDATE ACCEPTS IT, never adds a
+        # duplicate. This is not a nicety: a reviewer did exactly this --
+        # hand-added two spots that were already candidates, because the
+        # off-page circles were drawn too faint to see. That produces a
+        # label the training set counts twice and a judgement nobody
+        # needed to make. Snapping means the mistake is impossible rather
+        # than merely less likely.
+        near, best = None, ADD_SNAP_PX ** 2
+        for i, c in enumerate(self._state['cands']):
+            d2 = (float(c[0]) - y) ** 2 + (float(c[1]) - x) ** 2
+            if d2 < best:
+                near, best = i, d2
+        if near is not None:
+            self._state['accepted'].add(near)
+            self._snapped = near
+        else:
+            self._state['added'].append((y, x))
+            self._snapped = None
         self._adding = False
         self._draw()
 
@@ -258,7 +487,7 @@ class SpotCheck(QtWidgets.QMainWindow):
             if slot < len(s['ix']):
                 i = s['ix'][slot]
                 s['accepted'].symmetric_difference_update({i})
-                self._draw()
+                self._draw(restyle_only=True)
             return
         if k == QtCore.Qt.Key_A:
             self._adding = True; self._draw(); return
@@ -288,16 +517,34 @@ class SpotCheck(QtWidgets.QMainWindow):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
-    ap.add_argument('bundle_dir')
-    ap.add_argument('--reviewer', required=True,
+    ap.add_argument('bundle_dir', nargs='?', default=None)
+    ap.add_argument('--reviewer', default=None,
                     help='your name/initials -- names the verdict file, so '
                          'ten people can share one bundle directory')
     ap.add_argument('--per-page', type=int, default=VIEW.PER_PAGE)
+    ap.add_argument('--max-per-crop', type=int, default=DEFAULT_MAX_PER_CROP,
+                    help='judge at most this many candidates per crop '
+                         f'(default {DEFAULT_MAX_PER_CROP}). The bundle keeps '
+                         'every candidate the data produced; this bounds only '
+                         'what a person is shown, so raising it later needs no '
+                         're-extraction. Candidates are ordered gate-pass, then '
+                         'fitted, then by quality, so a cap keeps the confident '
+                         'spots AND the boundary cases either side of the gate '
+                         '-- which is where a detector learns. Pass 0 for no '
+                         'limit.')
     a = ap.parse_args(argv)
-    if not os.path.isdir(a.bundle_dir):
-        raise SystemExit(f'no such bundle directory: {a.bundle_dir}')
     app = QtWidgets.QApplication(sys.argv[:1])
-    w = SpotCheck(a.bundle_dir, a.reviewer, a.per_page)
+    # Whatever was not given on the command line is ASKED FOR, so the
+    # file can simply be double-clicked.
+    bundle_dir, reviewer = ask_session(a.bundle_dir, a.reviewer)
+    if not bundle_dir or not reviewer:
+        return 0
+    if not os.path.isdir(bundle_dir):
+        QtWidgets.QMessageBox.critical(
+            None, 'Spot Check', 'No such bundle folder:\n' + str(bundle_dir))
+        return 1
+    w = SpotCheck(bundle_dir, reviewer, a.per_page,
+                  max_per_crop=(a.max_per_crop or None))
     if len(w.queue) == 0:
         print('nothing left to review in', a.bundle_dir)
     w.show()

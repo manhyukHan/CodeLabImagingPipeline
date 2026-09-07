@@ -25,19 +25,15 @@ This workload is CPU bound, which is the opposite of the alignment path
 -- that one is bandwidth bound and measured FASTER at 3 workers than at
 6. Do not carry that worker count over here.
 
-GENEROSITY IS THE POINT AND IT IS COSTLY. At mode+1sigma the median real
-cell yields 21 candidates and the worst yields 156, and each v2 fit is
-~110 ms. Two caps keep that bounded without raising the threshold (which
-would drop the dim spots this whole exercise exists to learn): `max_fits`
-bounds how many anchors are fitted at all, brightest first, and
-`keep_top` bounds how many reach the bundle. Neither is a quality filter
--- both are effort limits, and both are recorded in the bundle's meta so
-a later reader knows the list was truncated rather than exhausted.
+GENEROSITY IS THE POINT, AND NOTHING CAPS IT. How many candidates a crop
+has is a property of that crop, and the anchor threshold already decides
+it from the data -- mode + k*sigma of the crop's own background. Both
+per-crop ceilings are gone; see DEFAULT_MAX_FITS below for the measured
+reason. The bundle is complete, its meta says so, and the review budget
+lives in the viewer where it can be changed without destroying anything.
 
-`keep_top` is applied to the COMBINED list, not inside the engine. The
-engine caps what it fitted; the unfitted anchors are appended after, and
-capping inside let them past the limit -- which is how the first real run
-asked for 12 candidates and produced a median of 33.
+Candidates are ordered gate-pass, then fitted, then by p -- so a reviewer
+meets the informative ones first and stopping early costs the least.
 
 WHAT IT WILL NOT DO. It never writes to the store. It reads cells,
 matrices and stacks; the only thing it creates is the bundle directory.
@@ -47,6 +43,9 @@ import time
 
 import numpy as np
 
+import numpy.linalg as la
+
+from ..alignment.chain import align_cell
 from ..io import analysis_store, paths
 from ..localization import engine as E
 from . import bundle as B
@@ -58,51 +57,121 @@ from . import bundle as B
 # it -- is still in frame and still proposed.
 DEFAULT_PAD = 14
 
-# How many anchors get fitted at all, brightest first. NOT a quality
-# filter -- an effort limit -- and it was set to 40 against the MAZ
-# store, where a crop yields ~21 anchors and every gate-passing spot came
-# from brightness rank <= 21. Applying that number to MP58/RNA, which is
-# roughly four times denser, was the mistake CLAUDE.md warns about:
+# NO PER-CROP CANDIDATE LIMIT. Both of these are None on purpose.
 #
-#   anchors per crop, MP58, all 2266 crops:
-#       p25 35   MEDIAN 90   p75 174   p90 239   max 464
-#   crops where max_fits=40 binds:            1625 / 2266  (71.7%)
-#   anchors never fitted because of it:     173076 / 250481 (69.1%)
-#   production-passing spots NEVER PROPOSED:  31 / 534  (5.8%)
-#       their anchor brightness rank: median 88, p90 147, max 215
-#       their p: 0.023 .. 0.785
+# How many spots a crop has is a property of the crop, and the anchor
+# threshold already answers it from the data: mode + k*sigma of that
+# crop's own background. Putting a fixed ceiling on top substitutes an
+# arbitrary number for a measured one, and it does not survive a change
+# of store.
 #
-# A spot never proposed is a label that can never be collected, and the
-# ones lost are systematically the dim ones -- exactly what a learned
-# detector is being built to find. 250 covers the observed max rank with
-# headroom. Re-measure on any store whose density is unknown; do not
-# assume this number transfers either.
-DEFAULT_MAX_FITS = 250
-DEFAULT_KEEP_TOP = 24
+# It was 40, chosen on the MAZ store where a crop yields ~21 anchors and
+# every gate-passing spot came from brightness rank <= 21. MP58/RNA is
+# about four times denser -- median 90 anchors a crop, max 464 -- and
+# that same 40 then:
+#
+#   bound on            1625 / 2266 crops   (71.7%)
+#   left unfitted     173076 / 250481 anchors (69.1%)
+#   NEVER PROPOSED        31 / 534 production-passing spots (5.8%),
+#                         at brightness rank up to 215, p up to 0.785
+#
+# Raising it to 250 would only have moved the same mistake to the next
+# store. A spot never proposed is a label that can never be collected,
+# and the ones lost are systematically the dim ones a learned detector
+# exists to find.
+#
+# The two caps existed for genuinely different reasons, and only one of
+# them belongs to the data at all:
+#
+#   max_fits  was a COMPUTE budget. Measured, it is not needed: fitting
+#             every anchor of this whole bundle is 250,481 fits at
+#             0.127 s = 8.8 h serial, 17 min across 32 workers, against
+#             6.1 min capped. Left as an optional safety valve for a
+#             pathological crop, off by default.
+#   keep_top  was a REVIEW budget, and a review budget has no business
+#             being baked into the data. Truncating at write time
+#             destroys candidates permanently; the same limit applied in
+#             the viewer costs nothing and can be changed per session.
+#             Keeping everything grows the bundle by 0.23% -- candidate
+#             rows are ~19 bytes against 1.57 GiB of pixels.
+#
+# So: the bundle is COMPLETE, and spotcheck's --max-per-crop bounds what
+# a person is shown.
+DEFAULT_MAX_FITS = None
+DEFAULT_KEEP_TOP = None
 
 
-def cell_masks(storage_path, fov):
-    """[(cell_id, y_area, x_area, frame_shape), ...] for one FOV.
+def cell_masks(storage_path, fov, hybe=None, modality=None, resolver=None):
+    """[(cell_id, y_area, x_area, frame_shape), ...] IN `hybe`'S OWN FRAME.
 
-    Reads the persisted cell dicts rather than building ACell objects:
-    the extractor needs a mask and a bbox, and nothing else a cell knows.
-    The mask is stored and drawn but NOT used to filter candidates -- see
-    extract_fov.
-    Going through CellContainer would drag in matrix resolution that this
-    path has no use for -- crops here are in the HYBE'S OWN native frame,
-    deliberately, because that is the frame a learned detector will be
-    handed at inference time. Alignment is applied to the coordinates
-    afterwards, by whoever needs them in a shared frame.
+    THE MASK HAS TO BE MOVED, and an earlier version of this function did
+    not move it. Its docstring argued that "crops here are in the hybe's
+    own native frame, deliberately, so this path has no use for matrix
+    resolution" -- which inverts the actual requirement. The pixels do
+    stay in the hybe's frame; the cell was segmented in a DIFFERENT hybe
+    (cell.reference_hybe), so it is the mask that has to travel. "The
+    crop is in the native frame" is the reason the transform is needed,
+    not a reason to skip it.
+
+    It is not cosmetic. The bbox is computed FROM the mask, so an
+    untransformed mask also places the crop WINDOW wrong, and the pad is
+    only 14 px: a drift larger than that clips the cell out of its own
+    crop. MEASURED on MP58/RNA Hyb_109, all 2266 cells, |shift| median
+    1.60 px, p90 2.38, max 4.63, systematic per FOV (fov003 dx -2.36,
+    fov009 dy +2.15) -- comfortably inside the pad there, and no reason
+    at all to assume the next experiment, FOV or hybe is as kind.
+
+    resolver: a frames.FrameResolver for this FOV. Build it once per FOV
+    and pass it in -- it reads matrices off disk. With none given, or no
+    hybe, the raw stored area is returned unchanged, which is correct
+    only when the crop comes from the cell's own reference hybe.
     """
     dicts, _ = analysis_store.read_cells(storage_path, fov)
+    dicts = dicts or []
+    cells = None
+    if resolver is not None and hybe:
+        from ..models.cell_container import CellContainer
+        cells = CellContainer.load({int(fov): dicts}).data[int(fov)]
     out = []
-    for c in dicts or []:
+    for c in dicts:
         ya, xa = c['area']
         if len(ya) == 0:
             continue
-        out.append((int(c['id']), np.asarray(ya).astype(int),
-                    np.asarray(xa).astype(int), tuple(c['frame_shape'])))
+        ya = np.asarray(ya).astype(int)
+        xa = np.asarray(xa).astype(int)
+        if cells is not None:
+            cell = cells.get(int(c['id']))
+            if cell is not None:
+                m = modality or c.get('reference_modality') or ''
+                # transform(src, dst) maps src -> dst, so this is
+                # hybe -> reference; the mask lives in the reference
+                # frame, so it moves under the INVERSE. Same composition
+                # localization.cell_crop uses for the production crop.
+                H, _dz, _missing = resolver.transform(
+                    (hybe, m),
+                    (cell.reference_hybe, cell.reference_modality), cell)
+                cy, cx = align_cell((cell.area[0], cell.area[1]), la.inv(H),
+                                    cell.frame_shape)
+                if len(cy):
+                    ya, xa = cy.astype(int), cx.astype(int)
+        out.append((int(c['id']), ya, xa, tuple(c['frame_shape'])))
     return out
+
+
+def resolver_for_fov(storage_path, fov):
+    """A FrameResolver for one FOV, or None if the store cannot make one.
+
+    None is not an error: a store with no matrices yet still has cells,
+    and returning the untransformed mask is the honest answer there --
+    the same "an uncomputed layer is identity" rule the resolver itself
+    follows. What must never happen is silently skipping the transform on
+    a store that COULD have done it.
+    """
+    try:
+        from ..analysis import resolvers
+        return resolvers.resolver_for(storage_path, int(fov))
+    except Exception:                                       # noqa: BLE001
+        return None
 
 
 def _read_crops(stack_path, channel, cells, pad):
@@ -163,8 +232,7 @@ def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
     anchors = E.anchor_candidates(stack, n_max=max_fits, **anchor)
     if not anchors:
         return []
-    detailed = engine.localize_detailed(stack, seeds=anchors,
-                                        n_max=max_fits)
+    detailed = engine.localize_detailed(stack, seeds=anchors, n_max=None)
     out = [(s.y, s.x, s.z, s.p, 1, 1 if ok else 0, why)
            for (s, ok, why) in detailed]
     taken = [(s.y, s.x) for (s, _o, _w) in detailed]
@@ -172,17 +240,19 @@ def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
         if any((ay - ty) ** 2 + (ax - tx) ** 2 < 9 for (ty, tx) in taken):
             continue
         out.append((ay, ax, az, 0.0, 0, 0, 'no fit'))
+    # GATE-PASS FIRST, then fitted, then by p -- ALWAYS, cap or no cap.
+    #
+    # This is the review order, and it matters even when nothing is
+    # truncated: the reviewer meets the informative candidates first, so
+    # stopping early costs the least. Sorting on (fit_ok, p) alone was
+    # wrong because p and the gate disagree -- MEASURED, the gate-pass
+    # candidates a wider search recovered had p from 0.023 to 0.785,
+    # median 0.061, far below the junk outranking them.
+    out.sort(key=lambda c: (-c[5], -c[4], -c[3]))
     if keep_top:
-        # GATE-PASS FIRST, then fitted, then by p.
-        #
-        # Sorting on (fit_ok, p) alone dropped production-passing spots:
-        # p and the gate disagree, and MEASURED on a real bundle the
-        # gate-pass candidates a wider search recovered had p from 0.023
-        # to 0.785, median 0.061 -- far below the junk that outranks them.
-        # A spot the production gate would accept must never be evicted
-        # by an effort cap, because a candidate never shown is a label
-        # that can never be collected.
-        out.sort(key=lambda c: (-c[5], -c[4], -c[3]))
+        # Only ever a caller's explicit ask. The default is None: a
+        # truncation at write time is permanent, and the same limit in
+        # the viewer costs nothing and is a per-session choice.
         out = out[:int(keep_top)]
     return out
 
@@ -216,11 +286,21 @@ def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
     anchor = dict(anchor if anchor is not None else E.GENEROUS_ANCHOR)
     engine = E.make_engine(engine_name, anchor=anchor)
     wanted = set(int(c) for c in cell_ids)
-    cells = [c for c in cell_masks(storage_path, fov) if c[0] in wanted]
+    modality = analysis_store.modality_of(storage_path)
+    resolver = resolver_for_fov(storage_path, fov)
+    cells = [c for c in cell_masks(storage_path, fov, hybe=hybe,
+                                   modality=modality,
+                                   resolver=resolver)
+             if c[0] in wanted]
     path = os.path.join(str(out_dir), f'fov{int(fov):03d}__{hybe}__{tag}.h5')
     info = dict(meta or {})
     info.update(fov=int(fov), hybe=str(hybe), channel=int(channel),
-                pad=int(pad), max_fits=int(max_fits), keep_top=int(keep_top),
+                pad=int(pad),
+                # None means "nothing was truncated" -- a reader has to be
+                # able to tell a complete candidate list from a capped one.
+                max_fits=None if max_fits is None else int(max_fits),
+                keep_top=None if keep_top is None else int(keep_top),
+                complete=(max_fits is None and keep_top is None),
                 engine=engine_name, anchor=anchor,
                 cells=sorted(wanted), storage_path=str(storage_path))
     sp = paths.stack_path(storage_path, fov, hybe)
@@ -253,6 +333,7 @@ def plan(storage_path, fovs, hybes, channel, chunk=DEFAULT_CHUNK):
     """
     tasks = []
     for fov in [int(f) for f in fovs]:
+        # ids only -- the frame does not change which cells exist
         ids = [c[0] for c in cell_masks(storage_path, fov)]
         if not ids:
             continue
@@ -277,20 +358,25 @@ def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
     # capping inside it let them append past the limit, which is how a run
     # asking for 12 produced a median of 33.
     engine = E.make_engine(engine_name, anchor=anchor)
-    cells = cell_masks(storage_path, fov)
+    modality = analysis_store.modality_of(storage_path)
+    resolver = resolver_for_fov(storage_path, fov)
     path = os.path.join(str(out_dir), f'fov{int(fov):03d}.h5')
     n_crop = n_cand = 0
     info = dict(meta or {})
     info.update(fov=int(fov), channel=int(channel), pad=int(pad),
-                max_fits=int(max_fits), keep_top=int(keep_top),
+                max_fits=None if max_fits is None else int(max_fits),
+                keep_top=None if keep_top is None else int(keep_top),
+                complete=(max_fits is None and keep_top is None),
                 engine=engine_name, anchor=anchor,
                 storage_path=str(storage_path))
-    if not cells:
-        return path, 0, 0
     with B.BundleWriter(path, meta=info) as w:
         for hybe in hybes:
             sp = paths.stack_path(storage_path, fov, hybe)
             if not os.path.exists(sp):
+                continue
+            cells = cell_masks(storage_path, fov, hybe=hybe,
+                               modality=modality, resolver=resolver)
+            if not cells:
                 continue
             try:
                 crops = _read_crops(sp, channel, cells, pad)

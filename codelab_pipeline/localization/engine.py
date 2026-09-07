@@ -155,7 +155,7 @@ class GaussianLocalizeEngine(LocalizeEngine):
                        sigma_y=r[5], sigma_x=r[4], sigma_z=r[6], offset=r[7])
                  for r in results if r is not None]
         spots.sort(key=lambda s: -s.amplitude)
-        return spots[:n_max]
+        return spots if n_max is None else spots[:int(n_max)]
 
 
 def background_mode(img):
@@ -215,7 +215,7 @@ real spots -- exactly the ones a learned detector is being built to find.
 """
 
 
-def anchor_candidates(stack, n_max=8, min_distance=3, mode_k=None,
+def anchor_candidates(stack, n_max=None, min_distance=3, mode_k=None,
                       threshold_rel=0.5, absolute_threshold=0.0,
                       background_quantile=0.5, max_to_background=2.0):
     """THE anchor step, alone: (h, w, depth) stack -> [(y, x, z), ...].
@@ -240,6 +240,7 @@ def anchor_candidates(stack, n_max=8, min_distance=3, mode_k=None,
     from skimage.feature import peak_local_max
     if stack is None or stack.size == 0 or not np.isfinite(stack).any():
         return []
+    n_max = None if n_max is None else int(n_max)
     # A cell crop is mostly mask: whole columns and planes ARE all-NaN by
     # construction, and nanmax says so once per column. Silenced here
     # rather than at the caller -- this is the expected shape of the
@@ -269,7 +270,12 @@ def anchor_candidates(stack, n_max=8, min_distance=3, mode_k=None,
         return []
     bright = mip[yx[:, 0], yx[:, 1]]
     out = []
-    for j in np.argsort(bright)[::-1][:n_max]:
+    # n_max=None means every anchor the threshold proposed. The threshold
+    # is mode + k*sigma of THIS crop, so how many there are is already the
+    # data's answer; a fixed ceiling on top of it is a second, arbitrary
+    # one that does not transfer between stores.
+    order = np.argsort(bright)[::-1]
+    for j in (order if n_max is None else order[:int(n_max)]):
         y, x = int(yx[j][0]), int(yx[j][1])
         # THIS ANCHOR'S OWN COLUMN, not the y-collapsed profile.
         #
@@ -360,7 +366,7 @@ class AnchorFitEngine(LocalizeEngine):
                 out.append(sp._replace(p=max(min(p, 1.0), 1e-6)))
         out = dedupe(out, min_sep=self.dedup_px)
         out.sort(key=lambda s: -s.p)
-        return out[:n_max]
+        return out if n_max is None else out[:int(n_max)]
 
 
 class AnchorFitV2Engine(LocalizeEngine):
@@ -481,8 +487,9 @@ class AnchorFitV2Engine(LocalizeEngine):
                         bool(ok), '' if ok else str(why or 'gate rejected')))
         out = dedupe(out, key=lambda t: t[0], min_sep=self.dedup_px)
         out.sort(key=lambda t: -t[0].p)
-        cap = min(n_max, self.keep_top) if self.keep_top else n_max
-        return out[:cap]
+        cap = self.keep_top if n_max is None else (
+            min(n_max, self.keep_top) if self.keep_top else n_max)
+        return out if cap is None else out[:int(cap)]
 
     def localize(self, stack, seed_yxz=None, n_max=1):
         return [s for (s, _ok, _why)

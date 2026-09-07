@@ -35,3 +35,6 @@ codelab_launch_*.log
 # here that a reader of the repository needs must therefore be stated in
 # code comments, in README.md, or in a commit message instead.
 docs/
+
+# Per-user launcher state: whose bundle and whose name, not the repo's.
+spotcheck/last_session.json

@@ -61,6 +61,25 @@ import os
 import time
 
 FILENAME_FMT = 'verdicts_{reviewer}.jsonl'
+SESSION_FMT = 'verdicts_{reviewer}__{session}.jsonl'
+
+
+def _safe(name):
+    """A reviewer name that is also a filename. Anything outside
+    [A-Za-z0-9._-] becomes '-', so a name with a space or a slash cannot
+    put the log somewhere unexpected -- or nowhere."""
+    s = ''.join(c if (c.isalnum() or c in '._-') else '-' for c in str(name))
+    return s.strip('-') or 'anon'
+
+
+def _session_tag():
+    """Unique per RUNNING PROCESS: timestamp plus pid.
+
+    The pid matters. Two windows opened in the same second would
+    otherwise share a file and hit the very append race this is here to
+    avoid.
+    """
+    return f'{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
 
 # Two coordinates within this many pixels are the same spot when tallying
 # votes. Well under a real emitter's ~1.3 px sigma, and loose enough that
@@ -74,15 +93,46 @@ def path_for(bundle_dir, reviewer):
 
 
 class VerdictLog:
-    """Append-only writer + the resume index for one reviewer."""
+    """Append-only writer + the resume index for one reviewer.
 
-    def __init__(self, bundle_dir, reviewer):
-        self.path = path_for(bundle_dir, reviewer)
+    ONE FILE PER SESSION, not per reviewer, and that is a correctness
+    decision rather than tidiness. `open(path, 'a')` is NOT an atomic
+    append on Windows -- the CRT seeks to end and then writes, so two
+    processes appending to one file can compute the same offset and
+    overwrite each other. Measured: two instances open under the same
+    reviewer name lose verdicts at the seam.
+
+    Locking would fix it and bring its own failure -- a crashed process
+    leaving a lock behind, on a program whose whole point is surviving a
+    crash. Giving each session its own file removes the shared resource
+    instead: two windows, two files, no seam. merge() already globs, and
+    done_pages() reads every file this reviewer owns, so resume is
+    unaffected.
+    """
+
+    def __init__(self, bundle_dir, reviewer, session=None):
+        self.dir = str(bundle_dir)
         self.reviewer = str(reviewer)
+        self.session = str(session) if session else _session_tag()
+        self.path = os.path.join(self.dir, SESSION_FMT.format(
+            reviewer=_safe(self.reviewer), session=self.session))
         self._done = None
 
+    def my_logs(self):
+        """Every file this REVIEWER has written to this bundle, any
+        session. Resume has to see all of them or a second window would
+        re-serve pages the first one already judged."""
+        import glob
+        pat = os.path.join(self.dir, SESSION_FMT.format(
+            reviewer=_safe(self.reviewer), session='*'))
+        found = sorted(glob.glob(pat))
+        legacy = path_for(self.dir, self.reviewer)   # pre-session layout
+        if os.path.exists(legacy) and legacy not in found:
+            found.append(legacy)
+        return found
+
     def done_pages(self):
-        """{(key, page)} already committed BY THIS REVIEWER.
+        """{(key, page)} already committed BY THIS REVIEWER, any session.
 
         Read once and cached: it is what lets a session resume where it
         stopped, and re-reading per page would make the queue O(n^2) in a
@@ -90,8 +140,9 @@ class VerdictLog:
         """
         if self._done is None:
             self._done = set()
-            for rec in read_log(self.path):
-                self._done.add((rec.get('key'), int(rec.get('page', 0))))
+            for p in self.my_logs():
+                for rec in read_log(p):
+                    self._done.add((rec.get('key'), int(rec.get('page', 0))))
         return self._done
 
     def page_verdict(self, key, page):
@@ -170,6 +221,22 @@ class VerdictLog:
         # the labels, possibly not on Windows, and one JSON object per
         # line is the whole contract.
         with open(self.path, 'a', encoding='utf-8', newline='\n') as f:
+            # HEAL A TORN TAIL BEFORE WRITING. A process killed mid-write
+            # leaves a fragment with no newline; appending straight onto
+            # it fuses the fragment and the next record into one
+            # unparseable line, and read_log then discards BOTH -- so a
+            # perfectly good verdict disappears, the page is missing from
+            # done_pages, and it is silently re-served. MEASURED: two
+            # commits either side of a torn line, one readable.
+            #
+            # One newline separates them, and the fragment stays its own
+            # (discarded) line, which is the only part that was ever lost.
+            if f.tell() > 0:
+                f.flush()
+                with open(self.path, 'rb') as probe:
+                    probe.seek(-1, os.SEEK_END)
+                    if probe.read(1) != b'\n':
+                        f.write('\n')
             f.write(json.dumps(rec) + '\n')
             f.flush()
             os.fsync(f.fileno())        # a page committed is a page kept
