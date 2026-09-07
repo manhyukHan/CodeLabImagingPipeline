@@ -50,7 +50,15 @@ def synth_bundle(d, n_crops=3, n_cands=9):
     """A bundle with the same shape as a real one."""
     rng = np.random.default_rng(0)
     path = os.path.join(d, 'fov001.h5')
-    with B.BundleWriter(path, meta={'synthetic': True}) as w:
+    # storage_path is part of what a real shard records, and the
+    # verdict format depends on it -- a fixture without it would
+    # quietly skip the checks that say a label can outlive its
+    # bundle. It points nowhere; only recut() would read it, and
+    # that check runs against the real bundle only.
+    with B.BundleWriter(path, meta={'synthetic': True,
+                                    'storage_path': os.path.join(d, 'no-such-store'),
+                                    'hybe': 'Hyb_001', 'channel': 555,
+                                    'pad': 14}) as w:
         for c in range(n_crops):
             h, w_, depth = 40, 44, 31
             stack = rng.integers(200, 400, (h, w_, depth)).astype(np.uint16)
@@ -133,14 +141,48 @@ def main():
     print('\n-- verdicts: the default is REJECT, so empty is a real answer --')
     log_dir = tempfile.mkdtemp()
     log = V.VerdictLog(log_dir, 'tester')
-    log.commit(row['key'], 0, pages[0], accepted=[], seconds=4.0)
+    store = B.read_meta(shards[0])[0].get('storage_path')
+    log.commit(row, 0, pages[0], rows, accepted=[], seconds=4.0, store=store)
     recs = V.read_log(log.path)
     check('an empty commit still writes a record', len(recs) == 1)
     check('and it says which candidates were shown',
-          recs[0]['page_ix'] == pages[0], str(recs[0].get('page_ix')))
-    check('with nothing accepted', recs[0]['accepted'] == [])
+          [e['i'] for e in recs[0]['shown']] == pages[0],
+          str([e['i'] for e in recs[0].get('shown', [])]))
+    check('with nothing kept',
+          all(e['keep'] == 0 for e in recs[0]['shown']))
     check('the dwell time is recorded, so a 0.3 s pass is visible later',
           'seconds' in recs[0])
+
+    print('\n-- a verdict must outlive the bundle --')
+    # A label that names a POSITION in a candidate list is worthless once
+    # the extractor changes: the sort is fitted-first-then-p after a 2 px
+    # dedup, so a scipy nudge or a dedup tweak makes index 2 a different
+    # spot, silently. And a label with no pixels is not training data.
+    r0 = recs[0]
+    check('every shown candidate carries its own coordinate',
+          all({'y', 'x', 'z'} <= set(e) for e in r0['shown']))
+    check('the crop geometry is recorded',
+          {'y0', 'x0', 'h', 'w', 'depth'} <= set(r0.get('crop') or {}),
+          str(sorted((r0.get('crop') or {}).keys())))
+    check('and where the pixels came from',
+          bool(r0.get('store')) and r0.get('fov') is not None
+          and r0.get('hybe') and r0.get('channel') is not None)
+    ff = V.full_frame(r0, r0['shown'][0])
+    check('full_frame lifts a crop-local coordinate into the hybe frame',
+          abs(ff[0] - (r0['shown'][0]['y'] + r0['crop']['y0'])) < 1e-9
+          and abs(ff[1] - (r0['shown'][0]['x'] + r0['crop']['x0'])) < 1e-9,
+          str(tuple(round(v, 2) for v in ff)))
+    if real:
+        # The claim that lets a bundle be deleted: the pixels are a pure
+        # window read, so the store reproduces them exactly.
+        try:
+            cut = V.recut(r0)
+            check('recut() from the STORE equals the bundle crop exactly',
+                  cut.shape == stack.shape and np.array_equal(cut, stack),
+                  f'{cut.shape} vs {stack.shape}')
+        except Exception as exc:                            # noqa: BLE001
+            check('recut() from the STORE equals the bundle crop exactly',
+                  False, f'{type(exc).__name__}: {exc}')
 
     print('\n-- resume --')
     check('a committed page is remembered',
@@ -156,8 +198,8 @@ def main():
 
     print('\n-- two reviewers on one page is agreement, not a conflict --')
     if len(pages) > 0:
-        log.commit(row['key'], 0, pages[0], accepted=[pages[0][0]])
-        other.commit(row['key'], 0, pages[0], accepted=[pages[0][0]])
+        log.commit(row, 0, pages[0], rows, accepted=[pages[0][0]], store=store)
+        other.commit(row, 0, pages[0], rows, accepted=[pages[0][0]], store=store)
     merged, agree = V.merge(log_dir)
     check('both reviewers survive the merge',
           len({r['reviewer'] for r in merged}) == 2,
@@ -165,12 +207,12 @@ def main():
     check('the shared page is reported as multiply-judged',
           any(len(v) > 1 for _k, v in agree), f'{len(agree)} shared page(s)')
     mine = [r for r in merged if r['reviewer'] == 'tester']
+    kept = [e['i'] for e in (mine[0]['shown'] if mine else []) if e['keep']]
     check('a re-review supersedes the earlier line for that reviewer',
-          len(mine) == 1 and mine[0]['accepted'] == [pages[0][0]],
-          str(mine[0]['accepted']) if mine else 'none')
+          len(mine) == 1 and kept == [pages[0][0]], str(kept))
 
     print('\n-- labels: tallied per candidate, not per record --')
-    lab = V.labels(log_dir, {row['key']: rows})
+    lab = V.labels(log_dir)
     e = lab.get(row['key'])
     check('the crop produced labels', e is not None)
     if e:
@@ -189,12 +231,14 @@ def main():
               str(e['reviewers']))
         check('the vote tally is exposed, so a caller can demand unanimity',
               all(seen == 2 for (_k, seen) in e['votes'].values()),
-              str(sorted(e['votes'].items())[:3]))
+              str(list(e['votes'].values())[:3]))
+        check('labels carry enough to re-cut their own pixels',
+              bool(e.get('store')) and bool(e.get('crop')))
 
     print('\n-- a DISAGREEMENT lands in neither bucket --')
     third = V.VerdictLog(log_dir, 'third-reviewer')
-    third.commit(row['key'], 0, pages[0], accepted=[])   # keeps nothing
-    lab2 = V.labels(log_dir, {row['key']: rows})
+    third.commit(row, 0, pages[0], rows, accepted=[], store=store)  # keeps nothing
+    lab2 = V.labels(log_dir)
     e2 = lab2[row['key']]
     check('the spot two kept and one dropped is CONTESTED',
           len(e2['contested']) == 1, str(len(e2['contested'])))

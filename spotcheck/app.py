@@ -53,6 +53,31 @@ from codelab_pipeline.training import verdicts as V        # noqa: E402
 from codelab_pipeline.training import view as VIEW         # noqa: E402
 
 
+class KeyPassingCanvas(FigureCanvasQTAgg):
+    """A matplotlib canvas that lets keystrokes reach the window.
+
+    WITHOUT THIS THE APP IS ENTIRELY DEAD TO THE KEYBOARD, and it fails
+    silently: the window draws, the mouse works, and every key does
+    nothing. matplotlib's FigureCanvasQT.keyPressEvent (3.11.1,
+    backends/backend_qt.py) neither calls super() nor ignores the event,
+    so Qt treats it as handled and never propagates it up to the
+    QMainWindow. The canvas holds focus because it is the only focusable
+    widget here, so nothing else can ever see a key.
+
+    Ignoring the event hands it back to Qt's propagation, which walks up
+    to SpotCheck.keyPressEvent. Mouse handling is untouched -- it goes
+    through mpl_connect and never needed focus.
+
+    This was invisible to a test that called keyPressEvent directly, and
+    the repo's first version of that test did exactly that. Anything
+    claiming the keyboard works has to go through QTest.keyClick into the
+    real focus widget, inside a running event loop.
+    """
+
+    def keyPressEvent(self, event):
+        event.ignore()
+
+
 class Queue:
     """Every (shard, crop, page) in the bundle, minus what is already done.
 
@@ -84,7 +109,16 @@ class Queue:
         return self.items[self.i] if 0 <= self.i < len(self.items) else None
 
     def advance(self, step=1):
-        self.i = max(0, min(len(self.items) - 1, self.i + step))
+        """Move, and allow running one PAST the end.
+
+        It used to clamp to the last index, so the final page never
+        advanced: it redisplayed itself with the reviewer's keeps cleared
+        from the screen, the completion screen was unreachable, and the
+        natural response -- press Space again -- filed an empty verdict
+        that superseded the real one and turned that page's kept spots
+        into confirmed negatives. Clamping only at the bottom.
+        """
+        self.i = max(0, min(len(self.items), self.i + step))
         return self.current()
 
 
@@ -104,7 +138,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         lay = QtWidgets.QVBoxLayout(central)
 
         self.fig = Figure(figsize=(15.0, 5.6), dpi=110)
-        self.canvas = FigureCanvasQTAgg(self.fig)
+        self.canvas = KeyPassingCanvas(self.fig)
         self.canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
         lay.addWidget(self.canvas, 1)
 
@@ -139,9 +173,22 @@ class SpotCheck(QtWidgets.QMainWindow):
                  int(c['fit_ok']), int(c['gate_pass']), w)
                 for c, w in zip(cands, words)]
         npage = len(VIEW.pages_of(len(rows), self.per_page))
+        # What this reviewer already recorded for THIS page, if anything.
+        # Without it, stepping back with Backspace showed a committed page
+        # with every keep wiped from the screen -- the display contradicting
+        # the file -- and one more Space then overwrote the real verdict
+        # with an empty one.
+        prior = self.log.page_verdict(row['key'], page)
+        # The store path comes from the shard's own meta, so a verdict can
+        # say where its pixels came from and be re-cut after the bundle
+        # is deleted (verdicts.recut).
+        meta, _n, _v = B.read_meta(shard)
         self._state = dict(shard=shard, row=row, page=page, ix=ix,
                            stack=stack, mask=mask, cands=rows, npage=npage,
-                           accepted=set(), added=[])
+                           store=meta.get('storage_path'),
+                           accepted=set(prior['accepted']) if prior else set(),
+                           added=list(prior['added']) if prior else [],
+                           revisited=bool(prior))
         self._adding = False
         self._t0 = time.time()
         self._draw()
@@ -158,13 +205,22 @@ class SpotCheck(QtWidgets.QMainWindow):
         self.canvas.draw_idle()
         kept = ', '.join(f'#{i + 1}' for i in sorted(s['accepted'])) or 'none'
         self.status.setText(
-            f'queue {self.queue.i + 1}/{len(self.queue)}   '
+            ('RE-VISITING a page you already judged -- Space re-commits it   |  '
+             if s.get('revisited') else '')
+            + f'queue {self.queue.i + 1}/{len(self.queue)}   '
             f'|  keeping: {kept}   '
             f'|  added: {len(s["added"])}   '
             + ('|  CLICK THE CELL TO ADD A SPOT (Esc cancels)'
                if self._adding else ''))
 
     def _finish(self):
+        # CLEAR THE STATE. Leaving the last page in _state meant a Space
+        # pressed on the completion screen re-committed it -- a duplicate
+        # record for a page already judged, and since merge() takes the
+        # later line, an empty one would have superseded the real verdict.
+        # Every key handler below returns early on _state is None.
+        self._state = None
+        self._adding = False
         self.fig.clear()
         ax = self.fig.add_subplot(111); ax.axis('off')
         ax.text(0.5, 0.5, 'Nothing left to review in this bundle.\n'
@@ -216,10 +272,14 @@ class SpotCheck(QtWidgets.QMainWindow):
             # confirmed negatives, which is a lie the model would learn.
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Space:
-            self.log.commit(s['row']['key'], s['page'], s['ix'],
+            # The whole index row and the whole candidate list go in, so
+            # the record can carry coordinates and crop geometry rather
+            # than positions in a list this bundle happens to have.
+            self.log.commit(s['row'], s['page'], s['ix'], s['cands'],
                             s['accepted'], added=s['added'],
                             seconds=time.time() - self._t0,
-                            bundle=os.path.basename(s['shard']))
+                            bundle=os.path.basename(s['shard']),
+                            store=s['store'])
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Backspace:
             self.queue.advance(-1); self._load(); return

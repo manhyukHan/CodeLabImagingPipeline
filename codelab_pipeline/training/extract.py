@@ -1,14 +1,29 @@
 """
 Build review bundles from a store: cell crops + generous anchor-fit.
 
-THE SHAPE OF THE WORK. One task is one (fov, hybe) pair, and it reads
-that hybe's stack file ONCE and crops every cell out of the open handle.
-That is not an optimisation detail, it is the whole cost model: a stack
-file is ~266 MB and opening it is what the 673 ms per-crop measurement
-was mostly measuring, so a task that reopened per cell would pay it 73
-times per FOV instead of once. Tasks are dispatched FOV-major through ONE
-shared pool -- never a pool per modality, never a pass per hybe -- for
-the same reason ingestion is.
+THE SHAPE OF THE WORK. One task is one (fov, hybe, chunk of ~8 cells),
+dispatched FOV-major through ONE shared pool -- never a pool per
+modality, never a pass per hybe -- the same rule ingestion follows.
+
+The task used to be a whole FOV, sized against the assumption that
+reading dominates. It does not. MEASURED per crop, MP58/RNA Hyb_109
+ch635, on an open stack handle:
+
+    read    0.03 s
+    anchor  0.07 s
+    FIT     4.54 s      99.8% of the work, at 0.127 s a fit
+
+That 673 ms-a-crop figure from the bundle-vs-store comparison is real but
+it is the cost of OPENING a 266 MB gzipped stack and pulling one window
+cold -- not of reading the next 120 windows from the handle already open.
+So batching whole FOVs bought almost nothing and cost a great deal: one
+FOV is 121 cells at ~6 s, a 12-minute serial chain, and a pool over 20 of
+those spends most of its life waiting on the slowest. Chunked, the pool
+stays full and the tail is one chunk long.
+
+This workload is CPU bound, which is the opposite of the alignment path
+-- that one is bandwidth bound and measured FASTER at 3 workers than at
+6. Do not carry that worker count over here.
 
 GENEROSITY IS THE POINT AND IT IS COSTLY. At mode+1sigma the median real
 cell yields 21 candidates and the worst yields 156, and each v2 fit is
@@ -42,8 +57,28 @@ from . import bundle as B
 # where a segmentation slip or a small inter-hybe alignment residual puts
 # it -- is still in frame and still proposed.
 DEFAULT_PAD = 14
-DEFAULT_MAX_FITS = 40
-DEFAULT_KEEP_TOP = 12
+
+# How many anchors get fitted at all, brightest first. NOT a quality
+# filter -- an effort limit -- and it was set to 40 against the MAZ
+# store, where a crop yields ~21 anchors and every gate-passing spot came
+# from brightness rank <= 21. Applying that number to MP58/RNA, which is
+# roughly four times denser, was the mistake CLAUDE.md warns about:
+#
+#   anchors per crop, MP58, all 2266 crops:
+#       p25 35   MEDIAN 90   p75 174   p90 239   max 464
+#   crops where max_fits=40 binds:            1625 / 2266  (71.7%)
+#   anchors never fitted because of it:     173076 / 250481 (69.1%)
+#   production-passing spots NEVER PROPOSED:  31 / 534  (5.8%)
+#       their anchor brightness rank: median 88, p90 147, max 215
+#       their p: 0.023 .. 0.785
+#
+# A spot never proposed is a label that can never be collected, and the
+# ones lost are systematically the dim ones -- exactly what a learned
+# detector is being built to find. 250 covers the observed max rank with
+# headroom. Re-measure on any store whose density is unknown; do not
+# assume this number transfers either.
+DEFAULT_MAX_FITS = 250
+DEFAULT_KEEP_TOP = 24
 
 
 def cell_masks(storage_path, fov):
@@ -138,12 +173,94 @@ def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
             continue
         out.append((ay, ax, az, 0.0, 0, 0, 'no fit'))
     if keep_top:
-        # fitted candidates first (p > 0), then unfitted anchors, each
-        # group already best-first -- an unfitted anchor is worth showing
-        # but never at the expense of a fit that succeeded.
-        out.sort(key=lambda c: (-c[4], -c[3]))
+        # GATE-PASS FIRST, then fitted, then by p.
+        #
+        # Sorting on (fit_ok, p) alone dropped production-passing spots:
+        # p and the gate disagree, and MEASURED on a real bundle the
+        # gate-pass candidates a wider search recovered had p from 0.023
+        # to 0.785, median 0.061 -- far below the junk that outranks them.
+        # A spot the production gate would accept must never be evicted
+        # by an effort cap, because a candidate never shown is a label
+        # that can never be collected.
+        out.sort(key=lambda c: (-c[5], -c[4], -c[3]))
         out = out[:int(keep_top)]
     return out
+
+
+DEFAULT_CHUNK = 8
+
+
+def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
+                  pad=DEFAULT_PAD, max_fits=DEFAULT_MAX_FITS,
+                  keep_top=DEFAULT_KEEP_TOP, anchor=None,
+                  engine_name='anchor-v2', meta=None):
+    """One (fov, hybe, few cells) -> one shard. THE unit of parallel work.
+
+    It used to be one whole FOV, and that was sized against the wrong
+    cost. MEASURED per crop on MP58/RNA Hyb_109 ch635:
+
+        read    0.03 s      one open stack, a cell-sized window
+        anchor  0.07 s
+        FIT     4.54 s      <- 99.8% of it, at 0.127 s a fit
+
+    Reading is not the cost, so there is nothing to be gained by keeping
+    a whole FOV in one task -- and a great deal lost: a FOV is 121 cells
+    at ~6 s, so one task was a 12-minute serial chain and 20 FOVs across
+    a pool left most workers idle waiting on the slowest. In chunks the
+    same pool stays full and the tail is one chunk long, not one FOV.
+
+    Each chunk reopens the stack file. That costs a file open per chunk
+    instead of per FOV, which against 0.03 s of reading and minutes of
+    fitting is not a trade worth thinking about.
+    """
+    anchor = dict(anchor if anchor is not None else E.GENEROUS_ANCHOR)
+    engine = E.make_engine(engine_name, anchor=anchor)
+    wanted = set(int(c) for c in cell_ids)
+    cells = [c for c in cell_masks(storage_path, fov) if c[0] in wanted]
+    path = os.path.join(str(out_dir), f'fov{int(fov):03d}__{hybe}__{tag}.h5')
+    info = dict(meta or {})
+    info.update(fov=int(fov), hybe=str(hybe), channel=int(channel),
+                pad=int(pad), max_fits=int(max_fits), keep_top=int(keep_top),
+                engine=engine_name, anchor=anchor,
+                cells=sorted(wanted), storage_path=str(storage_path))
+    sp = paths.stack_path(storage_path, fov, hybe)
+    if not cells or not os.path.exists(sp):
+        return path, 0, 0
+    try:
+        crops = _read_crops(sp, channel, cells, pad)
+    except OSError:
+        return path, 0, 0          # a broken stack is a skip, not a crash
+    if not crops:
+        return path, 0, 0
+    n_crop = n_cand = 0
+    with B.BundleWriter(path, meta=info) as w:
+        for (cid, y0, x0, block, mask) in crops:
+            cands = candidates_for(block.astype(float), engine, max_fits,
+                                   anchor, keep_top=keep_top)
+            w.add(fov, hybe, channel, cid, block, mask, y0, x0, cands)
+            n_crop += 1
+            n_cand += len(cands)
+    return path, n_crop, n_cand
+
+
+def plan(storage_path, fovs, hybes, channel, chunk=DEFAULT_CHUNK):
+    """[(fov, hybe, cell_ids, tag), ...] -- every task, FOV-major.
+
+    FOV-major ordering, one shared pool: the same rule ingestion follows.
+    Ordering matters even with balanced chunks, because a run stopped
+    half way then has whole FOVs finished rather than a scatter of
+    fragments across all of them.
+    """
+    tasks = []
+    for fov in [int(f) for f in fovs]:
+        ids = [c[0] for c in cell_masks(storage_path, fov)]
+        if not ids:
+            continue
+        for hybe in hybes:
+            for k in range(0, len(ids), int(chunk)):
+                part = ids[k:k + int(chunk)]
+                tasks.append((fov, hybe, part, f'c{k // int(chunk):03d}'))
+    return tasks
 
 
 def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
@@ -207,34 +324,46 @@ def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
 
 
 def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
-            on_fov=None, **kw):
-    """Build a whole bundle. FOV-major through one pool.
+            chunk=DEFAULT_CHUNK, on_task=None, **kw):
+    """Build a whole bundle. (fov, hybe, cell-chunk) through ONE pool.
 
-    on_fov(fov, path, n_crops, n_candidates) is called as each shard
-    lands, so a GUI or a CLI can report progress without waiting for the
-    slowest FOV.
+    on_task(done, total, fov, hybe, path, n_crops, n_candidates) fires as
+    each chunk lands, so progress is visible without waiting on the
+    slowest anything.
+
+    `workers` defaults to cpu_count-2 capped at 16. This workload is CPU
+    bound -- 99.8% of a crop is the fit -- so unlike the alignment path,
+    which is bandwidth bound and measured FASTER at 3 workers, here more
+    readers do not contend and the count should track cores.
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
     os.makedirs(str(out_dir), exist_ok=True)
-    fovs = [int(f) for f in fovs]
-    if workers is None or int(workers) <= 1:
-        results = []
-        for f in fovs:
-            r = extract_fov(storage_path, f, hybes, channel, out_dir, **kw)
-            if on_fov:
-                on_fov(f, *r)
-            results.append((f,) + r)
+    tasks = plan(storage_path, fovs, hybes, channel, chunk=chunk)
+    if workers is None:
+        workers = max(1, min(16, (multiprocessing.cpu_count() or 4) - 2))
+    workers = int(workers)
+    results, done = [], 0
+    if workers <= 1:
+        for (fov, hybe, ids, tag) in tasks:
+            r = extract_chunk(storage_path, fov, hybe, channel, ids,
+                              out_dir, tag, **kw)
+            done += 1
+            if on_task:
+                on_task(done, len(tasks), fov, hybe, *r)
+            results.append((fov, hybe, tag) + r)
         return results
-    results = []
-    with ProcessPoolExecutor(max_workers=int(workers)) as ex:
-        futs = {ex.submit(extract_fov, storage_path, f, hybes, channel,
-                          out_dir, **kw): f for f in fovs}
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(extract_chunk, storage_path, fov, hybe, channel,
+                          ids, out_dir, tag, **kw): (fov, hybe, tag)
+                for (fov, hybe, ids, tag) in tasks}
         for fut in as_completed(futs):
-            f = futs[fut]
+            fov, hybe, tag = futs[fut]
             r = fut.result()
-            if on_fov:
-                on_fov(f, *r)
-            results.append((f,) + r)
+            done += 1
+            if on_task:
+                on_task(done, len(tasks), fov, hybe, *r)
+            results.append((fov, hybe, tag) + r)
     return sorted(results)
 
 
