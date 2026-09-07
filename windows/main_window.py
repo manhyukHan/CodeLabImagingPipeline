@@ -5719,7 +5719,7 @@ class MainWindow(QtWidgets.QMainWindow):
         real, currently-displayed positioning (not internal-only use,
         where ACell's own bare get_area_in_readout -- with no access to
         live session state -- is the correct/only option, e.g. inside
-        localization._build_cell_crop's own have_real branch).
+        localization.cell_crop's own have_real branch).
 
         Confirmed real bug this fixes: _load_fov_spot_display's own
         "cell masks" FOV-view overlay called cell.get_area_in_readout
@@ -5742,10 +5742,10 @@ class MainWindow(QtWidgets.QMainWindow):
         Raw (unmasked) crop + cell-boundary mask for the interactive
         displayer's Current Cell scope -- per explicit request, the
         interactive view shows real surrounding context (not neutralized
-        to NaN/background the way localization._build_cell_crop's own
+        to NaN/background the way localization.cell_crop's own
         peak-search crop legitimately is, to keep neighboring-cell/
         background pixels out of auto-detect) and draws the cell's own
-        boundary as a contour instead. Same bbox math as _build_cell_crop
+        boundary as a contour instead. Same bbox math as cell_crop
         (padding, clamping); returns None if the cell doesn't overlap
         this hybe's frame at all (same "no no-alignment" graceful case).
         Uses _cell_area_in_readout (see its own docstring for the
@@ -7552,7 +7552,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect', 'Select a cell first (Cell view).')
                 return
             fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
-            crop = localization._build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality,
+            crop = localization.cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=modality,
                                                  fov_matrices=fov_matrices, resolver=self._frame_resolver(cell, fov))
             if crop is None:
                 QtWidgets.QMessageBox.warning(self, 'Run Auto-Detect',

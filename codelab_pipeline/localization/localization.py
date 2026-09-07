@@ -93,7 +93,7 @@ def fit_gaussian_3d(cubic, x0, y0, z0, peak_bound=2.0, init_sigma_xy=1.25, init_
 
     cubic: (height, width, depth) i.e. (Y, X, Z) axis order -- this
     project's standard layout everywhere a 3D crop is built
-    (localization._build_cell_crop's 'stacks', spot_mapper.
+    (localization.cell_crop's 'stacks', spot_mapper.
     crop_for_localization's use_stack=True return). x0/y0/z0 (the seed)
     are real pixel coordinates in that same frame. This must stay
     consistent: an earlier version built its index mesh assuming a (Z,Y,X)
@@ -340,7 +340,7 @@ def fit_gaussian_mixture_3d(cubic, seeds, peak_bound=2.0, init_sigma_xy=1.25, in
         out.append((amp, x0f, y0f, z0f, sigma_x, sigma_y, sigma_z, offset))
     return out
 
-def _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
+def cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
                      fov_matrices=None, cell_reference_hybe_matrix=None, resolver=None):
     """
     Shared crop-building logic for localize_cell_2d_worker/3d_worker AND
@@ -512,7 +512,7 @@ def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modali
     seeds are only ever searched for within +/-z_window planes of z0 (the
     crop's own coarse brightest-voxel Z, computed above) -- NOT across
     cubic's full native Z depth. cubic always carries the FULL Z-stack
-    (frequently 100+ planes, see crop_for_localization/_build_cell_crop),
+    (frequently 100+ planes, see crop_for_localization/cell_crop),
     so an unrestricted find_local_peaks_3d search over the whole thing
     would treat ANY brightish voxel ANYWHERE in that huge range as a
     candidate "second component" -- confirmed on real data as the actual
@@ -786,7 +786,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
     """
     from ..models.spot import ASpot
     spots = []
-    crop = _build_cell_crop(cell, hybe, channel, storage_path, fov, pad, resolver=resolver)
+    crop = cell_crop(cell, hybe, channel, storage_path, fov, pad, resolver=resolver)
     if crop is None:
         return cell.id, hybe, spots
     img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']

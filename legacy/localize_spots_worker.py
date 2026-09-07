@@ -21,7 +21,7 @@ same pass). Any port must take its matrices from vlinks_store, ideally via
 FrameResolver rather than by composing them by hand.
 
 The live equivalents are localize_cell_2d_worker / localize_cell_3d_worker,
-which share crop construction through _build_cell_crop.
+which share crop construction through cell_crop.
 """
 import os
 

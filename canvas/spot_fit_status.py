@@ -32,7 +32,7 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     differ per-axes (see that function's own comment on this).
 
     cubic: (height, width, depth) raw crop, this project's standard y,x,z
-    layout (matches localization._build_cell_crop's own 'stacks' field and
+    layout (matches localization.cell_crop's own 'stacks' field and
     refine_spot_z's own cubic, which always carries the FULL Z depth --
     fitting deliberately searches the whole depth for robustness, see
     fit_gaussian_3d).
