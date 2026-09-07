@@ -85,12 +85,25 @@ def pages_of(n, per_page=PER_PAGE):
     return [list(range(i, min(i + per_page, n))) for i in range(0, n, per_page)]
 
 
-def _frame(ax, xlabel, ylabel):
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_xlabel(xlabel, fontsize=5.6, labelpad=1.0, color='#555')
-    ax.set_ylabel(ylabel, fontsize=5.6, labelpad=1.0, color='#555')
-    for sp in ax.spines.values():
-        sp.set_linewidth(0.4); sp.set_color('#888')
+# What the panels are. Said ONCE, in the window's help line, instead of
+# per-axes labels inside the figure: the arrangement is the same on every
+# page a reviewer will ever see, so repeating it costs a fixed ~77 glyphs
+# of rasterization per repaint (~25 ms here) to tell a person something
+# they learned on their first page.
+PANEL_LEGEND = ('cell at left (x right, y down)   |   per spot: YX above, '
+                'ZX below (x right, z down)   |   bar: counts, one scale')
+
+
+def _frame(ax):
+    """Nothing but the image: no ticks, no grid, no spines, no words.
+
+    These panels are pictures, not plots. The box drawn round each one was
+    marking the edge of a solid dark rectangle on white paper, which needs
+    no marking, and every artist here is one more thing to rasterize on a
+    page that is redrawn a few thousand times a session.
+    """
+    ax.grid(False)
+    ax.set_axis_off()
 
 
 def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
@@ -212,13 +225,14 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
                    f'   |   page {page + 1}/{npage}, showing '
                    f'#{page_ix[0] + 1}-#{page_ix[-1] + 1}')
     art['header_text'] = header_text
-    _frame(axm, 'x  →', 'y  ↓')
+    _frame(axm)
 
     cax = axm.inset_axes([1.035, 0.0, 0.030, 1.0])
     cb = fig.colorbar(im, cax=cax, orientation='vertical')
+    # Numbers stay, the sentence goes: the tick values change per crop and
+    # are the reason the bar is here, while "counts, same scale everywhere"
+    # is the same 31 glyphs on every page and belongs in PANEL_LEGEND.
     cb.ax.tick_params(labelsize=6.0, length=2, pad=1.5)
-    cb.set_label('counts — same scale in every panel', fontsize=6.2,
-                 labelpad=3)
 
     grid = outer[0, 1].subgridspec(1, ncol, wspace=0.46)
     for slot, i in enumerate(page_ix):
@@ -241,7 +255,7 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
         ctitle = ax1.set_title(f'[{slot + 1}]  #{i + 1}  YX @ z={iz}'
                                + ('   ✓ KEEP' if chosen else ''),
                                fontsize=6.6, pad=1.8, color=col, weight='bold')
-        _frame(ax1, '', 'y ↓')
+        _frame(ax1)
 
         z0 = max(0, iz - ZHALF)
         z1 = min(st.shape[2], iz + ZHALF + 1)
@@ -256,7 +270,7 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
         # whenever the two axes scale differently.
         cmark, = ax2.plot(x - xa0, z - z0, 'o', mfc='none', mec=col, ms=8,
                           mew=2.2 if chosen else 1.3)
-        _frame(ax2, 'x →', 'z ↓')
+        _frame(ax2)
 
         kind = ('PASS' if gate else 'reject') if fit_ok else 'NO FIT'
         axt = fig.add_subplot(card[1]); axt.axis('off')

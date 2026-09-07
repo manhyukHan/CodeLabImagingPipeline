@@ -267,7 +267,8 @@ class SpotCheck(QtWidgets.QMainWindow):
             '1-4 keep/drop   Space commit+next   Backspace back   '
             'A add missed (then click the cell)   U undo add   '
             'S skip unlabelled   Q quit          '
-            'DEFAULT IS DROP — press a number only for a real spot')
+            'DEFAULT IS DROP — press a number only for a real spot\n'
+            + VIEW.PANEL_LEGEND)
         self.help.setStyleSheet('color:#555; padding: 2px;')
         lay.addWidget(self.help)
 
@@ -276,6 +277,8 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._state = None
         self._adding = False
         self._snapped = None
+        self._outside = False
+        self._committed = 0
         self._art = None
         self._bg = None
         self._t0 = time.time()
@@ -322,6 +325,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                            added=list(prior['added']) if prior else [],
                            revisited=bool(prior))
         self._adding = False
+        self._outside = False
         self._art = None
         self._bg = None
         self._t0 = time.time()
@@ -415,6 +419,8 @@ class SpotCheck(QtWidgets.QMainWindow):
             + (f'clicked ON candidate #{s["snapped"] + 1} -- kept it '
                f'instead of adding a duplicate   |  '
                if s.get('snapped') is not None else '')
+            + ('THAT CLICK WAS OUTSIDE THE CELL IMAGE -- nothing recorded. '
+               'Click on the picture itself.   |  ' if self._outside else '')
             + f'queue {self.queue.i + 1}/{len(self.queue)}   '
             f'|  keeping: {kept}   '
             f'|  added: {len(s["added"])}   '
@@ -429,14 +435,32 @@ class SpotCheck(QtWidgets.QMainWindow):
         # Every key handler below returns early on _state is None.
         self._state = None
         self._adding = False
+        self._outside = False
         self._art = None
         self._bg = None
         self.header.setText('')
         self.fig.clear()
-        ax = self.fig.add_subplot(111); ax.axis('off')
-        ax.text(0.5, 0.5, 'Nothing left to review in this bundle.\n'
-                          'Thank you — your verdicts are saved.',
-                ha='center', va='center', fontsize=14)
+        # SAY WHICH ENDING THIS IS. One message covered three situations
+        # and was wrong in two of them: a bundle with nothing in it, and a
+        # bundle this reviewer had already finished on an earlier day,
+        # both opened straight to "thank you, your verdicts are saved" --
+        # thanking someone for work they had not done, and giving a person
+        # handed an empty or mis-built bundle no hint that anything was
+        # wrong with it.
+        if self._committed:
+            msg = ('That was the last page.\n'
+                   f'{self._committed} judged this session — '
+                   'your verdicts are saved.')
+        elif len(self.queue) == 0 and self.log.done_pages():
+            msg = ('You have already reviewed every page of this bundle.\n'
+                   'Nothing further to do here.')
+        elif len(self.queue) == 0:
+            msg = ('This bundle has no pages to review.\n'
+                   'Either it holds no candidates, or it is not a bundle.')
+        else:
+            msg = 'Nothing left to review in this bundle.'
+        ax = self.fig.add_subplot(111); ax.set_axis_off()
+        ax.text(0.5, 0.5, msg, ha='center', va='center', fontsize=14)
         self.canvas.draw_idle()
         self.status.setText(f'log: {self.log.path}')
 
@@ -446,12 +470,34 @@ class SpotCheck(QtWidgets.QMainWindow):
         if not (self._adding and self._state and ev.inaxes is not None
                 and ev.xdata is not None):
             return
+        # LEFT BUTTON ONLY. Any button reached this, so a right-click --
+        # which on a plot is a reflex, not a decision -- filed a spot the
+        # reviewer never claimed to see.
+        if ev.button != 1:
+            return
         # Only the cell overview accepts an added spot: its axes is the
         # one whose coordinates are crop-local (y, x), which is the frame
         # the verdict is recorded in.
         if ev.inaxes is not self.fig.axes[0]:
             return
         y, x = float(ev.ydata), float(ev.xdata)
+        # AND INSIDE THE IMAGE. This is an invariant, not a fix for an
+        # observed bug: imshow's equal aspect with adjustable='box' shrinks
+        # the axes to hug the image, so today a click in the blank band
+        # beside a tall crop reports inaxes=None and never gets here
+        # (VERIFIED on a 90x30 crop -- the axes bbox and the image bbox are
+        # the same rectangle). It is cheap insurance for the day someone
+        # sets an explicit xlim or switches to adjustable='datalim', when a
+        # click outside the pixels would otherwise be filed as a label
+        # pointing at voxels that do not exist and recut() would fetch from
+        # the wrong place. Keep add mode on and say so, rather than
+        # swallowing the click.
+        h, w = self._state['stack'].shape[0], self._state['stack'].shape[1]
+        if not (-0.5 <= y <= h - 0.5 and -0.5 <= x <= w - 0.5):
+            self._outside = True
+            self._draw()
+            return
+        self._outside = False
         # A CLICK ON AN EXISTING CANDIDATE ACCEPTS IT, never adds a
         # duplicate. This is not a nicety: a reviewer did exactly this --
         # hand-added two spots that were already candidates, because the
@@ -476,10 +522,26 @@ class SpotCheck(QtWidgets.QMainWindow):
     def keyPressEvent(self, e):
         s = self._state
         k = e.key()
-        if k in (QtCore.Qt.Key_Q, QtCore.Qt.Key_Escape) and not self._adding:
+        # Q QUITS, ALWAYS -- including in add mode, where it used to do
+        # nothing at all and left the only way out as a click.
+        if k == QtCore.Qt.Key_Q:
             self.close(); return
+        # ESCAPE CANCELS, AND NEVER QUITS. It closed the window and threw
+        # away the page's uncommitted keeps, which is the opposite of what
+        # Escape means everywhere else and is one fumbled keystroke away
+        # from the reviewer's last few minutes of work.
         if k == QtCore.Qt.Key_Escape:
-            self._adding = False; self._draw(); return
+            if self._adding:
+                self._adding = False
+                self._outside = False
+                self._draw()
+            return
+        # BACKSPACE WORKS ON THE COMPLETION SCREEN. It has no _state, and
+        # the old guard returned before reaching this, so a reviewer who
+        # pressed Space once too often was stranded on "thank you" with no
+        # way back to the page they had just committed.
+        if k == QtCore.Qt.Key_Backspace:
+            self.queue.advance(-1); self._load(); return
         if s is None:
             return
         if QtCore.Qt.Key_1 <= k <= QtCore.Qt.Key_9:
@@ -509,6 +571,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                             seconds=time.time() - self._t0,
                             bundle=os.path.basename(s['shard']),
                             store=s['store'])
+            self._committed += 1
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Backspace:
             self.queue.advance(-1); self._load(); return

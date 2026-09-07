@@ -117,6 +117,7 @@ class VerdictLog:
         self.path = os.path.join(self.dir, SESSION_FMT.format(
             reviewer=_safe(self.reviewer), session=self.session))
         self._done = None
+        self._latest = None
 
     def my_logs(self):
         """Every file this REVIEWER has written to this bundle, any
@@ -156,11 +157,19 @@ class VerdictLog:
         the reviewer's positives into confirmed negatives.
 
         Latest wins, matching merge(): a page re-judged is a correction.
+
+        Served from an in-memory index, not by re-reading the file. The
+        app calls this on EVERY page load and the file grows all session,
+        so re-reading made a session quadratic in its own length -- and it
+        is called on the page-turn path, where the reviewer is waiting.
+        The index is seeded once from whatever this session's file already
+        holds (normally nothing) and updated by commit().
         """
-        found = None
-        for rec in read_log(self.path):
-            if rec.get('key') == key and int(rec.get('page', 0)) == int(page):
-                found = rec
+        if self._latest is None:
+            self._latest = {}
+            for rec in read_log(self.path):
+                self._latest[(rec.get('key'), int(rec.get('page', 0)))] = rec
+        found = self._latest.get((key, int(page)))
         if found is None:
             return None
         return {'accepted': [int(e['i']) for e in (found.get('shown') or [])
@@ -241,6 +250,9 @@ class VerdictLog:
             f.flush()
             os.fsync(f.fileno())        # a page committed is a page kept
         self.done_pages().add((rec['key'], rec['page']))
+        if self._latest is None:
+            self.page_verdict(rec['key'], rec['page'])   # seed from the file
+        self._latest[(rec['key'], rec['page'])] = rec
         return rec
 
 
@@ -335,6 +347,7 @@ def labels(bundle_dir):
     {key: {'crop': {...}, 'fov':, 'hybe':, 'channel':, 'cell':, 'store':,
            'positive': [(y,x,z), ...], 'negative': [...],
            'contested': [...], 'added': [(y,x), ...],
+           'added_votes': {(y,x): (added_by, reviewers)},
            'reviewers': n, 'votes': {(y,x,z): (kept, seen)}}}
     all crop-local; full_frame() converts.
 
@@ -356,7 +369,8 @@ def labels(bundle_dir):
     what to reject.
     """
     recs, _agree = merge(bundle_dir)
-    tally, coord, meta, added, who = {}, {}, {}, {}, {}
+    tally, coord, meta, who = {}, {}, {}, {}
+    add_who = {}                 # key -> spot_key -> [set(reviewers), (y, x)]
     for rec in recs:
         key = rec.get('key')
         if key is None:
@@ -371,16 +385,30 @@ def labels(bundle_dir):
             kept, seen = t.get(sk, (0, 0))
             t[sk] = (kept + (1 if e.get('keep') else 0), seen + 1)
             c[sk] = (float(e['y']), float(e['x']), float(e['z']))
-        added.setdefault(key, []).extend(
-            (float(a['y']), float(a['x'])) for a in (rec.get('added') or []))
+        # ADDED SPOTS ARE VOTED ON TOO. They used to be concatenated
+        # straight from every record, so one missed emitter that three
+        # reviewers all marked entered the training set three times --
+        # exactly the silent per-spot weighting the shown candidates are
+        # tallied to avoid -- and there was no way to tell a spot everyone
+        # who looked at the cell saw from one that a single person marked
+        # and nobody else did. Same quantisation as `shown`, so an added
+        # spot and a candidate at the same place collapse together.
+        aw = add_who.setdefault(key, {})
+        for a in rec.get('added') or []:
+            ak = _spot_key(a['y'], a['x'], 0.0)
+            slot = aw.setdefault(ak, [set(), (float(a['y']), float(a['x']))])
+            slot[0].add(rec.get('reviewer'))
         who.setdefault(key, set()).add(rec.get('reviewer'))
 
     out = {}
     for key, t in tally.items():
         e = dict(meta.get(key) or {})
+        aw = add_who.get(key, {})
+        nrev = len(who.get(key, ()))
         e.update(positive=[], negative=[], contested=[],
-                 added=added.get(key, []), reviewers=len(who.get(key, ())),
-                 votes={})
+                 added=sorted(v[1] for v in aw.values()),
+                 added_votes={v[1]: (len(v[0]), nrev) for v in aw.values()},
+                 reviewers=nrev, votes={})
         for sk, (kept, seen) in t.items():
             xyz = coord[key][sk]
             e['votes'][xyz] = (kept, seen)
