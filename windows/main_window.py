@@ -47,7 +47,10 @@ from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.localization import tracing_v2
 from codelab_pipeline.models.cell_container import CellContainer
-from codelab_pipeline.models.spot import ASpot
+from codelab_pipeline.models.spot import (ASpot, z_status_of as spot_z_status_of,
+                                          Z_ACCEPTED as SPOT_Z_ACCEPTED,
+                                          Z_REJECTED as SPOT_Z_REJECTED,
+                                          Z_NOT_FIT as SPOT_Z_NOT_FIT)
 from codelab_pipeline.models.spot_container import DiffUndo, SpotContainer
 from codelab_pipeline.models.allele import AnAllele
 from codelab_pipeline.models.allele_container import AlleleContainer
@@ -1850,6 +1853,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
         sp.ClearHybeChannelPushButton.clicked.connect(self._clear_current_hybe_channel)
+        sp.RemoveZRejectedPushButton.clicked.connect(self._remove_z_rejected_spots)
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
@@ -6206,16 +6210,25 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _z_status_text(spot):
         """
-        'Z-accepted'/'Z-rejected'/'Z-not run' -- spot._z_status is a
-        plain, SESSION-transient Python attribute (not part of ASpot's
-        persisted schema/set_metadata/save()), set directly by
-        _run_3d_localize the moment a spot goes through refine_spot_z,
-        whichever way the fit came out. Deliberately not persisted: it's
-        a "have I looked at this spot's Z this session" note, not real
-        localization data (that's coordinate/raw_coordinate themselves).
+        'Z-accepted'/'Z-rejected'/'Z-not run', from ASpot.z_status --
+        PERSISTED since 2026-09-07, set by _run_3d_localize the moment a
+        spot goes through refine_spot_z, whichever way the fit came out.
+
+        It used to be `spot._z_status`, a session-transient attribute
+        deliberately kept out of the schema on the grounds that the real
+        data is the coordinate. That was wrong in one specific way: the
+        coordinate cannot distinguish "the fit rejected this" from
+        "nobody has fitted it", and three consumers now need to --
+        Remove Z-rejected, allele building, and the Analysis distance
+        gate. A rejected spot is a measured negative; an unfitted one is
+        unknown; sweeping both would delete data nobody has looked at.
+
+        The gate's own words (spot._z_reason) stay transient: they are a
+        sentence for a person, not a fact anything filters on.
         """
-        status = getattr(spot, '_z_status', None)
-        text = {'accepted': 'Z-accepted', 'rejected': 'Z-rejected'}.get(status, 'Z-not run')
+        status = spot_z_status_of(spot)
+        text = {SPOT_Z_ACCEPTED: 'Z-accepted',
+                SPOT_Z_REJECTED: 'Z-rejected'}.get(status, 'Z-not run')
         reason = getattr(spot, '_z_reason', None)
         if status == 'rejected' and reason:
             text += f' ({reason})'      # the v2 gate's own words
@@ -6396,16 +6409,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 if new_coordinate is not None:
                     spot.adj_coordinate = new_coordinate
                     spot.raw_coordinate = new_raw
-                    spot._z_status = 'accepted'
+                    spot.z_status = SPOT_Z_ACCEPTED
                     spot._z_reason = None
                     spot.mixture_centroids = mixture_centroids
                     n_refined += 1
                     if mixture_centroids:
                         n_mixture += 1
                 else:
-                    spot._z_status = 'rejected'
-                    # the v2 gate's own words (session-transient, like
-                    # _z_status) -- shown in the spot list's status text
+                    spot.z_status = SPOT_Z_REJECTED
+                    # The verdict itself is PERSISTED on the spot now
+                    # (ASpot.z_status); only the gate's own words stay
+                    # session-transient, because they are a sentence for a
+                    # person to read, not a fact anything filters on.
                     spot._z_reason = reason
             # one undo step covers the whole batch
             self._commit_spot_edit(fov, fp_undo)
@@ -6894,6 +6909,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self._commit_spot_edit(fov, fp)
         self.log(f'FOV{fov:03d} {hybe} ch{channel}: {n} spot(s) cleared '
                  f'(in memory -- Save persists the empty slice).')
+        self._refresh_spot_cell_list()
+        if sp.ShowDisplayerPushButton.isChecked():
+            self._show_spot_displayer()
+
+    def _remove_z_rejected_spots(self):
+        """
+        Drop the spots whose 3D fit was REJECTED, and only those.
+
+        Scoped to the current (hybe, channel, modality) like every other
+        removal on this panel, in memory, persisted by Save -- so the
+        removal scope and the save scope stay identical, which is the
+        rule that stops a control here from destroying a hybe the user
+        never opened.
+
+        `not_fit` spots are deliberately untouched. That distinction is
+        the whole reason ASpot.z_status has three states rather than two:
+        a rejected spot is a measured negative and sweeping it is a
+        cleanup, while an unfitted one is simply unexamined and sweeping
+        it would delete data on the strength of a question nobody asked.
+        Before z_status was persisted this button could not have existed
+        at all -- reopening the app erased the verdict.
+        """
+        sp = self.ui.SpotLocalizationPanel
+        fov = self._current_spot_fov()
+        hybe = sp.current_hybe_folder()
+        modality = sp.current_hybe_modality()
+        channel_text = sp.ChannelComboBox.currentText().strip()
+        if fov is None or not hybe or not modality or not channel_text:
+            return
+        channel = int(channel_text)
+        in_slice = [s for s in self.spot_container.all(fov)
+                    if s.hybe == hybe and int(s.channel) == channel
+                    and (s.modality or modality) == modality]
+        doomed = [s.uid for s in in_slice
+                  if spot_z_status_of(s) == SPOT_Z_REJECTED]
+        if not doomed:
+            n_unfit = sum(1 for s in in_slice
+                          if spot_z_status_of(s) == SPOT_Z_NOT_FIT)
+            self.log(f'FOV{fov:03d} {hybe} ch{channel}: no Z-rejected spots '
+                     f'({len(in_slice)} here, {n_unfit} never 3D-localized).')
+            return
+        fp = self._begin_spot_edit(fov)
+        n = len(self.spot_container.remove(fov, doomed))
+        self._commit_spot_edit(fov, fp)
+        kept = len(in_slice) - n
+        self.log(f'FOV{fov:03d} {hybe} ch{channel}: {n} Z-rejected spot(s) '
+                 f'removed, {kept} kept (in memory -- Save persists it).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
@@ -7936,6 +7998,26 @@ class MainWindow(QtWidgets.QMainWindow):
             msg + ('\n\nNot everything succeeded:\n  '
                    + '\n  '.join(errors[:8]) if errors else ''))
 
+    def _drop_z_rejected_dicts(self, dicts):
+        """(kept, n_dropped) -- persisted spot dicts minus the Z-rejected.
+
+        Gated on the Chromatin Tracing panel's own checkbox, and applied
+        to BOTH build paths (selection and all-FOVs) through this one
+        function, so the two cannot answer the question differently.
+
+        Only 'rejected' is dropped. A dict with no z_status at all comes
+        from a store written before the field existed and reads back as
+        'not_fit' (columnar.unpack_spots), which is kept -- the whole
+        point of the third state is that unexamined spots survive a
+        sweep aimed at examined-and-failed ones.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        if not chp.DropZRejectedCheckBox.isChecked():
+            return list(dicts), 0
+        kept = [d for d in dicts
+                if str(d.get('z_status') or SPOT_Z_NOT_FIT) != SPOT_Z_REJECTED]
+        return kept, len(dicts) - len(kept)
+
     def _build_alleles_for_fov(self, storage_path, fov, hybe, channel, hybe_modality):
         """One FOV of _build_chromatin_alleles_all_fovs: build, then save.
 
@@ -7946,6 +8028,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stage_alleles(storage_path, fov)
         indexed = self._ordered_spot_dicts_for_scope(
             storage_path, fov, hybe, channel, hybe_modality)
+        # Filtered on the PAIRS, keeping each spot's global index intact:
+        # that index is the number the status displayer and the crop
+        # displayer show, so renumbering after a drop would make the same
+        # spot answer to two different names in two windows.
+        n_before = len(indexed)
+        indexed = [(i, d) for (i, d) in indexed
+                   if self._drop_z_rejected_dicts([d])[0]]
+        n_rejected = n_before - len(indexed)
+        if n_rejected:
+            self.log(f'FOV{fov:03d}: {n_rejected} Z-rejected spot(s) skipped.')
         seen = self.chromatin_alleles.anchor_uids(key)
         added = skipped = 0
         for _global_index, d in indexed:
@@ -8004,6 +8096,16 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = chp.selected_spot_dicts()
         if not selected:
             QtWidgets.QMessageBox.warning(self, 'Chromatin Tracing', 'Select at least one spot first.')
+            return
+        selected, n_rejected = self._drop_z_rejected_dicts(selected)
+        if n_rejected:
+            self.log(f'{n_rejected} Z-rejected spot(s) skipped '
+                     f'(uncheck "Skip Z-rejected spots" to include them).')
+        if not selected:
+            QtWidgets.QMessageBox.warning(
+                self, 'Chromatin Tracing',
+                'Every selected spot was Z-rejected. Uncheck "Skip Z-rejected '
+                'spots when building alleles" to use them anyway.')
             return
         key = (storage_path, int(fov))
         self._stage_alleles(storage_path, fov)

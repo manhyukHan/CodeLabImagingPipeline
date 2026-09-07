@@ -13,7 +13,7 @@ plain tables:
               (+ 'bin_hybes')                      concatenated
   expression  DataFrame (see expression.py)        None unless sources
   spots       DataFrame [fov, cell, celltype,      None unless
-              modality, hybe, channel,             spot_sources
+              modality, hybe, channel, z_status,    spot_sources
               y_um, x_um, z_um, brightness]
 
 Keys are ALWAYS (fov, cell) pairs. The SG scripts carry a measured scar
@@ -219,7 +219,13 @@ def _fov_bundle(item):
                              'modality': m, 'hybe': h, 'channel': int(ch),
                              'y_um': float(y) * dy, 'x_um': float(x) * dx,
                              'z_um': float(z) * dz,
-                             'brightness': float(s.get('brightness', np.nan))})
+                             'brightness': float(s.get('brightness', np.nan)),
+                             # 'not_fit' for every spot from a store older
+                             # than the field, which is the honest reading:
+                             # nobody 3D-localized it. Carried here so the
+                             # distance path can select on it without
+                             # re-reading the store -- see distances._spots_of.
+                             'z_status': str(s.get('z_status') or 'not_fit')})
         if rows:
             out['spots'] = pd.DataFrame(rows)
         # NO empty frame: a rows-less DataFrame has all-object columns,

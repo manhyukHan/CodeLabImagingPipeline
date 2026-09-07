@@ -73,19 +73,59 @@ def is_traced_source(source):
     return len(source) > 2 and str(source[2]) == TRACED
 
 
-def points_of(pop, source, alleles=None):
+def usable_z_statuses(dims):
+    """Which spots a distance in `dims` is allowed to be computed from.
+
+    The dimensionality and the spot set are ONE decision, not two, which
+    is why they come from one control rather than a separate checkbox
+    that could be set to contradict it.
+
+        'xyz'  ->  ('accepted',)
+        'xy'   ->  ('accepted', 'not_fit')
+
+    In 3D the z coordinate is load-bearing, so only a spot whose Z was
+    fitted AND accepted has one worth using; an unfitted spot's z is a
+    placeholder (manual anchoring writes exactly 0.0) and a rejected
+    one's is a measured failure. Including either would put fabricated
+    depth into a micrometre distance.
+
+    In 2D the z coordinate is not read at all, so an unfitted spot is
+    perfectly usable -- its y and x are real. A REJECTED spot is still
+    excluded even in 2D: the fit rejected the emitter, not merely its
+    depth, so its lateral position is not trustworthy either.
+
+    Traced sources are untouched by any of this. A traced bin's
+    coordinate comes from the chromatin-tracing fit, which has its own
+    gates and never carried a spot-level z_status.
+    """
+    return ('accepted',) if polymer._dim_axes(dims) == [0, 1, 2] \
+        else ('accepted', 'not_fit')
+
+
+def points_of(pop, source, alleles=None, dims='xyz'):
     """The tidy points for ANY source: a spot slice, or a traced bin."""
     if is_traced_source(source):
         return _traced_of(pop, source, alleles)
-    return _spots_of(pop, source)
+    return _spots_of(pop, source, dims=dims)
 
 
-def _spots_of(pop, source):
+def _spots_of(pop, source, dims='xyz'):
     m, h, ch = source
     t = pop.spots
     if t is None or len(t) == 0:
         raise ValueError('population carries no spot table; build with '
                          'spot_sources=[...] first')
+    if 'z_status' in t.columns:
+        t = t[t['z_status'].isin(usable_z_statuses(dims))]
+    # No column at all means a population assembled by hand rather than by
+    # Population.build -- tests and tools do this. Those frames are NOT
+    # filtered: every spot in one was put there deliberately by its
+    # author, and silently dropping all of them (which is what filtering
+    # an absent column to 'accepted' amounts to) would turn a working
+    # analysis into an empty one for a reason nothing on screen explains.
+    # Population.build always writes the column, so a population read from
+    # a store is always filtered -- including one read from a store older
+    # than the field, whose spots correctly arrive as 'not_fit'.
     rows = t[(t['modality'] == m) & (t['hybe'] == h) & (t['channel'] == int(ch))]
     if len(rows) == 0:
         raise ValueError(f'no spots for source {source!r} in the population '
@@ -108,10 +148,10 @@ def pair_distances(pop, source_a, source_b, alleles=None, dims='xyz'):
     path.
     """
     cols = ['fov', 'cell', 'celltype', 'y_um', 'x_um', 'z_um']
-    a = points_of(pop, source_a, alleles)[cols]
+    a = points_of(pop, source_a, alleles, dims=dims)[cols]
     a = a[a['cell'] >= 0].reset_index(drop=True)
     same = tuple(source_a) == tuple(source_b)
-    b = a if same else points_of(pop, source_b, alleles)[cols]
+    b = a if same else points_of(pop, source_b, alleles, dims=dims)[cols]
     if not same:
         b = b[b['cell'] >= 0].reset_index(drop=True)
     a = a.assign(_ia=np.arange(len(a)))

@@ -221,6 +221,18 @@ class SpotLocalizationPanelUI(object):
         # the emptied slice.
         self.ClearHybeChannelPushButton = QtWidgets.QPushButton('Clear This Hybe/Channel')
         removeRowLayout.addWidget(self.ClearHybeChannelPushButton)
+        # Removes ONLY spots 3D localization ran on and REJECTED
+        # (ASpot.z_status == 'rejected'). Spots nobody has fitted are
+        # 'not_fit' and are deliberately left alone -- "the fit said no"
+        # and "nobody asked" are different facts, and only the first is a
+        # measured negative safe to sweep. Same (hybe, channel) scope as
+        # every other removal here, in memory, persisted by Save.
+        self.RemoveZRejectedPushButton = QtWidgets.QPushButton('Remove Z-rejected')
+        self.RemoveZRejectedPushButton.setToolTip(
+            'Remove spots whose 3D fit was rejected, for this hybe/channel.\n'
+            'Spots that have never been 3D-localized are left untouched.\n'
+            'In memory -- Save Current Spots persists it.')
+        removeRowLayout.addWidget(self.RemoveZRejectedPushButton)
         layout.addWidget(removeRow)
 
         # -- Undo | Redo -- see MainWindow._push_spot_undo_snapshot/_undo_spot_edit/_redo_spot_edit --

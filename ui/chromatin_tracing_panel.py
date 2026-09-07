@@ -205,6 +205,23 @@ class ChromatinTracingPanelUI(object):
         self.SpotListWidget.setMaximumHeight(120)
         allelesLayout.addWidget(self.SpotListWidget)
 
+        # Applies to BOTH build buttons below, which is why it sits above
+        # them rather than beside either. Drops spots whose 3D fit was
+        # rejected (ASpot.z_status == 'rejected') before they can anchor
+        # an allele; spots nobody has 3D-localized ('not_fit') are kept,
+        # because an unasked question is not a negative answer. Checked by
+        # default -- a rejected fit is a measured statement that there is
+        # no localizable emitter there, and anchoring a trace on one
+        # propagates that into every hybe of the allele.
+        self.DropZRejectedCheckBox = QtWidgets.QCheckBox(
+            'Skip Z-rejected spots when building alleles')
+        self.DropZRejectedCheckBox.setChecked(True)
+        self.DropZRejectedCheckBox.setToolTip(
+            'Spots whose 3D fit was rejected do not become alleles.\n'
+            'Spots that have never been 3D-localized are still used -- '
+            '"not fitted" is not the same as "rejected".')
+        allelesLayout.addWidget(self.DropZRejectedCheckBox)
+
         # ADD, not refresh: the transient container accumulates across
         # clicks now, and Remove Selected is how a mistake is undone.
         self.BuildAllelesPushButton = QtWidgets.QPushButton('Add Alleles from Selected Spots')

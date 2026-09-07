@@ -187,7 +187,7 @@ def pack_spots(grp, dicts):
                              ('y', 'f8'), ('x', 'f8'), ('z', 'f8'),
                              ('ry', 'f8'), ('rx', 'f8'), ('rz', 'f8'),
                              ('size', 'f8'), ('brightness', 'f8'), ('linked', 'u1')])
-    strs = {k: [] for k in ('modality', 'hybe', 'celltype', 'linked_at')}
+    strs = {k: [] for k in ('modality', 'hybe', 'celltype', 'linked_at', 'z_status')}
     mix, mix_off = [], [0]
     for i, d in enumerate(dicts):
         c, r = d['adj_coordinate'], d['raw_coordinate']
@@ -195,7 +195,12 @@ def pack_spots(grp, dicts):
                   c[0], c[1], c[2], r[0], r[1], r[2],
                   d.get('size', 0.0), d.get('brightness', 0.0), bool(d.get('linked', False)))
         for k in strs:
-            strs[k].append(_s(d.get(k)))
+            # z_status defaults rather than blanks: a spot dict from
+            # anywhere that predates the field must land as 'not_fit',
+            # not as '' -- '' is not one of the three states and would
+            # read back through set_metadata as not_fit anyway, but
+            # writing it makes a store that says something it does not mean.
+            strs[k].append(_s(d.get(k) or ('not_fit' if k == 'z_status' else None)))
         # centroids are variable-width on real data (legacy 3-tuples
         # without amplitude, current 4-tuples) -- widths are preserved
         cents = d.get('mixture_centroids') or ()
@@ -214,6 +219,10 @@ def pack_spots(grp, dicts):
 def unpack_spots(grp):
     tab = grp['table'][()]
     strs = {k: grp[k][()] for k in ('modality', 'hybe', 'celltype', 'linked_at')}
+    # Written since 2026-09-07. Every store older than that has no such
+    # dataset, and those spots are exactly the ones nobody has fitted a
+    # Z for, so absence IS the default rather than an error.
+    zst = grp['z_status'][()] if 'z_status' in grp else None
     mvals, mwidth, off = grp['mix_vals'][()], grp['mix_width'][()], grp['mix_off'][()]
     mstart = np.concatenate([[0], np.cumsum(mwidth)])
     out = []
@@ -229,6 +238,7 @@ def unpack_spots(grp):
             'size': float(tab['size'][i]), 'brightness': float(tab['brightness'][i]),
             'linked': bool(tab['linked'][i]),
             'linked_at': la if la else None,
+            'z_status': (_rd(zst[i]) if zst is not None else 'not_fit'),
             'mixture_centroids': tuple(tuple(mvals[mstart[j]:mstart[j + 1]])
                                        for j in range(off[i], off[i + 1]))})
     return out

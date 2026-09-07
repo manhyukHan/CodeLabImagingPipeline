@@ -1,3 +1,23 @@
+Z_ACCEPTED = 'accepted'
+Z_REJECTED = 'rejected'
+Z_NOT_FIT = 'not_fit'
+Z_STATUSES = (Z_ACCEPTED, Z_REJECTED, Z_NOT_FIT)
+
+
+def z_status_of(spot):
+    """A spot's z_status, tolerant of anything that predates the field.
+
+    Old stores have no column and old in-memory objects have no
+    attribute; both mean the same thing -- nobody has fitted this spot's
+    Z -- so both read as Z_NOT_FIT rather than raising. Use this rather
+    than getattr at each site: "no answer" and "not yet fitted" must not
+    be allowed to drift apart the way `_z_status` and the persisted
+    coordinate already did.
+    """
+    v = getattr(spot, 'z_status', None)
+    return v if v in Z_STATUSES else Z_NOT_FIT
+
+
 class ASpot():
     """
     a spot class
@@ -50,6 +70,20 @@ class ASpot():
        the sibling positions survive even though they no longer spawn
        separate ASpot records. Empty tuple otherwise (single-component fit,
        or Z never refined).
+     z_status: str -- 'accepted' | 'rejected' | 'not_fit'. What happened
+       when 3D localization last ran on this spot, and PERSISTED, unlike
+       the session-only `_z_status` note this replaces. Three states, not
+       two, because "the fit rejected this" and "nobody has fitted it"
+       are different facts with opposite consequences: a rejected spot is
+       a measured negative and should be removable in bulk, while an
+       unfitted one is simply unknown and must survive every such sweep.
+       Collapsing them -- e.g. inferring "unfitted" from z == 0.0 -- was
+       never safe: a real emitter on plane 0 is indistinguishable from a
+       placeholder, and manual anchoring writes exactly 0.0.
+
+       Defaults to 'not_fit', which is also what a store written before
+       this field existed reads back as (see z_status_of and
+       columnar.unpack_spots). Nothing infers it from coordinates.
     """
     def __init__(self):
         self.uid = 0
@@ -66,6 +100,7 @@ class ASpot():
         self.linked = False
         self.linked_at = None
         self.mixture_centroids = ()
+        self.z_status = Z_NOT_FIT
 
     def set_metadata(self, **kwargs):
         if 'uid' in kwargs: self.uid = int(kwargs['uid'])
@@ -86,6 +121,12 @@ class ASpot():
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
         if 'mixture_centroids' in kwargs: self.mixture_centroids = tuple(kwargs['mixture_centroids'])
+        if 'z_status' in kwargs:
+            v = str(kwargs['z_status'])
+            # An unrecognised value is 'nobody has fitted it', never a
+            # crash: this field crosses a store boundary, and a store
+            # written by a newer build must stay readable by an older one.
+            self.z_status = v if v in Z_STATUSES else Z_NOT_FIT
 
     def save(self):
         """
@@ -114,4 +155,5 @@ class ASpot():
                 'brightness': r2(self.brightness),
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at,
-                'mixture_centroids': tuple(tuple(r2(v) for v in c) for c in self.mixture_centroids)}
+                'mixture_centroids': tuple(tuple(r2(v) for v in c) for c in self.mixture_centroids),
+                'z_status': z_status_of(self)}
