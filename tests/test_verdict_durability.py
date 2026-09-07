@@ -37,6 +37,17 @@ import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# THE CONSOLE HERE IS cp949, AND THIS FILE PRINTS THE APP'S OWN WORDS.
+# Without this the suite dies on the first em dash it echoes back -- at
+# check 18 of 41, on a PASSING check, with no summary line -- so a green
+# run and a broken run look the same at a glance and the later test
+# groups never execute at all. It was invisible while every run happened
+# to carry PYTHONIOENCODING=utf-8.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+
 from codelab_pipeline.training import verdicts as V      # noqa: E402
 
 PASS, FAIL = [], []

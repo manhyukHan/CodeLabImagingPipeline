@@ -39,10 +39,50 @@ from codelab_pipeline.localization import engine as E        # noqa: E402
 from codelab_pipeline.training import extract as X           # noqa: E402
 
 
-def hybes_in(storage_path, fov):
-    """Every hybe this FOV actually has a stack for, in file order."""
+# Which acquisitions are IMAGING ROUNDS, as the store's own stacks say.
+#
+#   H  hyb        the readout itself
+#   R  replicate  a hybe imaged a second time -- the same signal again
+#   T  toehold    after strand displacement, where the signal should be
+#                 GONE
+#   B  barcode    celltype calling, not a spot readout
+#
+# Default H,R. The toehold is the interesting exclusion. A generous
+# anchor CANNOT TELL IT APART: measured over the 420 MP58/RNA Toe_133
+# crops of this draw, it anchors a median of 64 candidates a crop against
+# 103 for the eleven real hybes -- the same order, not the empty frame
+# one might expect. So its whole 420 crops would enter the review queue
+# looking exactly like work, and be work, for a round whose answer is
+# already known. A toehold is worth having as a NEGATIVE CONTROL rather
+# than as a readout, and the ones to use for that are on the DNA side.
+DEFAULT_DATATYPES = 'H,R'
+
+
+def hybe_datatype(storage_path, fov, hybe):
+    """What the stack file says it is -- 'H', 'R', 'T', 'B', or ''."""
+    import h5py
+    try:
+        with h5py.File(paths.stack_path(storage_path, fov, hybe), 'r') as f:
+            dt = f.attrs.get('datatype', '')
+    except Exception:                                        # noqa: BLE001
+        return ''
+    return dt.decode() if isinstance(dt, bytes) else str(dt)
+
+
+def hybes_in(storage_path, fov, datatypes=None):
+    """Every hybe this FOV has a stack for, filtered by datatype.
+
+    Filtering on the stack's own attribute rather than on the name: a
+    prefix convention is a habit, and 'Toe_133' being a toehold is a fact
+    the file records.
+    """
     d = os.path.dirname(paths.stack_path(storage_path, fov, 'x'))
-    return sorted(n[:-3] for n in os.listdir(d) if n.endswith('.h5'))
+    names = sorted(n[:-3] for n in os.listdir(d) if n.endswith('.h5'))
+    if not datatypes:
+        return names
+    want = {s.strip().upper() for s in str(datatypes).split(',') if s.strip()}
+    return [h for h in names
+            if hybe_datatype(storage_path, fov, h).upper() in want]
 
 
 def fovs_with_cells(storage_path, candidates):
@@ -69,7 +109,14 @@ def main(argv=None):
     ap.add_argument('--out', required=True)
     ap.add_argument('--channel', type=int, required=True)
     ap.add_argument('--hybes', default='all',
-                    help='"all" for every hybe in the store, or a comma list')
+                    help='"all" for every hybe of the wanted datatypes, or '
+                         'a comma list (a named hybe is taken as asked for, '
+                         'whatever its datatype)')
+    ap.add_argument('--datatypes', default=DEFAULT_DATATYPES,
+                    help='which acquisitions count as readouts, by the '
+                         "stack's own datatype attribute: H hyb, R "
+                         'replicate, T toehold, B barcode. '
+                         f'Default {DEFAULT_DATATYPES}. Pass "" for all.')
     ap.add_argument('--n-fovs', type=int, default=None,
                     help='draw this many FOVs at random from those that '
                          'carry cell masks')
@@ -128,11 +175,12 @@ def main(argv=None):
             sorted(g for g, _ in have), min(n, len(have))))
 
     ncell = {g: c for g, c in have}
-    hybes = (hybes_in(store, fovs[0]) if a.hybes == 'all'
+    hybes = (hybes_in(store, fovs[0], a.datatypes) if a.hybes == 'all'
              else [h.strip() for h in a.hybes.split(',') if h.strip()])
+    dts = {h: hybe_datatype(store, fovs[0], h) for h in hybes}
     # A hybe missing from one of the drawn FOVs would fail mid-run.
     for f in fovs[1:]:
-        here = set(hybes_in(store, f))
+        here = set(hybes_in(store, f, a.datatypes))
         gone = [h for h in hybes if h not in here]
         if gone:
             print(f'   fov{f:03d} is missing {gone} -- dropping them')
@@ -143,7 +191,9 @@ def main(argv=None):
                                  '   (given)'))
     print(f'        cells per FOV: '
           + ', '.join(f'{f}:{ncell[f]}' for f in fovs) + f'   total {cells}')
-    print(f'hybes   {len(hybes)}  {hybes}')
+    print(f'hybes   {len(hybes)}  (datatypes {a.datatypes or "all"})')
+    for h in hybes:
+        print(f'          {h:10s} {dts.get(h, "?")}')
     print(f'channel {a.channel}')
     print(f'out     {a.out}')
     print(f'\nwork    {len(fovs)} FOVs x {len(hybes)} hybes = '
@@ -155,7 +205,8 @@ def main(argv=None):
     os.makedirs(str(a.out), exist_ok=True)
     manifest = dict(
         storage_path=store, out=str(a.out), channel=int(a.channel),
-        hybes=hybes, fovs=fovs, fov_seed=seed, fov_pool=str(a.fov_pool),
+        hybes=hybes, hybe_datatypes=dts, datatypes=str(a.datatypes),
+        fovs=fovs, fov_seed=seed, fov_pool=str(a.fov_pool),
         cells_per_fov={str(f): ncell[f] for f in fovs},
         pad=int(a.pad), chunk=int(a.chunk), workers=a.workers,
         engine='anchor-v2', anchor=dict(E.GENEROUS_ANCHOR),

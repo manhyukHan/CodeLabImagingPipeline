@@ -134,7 +134,7 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
     # imshows -- MEASURED 756 ms a keystroke, and a reviewer presses one
     # about four times a page. Over an 870-page assignment that alone was
     # 44 minutes of waiting. restyle() updates these in place instead.
-    art = {'fig': fig, 'axm': None, 'overview': {}, 'cards': {},
+    art = {'fig': fig, 'axm': None, 'cax': None, 'overview': {}, 'cards': {},
            'cands': cands, 'page_ix': page_ix, 'header_text': ''}
 
     outer = fig.add_gridspec(1, 2, width_ratios=[5.4, 1.95 * ncol], wspace=0.16)
@@ -233,6 +233,10 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
     # are the reason the bar is here, while "counts, same scale everywhere"
     # is the same 31 glyphs on every page and belongs in PANEL_LEGEND.
     cb.ax.tick_params(labelsize=6.0, length=2, pad=1.5)
+    # Named on the art dict because it is NOT in fig.axes: inset_axes
+    # makes a child of the overview, so anything looking for it by
+    # scanning the figure finds the overview instead.
+    art['cax'] = cb.ax
 
     grid = outer[0, 1].subgridspec(1, ncol, wspace=0.46)
     for slot, i in enumerate(page_ix):

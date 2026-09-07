@@ -278,6 +278,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._adding = False
         self._snapped = None
         self._outside = False
+        self._offpage = None
         self._committed = 0
         self._art = None
         self._bg = None
@@ -326,6 +327,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                            revisited=bool(prior))
         self._adding = False
         self._outside = False
+        self._offpage = None
         self._art = None
         self._bg = None
         self._t0 = time.time()
@@ -421,6 +423,10 @@ class SpotCheck(QtWidgets.QMainWindow):
                if s.get('snapped') is not None else '')
             + ('THAT CLICK WAS OUTSIDE THE CELL IMAGE -- nothing recorded. '
                'Click on the picture itself.   |  ' if self._outside else '')
+            + (f'THAT IS CANDIDATE #{self._offpage[0] + 1}, JUDGED ON PAGE '
+               f'{self._offpage[1]} -- nothing recorded here. Keep it there, '
+               f'where its YX and ZX panels are.   |  '
+               if self._offpage else '')
             + f'queue {self.queue.i + 1}/{len(self.queue)}   '
             f'|  keeping: {kept}   '
             f'|  added: {len(s["added"])}   '
@@ -436,6 +442,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._state = None
         self._adding = False
         self._outside = False
+        self._offpage = None
         self._art = None
         self._bg = None
         self.header.setText('')
@@ -510,14 +517,43 @@ class SpotCheck(QtWidgets.QMainWindow):
             d2 = (float(c[0]) - y) ** 2 + (float(c[1]) - x) ** 2
             if d2 < best:
                 near, best = i, d2
-        if near is not None:
+        if near is not None and near not in self._state['ix']:
+            # AN OFF-PAGE CANDIDATE CANNOT BE KEPT FROM HERE, and pretending
+            # otherwise turned a confirmed spot into a confirmed negative.
+            # The whole crop's circles are on the overview and all of them
+            # are clickable, but commit() writes only this page's indices
+            # (`for i in page_ix`), so a keep on any other index vanished
+            # from the record -- while the screen gave three confirmations
+            # that it had landed: the circle went green, the status said
+            # "kept it instead of adding a duplicate", and the header
+            # counted it. The page that owns that candidate then loaded
+            # with nothing accepted, and one Space filed the reviewer's
+            # explicit yes as a hard negative.
+            #
+            # Refusing is not a limitation to route around: that candidate
+            # gets judged on its own page, with its own YX and ZX panels,
+            # which is a better look at it than a click on the overview.
+            self._offpage = (near, self._page_of(near))
+            self._snapped = None
+        elif near is not None:
             self._state['accepted'].add(near)
             self._snapped = near
+            self._offpage = None
+            self._adding = False
         else:
             self._state['added'].append((y, x))
             self._snapped = None
-        self._adding = False
+            self._offpage = None
+            self._adding = False
         self._draw()
+
+    def _page_of(self, i):
+        """Which page of this crop judges candidate `i` (1-based)."""
+        for pi, ix in enumerate(VIEW.pages_of(len(self._state['cands']),
+                                              self.per_page)):
+            if i in ix:
+                return pi + 1
+        return None
 
     def keyPressEvent(self, e):
         s = self._state
@@ -534,6 +570,7 @@ class SpotCheck(QtWidgets.QMainWindow):
             if self._adding:
                 self._adding = False
                 self._outside = False
+                self._offpage = None
                 self._draw()
             return
         # BACKSPACE WORKS ON THE COMPLETION SCREEN. It has no _state, and

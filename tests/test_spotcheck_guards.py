@@ -21,6 +21,17 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# THE CONSOLE HERE IS cp949, AND THIS FILE PRINTS THE APP'S OWN WORDS.
+# Without this the suite dies on the first em dash it echoes back -- at
+# check 18 of 41, on a PASSING check, with no summary line -- so a green
+# run and a broken run look the same at a glance and the later test
+# groups never execute at all. It was invisible while every run happened
+# to carry PYTHONIOENCODING=utf-8.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+
 import numpy as np                                          # noqa: E402
 from PyQt5 import QtCore, QtWidgets                          # noqa: E402
 from PyQt5.QtTest import QTest                               # noqa: E402
@@ -164,6 +175,52 @@ def test_click_guards():
     w.close()
 
 
+def test_offpage_snap_is_refused():
+    """A KEEP THAT CANNOT BE RECORDED MUST NOT BE CLAIMED.
+
+    Every candidate in the crop is drawn on the overview and every circle
+    is clickable, but commit() writes only the current page's indices. A
+    click that snapped to an off-page candidate therefore turned green,
+    lit the status bar and bumped the header count, and then vanished:
+    the page that owned it loaded with nothing accepted and one Space
+    filed the reviewer's explicit yes as a confirmed hard negative.
+    """
+    print('\n-- a click on a candidate belonging to another page --')
+    d = tempfile.mkdtemp()
+    # 8 candidates, 4 a page: #5-#8 are off-page while page 1 is shown.
+    make_bundle(d, n_crops=1, n_cands=8)
+    app, w = app_on(d, 'offpage')
+    s = w._state
+    check('page 1 judges the first four', list(s['ix']) == [0, 1, 2, 3],
+          str(list(s['ix'])))
+    off = 6                                   # candidate #7, on page 2
+    oy, ox = float(s['cands'][off][0]), float(s['cands'][off][1])
+
+    key(app, w, QtCore.Qt.Key_A)
+    click(app, w, oy, ox, button=1)
+    check('it is NOT accepted, because this page cannot record it',
+          off not in w._state['accepted'], str(sorted(w._state['accepted'])))
+    check('and it is NOT filed as a new hand-added spot either',
+          not w._state['added'], str(w._state['added']))
+    check('the reviewer is told which page judges it',
+          'PAGE 2' in w.status.text(), w.status.text()[:90])
+
+    # The whole failure, end to end: commit both pages and read the labels.
+    key(app, w, QtCore.Qt.Key_Space)          # page 1, nothing kept
+    key(app, w, QtCore.Qt.Key_2)              # page 2: keep its 2nd card
+    kept_ix = sorted(w._state['accepted'])
+    key(app, w, QtCore.Qt.Key_Space)
+    e = V.labels(d)[str(B.read_index(B.shard_paths(d)[0])[0]['key'])]
+    neg = {(round(p[0], 1), round(p[1], 1)) for p in e['negative']}
+    pos = {(round(p[0], 1), round(p[1], 1)) for p in e['positive']}
+    here = (round(oy, 1), round(ox, 1))
+    check('candidate #7 was judged on its own page, not lost',
+          here in pos or here in neg, f'{here} pos={len(pos)} neg={len(neg)}')
+    check('and page 2 recorded the keep that was actually made there',
+          kept_ix == [5], str(kept_ix))
+    w.close()
+
+
 # -- the end of the queue -------------------------------------------------
 
 def test_completion_screen():
@@ -282,14 +339,67 @@ def test_added_spots_are_voted_on():
     check('the spot three reviewers added appears ONCE, not three times',
           len(e['added']) == 2, str(e['added']))
     votes = e.get('added_votes') or {}
-    unanimous = votes.get((40.0, 12.0))
-    lone = votes.get((60.0, 20.0))
+    by_y = {round(k[0]): v for k, v in votes.items()}
     check('and carries how many of the reviewers marked it',
-          unanimous == (3, 3), str(unanimous))
+          by_y.get(40) == (3, 3), str(votes))
     check('while one person\'s lone addition is visibly a minority',
-          lone == (1, 3), str(lone))
+          by_y.get(60) == (1, 3), str(votes))
     check('the denominator is reviewers, not records',
           e['reviewers'] == 3, str(e['reviewers']))
+
+
+def test_added_spots_merge_real_clicks():
+    """THE CASE THE APP CAN ACTUALLY PRODUCE.
+
+    Two people never click the same float. The first version of this
+    merge keyed on round(v/0.5) -- a GRID -- so three clicks agreeing to
+    0.4 px landed in three bins and one emitter became three labels, each
+    reported as a lone 1-of-3 minority: agreement recorded as
+    disagreement. A test with byte-identical coordinates passes on any
+    implementation at all, including no merge whatsoever, so it proved
+    nothing about the only input that occurs.
+    """
+    print('\n-- clicks that merely AGREE, as human clicks do --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1)
+    shard = B.shard_paths(d)[0]
+    row = B.read_index(shard)[0]
+    cands = [(10.0, 8.0, 8.0, 0.9, 1, 1, '')]
+    # Three reviewers at one emitter, scattered as a hand scatters, and
+    # deliberately straddling the 0.5 px bin edges at 40.25 and 12.25.
+    marks = {'ann': (40.24, 12.10), 'bob': (40.26, 12.09),
+             'cat': (40.31, 12.11)}
+    for who, pt in marks.items():
+        V.VerdictLog(d, who, session='s1').commit(
+            row, 0, [0], cands, set(), added=[pt])
+    e = V.labels(d)[str(row['key'])]
+    check('three near-identical clicks become ONE added spot',
+          len(e['added']) == 1, str(e['added']))
+    v = list((e.get('added_votes') or {}).values())
+    check('reported as unanimous, not as three lone opinions',
+          v == [(3, 3)], str(e.get('added_votes')))
+
+    # And it must not merge things that are genuinely apart.
+    d2 = tempfile.mkdtemp()
+    make_bundle(d2, n_crops=1)
+    row2 = B.read_index(B.shard_paths(d2)[0])[0]
+    V.VerdictLog(d2, 'ann', session='s1').commit(
+        row2, 0, [0], cands, set(),
+        added=[(20.0, 10.0), (34.0, 10.0), (48.0, 10.0)])
+    e2 = V.labels(d2)[str(row2['key'])]
+    check('spots 14 px apart stay three spots',
+          len(e2['added']) == 3, str(e2['added']))
+
+    # A chain of clicks 3 px apart must not smear into one spot.
+    d3 = tempfile.mkdtemp()
+    make_bundle(d3, n_crops=1)
+    row3 = B.read_index(B.shard_paths(d3)[0])[0]
+    V.VerdictLog(d3, 'ann', session='s1').commit(
+        row3, 0, [0], cands, set(),
+        added=[(20.0 + 3.0 * k, 10.0) for k in range(6)])
+    e3 = V.labels(d3)[str(row3['key'])]
+    check('a 15 px line of clicks does not chain into one spot',
+          len(e3['added']) >= 2, str(e3['added']))
 
 
 # -- the figure -----------------------------------------------------------
@@ -333,10 +443,30 @@ def test_figure_has_no_axis_furniture():
     check('the page header is returned rather than drawn on the overview',
           bool(art['header_text']) and not art['axm'].get_title(),
           art['header_text'][:40])
+    # A SEPARATE FIGURE. Drawing into `fig` again clears it, and every
+    # Axes captured above becomes a stale object that is no longer in
+    # fig.axes -- which is exactly how the colourbar check below came to
+    # be pointing at the overview and passing on nothing.
+    fig2 = Figure(figsize=(15, 5.6), dpi=110)
+    FigureCanvasAgg(fig2)
     check('and it says a cap is a cap',
           'top ' in VIEW.draw_page(
-              fig, stack, mask, rows[:2], [0, 1], header='h',
+              fig2, stack, mask, rows[:2], [0, 1], header='h',
               n_total=99)['header_text'])
+
+    # THE COLOURBAR IS NOT IN fig.axes AT ALL -- inset_axes makes it a
+    # child of the overview -- so draw_page names it on the art dict.
+    # Scanning the figure for it found the overview and passed on
+    # nothing, which is how a restored cb.set_label() went unnoticed.
+    cax = art.get('cax')
+    check('draw_page names the colourbar axes', cax is not None)
+    if cax is not None:
+        check('the colourbar carries no caption of its own',
+              not cax.get_ylabel() and not cax.get_xlabel(),
+              repr(cax.get_ylabel() or cax.get_xlabel()))
+        check('while keeping its tick numbers, which are the data',
+              len(cax.get_yticklabels()) > 0,
+              str(len(cax.get_yticklabels())))
 
     check('the panel legend exists for the window to show',
           bool(VIEW.PANEL_LEGEND) and 'YX' in VIEW.PANEL_LEGEND)
@@ -348,14 +478,75 @@ def test_figure_has_no_axis_furniture():
     w.close()
 
 
+def test_blit_shows_what_it_records():
+    """THE SCREEN AND THE STATE MUST NOT DISAGREE.
+
+    A keep-toggle no longer repaints the figure; it restores a cached
+    background and redraws ~25 artists. That is the largest change in
+    this app and the one that fails most quietly: if the blit does not
+    land, the reviewer sees an unchanged page while `accepted` has
+    changed underneath, and commits a verdict that does not match what
+    is on screen. Nothing else in the suite would notice.
+
+    So this asserts on PIXELS, not on flags.
+    """
+    print('\n-- a toggle actually repaints, without a full draw --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1)
+    app, w = app_on(d, 'blit')
+    for _ in range(3):
+        app.processEvents()
+    check('a background was cached for blitting', w._bg is not None)
+
+    before = np.asarray(w.canvas.buffer_rgba()).copy()
+    full = {'n': 0}
+    real_draw = type(w.canvas).draw
+
+    def counted(self, *a, **k):
+        full['n'] += 1
+        return real_draw(self, *a, **k)
+    type(w.canvas).draw = counted
+    try:
+        key(app, w, QtCore.Qt.Key_1)
+        after = np.asarray(w.canvas.buffer_rgba()).copy()
+    finally:
+        type(w.canvas).draw = real_draw
+
+    check('the toggle changed the state', 0 in w._state['accepted'],
+          str(sorted(w._state['accepted'])))
+    changed = int((before != after).any(axis=2).sum())
+    check('and the pixels on screen changed with it', changed > 0,
+          f'{changed} px')
+    check('without a full figure redraw', full['n'] == 0, str(full['n']))
+
+    # Toggling back must restore the pixels exactly -- a blit that leaks
+    # would accumulate.
+    key(app, w, QtCore.Qt.Key_1)
+    back = np.asarray(w.canvas.buffer_rgba()).copy()
+    check('toggling back restores the page exactly',
+          bool((back == before).all()),
+          f'{int((back != before).any(axis=2).sum())} px differ')
+
+    # A page turn invalidates the cache and must rebuild it.
+    key(app, w, QtCore.Qt.Key_Space)
+    for _ in range(3):
+        app.processEvents()
+    if w._state is not None:
+        check('a new page caches a fresh background', w._bg is not None)
+    w.close()
+
+
 def main():
     test_escape_and_q()
     test_click_guards()
+    test_offpage_snap_is_refused()
     test_completion_screen()
     test_empty_and_already_done()
     test_page_verdict_cache()
     test_added_spots_are_voted_on()
+    test_added_spots_merge_real_clicks()
     test_figure_has_no_axis_furniture()
+    test_blit_shows_what_it_records()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         for f in FAIL:

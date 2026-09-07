@@ -333,8 +333,64 @@ def merge(bundle_dir):
 
 
 def _spot_key(y, x, z):
+    """Quantise a FITTED coordinate. Not for anything a hand produced.
+
+    Two records name the same shown candidate with the same float -- both
+    read it out of the same read-only bundle -- so this is effectively an
+    identity function with a little slack for a re-extraction. It is a
+    GRID, not a radius: two values 0.02 px apart either side of a bin edge
+    get different keys, which is harmless for coordinates that agree
+    exactly and useless for coordinates that only agree closely.
+    """
     q = SAME_SPOT_PX
     return (round(float(y) / q), round(float(x) / q), round(float(z) / q))
+
+
+# How far apart two people's clicks can be and still be one spot.
+#
+# NOT SAME_SPOT_PX. That is 0.5 px, chosen for fitted coordinates that
+# arrive bit-identical, and it was briefly used for added spots too --
+# which failed in both possible ways. Measured on this figure geometry
+# (Figure(15.0, 5.6) at dpi 110), the overview renders at 4-8 device px
+# per image px, so 0.5 px is about three screen pixels: nobody aims that
+# well. Three reviewers marking one emitter within 0.4 px of each other
+# still produced three separate labels, each reported as a lone 1-of-3
+# minority -- agreement recorded as disagreement, which is worse than the
+# duplication it replaced.
+#
+# 4.0 px is what the app already uses to decide "this click IS that
+# candidate" (spotcheck.app.ADD_SNAP_PX), for the same reason and against
+# the same hand.
+SAME_ADDED_PX = 4.0
+
+
+def _cluster_added(points, radius=SAME_ADDED_PX):
+    """[(y, x, reviewer), ...] -> [((y, x), {reviewers}), ...].
+
+    Proximity, not quantisation: a bin edge does not decide whether two
+    clicks at the same emitter are the same spot. Each point joins the
+    first cluster whose CENTRE it falls within, which bounds the chaining
+    that single-link would allow -- a line of clicks 3 px apart stays
+    several spots rather than becoming one long smear.
+
+    Deterministic: points are sorted first, so the same logs give the same
+    clusters whatever order the files were read in.
+    """
+    r2 = float(radius) ** 2
+    out = []                       # [[sum_y, sum_x, n, {reviewers}], ...]
+    for y, x, who in sorted(points, key=lambda p: (p[0], p[1], str(p[2]))):
+        for c in out:
+            cy, cx = c[0] / c[2], c[1] / c[2]
+            if (cy - y) ** 2 + (cx - x) ** 2 <= r2:
+                c[0] += y
+                c[1] += x
+                c[2] += 1
+                c[3].add(who)
+                break
+        else:
+            out.append([y, x, 1, {who}])
+    return [((round(c[0] / c[2], 3), round(c[1] / c[2], 3)), c[3])
+            for c in out]
 
 
 def labels(bundle_dir):
@@ -370,7 +426,7 @@ def labels(bundle_dir):
     """
     recs, _agree = merge(bundle_dir)
     tally, coord, meta, who = {}, {}, {}, {}
-    add_who = {}                 # key -> spot_key -> [set(reviewers), (y, x)]
+    add_who = {}                 # key -> [(y, x, reviewer), ...]
     for rec in recs:
         key = rec.get('key')
         if key is None:
@@ -393,21 +449,19 @@ def labels(bundle_dir):
         # who looked at the cell saw from one that a single person marked
         # and nobody else did. Same quantisation as `shown`, so an added
         # spot and a candidate at the same place collapse together.
-        aw = add_who.setdefault(key, {})
         for a in rec.get('added') or []:
-            ak = _spot_key(a['y'], a['x'], 0.0)
-            slot = aw.setdefault(ak, [set(), (float(a['y']), float(a['x']))])
-            slot[0].add(rec.get('reviewer'))
+            add_who.setdefault(key, []).append(
+                (float(a['y']), float(a['x']), rec.get('reviewer')))
         who.setdefault(key, set()).add(rec.get('reviewer'))
 
     out = {}
     for key, t in tally.items():
         e = dict(meta.get(key) or {})
-        aw = add_who.get(key, {})
+        clusters = _cluster_added(add_who.get(key, []))
         nrev = len(who.get(key, ()))
         e.update(positive=[], negative=[], contested=[],
-                 added=sorted(v[1] for v in aw.values()),
-                 added_votes={v[1]: (len(v[0]), nrev) for v in aw.values()},
+                 added=sorted(c for c, _w in clusters),
+                 added_votes={c: (len(w), nrev) for c, w in clusters},
                  reviewers=nrev, votes={})
         for sk, (kept, seen) in t.items():
             xyz = coord[key][sk]
