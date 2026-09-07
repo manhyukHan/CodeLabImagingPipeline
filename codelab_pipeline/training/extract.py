@@ -36,7 +36,12 @@ from ..io import analysis_store, paths
 from ..localization import engine as E
 from . import bundle as B
 
-DEFAULT_PAD = 10
+# The cell bbox plus this much on every side. Widened from 10 on
+# 2026-09-07 together with dropping the mask from candidate generation:
+# both exist so a spot sitting on or just past the segmented boundary --
+# where a segmentation slip or a small inter-hybe alignment residual puts
+# it -- is still in frame and still proposed.
+DEFAULT_PAD = 14
 DEFAULT_MAX_FITS = 40
 DEFAULT_KEEP_TOP = 12
 
@@ -46,6 +51,8 @@ def cell_masks(storage_path, fov):
 
     Reads the persisted cell dicts rather than building ACell objects:
     the extractor needs a mask and a bbox, and nothing else a cell knows.
+    The mask is stored and drawn but NOT used to filter candidates -- see
+    extract_fov.
     Going through CellContainer would drag in matrix resolution that this
     path has no use for -- crops here are in the HYBE'S OWN native frame,
     deliberately, because that is the frame a learned detector will be
@@ -91,8 +98,13 @@ def _read_crops(stack_path, channel, cells, pad):
     return out
 
 
-def candidates_for(stack_masked, engine, max_fits, anchor, keep_top=None):
+def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
     """[(y, x, z, p, fit_ok, gate_pass, reason), ...] for one crop.
+
+    `stack` is the WHOLE padded rectangle, mask NOT applied. The
+    parameter was called stack_masked until 2026-09-07 and that is no
+    longer what it is: the mask cuts FOV-scale background down to a
+    region worth looking at, and does not decide whose spot this is.
 
     Anchors are found ONCE here and handed to the engine, not found here
     and then found again inside it -- the earlier version did exactly
@@ -113,10 +125,10 @@ def candidates_for(stack_masked, engine, max_fits, anchor, keep_top=None):
     unfitted anchors appended afterwards would otherwise sail past it --
     which is why an earlier run asked for 12 and produced a median of 33.
     """
-    anchors = E.anchor_candidates(stack_masked, n_max=max_fits, **anchor)
+    anchors = E.anchor_candidates(stack, n_max=max_fits, **anchor)
     if not anchors:
         return []
-    detailed = engine.localize_detailed(stack_masked, seeds=anchors,
+    detailed = engine.localize_detailed(stack, seeds=anchors,
                                         n_max=max_fits)
     out = [(s.y, s.x, s.z, s.p, 1, 1 if ok else 0, why)
            for (s, ok, why) in detailed]
@@ -168,10 +180,26 @@ def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
             except OSError:
                 continue          # a broken stack is a skip, not a crash
             for (cid, y0, x0, block, mask) in crops:
-                st = np.where(mask[:, :, None].astype(bool),
-                              block.astype(float), np.nan)
-                cands = candidates_for(st, engine, max_fits, anchor,
-                                       keep_top=keep_top)
+                # CANDIDATES COME FROM THE WHOLE PADDED RECTANGLE, mask
+                # not applied. The cell mask is here to cut FOV-scale
+                # background down to a region worth looking at, not to
+                # decide which cell a spot belongs to -- that is a
+                # question for the analysis path, and this is a training
+                # set of biological spots.
+                #
+                # Masking cost real spots. A boundary a couple of pixels
+                # off, or a small alignment residual between this hybe
+                # and the one the cell was segmented in, clips emitters
+                # sitting near the edge, and those are precisely the ones
+                # a detector most needs examples of. A neighbouring
+                # cell's spot intruding into the pad is not a problem
+                # either: it is a real spot in a real crop, and a person
+                # judging "is this a spot" does not need to know whose.
+                #
+                # The mask is still stored and still drawn, as an
+                # outline, so a reviewer sees where the cell is.
+                cands = candidates_for(block.astype(float), engine,
+                                       max_fits, anchor, keep_top=keep_top)
                 w.add(fov, hybe, channel, cid, block, mask, y0, x0, cands)
                 n_crop += 1
                 n_cand += len(cands)

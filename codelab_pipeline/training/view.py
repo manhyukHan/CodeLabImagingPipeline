@@ -28,8 +28,12 @@ crops from the MAZ store, and the wrong version of each was tried first:
   The crop is the whole padded rectangle with the mask as an outline, NOT
   the mask alone. With only the cell in frame there is no background for
   the intensity scale to work against, so the cell filled the range and
-  every spot looked low-contrast. Candidates are still GENERATED from the
-  masked copy, so a neighbour's spot can never be anchored as this cell's.
+  every spot looked low-contrast. Candidates are generated from that same
+  padded rectangle: the mask is here to cut FOV-scale background down to
+  a region worth looking at, not to decide whose spot this is. Masking
+  clipped real emitters near a boundary that a segmentation slip or a
+  small alignment residual had moved, and those are the examples a
+  detector most needs.
 
   One intensity scale for every panel in the figure. Per-panel scaling
   makes a dim candidate look exactly like a bright one, which is the one
