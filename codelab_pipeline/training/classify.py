@@ -151,13 +151,26 @@ class SpotClassifier:
     def score(self, X=None, boxes=None):
         """Calibrated p, STRICTLY inside (0, 1).
 
-        The clip is not cosmetic. A p of exactly 0 or 1 claims certainty
-        no finite training set supports, and it is an infinity to
-        anything downstream that takes a log of it.
+        A p of exactly 0 or 1 claims certainty no finite training set
+        supports, and it is an infinity to anything downstream that takes
+        a log of it.
+
+        THE FLOAT64 CAST IS THE LOAD-BEARING PART, not the clip. torch
+        hands back float32, and in float32 the sigmoid of the clipped
+        logit IS exactly 1.0 -- 1 - 9.3e-14 needs more precision than
+        float32 has, its epsilon being 1.2e-7. Clipping the logit to
+        +-30 looked like enough and was not: MEASURED on the real gated
+        set, where logits reach 72, p.max() came back as exactly 1.0
+        while p.min() was a healthy 9.4e-14. The asymmetry is the
+        giveaway -- small numbers survive float32, numbers a hair below
+        one do not. The synthetic tests never pushed a logit far enough
+        to see it.
         """
         a, b = self.platt
-        z = np.clip(a * self._logits(X, boxes) + b, -30.0, 30.0)
-        return 1.0 / (1.0 + np.exp(-z))
+        z = np.clip(np.asarray(self._logits(X, boxes), dtype=np.float64)
+                    * float(a) + float(b), -30.0, 30.0)
+        p = 1.0 / (1.0 + np.exp(-z))
+        return np.clip(p, 1e-12, 1.0 - 1e-12)
 
     def decide(self, X=None, boxes=None):
         return self.score(X, boxes) >= self.threshold

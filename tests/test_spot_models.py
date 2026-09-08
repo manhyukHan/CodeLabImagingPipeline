@@ -159,8 +159,25 @@ def test_classifier_trains_and_reloads():
               rep['train_groups'] + rep['val_groups']
               == len({tuple(g) for g in groups}))
 
+    # AN EXTREME LOGIT, which is what synthetic data never produced and
+    # the real gated set did (72, against about 5 here). torch returns
+    # float32, and in float32 the sigmoid of a clipped +-30 logit is
+    # exactly 1.0 -- the guarantee above held only because nothing ever
+    # pushed it. Forced here so it stays held.
     clf, _ = C.train(X, cores, y, groups, head='linear', epochs=200,
                      seed=0, verbose=False)
+    import torch
+    with torch.no_grad():
+        for prm in clf.model.parameters():
+            prm.mul_(60.0)
+    pe = clf.score(X)
+    check('p stays inside (0, 1) even at an absurd logit',
+          bool(((pe > 0) & (pe < 1)).all()),
+          f'max {pe.max():.17g}, min {pe.min():.3e}')
+    with torch.no_grad():
+        for prm in clf.model.parameters():
+            prm.div_(60.0)
+
     p = clf.score(X)
     with tempfile.TemporaryDirectory() as d:
         path = clf.save(os.path.join(d, 'clf.json'))
