@@ -81,7 +81,18 @@ def test_features():
 
     bl = dict(zip(F.NAMES, F.one(blank(), blank()[7, 7, :])))
     check('and it is brighter than nothing at all',
-          d['peak'] > bl['peak'], f"{d['peak']:.1f} vs {bl['peak']:.1f}")
+          d['log_peak'] > bl['log_peak'],
+          f"{d['log_peak']:.2f} vs {bl['log_peak']:.2f}")
+
+    # THE CONTRACT, not a spot check: every name resolves and nothing
+    # names a feature that has been removed. `peak` was in this list until
+    # its rank correlation with log_peak came back at 1.000000, and the
+    # test kept referring to it -- a KeyError that only fires on the
+    # first call, which is exactly how a suite reports 0 passed and 0
+    # failed and looks like it did not run.
+    check('every name in NAMES is produced by one()',
+          set(d) == set(F.NAMES) and len(d) == len(F.NAMES),
+          f'{len(d)} values for {len(F.NAMES)} names')
 
     X = np.array([F.one(emitter(seed=i), emitter(seed=i)[7, 7, :])
                   for i in range(20)])
