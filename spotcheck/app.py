@@ -279,7 +279,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._snapped = None
         self._outside = False
         self._offpage = None
-        self._committed = 0
+        self._committed = set()
         self._art = None
         self._bg = None
         self._t0 = time.time()
@@ -328,6 +328,11 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._adding = False
         self._outside = False
         self._offpage = None
+        # AND THE SNAP BANNER. It was set on a click and never cleared, so
+        # "clicked ON candidate #7 -- kept it" stayed under every later
+        # page for the rest of the session, claiming a keep on crops the
+        # reviewer had not touched.
+        self._snapped = None
         self._art = None
         self._bg = None
         self._t0 = time.time()
@@ -355,7 +360,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         s['snapped'] = self._snapped
         row = s['row']
         if restyle_only and self._art is not None:
-            VIEW.restyle(self._art, s['accepted'], s['added'])
+            VIEW.restyle(self._art, s['accepted'])
             if not self._blit():
                 self.canvas.draw_idle()
         else:
@@ -408,6 +413,20 @@ class SpotCheck(QtWidgets.QMainWindow):
             self._bg = None
             return False
 
+    def _status_only(self):
+        """Repaint the words, not the picture.
+
+        Add mode, its cancel, and the two refusal messages change a Qt
+        label and nothing in the figure, but each went through _draw() --
+        MEASURED 366-434 ms to rebuild nine imshows for a frame in which
+        no pixel of the plot differs.
+        """
+        if self._state is None:
+            return
+        s = dict(self._state)
+        s['snapped'] = self._snapped
+        self._set_status(s)
+
     def _set_status(self, s):
         kept = ', '.join(f'#{i + 1}' for i in sorted(s['accepted'])) or 'none'
         if self._art is not None:
@@ -455,8 +474,11 @@ class SpotCheck(QtWidgets.QMainWindow):
         # handed an empty or mis-built bundle no hint that anything was
         # wrong with it.
         if self._committed:
+            # PAGES, not commits. Re-checking a page with Backspace and
+            # committing it again is one page judged; counting the writes
+            # let the tally run past the size of the bundle.
             msg = ('That was the last page.\n'
-                   f'{self._committed} judged this session — '
+                   f'{len(self._committed)} judged this session — '
                    'your verdicts are saved.')
         elif len(self.queue) == 0 and self.log.done_pages():
             msg = ('You have already reviewed every page of this bundle.\n'
@@ -502,7 +524,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         h, w = self._state['stack'].shape[0], self._state['stack'].shape[1]
         if not (-0.5 <= y <= h - 0.5 and -0.5 <= x <= w - 0.5):
             self._outside = True
-            self._draw()
+            self._status_only()
             return
         self._outside = False
         # A CLICK ON AN EXISTING CANDIDATE ACCEPTS IT, never adds a
@@ -535,7 +557,9 @@ class SpotCheck(QtWidgets.QMainWindow):
             # which is a better look at it than a click on the overview.
             self._offpage = (near, self._page_of(near))
             self._snapped = None
-        elif near is not None:
+            self._status_only()
+            return
+        if near is not None:
             self._state['accepted'].add(near)
             self._snapped = near
             self._offpage = None
@@ -571,7 +595,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                 self._adding = False
                 self._outside = False
                 self._offpage = None
-                self._draw()
+                self._status_only()
             return
         # BACKSPACE WORKS ON THE COMPLETION SCREEN. It has no _state, and
         # the old guard returned before reaching this, so a reviewer who
@@ -589,7 +613,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                 self._draw(restyle_only=True)
             return
         if k == QtCore.Qt.Key_A:
-            self._adding = True; self._draw(); return
+            self._adding = True; self._status_only(); return
         if k == QtCore.Qt.Key_U:
             if s['added']:
                 s['added'].pop(); self._draw()
@@ -608,7 +632,7 @@ class SpotCheck(QtWidgets.QMainWindow):
                             seconds=time.time() - self._t0,
                             bundle=os.path.basename(s['shard']),
                             store=s['store'])
-            self._committed += 1
+            self._committed.add((s['row']['key'], s['page']))
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Backspace:
             self.queue.advance(-1); self._load(); return

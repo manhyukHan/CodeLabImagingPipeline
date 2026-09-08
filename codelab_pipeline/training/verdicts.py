@@ -447,8 +447,17 @@ def labels(bundle_dir):
         # exactly the silent per-spot weighting the shown candidates are
         # tallied to avoid -- and there was no way to tell a spot everyone
         # who looked at the cell saw from one that a single person marked
-        # and nobody else did. Same quantisation as `shown`, so an added
-        # spot and a candidate at the same place collapse together.
+        # and nobody else did.
+        #
+        # THEY DO NOT MERGE WITH `shown`, and an earlier version of this
+        # comment claimed they did. They cannot: an added spot has no z --
+        # the reviewer clicked a MIP -- so there is no common key, and
+        # the two are tallied separately by design. A reviewer who adds a
+        # spot that another reviewer's page already showed and rejected
+        # therefore produces both an `added` entry and a `negative` one
+        # for the same place. That is the honest record of what happened;
+        # resolving it is a question about those two people, not about
+        # this function.
         for a in rec.get('added') or []:
             add_who.setdefault(key, []).append(
                 (float(a['y']), float(a['x']), rec.get('reviewer')))

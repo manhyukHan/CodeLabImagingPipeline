@@ -222,8 +222,9 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
               else f'top {len(cands)} of {n_total} candidates')
     header_text = (f'{header}   |   {mip.shape[0]}(y) x {mip.shape[1]}(x) px, '
                    f'{st.shape[2]} planes   |   {n_seen}'
-                   f'   |   page {page + 1}/{npage}, showing '
-                   f'#{page_ix[0] + 1}-#{page_ix[-1] + 1}')
+                   f'   |   page {page + 1}/{npage}'
+                   + (f', showing #{page_ix[0] + 1}-#{page_ix[-1] + 1}'
+                      if page_ix else ', nothing to show'))
     art['header_text'] = header_text
     _frame(axm)
 
@@ -312,13 +313,18 @@ def mutable_artists(art):
     return out
 
 
-def restyle(art, accepted, added=()):
+def restyle(art, accepted):
     """Update only what a keep-toggle changes: colours, widths, the tick.
     Returns the figure, already re-styled.
 
     The accepted count is NOT here. It used to live in the axes title,
     which made every keystroke redraw 135 glyphs at ~0.48 ms each; it now
     lives in a Qt label the app updates for free.
+
+    Nor are ADDED spots. This took an `added` argument and never read it,
+    which is a signature that lies about what it can update: an added
+    spot needs a new artist, so it goes through draw_page. Taking the
+    argument invited a caller to believe a restyle would show one.
 
     THE POINT IS WHAT IT DOES NOT DO. draw_page clears the figure and
     builds nine imshows plus a colourbar; a toggle changes no pixel of

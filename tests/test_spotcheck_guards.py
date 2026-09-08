@@ -536,16 +536,110 @@ def test_blit_shows_what_it_records():
     w.close()
 
 
+def test_status_claims_expire_with_the_page():
+    """A BANNER MUST NOT OUTLIVE WHAT IT DESCRIBES.
+
+    `_snapped` was set by a click and never cleared, so "clicked ON
+    candidate #7 -- kept it" sat under every later page for the rest of
+    the session, claiming a keep on crops the reviewer had not touched.
+    """
+    print('\n-- what the status bar says stops being true elsewhere --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=2, n_cands=8)
+    app, w = app_on(d, 'banner')
+    on_page = w._state['ix'][1]
+    cy, cx = float(w._state['cands'][on_page][0]), \
+        float(w._state['cands'][on_page][1])
+    key(app, w, QtCore.Qt.Key_A)
+    click(app, w, cy, cx, button=1)
+    check('a click on an ON-page candidate keeps it',
+          on_page in w._state['accepted'], str(sorted(w._state['accepted'])))
+    check('and the status says so', 'clicked ON' in w.status.text(),
+          w.status.text()[:70])
+    key(app, w, QtCore.Qt.Key_Space)
+    check('the claim does not follow the reviewer to the next page',
+          'clicked ON' not in w.status.text(), w.status.text()[:70])
+    w.close()
+
+
+def test_status_only_changes_do_not_redraw():
+    """Add mode changes a Qt label, not a pixel of the plot."""
+    print('\n-- turning add mode on does not rebuild the figure --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1)
+    app, w = app_on(d, 'statusonly')
+    for _ in range(3):
+        app.processEvents()
+    before = np.asarray(w.canvas.buffer_rgba()).copy()
+    full = {'n': 0}
+    real = type(w.canvas).draw
+
+    def counted(self, *a, **k):
+        full['n'] += 1
+        return real(self, *a, **k)
+    type(w.canvas).draw = counted
+    try:
+        key(app, w, QtCore.Qt.Key_A)
+        key(app, w, QtCore.Qt.Key_Escape)
+    finally:
+        type(w.canvas).draw = real
+    after = np.asarray(w.canvas.buffer_rgba()).copy()
+    check('A then Escape redraws the figure zero times', full['n'] == 0,
+          str(full['n']))
+    check('and leaves the plot pixel-identical',
+          bool((before == after).all()),
+          f'{int((before != after).any(axis=2).sum())} px differ')
+    check('while the words did change', not w._adding)
+    w.close()
+
+
+def test_draw_page_survives_an_empty_page():
+    """draw_page is public; an empty page must not be a crash."""
+    print('\n-- a page with nothing on it --')
+    fig = Figure(figsize=(15, 5.6), dpi=110)
+    FigureCanvasAgg(fig)
+    st = np.random.default_rng(0).integers(200, 400, (40, 40, 20)).astype(float)
+    mk = np.ones((40, 40), np.uint8)
+    try:
+        art = VIEW.draw_page(fig, st, mk, [], [], header='h', page=0, npage=1)
+        fig.canvas.draw()
+        ok, why = True, art['header_text'][-28:]
+    except Exception as exc:                                # noqa: BLE001
+        ok, why = False, f'{type(exc).__name__}: {exc}'
+    check('an empty page_ix draws instead of raising', ok, why)
+
+
+def test_completion_counts_pages_not_commits():
+    print('\n-- the session tally counts pages --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1, n_cands=8)
+    app, w = app_on(d, 'tally')
+    n = len(w.queue)
+    key(app, w, QtCore.Qt.Key_Space)
+    key(app, w, QtCore.Qt.Key_Backspace)      # back to page 1
+    key(app, w, QtCore.Qt.Key_Space)          # commit it a second time
+    for _ in range(n + 1):
+        key(app, w, QtCore.Qt.Key_Space)
+    txt = ' '.join(t.get_text() for ax in w.fig.axes for t in ax.texts)
+    check('a page committed twice counts once',
+          f'{n} judged' in txt, txt.replace('\n', ' | ')[:80])
+    w.close()
+
+
 def main():
     test_escape_and_q()
     test_click_guards()
     test_offpage_snap_is_refused()
+    test_status_claims_expire_with_the_page()
+    test_status_only_changes_do_not_redraw()
     test_completion_screen()
+    test_completion_counts_pages_not_commits()
     test_empty_and_already_done()
     test_page_verdict_cache()
     test_added_spots_are_voted_on()
     test_added_spots_merge_real_clicks()
     test_figure_has_no_axis_furniture()
+    test_draw_page_survives_an_empty_page()
     test_blit_shows_what_it_records()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
