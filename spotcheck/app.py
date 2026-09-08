@@ -280,12 +280,28 @@ class SpotCheck(QtWidgets.QMainWindow):
         self._outside = False
         self._offpage = None
         self._committed = set()
+        # UNCOMMITTED WORK, PER PAGE. Backspace moves the queue and _load
+        # rebuilds the page from the FILE, so keeps not yet committed were
+        # simply gone -- and at queue position 0 Backspace did not even
+        # move, it just silently wiped the page the reviewer was working
+        # on. Worse than losing them: the reviewer comes forward again,
+        # sees an empty page, presses Space, and the spots they had marked
+        # are filed as confirmed negatives.
+        self._draft = {}
         self._art = None
         self._bg = None
         self._t0 = time.time()
         self._load()
 
     # -- data ------------------------------------------------------------
+
+    def _stash(self):
+        """Remember this page's uncommitted keeps before leaving it."""
+        s = self._state
+        if s is None:
+            return
+        self._draft[(str(s['row']['key']), int(s['page']))] = (
+            set(s['accepted']), list(s['added']))
 
     def _load(self):
         item = self.queue.current()
@@ -314,6 +330,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         # the file -- and one more Space then overwrote the real verdict
         # with an empty one.
         prior = self.log.page_verdict(row['key'], page)
+        draft = self._draft.get((str(row['key']), int(page)))
         # The store path comes from the shard's own meta, so a verdict can
         # say where its pixels came from and be re-cut after the bundle
         # is deleted (verdicts.recut).
@@ -322,8 +339,10 @@ class SpotCheck(QtWidgets.QMainWindow):
                            stack=stack, mask=mask, cands=rows, npage=npage,
                            store=meta.get('storage_path'),
                            n_total=n_total,
-                           accepted=set(prior['accepted']) if prior else set(),
-                           added=list(prior['added']) if prior else [],
+                           accepted=(set(draft[0]) if draft else
+                                     set(prior['accepted']) if prior else set()),
+                           added=(list(draft[1]) if draft else
+                                  list(prior['added']) if prior else []),
                            revisited=bool(prior))
         self._adding = False
         self._outside = False
@@ -602,6 +621,18 @@ class SpotCheck(QtWidgets.QMainWindow):
         # pressed Space once too often was stranded on "thank you" with no
         # way back to the page they had just committed.
         if k == QtCore.Qt.Key_Backspace:
+            if self.queue.i == 0 and s is not None:
+                # NOWHERE TO GO. This used to reload page 0, which threw
+                # away every uncommitted keep on it -- Backspace is the
+                # universal undo reflex and the app's own U undoes only
+                # adds, so it was the likeliest key to press here.
+                self._outside = False
+                self._offpage = None
+                self.status.setText(
+                    'ALREADY AT THE FIRST PAGE -- nothing behind it.   |  '
+                    + self.status.text())
+                return
+            self._stash()
             self.queue.advance(-1); self._load(); return
         if s is None:
             return
@@ -610,6 +641,13 @@ class SpotCheck(QtWidgets.QMainWindow):
             if slot < len(s['ix']):
                 i = s['ix'][slot]
                 s['accepted'].symmetric_difference_update({i})
+                # AND DROP THE SNAP BANNER. "clicked ON candidate #3 --
+                # kept it" was rebuilt from _snapped on every restyle, so
+                # pressing 3 to drop that very candidate left one status
+                # line asserting both the keep and "keeping: none". The
+                # cross-page case was fixed in _load; this is the same
+                # sentence going stale within the page.
+                self._snapped = None
                 self._draw(restyle_only=True)
             return
         if k == QtCore.Qt.Key_A:
@@ -622,17 +660,41 @@ class SpotCheck(QtWidgets.QMainWindow):
             # No record at all. A crop the reviewer cannot judge must stay
             # UNLABELLED -- committing it empty would file it as four
             # confirmed negatives, which is a lie the model would learn.
+            self._stash()
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Space:
             # The whole index row and the whole candidate list go in, so
             # the record can carry coordinates and crop geometry rather
             # than positions in a list this bundle happens to have.
-            self.log.commit(s['row'], s['page'], s['ix'], s['cands'],
-                            s['accepted'], added=s['added'],
-                            seconds=time.time() - self._t0,
-                            bundle=os.path.basename(s['shard']),
-                            store=s['store'])
+            # A WRITE THAT FAILS MUST NOT TAKE THE WINDOW WITH IT. An
+            # unhandled exception inside a Qt slot aborts the process --
+            # MEASURED exit 127, no traceback, no message -- so a share
+            # going read-only mid-session looked like the app vanishing,
+            # and the reviewer had no way to know which page was the last
+            # one saved. Stay on the page, say what happened, and let them
+            # retry once the disk is back.
+            try:
+                self.log.commit(s['row'], s['page'], s['ix'], s['cands'],
+                                s['accepted'], added=s['added'],
+                                seconds=time.time() - self._t0,
+                                bundle=os.path.basename(s['shard']),
+                                store=s['store'])
+            except Exception as exc:                        # noqa: BLE001
+                self._stash()
+                QtWidgets.QMessageBox.critical(
+                    self, 'Spot Check -- verdict NOT saved',
+                    'This page could not be written:\n\n'
+                    f'{type(exc).__name__}: {exc}\n\n'
+                    f'{self.log.path}\n\n'
+                    'Your keeps are still on screen. Fix the disk or the '
+                    'share and press Space again. Nothing already saved '
+                    'is affected.')
+                self.status.setText('VERDICT NOT SAVED -- see the message; '
+                                    'press Space to retry.   |  '
+                                    + self.status.text())
+                return
             self._committed.add((s['row']['key'], s['page']))
+            self._draft.pop((str(s['row']['key']), int(s['page'])), None)
             self.queue.advance(1); self._load(); return
         if k == QtCore.Qt.Key_Backspace:
             self.queue.advance(-1); self._load(); return

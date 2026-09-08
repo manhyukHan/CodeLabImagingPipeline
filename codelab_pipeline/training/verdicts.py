@@ -124,7 +124,13 @@ class VerdictLog:
         session. Resume has to see all of them or a second window would
         re-serve pages the first one already judged."""
         import glob
-        pat = os.path.join(self.dir, SESSION_FMT.format(
+        # ESCAPE THE DIRECTORY. glob treats [ ] as a character class, so a
+        # bundle in a folder named "MP58 [RNA] copy" matched nothing: every
+        # session found no previous logs, done_pages() came back empty, and
+        # the whole bundle was served again from the top, forever. The
+        # pattern's own '*' must stay live, so only the directory is
+        # escaped.
+        pat = os.path.join(glob.escape(self.dir), SESSION_FMT.format(
             reviewer=_safe(self.reviewer), session='*'))
         found = sorted(glob.glob(pat))
         legacy = path_for(self.dir, self.reviewer)   # pre-session layout
@@ -318,14 +324,26 @@ def merge(bundle_dir):
     material for an inter-rater number. Nothing is resolved here: which
     of two disagreeing reviewers is right is not a decision this file
     gets to make.
+
+    LATER WINS BY THE CLOCK, not by which file sorted last. One reviewer
+    with two windows open writes two files, and the file whose name sorts
+    later is not the one written later: MEASURED with two real processes,
+    a page fat-fingered empty at 10:40:58 in window B beat the same
+    page's real keeps filed at 10:40:59 in window A, turning two spots
+    the reviewer had explicitly marked into confirmed negatives.
+
+    `at` has one-second resolution, so ties fall back to file order and
+    then to line order, both of which are chronological within a session.
     """
-    latest, by_page = {}, {}
-    for name in sorted(os.listdir(str(bundle_dir))):
+    latest, order, by_page = {}, {}, {}
+    for fi, name in enumerate(sorted(os.listdir(str(bundle_dir)))):
         if not (name.startswith('verdicts_') and name.endswith('.jsonl')):
             continue
-        for rec in read_log(os.path.join(str(bundle_dir), name)):
+        for li, rec in enumerate(read_log(os.path.join(str(bundle_dir), name))):
             k = (rec.get('reviewer'), rec.get('key'), int(rec.get('page', 0)))
-            latest[k] = rec            # a later line supersedes an earlier one
+            stamp = (str(rec.get('at') or ''), fi, li)
+            if k not in latest or stamp > order[k]:
+                latest[k], order[k] = rec, stamp
     for (reviewer, key, page), rec in latest.items():
         by_page.setdefault((key, page), []).append(rec)
     agreement = [(k, v) for k, v in sorted(by_page.items()) if len(v) > 1]

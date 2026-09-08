@@ -94,6 +94,46 @@ PANEL_LEGEND = ('cell at left (x right, y down)   |   per spot: YX above, '
                 'ZX below (x right, z down)   |   bar: counts, one scale')
 
 
+def _fill(dst, src, oy, ox):
+    """Copy whatever of `src` overlaps `dst` placed at (oy, ox)."""
+    h, w = dst.shape
+    sy0, sx0 = max(0, -oy), max(0, -ox)
+    dy0, dx0 = max(0, oy), max(0, ox)
+    n = min(h - dy0, src.shape[0] - sy0)
+    m = min(w - dx0, src.shape[1] - sx0)
+    if n > 0 and m > 0:
+        dst[dy0:dy0 + n, dx0:dx0 + m] = src[sy0:sy0 + n, sx0:sx0 + m]
+    return dst
+
+
+def _window2d(st, iy, ix, iz, half, fill):
+    """A (2*half+1)^2 YX view centred on (iy, ix), padded to size.
+
+    Returns (image, (y_origin, x_origin)) so a marker can be placed with
+    plain `y - y_origin` whether or not the window ran off the crop.
+    """
+    n = 2 * half + 1
+    out = np.full((n, n), float(fill))
+    zc = int(np.clip(iz, 0, st.shape[2] - 1))
+    return _fill(out, st[:, :, zc], -(iy - half), -(ix - half)), \
+        (iy - half, ix - half)
+
+
+def _windowzx(st, iy, ix, iz, half, zhalf, fill):
+    """A (2*zhalf+1) x (2*half+1) ZX view, padded to size.
+
+    Fixed height AND width, because the panel is sized as a percentage of
+    the YX panel's width and shares its x axis -- either dimension going
+    short silently unpins the two.
+    """
+    n, m = 2 * zhalf + 1, 2 * half + 1
+    out = np.full((n, m), float(fill))
+    yc = int(np.clip(iy, 0, st.shape[0] - 1))
+    if 0 <= iy < st.shape[0]:
+        out = _fill(out, st[yc, :, :].T, -(iz - zhalf), -(ix - half))
+    return out, (iz - zhalf, ix - half)
+
+
 def _frame(ax):
     """Nothing but the image: no ticks, no grid, no spines, no words.
 
@@ -243,46 +283,73 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
     for slot, i in enumerate(page_ix):
         c = cands[i]
         y, x, z, p, fit_ok, gate, why = c
+        # THE WINDOWS ARE A FIXED SIZE, ALWAYS, filled in from whatever the
+        # crop actually has. Slicing with clamped bounds instead made the
+        # panel smaller near a crop edge, and three separate things broke
+        # with it: the ZX panel is sized as a PERCENTAGE of the YX width,
+        # so a truncated YX unpinned the two (MEASURED width ratio 0.63 at
+        # y=77 of an 80-row crop, and the left edges 23 px apart -- a
+        # column read off ZX was not the column above it); a candidate
+        # whose rounded y fell outside the crop got a 1x1 black square
+        # instead of an axial panel, which happens to 53 reachable
+        # candidates in the MP58 RNA bundle; and an unclamped marker
+        # stretched the axis it was drawn on.
         iy, ix, iz = int(round(y)), int(round(x)), int(round(z))
-        ya0, ya1 = max(0, iy - HALF), min(st.shape[0], iy + HALF + 1)
-        xa0, xa1 = max(0, ix - HALF), min(st.shape[1], ix + HALF + 1)
+        yx, (dy, dx) = _window2d(st, iy, ix, iz, HALF, vlo)
+        zxi, (dz, _dx2) = _windowzx(st, iy, ix, iz, HALF, ZHALF, vlo)
         chosen = i in accepted
         col = CHOSEN_C if chosen else candidate_colour(c)
+        iz_shown = int(np.clip(iz, 0, st.shape[2] - 1))
 
         card = grid[0, slot].subgridspec(2, 1, height_ratios=[1.0, 0.34],
                                          hspace=0.72)
         ax1 = fig.add_subplot(card[0])
-        ax1.imshow(st[ya0:ya1, xa0:xa1, max(0, min(iz, st.shape[2] - 1))],
-                   cmap=CMAP, vmin=vlo, vmax=vhi, interpolation='nearest')
-        ccirc = Circle((x - xa0, y - ya0), 2.9, fill=False, ec=col,
+        ax1.imshow(yx, cmap=CMAP, vmin=vlo, vmax=vhi, interpolation='nearest')
+        ccirc = Circle((x - dx, y - dy), 2.9, fill=False, ec=col,
                        lw=2.2 if chosen else 1.3)
         ax1.add_patch(ccirc)
-        ctitle = ax1.set_title(f'[{slot + 1}]  #{i + 1}  YX @ z={iz}'
+        # The title names the plane that was DRAWN. It used to name the
+        # candidate's own rounded z even when that plane does not exist --
+        # "YX @ z=-4" over a picture of plane 0 -- which is the one number
+        # on the card a reviewer would quote.
+        ctitle = ax1.set_title(f'[{slot + 1}]  #{i + 1}  YX @ z={iz_shown}'
                                + ('   ✓ KEEP' if chosen else ''),
                                fontsize=6.6, pad=1.8, color=col, weight='bold')
         _frame(ax1)
 
-        z0 = max(0, iz - ZHALF)
-        z1 = min(st.shape[2], iz + ZHALF + 1)
-        zx = st[iy, xa0:xa1, z0:z1].T if 0 <= iy < st.shape[0] else np.zeros((1, 1))
+        z0, z1 = dz, dz + zxi.shape[0]
         ax2 = make_axes_locatable(ax1).append_axes(
             'bottom',
-            size=f'{100.0 * zx.shape[0] / max(1, zx.shape[1]):.0f}%',
+            size=f'{100.0 * zxi.shape[0] / max(1, zxi.shape[1]):.0f}%',
             pad=0.10, sharex=ax1)
-        ax2.imshow(zx, cmap=CMAP, vmin=vlo, vmax=vhi, interpolation='nearest')
+        ax2.imshow(zxi, cmap=CMAP, vmin=vlo, vmax=vhi, interpolation='nearest')
         # A marker ring, not a Circle patch: a patch lives in data
         # coordinates and would swallow the very spot it points at
         # whenever the two axes scale differently.
-        cmark, = ax2.plot(x - xa0, z - z0, 'o', mfc='none', mec=col, ms=8,
+        #
+        # CLAMPED INTO THE PANEL. Drawing it at an out-of-range z made
+        # matplotlib grow the y limits to include it, which changed the
+        # panel's aspect and unpinned it from YX -- so a marker pointing
+        # off the picture also moved the picture.
+        cmark, = ax2.plot(np.clip(x - dx, -0.5, zxi.shape[1] - 0.5),
+                          np.clip(z - z0, -0.5, zxi.shape[0] - 0.5),
+                          'o', mfc='none', mec=col, ms=8,
                           mew=2.2 if chosen else 1.3)
+        ax2.set_xlim(-0.5, zxi.shape[1] - 0.5)
+        ax2.set_ylim(zxi.shape[0] - 0.5, -0.5)
         _frame(ax2)
 
         kind = ('PASS' if gate else 'reject') if fit_ok else 'NO FIT'
         axt = fig.add_subplot(card[1]); axt.axis('off')
         ctext = axt.text(0, 1.0, f'p={p:.3f}  {kind}', fontsize=6.5, color=col,
                          va='top', ha='left', family='monospace', weight='bold')
+        # The planes that EXIST in what was drawn, not the window's
+        # nominal bounds -- a window running off the stack is padded, and
+        # saying "z shown -4-36" names four planes nobody imaged.
+        zs0 = int(np.clip(z0, 0, st.shape[2] - 1))
+        zs1 = int(np.clip(z1 - 1, 0, st.shape[2] - 1))
         body = (f'y{y:5.1f} x{x:5.1f} z{z:5.1f}\n'
-                f'z shown {z0}-{z1 - 1}')
+                f'z shown {zs0}-{zs1}')
         if why:
             body += '\n' + str(why)[:26]
         axt.text(0, 0.60, body, fontsize=5.6, color='#555', va='top',

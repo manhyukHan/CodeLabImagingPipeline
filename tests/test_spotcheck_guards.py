@@ -626,20 +626,215 @@ def test_completion_counts_pages_not_commits():
     w.close()
 
 
+def test_uncommitted_work_survives_navigation():
+    """LEAVING A PAGE IS NOT DISCARDING IT.
+
+    Backspace rebuilt the page from the file, so keeps not yet committed
+    were gone -- and at queue position 0 it did not even move, it just
+    wiped the page being worked on. The reviewer then comes forward,
+    sees an empty page, presses Space, and their marked spots are filed
+    as confirmed negatives.
+    """
+    print('\n-- keeps that have not been committed yet --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=2, n_cands=8)
+    app, w = app_on(d, 'draft')
+    h, wd = w._state['stack'].shape[:2]
+
+    key(app, w, QtCore.Qt.Key_1)
+    key(app, w, QtCore.Qt.Key_3)
+    key(app, w, QtCore.Qt.Key_A)
+    click(app, w, h - 8.0, wd / 2, button=1)
+    want, want_add = set(w._state['accepted']), list(w._state['added'])
+    check('page 0 has uncommitted keeps and an added spot',
+          len(want) == 2 and len(want_add) == 1,
+          f'{sorted(want)} + {want_add}')
+
+    key(app, w, QtCore.Qt.Key_Backspace)          # nowhere to go
+    check('Backspace at the first page does not wipe them',
+          set(w._state['accepted']) == want and w._state['added'] == want_add,
+          f'{sorted(w._state["accepted"])} + {w._state["added"]}')
+    check('and says why nothing happened',
+          'FIRST PAGE' in w.status.text(), w.status.text()[:60])
+
+    key(app, w, QtCore.Qt.Key_Space)              # commit page 0, move on
+    key(app, w, QtCore.Qt.Key_2)
+    mid = set(w._state['accepted'])
+    key(app, w, QtCore.Qt.Key_Backspace)          # back to page 0
+    key(app, w, QtCore.Qt.Key_Space)              # forward again
+    check('an uncommitted keep survives a round trip',
+          set(w._state['accepted']) == mid,
+          f'{sorted(mid)} -> {sorted(w._state["accepted"])}')
+
+    # S leaves a page unlabelled -- and must not eat it either.
+    key(app, w, QtCore.Qt.Key_4)
+    before = set(w._state['accepted'])
+    key(app, w, QtCore.Qt.Key_S)
+    key(app, w, QtCore.Qt.Key_Backspace)
+    check('S skips without discarding what was marked',
+          set(w._state['accepted']) == before,
+          f'{sorted(before)} -> {sorted(w._state["accepted"])}')
+    w.close()
+
+
+def test_snap_banner_dies_with_the_keep():
+    print('\n-- the snap banner and the keep it describes --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1, n_cands=8)
+    app, w = app_on(d, 'banner2')
+    on_page = w._state['ix'][2]
+    cy, cx = float(w._state['cands'][on_page][0]), \
+        float(w._state['cands'][on_page][1])
+    key(app, w, QtCore.Qt.Key_A)
+    click(app, w, cy, cx, button=1)
+    check('the click keeps it and says so',
+          on_page in w._state['accepted'] and 'clicked ON' in w.status.text())
+    key(app, w, QtCore.Qt.Key_3)                  # drop the same candidate
+    check('dropping it removes the keep',
+          on_page not in w._state['accepted'])
+    check('and the sentence claiming the keep goes with it',
+          'clicked ON' not in w.status.text(), w.status.text()[:80])
+    w.close()
+
+
+def test_a_failed_write_does_not_kill_the_window():
+    print('\n-- the disk goes read-only mid-session --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1, n_cands=8)
+    app, w = app_on(d, 'nodisk')
+
+    boom = {'n': 0}
+
+    def explode(*a, **k):
+        boom['n'] += 1
+        raise OSError(13, 'Permission denied')
+    w.log.commit = explode
+    shown = {'n': 0}
+    real = QtWidgets.QMessageBox.critical
+    QtWidgets.QMessageBox.critical = staticmethod(
+        lambda *a, **k: shown.__setitem__('n', shown['n'] + 1))
+    try:
+        key(app, w, QtCore.Qt.Key_1)
+        here = (w._state['row']['key'], w._state['page'])
+        key(app, w, QtCore.Qt.Key_Space)
+        check('the write was attempted', boom['n'] == 1)
+        check('the window is still open', w.isVisible())
+        check('and still on the same page, keeps intact',
+              w._state is not None
+              and (w._state['row']['key'], w._state['page']) == here
+              and 0 in w._state['accepted'],
+              str(sorted(w._state['accepted'])) if w._state else 'gone')
+        check('the reviewer was told', shown['n'] == 1)
+        check('and the status says the verdict was not saved',
+              'NOT SAVED' in w.status.text(), w.status.text()[:50])
+    finally:
+        QtWidgets.QMessageBox.critical = real
+    w.close()
+
+
+def test_merge_resolves_by_clock_not_filename():
+    """Two windows, one reviewer: the LATER verdict must win."""
+    print('\n-- which of two verdicts for one page counts --')
+    d = tempfile.mkdtemp()
+    make_bundle(d, n_crops=1, n_cands=4)
+    row = B.read_index(B.shard_paths(d)[0])[0]
+    cands = [(10.0, 8.0, 8.0, 0.9, 1, 1, ''), (16.0, 9.0, 9.0, 0.8, 1, 1, '')]
+
+    # 'zz' sorts AFTER 'aa', but is written a second EARLIER.
+    late = V.VerdictLog(d, 'one', session='zzzz-1')
+    early = V.VerdictLog(d, 'one', session='aaaa-2')
+    r = late.commit(row, 0, [0, 1], cands, set())          # empty, at T
+    r['at'] = '2026-09-08T10:40:58'
+    with open(late.path, 'w', encoding='utf-8', newline='\n') as f:
+        import json as _j
+        f.write(_j.dumps(r) + '\n')
+    r2 = early.commit(row, 0, [0, 1], cands, {0, 1})       # keeps, at T+1
+    r2['at'] = '2026-09-08T10:40:59'
+    with open(early.path, 'w', encoding='utf-8', newline='\n') as f:
+        import json as _j
+        f.write(_j.dumps(r2) + '\n')
+
+    recs, _ = V.merge(d)
+    kept = [e['i'] for e in recs[0]['shown'] if e['keep']]
+    check('the verdict written later wins, not the file sorted later',
+          kept == [0, 1], f'kept={kept} from {recs[0]["at"]}')
+    e = V.labels(d)[str(row['key'])]
+    check('so the two marked spots are positives, not negatives',
+          len(e['positive']) == 2 and not e['negative'],
+          f'pos={len(e["positive"])} neg={len(e["negative"])}')
+
+
+def test_resume_survives_brackets_in_the_path():
+    print('\n-- a bundle folder named with [ ] --')
+    base = tempfile.mkdtemp()
+    d = os.path.join(base, 'MP58 [RNA] copy')
+    os.makedirs(d)
+    make_bundle(d, n_crops=1, n_cands=8)
+    app, w = app_on(d, 'brackets')
+    n = len(w.queue)
+    key(app, w, QtCore.Qt.Key_Space)
+    w.close()
+    _app, w2 = app_on(d, 'brackets')
+    check('the second session sees the first one\'s log',
+          len(w2.log.my_logs()) >= 1, str(len(w2.log.my_logs())))
+    check('and does not re-serve the page already judged',
+          len(w2.queue) == n - 1, f'{n} -> {len(w2.queue)}')
+    w2.close()
+
+
+def test_cards_stay_pinned_at_the_crop_edges():
+    """ZX is sized as a percentage of YX's width and shares its x axis."""
+    print('\n-- the axial panel at the edges of a crop --')
+    rng = np.random.default_rng(0)
+    st = rng.integers(200, 400, (80, 80, 105)).astype(np.uint16)
+    mask = np.ones((80, 80), np.uint8)
+    worst = (1.0, '')
+    for name, y, x, z in (('centre', 40, 40, 50), ('y=3', 3, 40, 50),
+                          ('y=77', 77, 40, 50), ('x=3', 40, 3, 50),
+                          ('y=-1.2', -1.2, 40, 50), ('y=79.6', 79.6, 40, 50),
+                          ('z=-4.1', 40, 40, -4.1), ('z=107.5', 40, 40, 107.5)):
+        fig = Figure(figsize=(15, 5.6), dpi=110)
+        FigureCanvasAgg(fig)
+        art = VIEW.draw_page(fig, st, mask,
+                             [(float(y), float(x), float(z), .9, 1, 1, '')],
+                             [0], header='h', page=0, npage=1)
+        fig.canvas.draw()
+        a1 = art['cards'][0][0].axes
+        a2 = art['cards'][0][2].axes
+        b1, b2 = a1.get_window_extent(), a2.get_window_extent()
+        r = b2.width / b1.width
+        if abs(r - 1.0) > abs(worst[0] - 1.0):
+            worst = (r, f'{name} ratio {r:.3f} dx {abs(b2.x0-b1.x0):.1f}px')
+        check(f'ZX pinned to YX at {name}',
+              abs(r - 1.0) < 0.01 and abs(b2.x0 - b1.x0) < 1.0,
+              f'ratio {r:.3f}, left edges {abs(b2.x0-b1.x0):.2f} px apart')
+        # and the title must name a plane that exists
+        t = a1.get_title()
+        zt = int(t.split('z=')[1].split()[0])
+        check(f'  and names a real plane at {name}',
+              0 <= zt < st.shape[2], t[:30])
+
+
 def main():
     test_escape_and_q()
     test_click_guards()
     test_offpage_snap_is_refused()
     test_status_claims_expire_with_the_page()
+    test_snap_banner_dies_with_the_keep()
     test_status_only_changes_do_not_redraw()
+    test_uncommitted_work_survives_navigation()
+    test_a_failed_write_does_not_kill_the_window()
     test_completion_screen()
     test_completion_counts_pages_not_commits()
     test_empty_and_already_done()
     test_page_verdict_cache()
+    test_merge_resolves_by_clock_not_filename()
+    test_resume_survives_brackets_in_the_path()
     test_added_spots_are_voted_on()
     test_added_spots_merge_real_clicks()
     test_figure_has_no_axis_furniture()
     test_draw_page_survives_an_empty_page()
+    test_cards_stay_pinned_at_the_crop_edges()
     test_blit_shows_what_it_records()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
