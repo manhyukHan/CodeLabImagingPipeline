@@ -325,8 +325,15 @@ class Queue:
 class SpotCheck(QtWidgets.QMainWindow):
 
     def __init__(self, bundle_dir, reviewer, per_page=VIEW.PER_PAGE,
-                 max_per_crop=None, shuffle=True,
+                 max_per_crop=DEFAULT_MAX_PER_CROP, shuffle=True,
                  overlap_frac=OVERLAP_FRAC):
+        # THE DEFAULT IS THE APP'S DEFAULT, not "no limit". It was None,
+        # and only main() supplied the cap -- so every other way of
+        # opening this window silently got the uncapped queue: MEASURED
+        # 134,592 pages against 9,070 on MP58_RNA_all_4fov, with every
+        # crop's full candidate list drawn on the overview and page turns
+        # at 1.2 s instead of 0.5. Pass max_per_crop=None to mean no cap
+        # on purpose; --max-per-crop 0 on the command line still does.
         super().__init__()
         self.bundle_dir = str(bundle_dir)
         self.per_page = int(per_page)
