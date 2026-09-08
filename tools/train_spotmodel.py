@@ -54,17 +54,26 @@ def analytic_reference(mean, voxel_um, storage_path=None):
         return {}
     if not doc:
         return {}
+    # THE PARAMETERS ARE A TUPLE IN THE FAMILY'S OWN ORDER, and getting
+    # that from the dict is what psf_library.shape_tuple is for. Passing
+    # the dict straight to evaluate() raises -- and the first version of
+    # this function did exactly that inside a bare `except`, so the
+    # comparison never ran and reported "no analytic calibration" for a
+    # store that has one. A silent fallback that looks like an absence is
+    # worse than the error it was hiding.
+    from codelab_pipeline.localization import psf_library as PL
+    st = PL.shape_tuple(doc)
+    if st is None:
+        return {}
+    family, shape_params = st
     ny, nx, nz = mean.shape
     yy, xx, zz = np.mgrid[0:ny, 0:nx, 0:nz].astype(float)
     dy = (yy - ny // 2) * voxel_um[0]
     dx = (xx - nx // 2) * voxel_um[1]
     dz = (zz - nz // 2) * voxel_um[2]
-    try:
-        vol = PSF.evaluate(doc['family'], doc['params'], dy, dx, dz)
-    except Exception:                                        # noqa: BLE001
-        return {}
+    vol = PSF.evaluate(family, shape_params, dy, dx, dz)
     a = PB.normalise(np.asarray(vol, float)).ravel()
-    return {'family': doc.get('family'), 'params': doc.get('params'),
+    return {'family': family, 'params': doc.get('params'),
             'cosine_to_measured': float(a @ PB.normalise(mean).ravel())}
 
 
