@@ -130,6 +130,30 @@ def fit_from_spots(patches, voxel_um, families=None, verbose=False):
     squares, which scales with amplitude, so without this the brightest
     few cells would set the shape for all of them.
 
+    A REFIT FROM A SMALL SET IS NOT AN IMPROVEMENT, and the first one run
+    here was slightly worse than what it would have replaced. Fitted to
+    120 human-confirmed MP58/RNA readout spots it converged on
+    gaussian_halo -- the same family as the installed universal default
+    -- with sigma_z 11% larger and sigma_xy 3% smaller. Those parameters
+    trade off against each other: the two shapes agree at COSINE 0.9938,
+    so the 11% is not a physical difference and reading gaussian_halo's
+    parameters one at a time is misleading. Scored on the spots
+    themselves the refit LOST:
+
+        NCC to the 207 confirmed spots   universal 0.3380, refit 0.3355
+        refit higher on 43 of 207 (21%)
+        against held-out averages, 20 splits: -0.0108 +- 0.0011
+
+    The universal default is a mean over three experiments and thousands
+    of crops and carries almost no noise; a fit to 120 boxes follows
+    theirs. Same lesson as the matched filter: for a filter, cleaner
+    beats better-fitted.
+
+    So this is a CONFIRMATION path before it is a replacement one --
+    running it and getting the installed shape back is the good outcome.
+    Re-run it when a review has produced labels across many hybes, and
+    install only if it wins on held-out spots.
+
     Returns (family, params, scores). `scores` keeps every candidate
     family's result, so what LOST is visible too.
     """
