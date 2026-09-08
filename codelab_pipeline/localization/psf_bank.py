@@ -109,6 +109,67 @@ def normalise(patch):
     return p / n if n > 0 else p
 
 
+def fit_from_spots(patches, voxel_um, families=None, verbose=False):
+    """Fit an analytic PSF to boxes humans confirmed. THE DENOISING STEP.
+
+    The average of a few hundred boxes is a picture of the PSF plus
+    1/sqrt(N) of noise everywhere, and a matched filter pays for that
+    noise directly: detection SNR is the cosine between the filter and
+    the true shape, so any noise in the filter comes straight off it. A
+    four-parameter surface fitted through those boxes has no noise at
+    all, and -- because it is a FORMULA -- it can be rendered at any
+    voxel size and any window, which a stored array cannot.
+
+    psf.calibrate already does the hard part: one shape shared across
+    every box, with amplitude, centre and background profiled out per
+    box. What is new here is the INPUT -- spots a person confirmed,
+    rather than crops from the reference hybe -- which is what closes the
+    loop from the review app back to the calibration.
+
+    EACH BOX IS NORMALISED FIRST. calibrate scores by residual sum of
+    squares, which scales with amplitude, so without this the brightest
+    few cells would set the shape for all of them.
+
+    Returns (family, params, scores). `scores` keeps every candidate
+    family's result, so what LOST is visible too.
+    """
+    from . import psf as P
+    crops = []
+    for p in patches:
+        a = np.asarray(p, float)
+        n = float(np.linalg.norm(a - np.median(a)))
+        crops.append(a / n if n > 0 else a)
+    res = P.calibrate(crops, voxel_um=voxel_um, families=families,
+                      verbose=verbose)
+    best = res.get('best')
+    if not best:
+        raise ValueError('no PSF family could be fitted to these spots')
+    return best, res[best]['params'], res
+
+
+def render(family, params, r, rz, voxel_um, dy=0.0, dx=0.0, dz=0.0):
+    """A clean template of any size from a fitted shape.
+
+    This is what the grid-independence is FOR: the matching template does
+    not have to be the size the spots were measured in, and a sub-voxel
+    offset costs a re-render rather than an interpolation.
+    """
+    from . import psf as P
+    from . import psf_library as PL
+    if isinstance(params, dict):
+        st = PL.shape_tuple({'family': family, 'params': params})
+        if st is None:
+            raise ValueError(f'unknown PSF family {family!r}')
+        family, shape_params = st
+    else:
+        shape_params = tuple(params)
+    yy, xx, zz = np.mgrid[0:2 * r + 1, 0:2 * r + 1, 0:2 * rz + 1].astype(float)
+    return P.evaluate(family, shape_params,
+                      (yy - r - dy) * voxel_um[0],
+                      (xx - r - dx) * voxel_um[1],
+                      (zz - rz - dz) * voxel_um[2])
+
+
 def build(patches, voxel_um, n_components=0, align=True):
     """Patches of confirmed spots -> (mean, components, explained_var).
 

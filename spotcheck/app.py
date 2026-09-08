@@ -88,6 +88,16 @@ ADD_SNAP_PX = 4.0
 # time would buy 0.6% and cost the option.
 DEFAULT_MAX_PER_CROP = 16
 
+# How much of each reviewer's stream is drawn from the shared order that
+# EVERY reviewer walks, rather than from their own shuffle.
+#
+# The rest spreads out so that stopping early still leaves an unbiased
+# sample of the whole bundle. This slice is what stays comparable: two
+# people who each judge 200 pages of an 18,000-page bundle would
+# otherwise share about two, and an inter-rater number needs more than
+# that. At 0.1, every tenth page is one everybody sees.
+OVERLAP_FRAC = 0.1
+
 
 def ask_session(bundle_dir=None, reviewer=None, parent=None):
     """(bundle_dir, reviewer) -- prompting for whatever was not given.
@@ -183,11 +193,11 @@ class Queue:
     """
 
     def __init__(self, bundle_dir, log, per_page=VIEW.PER_PAGE,
-                 max_per_crop=None):
+                 max_per_crop=None, reviewer=None, shuffle=True,
+                 overlap_frac=OVERLAP_FRAC, seed=None):
         self.dir = str(bundle_dir)
         self.log = log
-        self.items = []
-        done = log.done_pages()
+        every = []
         for shard in B.shard_paths(self.dir):
             for row in B.read_index(shard):
                 n = int(row['n_candidates'])
@@ -202,10 +212,74 @@ class Queue:
                 if max_per_crop:
                     n = min(n, int(max_per_crop))
                 for pi, ix in enumerate(VIEW.pages_of(n, per_page)):
-                    if (row['key'], pi) in done:
-                        continue
-                    self.items.append((shard, row, pi, ix))
+                    every.append((shard, row, pi, ix))
+        order = (self._mixed(every, reviewer, overlap_frac, seed)
+                 if shuffle else every)
+        # DONE PAGES ARE DROPPED AFTER THE ORDER IS FIXED, so a reviewer
+        # who stops and comes back gets the same sequence minus what they
+        # finished, rather than a resequenced queue.
+        done = log.done_pages()
+        self.items = [it for it in order if (it[1]['key'], it[2]) not in done]
         self.i = 0
+
+    @staticmethod
+    def _mixed(every, reviewer, overlap_frac, seed):
+        """A per-reviewer order, with a shared slice everyone sees.
+
+        THE SERIAL ORDER WAS A SAMPLING BUG, not an inconvenience. The
+        bundle is written FOV by FOV, hybe by hybe, cell by cell, and
+        nobody reviews 18,000 pages -- so wherever a reviewer stopped,
+        the labels covered the first few FOVs of the first few hybes and
+        nothing else. A model trained on that has seen one corner of the
+        experiment. Worse, done_pages() is per reviewer, so ten people
+        starting together all judged the SAME first pages: ten times the
+        duplication and a tenth of the coverage.
+
+        Shuffling per reviewer fixes coverage but destroys the other
+        thing overlapping assignments are for -- with 18,000 pages and
+        200 judged each, two people would share about two pages, which
+        measures no agreement at all. So a fraction of every stream comes
+        from ONE bundle-wide shuffle that every reviewer walks in the
+        same order: those pages get judged by everybody, and the rest
+        spreads out.
+
+        Both streams are seeded, so a reviewer who resumes tomorrow --
+        or a second window today -- continues the same sequence.
+        """
+        import hashlib
+        import random
+        base = (str(seed) if seed is not None
+                else hashlib.sha256(str(len(every)).encode()).hexdigest())
+        shared = list(every)
+        random.Random('shared:' + base).shuffle(shared)
+        if not reviewer:
+            return shared
+        mine = list(every)
+        random.Random('own:' + base + ':' + str(reviewer)).shuffle(mine)
+
+        frac = min(max(float(overlap_frac), 0.0), 1.0)
+        if frac <= 0:
+            return mine
+        step = max(2, int(round(1.0 / frac)))
+        out, seen = [], set()
+        si = mi = 0
+        while si < len(shared) or mi < len(mine):
+            take_shared = (len(out) % step == 0) and si < len(shared)
+            src, idx = ((shared, si) if take_shared
+                        else (mine, mi) if mi < len(mine) else (shared, si))
+            while idx < len(src):
+                it = src[idx]
+                idx += 1
+                k = (it[1]['key'], it[2])
+                if k not in seen:
+                    seen.add(k)
+                    out.append(it)
+                    break
+            if src is shared:
+                si = idx
+            else:
+                mi = idx
+        return out
 
     def __len__(self):
         return len(self.items)
@@ -230,14 +304,16 @@ class Queue:
 class SpotCheck(QtWidgets.QMainWindow):
 
     def __init__(self, bundle_dir, reviewer, per_page=VIEW.PER_PAGE,
-                 max_per_crop=None):
+                 max_per_crop=None, shuffle=True,
+                 overlap_frac=OVERLAP_FRAC):
         super().__init__()
         self.bundle_dir = str(bundle_dir)
         self.per_page = int(per_page)
         self.log = V.VerdictLog(self.bundle_dir, reviewer)
         self.max_per_crop = max_per_crop
         self.queue = Queue(self.bundle_dir, self.log, self.per_page,
-                           max_per_crop=max_per_crop)
+                           max_per_crop=max_per_crop, reviewer=reviewer,
+                           shuffle=shuffle, overlap_frac=overlap_frac)
 
         self.setWindowTitle(f'Spot Check — {reviewer} — {self.bundle_dir}')
         self.resize(1750, 780)
@@ -708,6 +784,15 @@ def main(argv=None):
                     help='your name/initials -- names the verdict file, so '
                          'ten people can share one bundle directory')
     ap.add_argument('--per-page', type=int, default=VIEW.PER_PAGE)
+    ap.add_argument('--no-shuffle', action='store_true',
+                    help='walk the bundle in file order. Only for looking at '
+                         'one FOV deliberately -- a review stopped partway '
+                         'through file order labels the first few FOVs and '
+                         'nothing else.')
+    ap.add_argument('--overlap-frac', type=float, default=OVERLAP_FRAC,
+                    help=f'fraction of pages drawn from the order EVERY '
+                         f'reviewer walks, so agreement between people is '
+                         f'measurable (default {OVERLAP_FRAC})')
     ap.add_argument('--max-per-crop', type=int, default=DEFAULT_MAX_PER_CROP,
                     help='judge at most this many candidates per crop '
                          f'(default {DEFAULT_MAX_PER_CROP}). The bundle keeps '
@@ -730,7 +815,8 @@ def main(argv=None):
             None, 'Spot Check', 'No such bundle folder:\n' + str(bundle_dir))
         return 1
     w = SpotCheck(bundle_dir, reviewer, a.per_page,
-                  max_per_crop=(a.max_per_crop or None))
+                  max_per_crop=(a.max_per_crop or None),
+                  shuffle=not a.no_shuffle, overlap_frac=a.overlap_frac)
     if len(w.queue) == 0:
         print('nothing left to review in', a.bundle_dir)
     w.show()

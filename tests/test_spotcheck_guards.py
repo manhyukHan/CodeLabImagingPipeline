@@ -815,8 +815,91 @@ def test_cards_stay_pinned_at_the_crop_edges():
               0 <= zt < st.shape[2], t[:30])
 
 
+def make_wide_bundle(d, n_fov=3, n_hybe=3, n_cells=8):
+    """Several FOVs and hybes, written the way the extractor writes them:
+    one shard per (fov, hybe), cells in order inside it."""
+    rng = np.random.default_rng(5)
+    for f in range(1, n_fov + 1):
+        for hh in range(1, n_hybe + 1):
+            hy = f'Hyb_{100 + hh}'
+            with B.BundleWriter(
+                    os.path.join(d, f'fov{f:03d}__{hy}__c000.h5'),
+                    meta={'storage_path': 'nostore', 'hybe': hy,
+                          'channel': 635, 'pad': 14}) as bw:
+                for c in range(n_cells):
+                    stack = rng.integers(200, 400, (30, 30, 25)).astype(np.uint16)
+                    mask = np.zeros((30, 30), np.uint8)
+                    mask[4:26, 4:26] = 1
+                    cands = [(6.0 + k, 7.0 + k, 8.0 + k, 0.9 - .05 * k, 1,
+                              1 if k < 2 else 0, '') for k in range(8)]
+                    bw.add(f, hy, 635, c + 1, stack, mask, 0, 0, cands)
+
+
+def test_queue_mixes_the_bundle():
+    """SERIAL ORDER IS A SAMPLING BUG, not an inconvenience.
+
+    The bundle is written FOV by FOV, hybe by hybe, cell by cell, and
+    nobody finishes 18,000 pages. In file order, whatever a reviewer
+    manages covers the first FOVs of the first hybes and nothing else --
+    and since done_pages() is per reviewer, ten people all judge the same
+    first pages. Both failures are silent: the queue looks full and the
+    verdicts look plentiful.
+    """
+    print('\n-- the queue is a sample of the bundle, not its first pages --')
+    d = tempfile.mkdtemp()
+    make_wide_bundle(d)
+    log = V.VerdictLog(d, 'q', session='s1')
+
+    serial = A.Queue(d, log, max_per_crop=A.DEFAULT_MAX_PER_CROP,
+                     shuffle=False)
+    mixed = A.Queue(d, log, max_per_crop=A.DEFAULT_MAX_PER_CROP,
+                    reviewer='ann', seed='fixed')
+    check('both queues hold every page', len(serial) == len(mixed),
+          f'{len(serial)} vs {len(mixed)}')
+
+    def spread(q, n):
+        return len({(it[1]['fov'],
+                     it[1]['hybe'].decode() if isinstance(it[1]['hybe'], bytes)
+                     else str(it[1]['hybe'])) for it in q.items[:n]})
+
+    n = max(4, len(serial) // 8)
+    tot = 9                              # 3 FOVs x 3 hybes
+    check(f'the first {n} pages in FILE order touch few (fov, hybe) pairs',
+          spread(serial, n) <= 2, f'{spread(serial, n)} of {tot}')
+    check(f'the first {n} pages MIXED touch most of them',
+          spread(mixed, n) >= tot - 1, f'{spread(mixed, n)} of {tot}')
+
+    # Two people must not simply repeat each other.
+    bob = A.Queue(d, V.VerdictLog(d, 'b', session='s1'),
+                  max_per_crop=A.DEFAULT_MAX_PER_CROP, reviewer='bob',
+                  seed='fixed')
+    k = max(6, len(mixed) // 4)
+    ka = [(it[1]['key'], it[2]) for it in mixed.items[:k]]
+    kb = [(it[1]['key'], it[2]) for it in bob.items[:k]]
+    shared = len(set(ka) & set(kb))
+    check('two reviewers do not walk the same order',
+          ka != kb, 'identical' if ka == kb else 'different')
+    check('but they still share pages, so agreement is measurable',
+          shared > 0, f'{shared} of {k} in common')
+    check('and the shared part is roughly the requested fraction, '
+          'not everything', shared < k * 0.9, f'{100 * shared / k:.0f}%')
+
+    # Resuming must not resequence what is left.
+    first = [(it[1]['key'], it[2]) for it in mixed.items]
+    log2 = V.VerdictLog(d, 'ann', session='s2')
+    shard, row, page, ix = mixed.items[0]
+    log2.commit(row, page, ix, [(1., 1., 1., .9, 1, 1, '')] * 8, set())
+    again = A.Queue(d, log2, max_per_crop=A.DEFAULT_MAX_PER_CROP,
+                    reviewer='ann', seed='fixed')
+    rest = [(it[1]['key'], it[2]) for it in again.items]
+    check('resuming keeps the same order minus what was judged',
+          rest == [k2 for k2 in first if k2 != (row['key'], page)],
+          f'{len(first)} -> {len(rest)}')
+
+
 def main():
     test_escape_and_q()
+    test_queue_mixes_the_bundle()
     test_click_guards()
     test_offpage_snap_is_refused()
     test_status_claims_expire_with_the_page()
