@@ -496,10 +496,73 @@ class AnchorFitV2Engine(LocalizeEngine):
                 in self.localize_detailed(stack, seed_yxz=seed_yxz, n_max=n_max)]
 
 
+class PsfMatchEngine(LocalizeEngine):
+    """Find spots by matching a MEASURED PSF, not by fitting a Gaussian.
+
+    The template comes from psf_bank -- an average of boxes humans
+    confirmed -- and detection is a normalised cross-correlation whose
+    local maxima are the emitters. That is the whole point of it: a box
+    with three spots in it yields three peaks, with no decision about how
+    many components to fit and no mixture model to fail.
+
+    p IS THE NCC SCORE mapped onto (0, 1], so it is a SHAPE agreement and
+    not a probability -- LocalizedSpot's own docstring asks each engine
+    to say which it is. The Gaussian fields are NaN: there is no fit here
+    and inventing a sigma to fill them would be a lie a caller could not
+    detect.
+
+    Give it either `templates` (arrays) or `bank` (a path), plus the
+    `voxel_um` the data is on -- psf_bank.load refuses a grid the
+    template was not measured on.
+    """
+
+    name = 'psf-match'
+
+    def __init__(self, templates=None, bank=None, voxel_um=None,
+                 min_distance=3, threshold=0.3, **_ignored):
+        from . import psf_bank as PB
+        if templates is None:
+            if not bank:
+                raise ValueError('psf-match needs templates= or bank=')
+            mean, comps, meta = PB.load(bank, voxel_um=voxel_um)
+            templates = [mean]
+            self.meta = meta
+        else:
+            templates = ([templates] if np.asarray(templates).ndim == 3
+                         else list(templates))
+            self.meta = {}
+        self.templates = [np.asarray(t, float) for t in templates]
+        self.min_distance = int(min_distance)
+        self.threshold = float(threshold)
+
+    def localize(self, stack, seed_yxz=None, n_max=1):
+        from . import psf_bank as PB
+        # WITH A SEED, TAKE EVERYTHING AND THEN CHOOSE. Cutting to n_max
+        # inside match() ranks by score, so the seed arrived after the
+        # only candidate it could have picked had already been thrown
+        # away -- asking for the spot nearest a click returned the
+        # brightest spot in the box instead, silently.
+        hits = PB.match(np.asarray(stack, float), self.templates,
+                        min_distance=self.min_distance,
+                        threshold=self.threshold,
+                        n_max=None if seed_yxz is not None else n_max)
+        if seed_yxz is not None and hits:
+            sy, sx, sz = (float(v) for v in seed_yxz)
+            hits.sort(key=lambda r: (r[0] - sy) ** 2 + (r[1] - sx) ** 2
+                      + (r[2] - sz) ** 2)
+            if n_max is not None:
+                hits = hits[:int(n_max)]
+        # NCC runs to -1; only agreement is evidence, so the negative
+        # half collapses to the floor rather than wrapping around.
+        return [_spot(y, x, z, max(min((s + 1.0) / 2.0, 1.0), 1e-6))
+                for (y, x, z, s) in hits]
+
+
 ENGINES = {
     GaussianLocalizeEngine.name: GaussianLocalizeEngine,
     AnchorFitEngine.name: AnchorFitEngine,
     AnchorFitV2Engine.name: AnchorFitV2Engine,
+    PsfMatchEngine.name: PsfMatchEngine,
 }
 
 
