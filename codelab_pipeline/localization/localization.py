@@ -349,9 +349,13 @@ def cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     apart. Transforms this cell's own mask area into `hybe`'s native frame
     (cell.get_area_in_readout, itself never resampling raw pixels -- only
     coordinates move), reads a padded bbox crop of both the MIP and full
-    Z-stack, and NaNs out every pixel outside the cell's own mask within
-    that bbox (so background/neighboring-cell pixels never contaminate a
-    per-cell peak search). h5py fancy-indexing requires ascending-order
+    Z-stack, and returns them BOTH ways: masked, with every pixel outside
+    the cell's own mask NaN'd (so background/neighbouring-cell pixels
+    never contaminate a per-cell PEAK SEARCH), and unmasked, which is
+    what a FIT must see -- an emitter on the boundary has its wings
+    across it, and the anchor box is one body with the spot. The long
+    comment beside img_unmasked says why. h5py fancy-indexing requires
+    ascending-order
     indices (unlike numpy); y_area/x_area come from np.where and aren't
     sorted, so the rectangular crop is sliced first (always
     contiguous/ascending) and the cell-mask fancy indexing done on the
@@ -388,6 +392,9 @@ def cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     already implement. Otherwise returns a dict: {'img': (h,w) MIP crop
     (NaN outside cell), 'stacks': (h,w,depth) Z-stack crop (NaN outside
     cell), 'bimg': (w,depth) Z-profile per column (nanmax over y),
+    'img_unmasked': the same MIP rectangle with nothing removed,
+    'stacks_unmasked': the same Z-stack rectangle with nothing removed --
+    USE THESE TWO FOR FITTING and the masked pair for searching,
     'rxmin': int, 'rymin': int, 'H': cell's yx matrix for this hybe
     (identity if none), 'Hz': cell's zx matrix for this hybe (identity
     if none)}.
@@ -453,6 +460,35 @@ def cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
     stacks[y_area - rymin, x_area - rxmin] = stacks_value[y_area - rymin, x_area - rxmin]
     bimg = np.nanmax(stacks, axis=0)  # (width_crop, depth) -- Z-profile per column
 
+    # THE MASK DECIDES OWNERSHIP, NOT WHAT A FIT MAY LOOK AT.
+    #
+    # The rectangle above is read from disk in full and then thrown away
+    # outside the cell. That is right for the PEAK SEARCH -- a peak in a
+    # neighbouring cell is not this cell's spot -- and wrong for the FIT,
+    # because an emitter sitting on the boundary has its PSF wings across
+    # it. Fitting a Gaussian to a window with the far half set to NaN
+    # pulls the centre inward, shrinks sigma on that side, and biases the
+    # background the fit solves for, all without failing: the anchor box
+    # is one body with the spot, and the mask cuts through it.
+    #
+    # This is also what the training extractor already does -- it crops
+    # the padded rectangle and keeps the mask only as an outline (see
+    # training/view.py's header, which argues the same point for the same
+    # reason). Leaving the two different would have trained a detector on
+    # unmasked boxes and run it on masked ones.
+    #
+    # MEASURED and INCONCLUSIVE, stated plainly: over 14 shards of the
+    # MP58 RNA bundle, 447 of 645 candidates whose centre is inside the
+    # mask have it cutting into their 21x21 fit window, but only 3 of
+    # those pass the 2D worker's own gates in BOTH arms -- the bundle's
+    # anchors are deliberately generous and mostly do not survive those
+    # gates at all. On those 3 the centre moved 0.004 px and sigma fell
+    # 4%. So the change rests on the geometry above, not on a measured
+    # improvement; quantifying it needs the worker run over the real
+    # store both ways.
+    img_unmasked = np.asarray(mip_crop, dtype=float)
+    stacks_unmasked = np.asarray(stacks_value, dtype=float)
+
     # matrix_to_shared (not a direct cell.matrices lookup): the caller
     # below applies H forward to a raw point to land in the pipeline's
     # ONE shared reference frame (RNA's own same-modality reference hybe
@@ -472,7 +508,9 @@ def cell_crop(cell, hybe, channel, storage_path, fov, pad, modality=None,
         H = cell.matrix_to_shared(hybe, modality)
     Hz = alignment.entry_dz(cell.matrices.get((hybe, modality)))
 
-    return {'img': img, 'stacks': stacks, 'bimg': bimg, 'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
+    return {'img': img, 'stacks': stacks, 'bimg': bimg,
+            'img_unmasked': img_unmasked, 'stacks_unmasked': stacks_unmasked,
+            'rxmin': rxmin, 'rymin': rymin, 'H': H, 'Hz': Hz}
 
 
 def refine_spot_z(spot, storage_path, fov, channel, hybe=None, cell=None, modality=None,
@@ -790,6 +828,9 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
     if crop is None:
         return cell.id, hybe, spots
     img, stacks, bimg = crop['img'], crop['stacks'], crop['bimg']
+    # Search below is on `img` (masked -- ownership); the fit is on
+    # this (unmasked -- the spot's own wings). See cell_crop.
+    img_fit = crop['img_unmasked']
     rxmin, rymin, H, Hz = crop['rxmin'], crop['rymin'], crop['H'], crop['Hz']
 
     cutoff = max_to_background * np.nanquantile(img, 0.5)
@@ -809,7 +850,7 @@ def localize_cell_2d_worker(cell, hybe, channel, storage_path, fov,
 
         symin, symax = max(0, y - pad), min(img.shape[0], y + pad + 1)
         sxmin, sxmax = max(0, x - pad), min(img.shape[1], x + pad + 1)
-        params = fit_gaussian_2d(img[symin:symax, sxmin:sxmax], x - sxmin, y - symin)
+        params = fit_gaussian_2d(img_fit[symin:symax, sxmin:sxmax], x - sxmin, y - symin)
         if params is None:
             continue
         amp, xo, yo, sigma_x, sigma_y, theta, offset = params
