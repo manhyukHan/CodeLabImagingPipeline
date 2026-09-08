@@ -90,17 +90,50 @@ import numpy as np
 
 # The order is the contract: a saved model stores this list, and
 # refuses to score a vector built by a different version of this file.
+# NAMES SAY WHERE THEY LOOK AND WHAT THEY COUNT, at whatever length that
+# takes. The first version used `col_*` for a line one voxel wide through
+# the whole stack and `run` for a stretch of adjacent planes above half
+# maximum, and both had to be explained every time somebody read them --
+# `column` was read as the box's 25 planes, `run` as anything at all.
+# Nobody types these; a name that needs a footnote is a worse trade than
+# a name that is long.
+#
+#   box_*    the 15 x 15 x 25 window around the candidate
+#   stack_*  the 1 x 1 x 105 line through its centre, WHOLE depth
 NAMES = (
     # contrast
-    'log_peak', 'core3', 'annulus_med', 'core_over_annulus',
+    'box_peak_log_sigma', 'box_centre_sum_sigma',
+    'box_surround_median_sigma', 'box_centre_over_surround',
     # lateral shape
-    'sigma_xy', 'eccentricity', 'centroid_offset', 'ring2', 'ring4',
-    # axial shape, from the FULL column
-    'sigma_z', 'z_fwhm', 'col_frac_above_half', 'col_n_runs',
-    'col_skew', 'z_from_edge', 'aspect_z_over_xy',
+    'box_lateral_spread_px', 'box_lateral_asymmetry',
+    'box_centroid_offset_px', 'box_radial_at_2px', 'box_radial_at_4px',
+    # axial shape, read from the whole stack
+    'stack_axial_spread_planes', 'stack_longest_bright_stretch_planes',
+    'stack_frac_above_half_max', 'stack_n_bright_stretches',
+    'stack_axial_skew', 'axial_over_lateral_spread',
     # context
-    'border_frac',
+    'box_frac_padded',
 )
+
+# NOT A FEATURE, AND NOT A NEAR MISS: how close the brightest plane sits
+# to the top or bottom of the stack.
+#
+# It answers a DIFFERENT QUESTION. "Is this a real spot?" is what this
+# model is for; "can we believe its z?" is a separate judgement, and a
+# spot two planes from the end of the stack can be entirely real while
+# its axial position is not to be trusted -- the emitter's focal plane
+# may simply be outside what was imaged. Handed to the classifier, that
+# becomes "spots near the end of a stack are less likely to be real",
+# which is false, and it biases the model against exactly the real spots
+# it should be finding there.
+#
+# It belongs downstream, as a gate on the ANSWER rather than an input to
+# it. models/spot.py already carries the vocabulary: z_status is
+# accepted / rejected / not_fit, and "real spot, untrustworthy z" is
+# precisely Z_REJECTED. Measured before removing: -0.0006 to the mlp,
+# -0.0004 to the linear head -- it was contributing nothing either way,
+# so nothing is lost by putting it where it means something.
+
 
 # NOT HERE, AND NOT BY ACCIDENT: engine_p, fit_ok, gate_pass.
 #
@@ -119,8 +152,16 @@ NAMES = (
 # The box and the full z column through it are the whole input.
 
 
-def _runs_above(v):
-    """(count, longest) of the runs where v is True."""
+def _bright_stretches(v):
+    """(count, longest) of the maximal stretches where v is True.
+
+    ADJACENT INDICES, nothing else. Walking planes 0..104, one plane
+    dipping below the threshold ends a stretch and the next plane above
+    it starts a new one -- no smoothing, no gap tolerance. The
+    strictness is the signal: a confirmed spot has a median of ONE
+    stretch and 69% have exactly one, while a rejected candidate has a
+    median of six and only 18% have one.
+    """
     runs, cur = [], 0
     for t in v:
         if t:
@@ -133,14 +174,14 @@ def _runs_above(v):
     return len(runs), (max(runs) if runs else 0)
 
 
-def one(core, col, border_frac=0.0):
+def one(box, stack_line, frac_padded=0.0):
     """One box -> one vector, in NAMES order.
 
     `core` and `col` are already background-subtracted and in sigma
     units (dataset.boxes).
     """
-    core = np.asarray(core, float)
-    col = np.asarray(col, float)
+    core = np.asarray(box, float)
+    col = np.asarray(stack_line, float)
     ny, nx, nz = core.shape
     cy, cx, cz = ny // 2, nx // 2, nz // 2
     f = {}
@@ -152,16 +193,16 @@ def one(core, col, border_frac=0.0):
     # ranking measure, and removing it moved held-out ROC by +0.0001
     # (linear) and +0.0008 (mlp).
     pk = float(np.nanmax(core)) if core.size else 0.0
-    f['log_peak'] = float(np.log1p(max(pk, 0.0)))
+    f['box_peak_log_sigma'] = float(np.log1p(max(pk, 0.0)))
 
     pl = core[:, :, cz]
-    f['core3'] = float(np.nansum(pl[max(cy - 1, 0):cy + 2,
+    f['box_centre_sum_sigma'] = float(np.nansum(pl[max(cy - 1, 0):cy + 2,
                                     max(cx - 1, 0):cx + 2]))
     ann = pl.astype(float).copy()
     ann[max(cy - 2, 0):cy + 3, max(cx - 2, 0):cx + 3] = np.nan
-    f['annulus_med'] = (float(np.nanmedian(ann))
+    f['box_surround_median_sigma'] = (float(np.nanmedian(ann))
                         if np.isfinite(ann).any() else 0.0)
-    f['core_over_annulus'] = f['core3'] / (abs(f['annulus_med']) + 1.0)
+    f['box_centre_over_surround'] = f['box_centre_sum_sigma'] / (abs(f['box_surround_median_sigma']) + 1.0)
 
     P = np.clip(np.nan_to_num(pl), 0, None)
     s = P.sum() + 1e-9
@@ -170,36 +211,35 @@ def one(core, col, border_frac=0.0):
     mx = float((P * xx).sum() / s)
     vy = float((P * (yy - my) ** 2).sum() / s)
     vx = float((P * (xx - mx) ** 2).sum() / s)
-    f['sigma_xy'] = float(np.sqrt(max(vy, 0.0) + max(vx, 0.0)))
-    f['eccentricity'] = abs(vy - vx) / (vy + vx + 1e-9)
-    f['centroid_offset'] = float(np.hypot(my - cy, mx - cx))
+    f['box_lateral_spread_px'] = float(np.sqrt(max(vy, 0.0) + max(vx, 0.0)))
+    f['box_lateral_asymmetry'] = abs(vy - vx) / (vy + vx + 1e-9)
+    f['box_centroid_offset_px'] = float(np.hypot(my - cy, mx - cx))
     # How fast it falls off: a real emitter is ~1.3 px sigma, a hot pixel
     # is gone by r=2, a blob of background is still there at r=4.
     rr = np.hypot(yy - cy, xx - cx)
     c0 = max(pk, 1e-9)
-    for rad, name in ((2.0, 'ring2'), (4.0, 'ring4')):
+    for rad, name in ((2.0, 'box_radial_at_2px'),
+                  (4.0, 'box_radial_at_4px')):
         m = (rr >= rad - 0.5) & (rr < rad + 0.5)
         f[name] = float(np.nanmean(pl[m]) / c0) if m.any() else 0.0
 
     c = np.clip(np.nan_to_num(col), 0, None)
     cmax = float(c.max()) if c.size else 0.0
     above = c > (cmax / 2.0 if cmax > 0 else 1.0)
-    n_runs, longest = _runs_above(above)
-    f['col_frac_above_half'] = float(above.mean()) if c.size else 0.0
-    f['col_n_runs'] = float(n_runs)
-    f['z_fwhm'] = float(longest)
+    n_stretches, longest = _bright_stretches(above)
+    f['stack_frac_above_half_max'] = float(above.mean()) if c.size else 0.0
+    f['stack_n_bright_stretches'] = float(n_stretches)
+    f['stack_longest_bright_stretch_planes'] = float(longest)
     zs = np.arange(c.size, dtype=float)
     ss = c.sum() + 1e-9
     mz = float((c * zs).sum() / ss)
     var_z = float((c * (zs - mz) ** 2).sum() / ss)
-    f['sigma_z'] = float(np.sqrt(max(var_z, 0.0)))
+    f['stack_axial_spread_planes'] = float(np.sqrt(max(var_z, 0.0)))
     sd = np.sqrt(max(var_z, 1e-9))
-    f['col_skew'] = float((c * ((zs - mz) / sd) ** 3).sum() / ss)
-    zi = int(np.clip(np.argmax(c) if c.size else 0, 0, max(c.size - 1, 0)))
-    f['z_from_edge'] = float(min(zi, max(c.size - 1 - zi, 0)))
-    f['aspect_z_over_xy'] = f['sigma_z'] / (f['sigma_xy'] + 1e-9)
+    f['stack_axial_skew'] = float((c * ((zs - mz) / sd) ** 3).sum() / ss)
+    f['axial_over_lateral_spread'] = f['stack_axial_spread_planes'] / (f['box_lateral_spread_px'] + 1e-9)
 
-    f['border_frac'] = float(border_frac)
+    f['box_frac_padded'] = float(frac_padded)
 
     v = np.array([f[n] for n in NAMES], dtype=np.float64)
     # A non-finite feature is a bug upstream, not a value to propagate
@@ -213,7 +253,7 @@ def many(cores, cols, rows=None):
     for i in range(len(cores)):
         r = (rows[i] if rows is not None else {}) or {}
         out[i] = one(cores[i], cols[i],
-                     border_frac=r.get('border_frac', 0.0))
+                     frac_padded=r.get('border_frac', 0.0))
     return out
 
 

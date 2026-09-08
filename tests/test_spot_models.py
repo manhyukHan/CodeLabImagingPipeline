@@ -75,14 +75,15 @@ def test_features():
     d = dict(zip(F.NAMES, v))
     hp = dict(zip(F.NAMES, F.one(hot_pixel(), hot_pixel()[7, 7, :])))
     check('a real emitter is bright in few planes, a hot pixel in all',
-          d['col_frac_above_half'] < hp['col_frac_above_half'],
-          f"emitter {d['col_frac_above_half']:.2f} vs "
-          f"hot pixel {hp['col_frac_above_half']:.2f}")
+          d['stack_frac_above_half_max'] < hp['stack_frac_above_half_max'],
+          f"emitter {d['stack_frac_above_half_max']:.2f} vs "
+          f"hot pixel {hp['stack_frac_above_half_max']:.2f}")
 
     bl = dict(zip(F.NAMES, F.one(blank(), blank()[7, 7, :])))
     check('and it is brighter than nothing at all',
-          d['log_peak'] > bl['log_peak'],
-          f"{d['log_peak']:.2f} vs {bl['log_peak']:.2f}")
+          d['box_peak_log_sigma'] > bl['box_peak_log_sigma'],
+          f"{d['box_peak_log_sigma']:.2f} vs "
+          f"{bl['box_peak_log_sigma']:.2f}")
 
     # THE CONTRACT, not a spot check: every name resolves and nothing
     # names a feature that has been removed. `peak` was in this list until
@@ -93,6 +94,16 @@ def test_features():
     check('every name in NAMES is produced by one()',
           set(d) == set(F.NAMES) and len(d) == len(F.NAMES),
           f'{len(d)} values for {len(F.NAMES)} names')
+    # A NAME MUST SAY WHERE IT LOOKS. Every feature reads either the
+    # 15x15x25 box or the full-depth line through it, and the name says
+    # which -- `col_*` and `run` had to be explained to every reader.
+    stray = [n for n in F.NAMES
+             if not (n.startswith('box_') or n.startswith('stack_')
+                     or n == 'axial_over_lateral_spread')]
+    check('every name says which region it reads', not stray, str(stray))
+    check('nothing measures distance to the end of the stack -- that is a '
+          'gate on the answer, not an input',
+          not any('from_edge' in n for n in F.NAMES))
 
     X = np.array([F.one(emitter(seed=i), emitter(seed=i)[7, 7, :])
                   for i in range(20)])
