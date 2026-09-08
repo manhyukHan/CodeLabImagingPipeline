@@ -67,26 +67,47 @@ ADD_SNAP_PX = 4.0
 
 # How many candidates per cell a reviewer is asked to judge, by default.
 #
-# NOT a review budget -- a judgement about where the LEARNING is. A cell
-# that reliably shows dozens of spots teaches little from its 200th
-# candidate; what a detector needs is the boundary, and the bundle's own
-# ordering (gate-pass, then fitted, then by p) puts the boundary right
-# after the confident yeses. MEASURED over all 2264 non-empty crops of
-# the MP58 bundle, the top 16 contains on average:
+# EIGHT, BECAUSE CONFIRMED SPOTS PER PAGE IS WHAT LIMITS EVERYTHING.
+# MEASURED on 117 pages a reviewer actually judged, the keep rate falls
+# steeply with the bundle's own ordering (gate-pass, then fitted, then
+# by quality):
 #
-#     2.5  gate-pass            the confident yes
-#    12.5  fitted, not passed   THE GRAY AREA -- most of what is shown
-#     0.2  anchor, no fit
+#     rank    1    2    3    4    5    6    7    8  | 9-16
+#     kept   97%  91%  83%  62%  69%  55%  45%  31% |  21%
 #
-# and it cannot clip the confident ones: gate-pass per crop is median 2,
-# max 13, and NO crop has more than 16. Only 3 crops of 2264 fill their
-# 16 with gate-passes alone.
+# so ranks 1-8 keep 67% and ranks 9-16 keep 21%. A page is four cards,
+# which makes it
+#
+#     confirmed spots per page   cap 8: 2.69     cap 16: 1.80
+#
+# -- the same number of true positives for a THIRD fewer pages turned.
+# It is not free: those 222 shown ranks 9-16 still held 47 real spots.
+#
+# WHAT THE CAP USED TO BUY WAS THE GRAY AREA, and the data supplies that
+# on its own. Hybes differ enormously in how many candidates clear the
+# gate -- MEASURED over 455 crops of MP58/RNA, per crop:
+#
+#     Hyb_101   0.7 gate-pass   ( 0.9% of its candidates)
+#     Hyb_105   2.3             ( 2.2%)
+#     Hyb_103   6.8             ( 6.6%)
+#     Hyb_107  31.0             (28.2%)
+#
+# a factor of forty. The quiet hybes are all boundary; the loud ones are
+# all confident. A fixed cap therefore means something different on each,
+# and 33% of crops now carry more than 8 gate-passes (median 4, p90 34,
+# max 54), so on those the reviewer sees confident spots only. That is
+# the trade taken deliberately: volume of confirmed spots first, and the
+# gray area from the hybes that are made of it.
+#
+# (Hyb_107 clearing 28% of its own candidates is itself worth a look --
+# either it is genuinely much brighter, or the gate does not hold there.
+# Unmeasured either way.)
 #
 # The bundle keeps every candidate regardless. This bounds the view, so
 # raising it later is a flag rather than a re-extraction -- candidate
 # rows are 19 bytes against 1.58 GiB of pixels, and truncating at write
 # time would buy 0.6% and cost the option.
-DEFAULT_MAX_PER_CROP = 16
+DEFAULT_MAX_PER_CROP = 8
 
 # How much of each reviewer's stream is drawn from the shared order that
 # EVERY reviewer walks, rather than from their own shuffle.
