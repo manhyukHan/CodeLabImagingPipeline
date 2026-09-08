@@ -115,25 +115,22 @@ NAMES = (
     'box_frac_padded',
 )
 
-# NOT A FEATURE, AND NOT A NEAR MISS: how close the brightest plane sits
-# to the top or bottom of the stack.
+# NOT A FEATURE: how close the brightest plane sits to the end of the
+# stack. localization/edge_gate.py computes it, and computes it AFTER
+# everything -- after pass/fail, after the matched filter has placed the
+# spot to sub-voxel precision -- because it gates a finished answer
+# rather than informing one.
 #
-# It answers a DIFFERENT QUESTION. "Is this a real spot?" is what this
-# model is for; "can we believe its z?" is a separate judgement, and a
-# spot two planes from the end of the stack can be entirely real while
-# its axial position is not to be trusted -- the emitter's focal plane
-# may simply be outside what was imaged. Handed to the classifier, that
-# becomes "spots near the end of a stack are less likely to be real",
-# which is false, and it biases the model against exactly the real spots
-# it should be finding there.
+# Given to the classifier it becomes "spots near the end of a stack are
+# less likely to be real", which is false. The reviewer refuses almost
+# everything down there (3.4% confirmed within 11 planes of an end,
+# against 57.5% beyond 20), and a model that learns that refusal will
+# apply it to the real emitters too.
 #
-# It belongs downstream, as a gate on the ANSWER rather than an input to
-# it. models/spot.py already carries the vocabulary: z_status is
-# accepted / rejected / not_fit, and "real spot, untrustworthy z" is
-# precisely Z_REJECTED. Measured before removing: -0.0006 to the mlp,
-# -0.0004 to the linear head -- it was contributing nothing either way,
-# so nothing is lost by putting it where it means something.
-
+# It has nothing to do with z_status either. That field says whether a
+# spot's Z has been FITTED -- accepted / rejected / not_fit -- and is
+# where THIS MODEL's verdict is stored. A spot the edge gate denies has
+# a perfectly good fit; what it lacks is stack either side of it.
 
 # NOT HERE, AND NOT BY ACCIDENT: engine_p, fit_ok, gate_pass.
 #

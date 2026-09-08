@@ -103,7 +103,36 @@ def test_features():
     check('every name says which region it reads', not stray, str(stray))
     check('nothing measures distance to the end of the stack -- that is a '
           'gate on the answer, not an input',
-          not any('from_edge' in n for n in F.NAMES))
+          not any('from_edge' in n or 'stack_end' in n for n in F.NAMES))
+
+
+def test_edge_gate():
+    """The gate runs AFTER everything and is nobody's feature."""
+    print('\n-- denying a position rather than an emitter --')
+    from codelab_pipeline.localization import edge_gate as EG
+    d = 105
+    check('a spot at the face is zero planes from an end',
+          EG.planes_from_end(0, d) == 0.0 and EG.planes_from_end(104, d) == 0.0)
+    check('the middle is furthest', EG.planes_from_end(52, d) == 52.0)
+    check('sub-voxel z is kept, not rounded',
+          EG.planes_from_end(10.5, d) == 10.5)
+    check('the default margin denies inside it and not outside',
+          EG.deny(10.9, d) and not EG.deny(11.0, d),
+          f'margin {EG.DEFAULT_MARGIN_PLANES}')
+    check('a degenerate depth does not raise', EG.planes_from_end(3, 0) == 0.0)
+
+    class S:
+        def __init__(self, z):
+            self.z = z
+    ann = EG.annotate([S(2.0), S(50.0)], d)
+    check('annotate returns the number beside the verdict',
+          [(round(a[1], 1), a[2]) for a in ann] == [(2.0, True), (50.0, False)])
+
+    # THE SEPARATION ITSELF: this must not be reachable from the model.
+    check('the gate lives outside the feature module',
+          not any('edge_gate' in line for line in
+                  open(F.__file__, encoding='utf-8').read().splitlines()
+                  if line.strip().startswith(('import ', 'from '))))
 
     X = np.array([F.one(emitter(seed=i), emitter(seed=i)[7, 7, :])
                   for i in range(20)])
@@ -330,6 +359,7 @@ def test_on_the_stored_labels():
 def main():
     test_features()
     test_split_does_not_leak()
+    test_edge_gate()
     test_classifier_trains_and_reloads()
     test_psf_bank()
     test_on_the_stored_labels()

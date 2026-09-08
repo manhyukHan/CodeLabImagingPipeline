@@ -179,8 +179,14 @@ def boxes(label_rows, r=DEFAULT_R, rz=DEFAULT_RZ,
         col = np.asarray(
             st[int(np.clip(iy, 0, h - 1)), int(np.clip(ix, 0, w - 1)), :],
             float)
+        # planes_from_stack_end rides along as METADATA, never as a
+        # feature -- see localization/edge_gate.py for why the distance
+        # to the end of a stack gates a finished answer instead of
+        # informing the model that produces it.
         kept.append(dict(rrow, z=float(z), border_frac=float(border),
-                         bg=float(b0), sigma=float(sg)))
+                         bg=float(b0), sigma=float(sg),
+                         planes_from_stack_end=float(
+                             min(max(z, 0.0), max(st.shape[2] - 1 - z, 0.0)))))
         cores.append((core - b0) / max(sg, 1e-9))
         cols.append((col - b0) / max(sg, 1e-9))
     return kept, np.asarray(cores), np.asarray(cols)
