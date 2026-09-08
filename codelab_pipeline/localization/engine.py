@@ -518,22 +518,48 @@ class PsfMatchEngine(LocalizeEngine):
 
     name = 'psf-match'
 
-    def __init__(self, templates=None, bank=None, voxel_um=None,
-                 min_distance=3, threshold=0.3, **_ignored):
+    def __init__(self, templates=None, bank=None, storage_path=None,
+                 voxel_um=None, r=None, rz=None,
+                 min_distance=3, threshold=None, **_ignored):
         from . import psf_bank as PB
-        if templates is None:
-            if not bank:
-                raise ValueError('psf-match needs templates= or bank=')
+        r = PB.DEFAULT_R if r is None else int(r)
+        rz = PB.DEFAULT_RZ if rz is None else int(rz)
+        self.meta = {}
+        if templates is not None:
+            templates = ([templates] if np.asarray(templates).ndim == 3
+                         else list(templates))
+        elif storage_path:
+            # THE ORDINARY WAY TO BUILD ONE: render the store's own
+            # calibrated shape at the matching size. A formula can be
+            # rendered at whatever size the search needs, which is the
+            # whole advantage of keeping the PSF as parameters -- and it
+            # is what makes psf_bank.DEFAULT_R/RZ mean something. They
+            # were dead constants until this path existed: nothing read
+            # them, so setting them changed nothing.
+            from . import psf as P
+            doc = P.load(storage_path)
+            if not doc:
+                raise ValueError(f'{storage_path} has no calibrated PSF; '
+                                 'pass templates= or bank=')
+            vx = voxel_um or doc.get('voxel_um') or P.DEFAULT_VOXEL_UM
+            templates = [PB.normalise(
+                PB.render(doc['family'], doc['params'], r, rz, tuple(vx)))]
+            self.meta = {'family': doc['family'], 'params': doc['params'],
+                         'voxel_um': list(vx), 'r': r, 'rz': rz,
+                         'source': 'store calibration'}
+        elif bank:
             mean, comps, meta = PB.load(bank, voxel_um=voxel_um)
             templates = [mean]
             self.meta = meta
         else:
-            templates = ([templates] if np.asarray(templates).ndim == 3
-                         else list(templates))
-            self.meta = {}
+            raise ValueError('psf-match needs templates=, bank= or '
+                             'storage_path=')
         self.templates = [np.asarray(t, float) for t in templates]
         self.min_distance = int(min_distance)
-        self.threshold = float(threshold)
+        # None means "this template's own 4.5 sigma" -- see
+        # psf_bank.K_SIGMA for why a raw NCC number cannot be a
+        # default when the template size can change.
+        self.threshold = None if threshold is None else float(threshold)
 
     def localize(self, stack, seed_yxz=None, n_max=1):
         from . import psf_bank as PB

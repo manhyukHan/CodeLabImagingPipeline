@@ -68,8 +68,76 @@ import time
 import numpy as np
 from scipy import ndimage
 
-DEFAULT_R = 7          # template half-width in y, x -> 15
-DEFAULT_RZ = 12        # template half-depth -> 25
+# The MATCHING template's half-widths: 7x7x11. Not the size the spots are
+# measured in -- that is dataset.DEFAULT_R/RZ and stays 15x15x25 -- but
+# the size the filter is rendered at, which is a different question with
+# a different answer.
+#
+# THREE THINGS DECIDE IT, and the first two contradicted each other until
+# the third was measured on real pixels.
+#
+#   RECALL. In WHITE noise a bigger filter wins at low SNR: at 5 false
+#   positives per field, 7x7x11 gives up 21.3 pp against 15x15x25 at
+#   SNR 2.0 and 8.3 pp at 2.5. In SPATIALLY CORRELATED background the
+#   ordering inverts completely -- 69.8% against 1.3% at SNR 2.5. Real
+#   cells are neither. MEASURED by planting the calibrated PSF into 15
+#   real MP58/RNA crops that carry no gate-passing candidate, recall at
+#   5 FP/field:
+#
+#       SNR    5x5x9  7x7x11  9x9x13  11x11x17  15x15x25
+#       2.0     42.2    43.1    42.6      52.2      54.4
+#       3.0     98.5    98.4    96.7      89.8      87.0
+#       4.0    100.0    98.6   100.0     100.0      95.8
+#       6.0    100.0   100.0   100.0     100.0     100.0
+#
+#   The big filter leads only at SNR 2, where every size fails anyway,
+#   and trails once detection starts working at all.
+#
+#   WHAT IS NOT SETTLED: 5x5x9 ties 7x7x11 on real-background recall and
+#   beats it on close pairs (91% against 73% at 8 planes), so the case
+#   for going smaller still is open. 7x7x11 is taken as the more
+#   conservative of the two because 5x5x9 falls furthest behind in the
+#   white-noise arm at SNR 2-2.5, and 60 trials on one bundle is not
+#   enough to spend that on. Revisit when a review has produced labels
+#   across many hybes.
+#
+#   RESOLVING TWO SPOTS. This is what the whole architecture is for: the
+#   pillar was centred on one thing by peak_local_max and argmax, and a
+#   second locus a few planes away sits inside the same box the
+#   classifier judged. Two spots at one (y, x), SNR 6, both to be found
+#   within 2 planes, 60 trials, each template at its own 4.5 sigma:
+#
+#       separation   4pl  5pl  6pl  8pl  10pl  14pl
+#       5x5x9         0%   1%  33%  91%  100%  100%
+#       7x7x11        0%   1%   0%  73%  100%  100%
+#       9x9x13        0%   0%   0%  43%   98%  100%
+#       11x11x17      0%   0%   0%  18%   81%  100%
+#
+#   Smaller resolves closer, monotonically, and nothing resolves below
+#   about 6 planes. Two earlier attempts at this table -- one saying 43%
+#   at 8 planes for 7x7x11, one saying 100% -- were both run at a fixed
+#   raw threshold and are withdrawn; the number is 73%.
+#
+#   WHAT CAN BE SCORED AT ALL. ncc scores only where the template fully
+#   fits. On a 120-plane stack 7x7x11 scores 110 planes and 15x15x25
+#   scores 96 -- a fifth of every stack with no score, on the axis where
+#   inter-round drift runs to 11 planes.
+#
+# NOT SPEED. ncc is FFT-based, so its cost is set by the VOLUME: 0.54 to
+# 0.61 s for every size from 5x5x9 to 15x15x25 on a 3.2 Mvoxel field, and
+# the total is actually lowest for the biggest template because there are
+# fewer noise maxima to extract. An earlier claim here that the small
+# template was faster came from timing a box rather than a field, and is
+# withdrawn.
+#
+# AND NOT A FIXED THRESHOLD. NCC noise sd goes as 1/sqrt(n_voxels), so one
+# threshold means a different false-alarm rate for every size -- which is
+# what made an earlier sweep report 229 false positives for 5x5x9 and
+# call it a property of the template. Every comparison above reads recall
+# at a fixed FALSE-POSITIVE BUDGET; the thresholds that budget picks are
+# a constant 4.3-4.5 sigma across all sizes.
+DEFAULT_R = 3          # matching template half-width in y, x -> 7
+DEFAULT_RZ = 5         # matching template half-depth -> 11
 NORMALISATION = 'zero-mean, unit-L2'
 
 
@@ -171,7 +239,8 @@ def fit_from_spots(patches, voxel_um, families=None, verbose=False):
     return best, res[best]['params'], res
 
 
-def render(family, params, r, rz, voxel_um, dy=0.0, dx=0.0, dz=0.0):
+def render(family, params, r=DEFAULT_R, rz=DEFAULT_RZ,
+           voxel_um=(0.208, 0.208, 0.2), dy=0.0, dx=0.0, dz=0.0):
     """A clean template of any size from a fitted shape.
 
     This is what the grid-independence is FOR: the matching template does
@@ -348,7 +417,30 @@ def _parabolic(v, i):
     return 0.0 if den == 0 else float(np.clip(0.5 * (a - c) / den, -1, 1))
 
 
-def match(volume, templates, min_distance=3, threshold=0.3, n_max=None):
+# How many sigma above the noise a score has to reach to be a spot.
+#
+# THE THRESHOLD IS IN SIGMA, NOT IN NCC. NCC noise has sd 1/sqrt(n) for a
+# template of n voxels, so one raw cut-off means a different false-alarm
+# rate for every template size: 0.3 is 7 sigma for a 7x7x11 filter and 22
+# sigma for a 15x15x25 one. That is not a stricter setting, it is a
+# different experiment -- it made an earlier sweep report 229 false
+# positives for 5x5x9 and call it a property of the template, and it made
+# the engine's own default miss one of two spots it had just been shown.
+#
+# 4.5 is what a budget of ~5 false positives per field picks, and it
+# picks the SAME 4.3-4.5 sigma at every size, which is what makes it a
+# size-invariant operating point rather than a tuned number.
+K_SIGMA = 4.5
+
+
+def sigma_threshold(template, k=K_SIGMA):
+    """The NCC cut-off for this template at `k` sigma of its own noise."""
+    n = int(np.asarray(template).size)
+    return float(k) / np.sqrt(max(n, 1))
+
+
+def match(volume, templates, min_distance=3, threshold=None, n_max=None,
+          k_sigma=K_SIGMA):
     """Every place in `volume` that looks like one of `templates`.
 
     Returns [(y, x, z, score), ...] sub-voxel, strongest first.
@@ -364,6 +456,10 @@ def match(volume, templates, min_distance=3, threshold=0.3, n_max=None):
     for t in ts:
         s = ncc(v, t)
         score = s if score is None else np.maximum(score, s)
+    if threshold is None:
+        # Each template's own noise floor; with several, the loosest,
+        # since the score volume is their maximum.
+        threshold = min(sigma_threshold(t, k_sigma) for t in ts)
     peaks = peak_local_max(score, min_distance=int(min_distance),
                            threshold_abs=float(threshold))
     out = []
