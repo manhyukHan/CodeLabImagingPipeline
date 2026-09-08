@@ -427,14 +427,49 @@ def _parabolic(v, i):
 # positives for 5x5x9 and call it a property of the template, and it made
 # the engine's own default miss one of two spots it had just been shown.
 #
-# 4.5 is what a budget of ~5 false positives per field picks, and it
-# picks the SAME 4.3-4.5 sigma at every size, which is what makes it a
-# size-invariant operating point rather than a tuned number.
-K_SIGMA = 4.5
+# AND THE SIGMA IS MEASURED, NOT DERIVED. 1/sqrt(n) is the NCC noise of
+# WHITE noise, and a cell is not white: measured over 623,295 scored
+# voxels of real MP58/RNA background, the NCC sd is 0.0578 against a
+# theoretical 0.0431 -- 1.34x wider. A cut-off of 4.5 theoretical sigma
+# is therefore 3.35 REAL sigma, and it let about 26 voxels per pillar
+# over the line. That is what put four to seven "matches" in pillars
+# holding one spot, on flat background, in the first panel drawn from
+# this.
+#
+# So the threshold comes from the SCORE VOLUME'S OWN noise, by MAD,
+# which is immune to the handful of peaks being looked for and follows
+# whatever the background actually does. 5.0 of those puts roughly one
+# spurious peak in a 15 x 15 x 105 pillar.
+K_SIGMA = 5.0
 
 
-def sigma_threshold(template, k=K_SIGMA):
-    """The NCC cut-off for this template at `k` sigma of its own noise."""
+def noise_sd(score):
+    """Robust sd of an NCC volume's background, ignoring its peaks.
+
+    MAD rather than std: the spots are in there, and a handful of 0.9s
+    would drag a plain standard deviation up and raise the threshold
+    that is meant to find them.
+    """
+    v = np.asarray(score, float)
+    v = v[v != 0]
+    if v.size == 0:
+        return 0.0
+    return float(1.4826 * np.median(np.abs(v - np.median(v))))
+
+
+def sigma_threshold(template, k=K_SIGMA, score=None):
+    """The NCC cut-off at `k` sigma.
+
+    With a score volume, `k` sigma of ITS noise. Without one, the
+    white-noise fallback 1/sqrt(n) -- which is optimistic on real cells
+    by about a third, and is here only so a caller with no volume in
+    hand still gets a number.
+    """
+    if score is not None:
+        sd = noise_sd(score)
+        if sd > 0:
+            return float(np.median(np.asarray(score)[np.asarray(score) != 0])
+                         + k * sd)
     n = int(np.asarray(template).size)
     return float(k) / np.sqrt(max(n, 1))
 
@@ -457,9 +492,8 @@ def match(volume, templates, min_distance=3, threshold=None, n_max=None,
         s = ncc(v, t)
         score = s if score is None else np.maximum(score, s)
     if threshold is None:
-        # Each template's own noise floor; with several, the loosest,
-        # since the score volume is their maximum.
-        threshold = min(sigma_threshold(t, k_sigma) for t in ts)
+        # The noise of THIS volume, not of an idealised one.
+        threshold = sigma_threshold(ts[0], k_sigma, score=score)
     peaks = peak_local_max(score, min_distance=int(min_distance),
                            threshold_abs=float(threshold))
     out = []
