@@ -82,13 +82,20 @@ def scale_of(pillar, lo_pct=1.0, hi_pct=99.7):
 
 
 def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
-                zhalf=ZHALF, pad_frac=0.0):
+                zhalf=ZHALF, pad_frac=0.0, added=()):
     """Render one pillar and all its candidates. Returns an `art` dict.
 
     `hits` are (y, x, z, p) in PILLAR coordinates -- psf-match searches
     the pillar, so its answers are pillar-local and a caller adds the
     pillar's own origin to reach the crop. `accepted` are indices into
-    `hits` the reviewer has kept.
+    `hits` the reviewer has kept. `added` are (y, x) the reviewer marked
+    where psf-match found nothing.
+
+    THE HEADER IS RETURNED, NOT DRAWN. Glyph rasterization is the single
+    largest cost in this window -- MEASURED 0.48 ms per glyph, 65% of a
+    page draw -- and a header is the one piece of text that changes every
+    page while none of the pixels under it do. The app puts it in a Qt
+    label; view.py does the same for the same reason.
     """
     fig.clear()
     p = np.asarray(pillar, float)
@@ -131,10 +138,17 @@ def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
                                                       foreground='black',
                                                       alpha=0.85)])
         art['cards'][i] = {'mark': c, 'num': t}
-    art['header'] = header + (f'   ·   {100 * pad_frac:.0f}% of the pillar '
-                              f'ran off the crop and is padded'
-                              if pad_frac > 0.01 else '')
-    fig.suptitle(art['header'], fontsize=10, y=0.985, color='#333')
+    # A SPOT THE REVIEWER MARKED WHERE PSF-MATCH FOUND NOTHING. Drawn as
+    # a cross rather than a ring so it cannot be mistaken for a match
+    # that happens to be kept -- the two mean different things to
+    # whatever reads the labels, and a page that draws them alike invites
+    # a reviewer to add a duplicate of something already on screen.
+    art['added'] = [axm.plot(ax_, ay_, 'x', color=CHOSEN_C, ms=9, mew=1.8,
+                             zorder=5)[0]
+                    for (ay_, ax_) in added]
+    art['header_text'] = header + (
+        f'   ·   {100 * pad_frac:.0f}% of the pillar ran off the crop '
+        f'and is padded' if pad_frac > 0.01 else '')
 
     # THE BAR, so intensity is readable and not only shape.
     cax = make_axes_locatable(axm).append_axes('right', size='5%', pad=0.06)

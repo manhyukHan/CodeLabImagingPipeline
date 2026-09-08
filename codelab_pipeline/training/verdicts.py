@@ -61,7 +61,21 @@ import os
 import time
 
 FILENAME_FMT = 'verdicts_{reviewer}.jsonl'
-SESSION_FMT = 'verdicts_{reviewer}__{session}.jsonl'
+SESSION_FMT = '{kind}_{reviewer}__{session}.jsonl'
+
+# THE REVIEW KIND IS IN THE FILE NAME, and that is what keeps two
+# different questions from being averaged into one training set.
+#
+# Pass/fail asks "is there a spot here"; multispot asks "how many are in
+# this pillar, and where". They are recorded against the same crops by
+# the same people in the same folder, and every reader here keys a record
+# by (key, page) -- so in one file a multispot record and a pass/fail
+# record for the same crop would collide in done_pages(), in
+# page_verdict(), and in the `latest` map merge() builds, with the later
+# one silently winning. Separate names mean merge() and labels() see only
+# their own kind without needing to know the other exists.
+DEFAULT_KIND = 'verdicts'
+MULTISPOT_KIND = 'multispot'
 
 
 def _safe(name):
@@ -110,12 +124,14 @@ class VerdictLog:
     unaffected.
     """
 
-    def __init__(self, bundle_dir, reviewer, session=None):
+    def __init__(self, bundle_dir, reviewer, session=None, kind=DEFAULT_KIND):
         self.dir = str(bundle_dir)
         self.reviewer = str(reviewer)
+        self.kind = _safe(kind or DEFAULT_KIND)
         self.session = str(session) if session else _session_tag()
         self.path = os.path.join(self.dir, SESSION_FMT.format(
-            reviewer=_safe(self.reviewer), session=self.session))
+            kind=self.kind, reviewer=_safe(self.reviewer),
+            session=self.session))
         self._done = None
         self._latest = None
 
@@ -131,11 +147,12 @@ class VerdictLog:
         # pattern's own '*' must stay live, so only the directory is
         # escaped.
         pat = os.path.join(glob.escape(self.dir), SESSION_FMT.format(
-            reviewer=_safe(self.reviewer), session='*'))
+            kind=self.kind, reviewer=_safe(self.reviewer), session='*'))
         found = sorted(glob.glob(pat))
-        legacy = path_for(self.dir, self.reviewer)   # pre-session layout
-        if os.path.exists(legacy) and legacy not in found:
-            found.append(legacy)
+        if self.kind == DEFAULT_KIND:
+            legacy = path_for(self.dir, self.reviewer)   # pre-session layout
+            if os.path.exists(legacy) and legacy not in found:
+                found.append(legacy)
         return found
 
     def done_pages(self):
@@ -229,6 +246,18 @@ class VerdictLog:
             rec['seconds'] = round(float(seconds), 2)
         if bundle:
             rec['bundle'] = str(bundle)
+        return self._append(rec)
+
+    def _append(self, rec):
+        """Write one record durably, whatever question it answers.
+
+        Split out of commit() so the multispot review -- a different
+        record shape for a different question -- gets the torn-tail
+        healing and the fsync rather than a second, thinner writer that
+        would have to rediscover both. commit() builds the pass/fail
+        record; anything else builds its own and lands here.
+        """
+        rec.setdefault('kind', self.kind)
         d = os.path.dirname(os.path.abspath(self.path))
         if d:
             os.makedirs(d, exist_ok=True)
@@ -316,7 +345,7 @@ def read_log(path):
     return out
 
 
-def merge(bundle_dir):
+def merge(bundle_dir, kind=DEFAULT_KIND):
     """Every reviewer's log, latest verdict per (reviewer, key, page).
 
     Returns (records, agreement) where agreement lists the (key, page)
@@ -336,8 +365,9 @@ def merge(bundle_dir):
     then to line order, both of which are chronological within a session.
     """
     latest, order, by_page = {}, {}, {}
+    prefix = _safe(kind or DEFAULT_KIND) + '_'
     for fi, name in enumerate(sorted(os.listdir(str(bundle_dir)))):
-        if not (name.startswith('verdicts_') and name.endswith('.jsonl')):
+        if not (name.startswith(prefix) and name.endswith('.jsonl')):
             continue
         for li, rec in enumerate(read_log(os.path.join(str(bundle_dir), name))):
             k = (rec.get('reviewer'), rec.get('key'), int(rec.get('page', 0)))
@@ -502,4 +532,85 @@ def labels(bundle_dir):
         for b in ('positive', 'negative', 'contested'):
             e[b].sort()
         out[key] = e
+    return out
+
+
+def multispot_key(y, x, z):
+    """The identity of a PILLAR, which is the spot it was centred on.
+
+    Same grid as _spot_key and for the same reason -- the seed comes out
+    of the pass/fail record as a float and is not recomputed -- but named
+    separately because what it identifies is different: not a candidate
+    inside a page, but which pillar of a crop a reviewer was looking at.
+
+    THIS, NOT THE PAGE NUMBER, IS WHAT DONE-TRACKING KEYS ON. A crop's
+    pillars are ordinals over its confirmed spots, so one more pass/fail
+    positive arriving in that crop renumbers every pillar after it, and a
+    reviewer who had finished them would be served them all again under
+    their new numbers. The coordinate does not move when its neighbours
+    do.
+    """
+    return _spot_key(y, x, z)
+
+
+def multispot_labels(bundle_dir):
+    """Multispot verdicts as per-pillar labels, tallied by VOTE.
+
+    {key: {'crop':, 'fov':, 'hybe':, 'channel':, 'cell':, 'store':,
+           'pillars': {seed_key: {'seed': (y,x,z),
+                                  'positive': [(y,x,z,p), ...],
+                                  'negative': [...], 'contested': [...],
+                                  'added': [(y,x), ...], 'reviewers': n}}}}
+
+    All crop-local, like labels(). The buckets mean the same three things
+    they mean there, for the same reason: a match some reviewers called a
+    real second locus and others did not is the example people could not
+    agree about, and it is worth far more as a list to look at again than
+    as a training row on either side.
+
+    A POSITIVE HERE IS NOT A POSITIVE THERE. Pass/fail asks whether a
+    crop holds a spot at all; this asks how many the pillar around a
+    CONFIRMED spot holds. Every pillar in this file already contains one
+    spot everybody agreed on -- the seed -- so the negatives are matches
+    beside a real emitter, which is exactly the class a demultiplexer has
+    to get right and the one pass/fail never sees.
+    """
+    recs, _agree = merge(bundle_dir, kind=MULTISPOT_KIND)
+    out = {}
+    tally, coord, seeds, adds = {}, {}, {}, {}
+    for rec in recs:
+        key = rec.get('key')
+        seed = rec.get('seed')
+        if key is None or not seed:
+            continue
+        sk = multispot_key(seed['y'], seed['x'], seed['z'])
+        out.setdefault(key, {k: rec.get(k) for k in
+                             ('crop', 'fov', 'hybe', 'channel', 'cell',
+                              'store')})
+        seeds[(key, sk)] = (float(seed['y']), float(seed['x']),
+                            float(seed['z']))
+        t = tally.setdefault((key, sk), {})
+        c = coord.setdefault((key, sk), {})
+        for e in rec.get('shown') or []:
+            hk = _spot_key(e['y'], e['x'], e['z'])
+            kept, seen = t.get(hk, (0, 0))
+            t[hk] = (kept + (1 if e.get('keep') else 0), seen + 1)
+            c[hk] = (float(e['y']), float(e['x']), float(e['z']),
+                     float(e.get('p', 0.0)))
+        a = adds.setdefault((key, sk), [])
+        for e in rec.get('added') or []:
+            a.append((float(e['y']), float(e['x']), rec.get('reviewer')))
+
+    for (key, sk), t in tally.items():
+        pillar = out[key].setdefault('pillars', {}).setdefault(
+            sk, {'seed': seeds[(key, sk)], 'positive': [], 'negative': [],
+                 'contested': [], 'added': [], 'reviewers': 0})
+        pillar['reviewers'] = max((seen for _k, (_kept, seen) in t.items()),
+                                  default=0)
+        for hk, (kept, seen) in sorted(t.items()):
+            bucket = ('positive' if kept == seen else
+                      'negative' if kept == 0 else 'contested')
+            pillar[bucket].append(coord[(key, sk)][hk])
+        pts = adds.get((key, sk), [])
+        pillar['added'] = [p for p, _n in _cluster_added(pts)] if pts else []
     return out

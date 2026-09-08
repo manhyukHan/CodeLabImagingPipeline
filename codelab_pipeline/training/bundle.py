@@ -221,7 +221,32 @@ def read_crop(path, key):
 
 
 def shard_paths(bundle_dir):
-    """Every shard in a bundle directory, in FOV order."""
+    """Every shard in a bundle directory, in FOV order.
+
+    A SHARD IS AN .h5 WITH AN `index`, not every .h5 in the folder. The
+    bundle folder is what gets copied to a reviewer, so it is exactly
+    where other HDF5 files end up living -- psf_bank.h5 for the
+    multispot review is one the app itself looks for there. Taking any
+    .h5 as a shard made opening such a folder a KeyError on 'index'
+    before a single page was drawn, and the message named the missing
+    dataset rather than the file that had no business being read.
+
+    The probe is one header read per file and the queue already reads
+    every index, so this costs nothing measurable. Anything unreadable
+    is skipped rather than raised on: a half-copied shard should cost
+    its own crops, not the whole session.
+    """
     d = str(bundle_dir)
-    return sorted(os.path.join(d, n) for n in os.listdir(d)
-                  if n.endswith('.h5') and not n.endswith('.part.h5'))
+    out = []
+    for n in sorted(os.listdir(d)):
+        if not n.endswith('.h5') or n.endswith('.part.h5'):
+            continue
+        p = os.path.join(d, n)
+        try:
+            with h5py.File(p, 'r') as f:
+                if 'index' not in f:
+                    continue
+        except OSError:
+            continue
+        out.append(p)
+    return out

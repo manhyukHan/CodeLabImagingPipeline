@@ -520,7 +520,7 @@ class PsfMatchEngine(LocalizeEngine):
 
     def __init__(self, templates=None, bank=None, storage_path=None,
                  voxel_um=None, r=None, rz=None,
-                 min_distance=3, threshold=None, **_ignored):
+                 min_distance=3, threshold=None, k_sigma=None, **_ignored):
         from . import psf_bank as PB
         r = PB.DEFAULT_R if r is None else int(r)
         rz = PB.DEFAULT_RZ if rz is None else int(rz)
@@ -549,6 +549,19 @@ class PsfMatchEngine(LocalizeEngine):
                          'source': 'store calibration'}
         elif bank:
             mean, comps, meta = PB.load(bank, voxel_um=voxel_um)
+            # CUT IT TO THE SEARCH SIZE. A bank is stored at the size it
+            # was measured at -- train_spotmodel averages the
+            # classifier's 15 x 15 x 25 boxes -- and ncc() scores only
+            # where the template fits, so handing that straight to a
+            # 15 x 15 pillar leaves ONE lateral position to search and
+            # every neighbour is unfindable at any threshold. See
+            # psf_bank.centre_crop, which measured it.
+            meta = dict(meta)
+            meta['stored_shape'] = list(np.asarray(mean).shape)
+            if tuple(np.asarray(mean).shape) != (2 * r + 1, 2 * r + 1,
+                                                 2 * rz + 1):
+                mean = PB.normalise(PB.centre_crop(mean, r, rz))
+                meta['cropped_to'] = [2 * r + 1, 2 * r + 1, 2 * rz + 1]
             templates = [mean]
             self.meta = meta
         else:
@@ -560,6 +573,12 @@ class PsfMatchEngine(LocalizeEngine):
         # psf_bank.K_SIGMA for why a raw NCC number cannot be a
         # default when the template size can change.
         self.threshold = None if threshold is None else float(threshold)
+        # HOW MANY SIGMA A PEAK MUST CLEAR, when no absolute threshold is
+        # given. Separate from `threshold` because it is the parameter
+        # that survives a change of template size: a raw NCC number does
+        # not (psf_bank.K_SIGMA's own header says why), and a caller who
+        # wants a looser or stricter search wants it in these units.
+        self.k_sigma = (PB.K_SIGMA if k_sigma is None else float(k_sigma))
 
     def localize(self, stack, seed_yxz=None, n_max=1):
         from . import psf_bank as PB
@@ -570,7 +589,7 @@ class PsfMatchEngine(LocalizeEngine):
         # brightest spot in the box instead, silently.
         hits = PB.match(np.asarray(stack, float), self.templates,
                         min_distance=self.min_distance,
-                        threshold=self.threshold,
+                        threshold=self.threshold, k_sigma=self.k_sigma,
                         n_max=None if seed_yxz is not None else n_max)
         if seed_yxz is not None and hits:
             sy, sx, sz = (float(v) for v in seed_yxz)

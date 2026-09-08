@@ -363,6 +363,38 @@ def load(path, voxel_um=None, tol=1e-6):
     return mean, comps, meta
 
 
+def centre_crop(patch, r=DEFAULT_R, rz=DEFAULT_RZ):
+    """The central (2r+1, 2r+1, 2rz+1) of a stored template.
+
+    A BANK IS STORED AT THE SIZE IT WAS MEASURED AT, WHICH IS NOT THE
+    SIZE A SEARCH WANTS, and until this existed the two were silently
+    the same number. tools/train_spotmodel.py averages the classifier's
+    own boxes, so psf_bank.h5 holds a 15 x 15 x 25 mean; ncc() scores
+    only where the template fits, so matching a 15 x 15 x 105 pillar
+    with it leaves a valid region of 1 x 1 x 81 -- ONE lateral position.
+
+    MEASURED on 200 confirmed-spot pillars of MP58/RNA, every "match"
+    that came back was a z peak in the pillar's own centre column, and a
+    second emitter three pixels to the side could not be found at any
+    threshold. It did not look like a failure: the pillars each returned
+    a plausible hit at a plausible depth.
+
+    Cropping is exact, not resampling: these are the same voxels on the
+    same grid, so load()'s refusal to resample is not being routed
+    around. Growing one is refused -- the voxels are not there to invent.
+    """
+    p = np.asarray(patch, float)
+    cy, cx, cz = (n // 2 for n in p.shape)
+    r, rz = int(r), int(rz)
+    if p.shape[0] < 2 * r + 1 or p.shape[1] < 2 * r + 1 \
+            or p.shape[2] < 2 * rz + 1:
+        raise ValueError(
+            f'this template is {p.shape} and a {2*r+1} x {2*r+1} x '
+            f'{2*rz+1} one was asked for. Cropping can only make a '
+            'template smaller; measure or render a larger one.')
+    return p[cy - r:cy + r + 1, cx - r:cx + r + 1, cz - rz:cz + rz + 1]
+
+
 # -- matching -------------------------------------------------------------
 
 def ncc(volume, template, eps=1e-9):

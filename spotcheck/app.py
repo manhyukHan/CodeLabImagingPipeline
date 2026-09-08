@@ -33,8 +33,22 @@ KEYS
               a false negative)
   Q           quit -- nothing is lost, the log is flushed per page
 
+TWO REVIEWS, ONE ARGUMENT. --mode passfail is the above. --mode
+multispot takes the spots pass/fail already confirmed and shows the
+15 x 15 x full-depth pillar around each one, with every match psf-match
+found in it, asking how many emitters are really there -- the question
+that decides whether a bright blob is one locus or two. Its keys are
+1-9 and its picture is one pillar rather than four cards; everything
+else about the window is the same.
+
+They write to SEPARATE verdict files -- verdicts_*.jsonl and
+multispot_*.jsonl -- because they are different questions about the same
+pixels, and one file keyed by (key, page) would let a record of one kind
+silently supersede the other.
+
 Run:
   python -m spotcheck.app <bundle_dir> --reviewer <name>
+  python -m spotcheck.app <bundle_dir> --reviewer <name> --mode multispot
 """
 import argparse
 import os
@@ -58,6 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from codelab_pipeline.training import bundle as B          # noqa: E402
 from codelab_pipeline.training import verdicts as V        # noqa: E402
 from codelab_pipeline.training import view as VIEW         # noqa: E402
+from spotcheck import modes as MODES                       # noqa: E402
 
 
 # How close a click has to land to count as "that candidate" rather than
@@ -120,8 +135,8 @@ DEFAULT_MAX_PER_CROP = 8
 OVERLAP_FRAC = 0.1
 
 
-def ask_session(bundle_dir=None, reviewer=None, parent=None):
-    """(bundle_dir, reviewer) -- prompting for whatever was not given.
+def ask_session(bundle_dir=None, reviewer=None, mode=None, parent=None):
+    """(bundle_dir, reviewer, mode) -- prompting for whatever was not given.
 
     The reviewer NAMES THE VERDICT FILE, so the same program writes to a
     different place per person and ten of them share one bundle folder
@@ -132,6 +147,11 @@ def ask_session(bundle_dir=None, reviewer=None, parent=None):
     A name typed differently on the second day starts a FRESH queue and
     re-reviews everything already done, so the field is pre-filled with
     the last one used and the answer is remembered.
+
+    THE MODE IS ASKED HERE TOO, not only as --mode. The whole reason this
+    dialog exists is that a reviewer opens the app by double-clicking it,
+    and a second review reachable only by typing a flag into a shell is a
+    review the people doing the reviewing cannot reach.
     """
     from PyQt5 import QtWidgets as W
     remembered = _remembered()
@@ -140,20 +160,72 @@ def ask_session(bundle_dir=None, reviewer=None, parent=None):
             parent, 'Choose the review bundle folder',
             remembered.get('bundle', ''))
         if not bundle_dir:
-            return None, None
-    if not reviewer:
-        reviewer, ok = W.QInputDialog.getText(
-            parent, 'Spot Check',
-            'Your name or initials.\n\n'
-            'It names your verdict file, so several people can share one\n'
-            'bundle folder. Use the SAME spelling every session -- a new\n'
-            'name starts a fresh queue and re-reviews what you have done.',
-            text=remembered.get('reviewer', ''))
-        if not ok or not str(reviewer).strip():
-            return None, None
-        reviewer = str(reviewer).strip()
-    _remember(bundle_dir, reviewer)
-    return bundle_dir, reviewer
+            return None, None, None
+    if reviewer and mode:
+        _remember(bundle_dir, reviewer, mode)
+        return bundle_dir, reviewer, mode
+
+    d = W.QDialog(parent)
+    d.setWindowTitle('Spot Check')
+    form = W.QVBoxLayout(d)
+    form.addWidget(W.QLabel(
+        'Your name or initials.\n\n'
+        'It names your verdict file, so several people can share one\n'
+        'bundle folder. Use the SAME spelling every session -- a new\n'
+        'name starts a fresh queue and re-reviews what you have done.'))
+    name = W.QLineEdit(str(reviewer or remembered.get('reviewer', '')))
+    name.setObjectName('reviewer')
+    form.addWidget(name)
+    form.addSpacing(8)
+    form.addWidget(W.QLabel('Which review:'))
+    pick = W.QComboBox()
+    pick.setObjectName('mode')
+    for cls in (MODES.PassFail, MODES.Multispot):
+        pick.addItem(cls.label, cls.name)
+    want = str(mode or remembered.get('mode') or MODES.PassFail.name)
+    at = pick.findData(want)
+    pick.setCurrentIndex(at if at >= 0 else 0)
+    form.addWidget(pick)
+    note = W.QLabel('')
+    note.setObjectName('note')
+    note.setWordWrap(True)
+    note.setStyleSheet('color:#555; font-size: 11px;')
+    form.addWidget(note)
+
+    def _explain(_i=None):
+        # SAY WHAT THE CHOICE MEANS BEFORE IT IS MADE, and say it here
+        # rather than in a README. The two reviews write to different
+        # files and ask different questions of the same pictures, and a
+        # reviewer who picks the wrong one spends an hour answering a
+        # question nobody asked. Multispot also needs a PSF bank, which
+        # is a property of the FOLDER rather than of the reviewer -- so
+        # whether this bundle has one is worth knowing before the queue
+        # is built rather than as an error afterwards.
+        if pick.currentData() == MODES.Multispot.name:
+            has = MODES.Multispot._find_bank(None, bundle_dir)
+            note.setText(
+                'Second pass: for each spot ALREADY confirmed in '
+                'pass/fail, judge every extra match psf-match finds in '
+                'its pillar.\n'
+                + (('PSF bank: ' + os.path.basename(has)) if has else
+                   ('NO PSF BANK IN THIS FOLDER -- put ' + MODES.BANK_NAME
+                    + ' beside the shards, or pass --psf-bank.')))
+        else:
+            note.setText('First pass: judge each candidate spot in a cell.')
+    pick.currentIndexChanged.connect(_explain)
+    _explain()
+
+    btn = W.QDialogButtonBox(W.QDialogButtonBox.Ok | W.QDialogButtonBox.Cancel)
+    btn.accepted.connect(d.accept)
+    btn.rejected.connect(d.reject)
+    form.addWidget(btn)
+    d.resize(470, 0)
+    if d.exec_() != W.QDialog.Accepted or not str(name.text()).strip():
+        return None, None, None
+    reviewer = str(name.text()).strip()
+    mode = str(pick.currentData())
+    _remember(bundle_dir, reviewer, mode)
+    return bundle_dir, reviewer, mode
 
 
 def _remember_path():
@@ -170,12 +242,13 @@ def _remembered():
         return {}
 
 
-def _remember(bundle_dir, reviewer):
+def _remember(bundle_dir, reviewer, mode=None):
     import json
     try:
         with open(_remember_path(), 'w', encoding='utf-8') as f:
             json.dump({'bundle': str(bundle_dir),
-                       'reviewer': str(reviewer)}, f)
+                       'reviewer': str(reviewer),
+                       'mode': str(mode or MODES.PassFail.name)}, f)
     except Exception:                                       # noqa: BLE001
         pass          # remembering is a convenience, never a requirement
 
@@ -215,36 +288,27 @@ class Queue:
 
     def __init__(self, bundle_dir, log, per_page=VIEW.PER_PAGE,
                  max_per_crop=None, reviewer=None, shuffle=True,
-                 overlap_frac=OVERLAP_FRAC, seed=None):
+                 overlap_frac=OVERLAP_FRAC, seed=None, mode=None):
         self.dir = str(bundle_dir)
         self.log = log
-        every = []
-        for shard in B.shard_paths(self.dir):
-            for row in B.read_index(shard):
-                n = int(row['n_candidates'])
-                if n == 0:
-                    continue          # nothing to judge, not a skipped page
-                # THE REVIEW BUDGET, and it lives here rather than in the
-                # bundle. The extractor keeps every candidate the data
-                # produced; how many of them a person is asked to judge is
-                # a per-session choice, and applying it here costs nothing
-                # and destroys nothing. Candidates are stored gate-pass
-                # first, so a cap always keeps the informative ones.
-                if max_per_crop:
-                    n = min(n, int(max_per_crop))
-                for pi, ix in enumerate(VIEW.pages_of(n, per_page)):
-                    every.append((shard, row, pi, ix))
-        order = (self._mixed(every, reviewer, overlap_frac, seed)
+        # WHAT A PAGE IS, is the mode's business; the order it is served
+        # in is this class's, and that split is why the shuffle and its
+        # shared slice did not have to be written twice.
+        self.mode = mode or MODES.PassFail()
+        every = self.mode.all_items(self.dir, per_page, max_per_crop)
+        order = (self._mixed(every, reviewer, overlap_frac, seed,
+                             self.mode.item_key)
                  if shuffle else every)
         # DONE PAGES ARE DROPPED AFTER THE ORDER IS FIXED, so a reviewer
         # who stops and comes back gets the same sequence minus what they
         # finished, rather than a resequenced queue.
-        done = log.done_pages()
-        self.items = [it for it in order if (it[1]['key'], it[2]) not in done]
+        done = self.mode.done_keys(log)
+        self.items = [it for it in order
+                      if self.mode.item_key(it) not in done]
         self.i = 0
 
     @staticmethod
-    def _mixed(every, reviewer, overlap_frac, seed):
+    def _mixed(every, reviewer, overlap_frac, seed, item_key=None):
         """A per-reviewer order, with a shared slice everyone sees.
 
         THE SERIAL ORDER WAS A SAMPLING BUG, not an inconvenience. The
@@ -269,6 +333,7 @@ class Queue:
         """
         import hashlib
         import random
+        item_key = item_key or MODES.PassFail.item_key
         base = (str(seed) if seed is not None
                 else hashlib.sha256(str(len(every)).encode()).hexdigest())
         shared = list(every)
@@ -291,7 +356,7 @@ class Queue:
             while idx < len(src):
                 it = src[idx]
                 idx += 1
-                k = (it[1]['key'], it[2])
+                k = item_key(it)
                 if k not in seen:
                     seen.add(k)
                     out.append(it)
@@ -326,7 +391,7 @@ class SpotCheck(QtWidgets.QMainWindow):
 
     def __init__(self, bundle_dir, reviewer, per_page=VIEW.PER_PAGE,
                  max_per_crop=DEFAULT_MAX_PER_CROP, shuffle=True,
-                 overlap_frac=OVERLAP_FRAC):
+                 overlap_frac=OVERLAP_FRAC, mode=None):
         # THE DEFAULT IS THE APP'S DEFAULT, not "no limit". It was None,
         # and only main() supplied the cap -- so every other way of
         # opening this window silently got the uncapped queue: MEASURED
@@ -337,13 +402,20 @@ class SpotCheck(QtWidgets.QMainWindow):
         super().__init__()
         self.bundle_dir = str(bundle_dir)
         self.per_page = int(per_page)
-        self.log = V.VerdictLog(self.bundle_dir, reviewer)
+        self.mode = mode or MODES.PassFail()
+        # THE LOG IS NAMED AFTER THE MODE, so the two reviews cannot end
+        # up in one file keyed by the same (key, page) and silently
+        # supersede each other. See verdicts.DEFAULT_KIND.
+        self.log = V.VerdictLog(self.bundle_dir, reviewer,
+                                kind=self.mode.log_kind)
         self.max_per_crop = max_per_crop
         self.queue = Queue(self.bundle_dir, self.log, self.per_page,
                            max_per_crop=max_per_crop, reviewer=reviewer,
-                           shuffle=shuffle, overlap_frac=overlap_frac)
+                           shuffle=shuffle, overlap_frac=overlap_frac,
+                           mode=self.mode)
 
-        self.setWindowTitle(f'Spot Check — {reviewer} — {self.bundle_dir}')
+        self.setWindowTitle(f'Spot Check — {self.mode.name} — {reviewer} — '
+                            f'{self.bundle_dir}')
         self.resize(1750, 780)
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -367,12 +439,7 @@ class SpotCheck(QtWidgets.QMainWindow):
         self.status.setStyleSheet('font-family: monospace; padding: 3px;')
         lay.addWidget(self.status)
 
-        self.help = QtWidgets.QLabel(
-            '1-4 keep/drop   Space commit+next   Backspace back   '
-            'A add missed (then click the cell)   U undo add   '
-            'S skip unlabelled   Q quit          '
-            'DEFAULT IS DROP — press a number only for a real spot\n'
-            + VIEW.PANEL_LEGEND)
+        self.help = QtWidgets.QLabel(self.mode.help_text)
         self.help.setStyleSheet('color:#555; padding: 2px;')
         lay.addWidget(self.help)
 
@@ -412,42 +479,26 @@ class SpotCheck(QtWidgets.QMainWindow):
         if item is None:
             self._finish()
             return
-        shard, row, page, ix = item
-        stack, mask, cands, words = B.read_crop(shard, row['key'])
-        rows = [(float(c['y']), float(c['x']), float(c['z']), float(c['p']),
-                 int(c['fit_ok']), int(c['gate_pass']), w)
-                for c, w in zip(cands, words)]
-        shown_n = (min(len(rows), int(self.max_per_crop))
-                   if self.max_per_crop else len(rows))
         # THE OVERVIEW SHOWS WHAT CAN BE JUDGED, and nothing else. It used
         # to draw every candidate in the crop, so a busy cell put 338
         # circles and 338 numbers on the image when only the top 16 were
         # ever reachable by a keystroke -- 322 marks the reviewer cannot
         # act on, and MEASURED 1730 ms a page against 640 ms for a cell of
-        # the same size with a normal candidate count.
-        n_total = len(rows)
-        rows = rows[:shown_n]
-        npage = len(VIEW.pages_of(shown_n, self.per_page))
-        # What this reviewer already recorded for THIS page, if anything.
-        # Without it, stepping back with Backspace showed a committed page
-        # with every keep wiped from the screen -- the display contradicting
-        # the file -- and one more Space then overwrote the real verdict
-        # with an empty one.
-        prior = self.log.page_verdict(row['key'], page)
-        draft = self._draft.get((str(row['key']), int(page)))
-        # The store path comes from the shard's own meta, so a verdict can
-        # say where its pixels came from and be re-cut after the bundle
-        # is deleted (verdicts.recut).
-        meta, _n, _v = B.read_meta(shard)
-        self._state = dict(shard=shard, row=row, page=page, ix=ix,
-                           stack=stack, mask=mask, cands=rows, npage=npage,
-                           store=meta.get('storage_path'),
-                           n_total=n_total,
-                           accepted=(set(draft[0]) if draft else
-                                     set(prior['accepted']) if prior else set()),
-                           added=(list(draft[1]) if draft else
-                                  list(prior['added']) if prior else []),
-                           revisited=bool(prior))
+        # the same size with a normal candidate count. The cap is applied
+        # in the mode's load(), which is where a page is decided.
+        #
+        # `prior_accepted`/`prior_added` are what this reviewer already
+        # recorded for THIS page. Without them, stepping back with
+        # Backspace showed a committed page with every keep wiped from the
+        # screen -- the display contradicting the file -- and one more
+        # Space then overwrote the real verdict with an empty one.
+        s = self.mode.load(item, self.log, self.per_page, self.max_per_crop)
+        draft = self._draft.get((str(s['row']['key']), int(s['page'])))
+        prior_acc = s.pop('prior_accepted', None) or set()
+        prior_add = s.pop('prior_added', None) or []
+        s['accepted'] = set(draft[0]) if draft else set(prior_acc)
+        s['added'] = list(draft[1]) if draft else list(prior_add)
+        self._state = s
         self._adding = False
         self._outside = False
         self._offpage = None
@@ -481,20 +532,13 @@ class SpotCheck(QtWidgets.QMainWindow):
         """
         s = dict(self._state)
         s['snapped'] = self._snapped
-        row = s['row']
         if restyle_only and self._art is not None:
-            VIEW.restyle(self._art, s['accepted'])
+            self.mode.restyle(self._art, s['accepted'])
             if not self._blit():
                 self.canvas.draw_idle()
         else:
-            header = (f"FOV{int(row['fov']):03d}   {row['hybe']}   "
-                      f"ch{int(row['channel'])}   cell {int(row['cell'])}")
-            self._art = VIEW.draw_page(
-                self.fig, s['stack'], s['mask'], s['cands'], s['ix'],
-                header=header, accepted=s['accepted'], added=s['added'],
-                page=s['page'], npage=s['npage'], per_page=self.per_page,
-                n_total=s['n_total'])
-            for a in VIEW.mutable_artists(self._art):
+            self._art = self.mode.draw(self.fig, s, self.per_page)
+            for a in self.mode.mutable_artists(self._art):
                 a.set_animated(True)
             self._bg = None              # invalid until the next draw lands
             self.canvas.draw_idle()
@@ -516,7 +560,7 @@ class SpotCheck(QtWidgets.QMainWindow):
             self._bg = None
 
     def _draw_mutable(self):
-        for a in VIEW.mutable_artists(self._art):
+        for a in self.mode.mutable_artists(self._art):
             self.fig.draw_artist(a)
 
     def _blit(self):
@@ -696,11 +740,7 @@ class SpotCheck(QtWidgets.QMainWindow):
 
     def _page_of(self, i):
         """Which page of this crop judges candidate `i` (1-based)."""
-        for pi, ix in enumerate(VIEW.pages_of(len(self._state['cands']),
-                                              self.per_page)):
-            if i in ix:
-                return pi + 1
-        return None
+        return self.mode.page_of(self._state, i, self.per_page)
 
     def keyPressEvent(self, e):
         s = self._state
@@ -778,11 +818,7 @@ class SpotCheck(QtWidgets.QMainWindow):
             # one saved. Stay on the page, say what happened, and let them
             # retry once the disk is back.
             try:
-                self.log.commit(s['row'], s['page'], s['ix'], s['cands'],
-                                s['accepted'], added=s['added'],
-                                seconds=time.time() - self._t0,
-                                bundle=os.path.basename(s['shard']),
-                                store=s['store'])
+                self.mode.commit(self.log, s, time.time() - self._t0)
             except Exception as exc:                        # noqa: BLE001
                 self._stash()
                 QtWidgets.QMessageBox.critical(
@@ -831,22 +867,55 @@ def main(argv=None):
                          'spots AND the boundary cases either side of the gate '
                          '-- which is where a detector learns. Pass 0 for no '
                          'limit.')
+    ap.add_argument('--mode', default=None, choices=sorted(MODES.MODES),
+                    help='which review to run. passfail asks whether each '
+                         'candidate is a real spot; multispot takes the '
+                         'spots pass/fail already confirmed and asks how '
+                         'many emitters are in the pillar around each. The '
+                         'two write to SEPARATE verdict files. Omit it and '
+                         'the startup dialog asks.')
+    ap.add_argument('--psf-bank', default=None,
+                    help='the measured PSF multispot matches with, written '
+                         'by tools/train_spotmodel.py. Defaults to '
+                         + MODES.BANK_NAME + ' inside the bundle folder, so '
+                         'copying the folder to a reviewer copies everything '
+                         'the mode needs.')
+    ap.add_argument('--review-k', type=float, default=MODES.REVIEW_K_SIGMA,
+                    help='multispot only: how many sigma a match must clear '
+                         'to be shown. Looser than the pipeline default on '
+                         'purpose -- an unkept proposal costs no keystroke, '
+                         'a proposal never made costs a label. See '
+                         f'modes.REVIEW_K_SIGMA (default {MODES.REVIEW_K_SIGMA}) '
+                         'for the measured trade.')
     a = ap.parse_args(argv)
     app = QtWidgets.QApplication(sys.argv[:1])
     # Whatever was not given on the command line is ASKED FOR, so the
     # file can simply be double-clicked.
-    bundle_dir, reviewer = ask_session(a.bundle_dir, a.reviewer)
+    bundle_dir, reviewer, mode_name = ask_session(a.bundle_dir, a.reviewer,
+                                                  a.mode)
     if not bundle_dir or not reviewer:
         return 0
     if not os.path.isdir(bundle_dir):
         QtWidgets.QMessageBox.critical(
-            None, 'Spot Check', 'No such bundle folder:\n' + str(bundle_dir))
+            None, 'Spot Check', 'No such bundle folder:' + os.linesep
+            + str(bundle_dir))
         return 1
-    w = SpotCheck(bundle_dir, reviewer, a.per_page,
-                  max_per_crop=(a.max_per_crop or None),
-                  shuffle=not a.no_shuffle, overlap_frac=a.overlap_frac)
+    mode = MODES.make_mode(mode_name, bundle_dir=bundle_dir, bank=a.psf_bank,
+                           k_sigma=a.review_k)
+    # A MISSING PSF BANK IS A MESSAGE, NOT A TRACEBACK. Multispot needs
+    # one, and a reviewer handed a bundle without it should be told what
+    # to put where -- in the window, rather than by watching the app fail
+    # to open with a stack trace in a console they may not have.
+    try:
+        w = SpotCheck(bundle_dir, reviewer, a.per_page,
+                      max_per_crop=(a.max_per_crop or None),
+                      shuffle=not a.no_shuffle, overlap_frac=a.overlap_frac,
+                      mode=mode)
+    except FileNotFoundError as exc:
+        QtWidgets.QMessageBox.critical(None, 'Spot Check', str(exc))
+        return 1
     if len(w.queue) == 0:
-        print('nothing left to review in', a.bundle_dir)
+        print('nothing left to review in', bundle_dir)
     w.show()
     w.canvas.setFocus()
     return app.exec_()
