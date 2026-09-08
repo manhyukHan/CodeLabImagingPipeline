@@ -42,7 +42,32 @@ has never seen. Baseline ROC 0.943.
     sigma_z              0.649       +0.046
     col_n_runs           0.834       +0.035
     ...
-    z_fwhm, col_skew, z_from_edge, centroid_offset, border_frac  ~0
+    border_frac, z_from_edge                                     ~0
+
+INERT IS A STATEMENT ABOUT THE LINEAR HEAD, and the mlp is the better
+model (held-out ROC 0.961 against 0.943). Shuffled against the mlp, four
+of the features that do nothing linearly come alive:
+
+    feature            linear      mlp
+    z_fwhm            -0.0014   +0.0233
+    centroid_offset   +0.0017   +0.0124
+    col_skew          -0.0001   +0.0037
+    eccentricity      +0.0018   +0.0036
+    border_frac       +0.0000   +0.0022
+    z_from_edge       -0.0004   -0.0006
+
+centroid_offset is the clearest case and the reason it was worth keeping:
+the box is centred on a local maximum BY CONSTRUCTION, so a clean single
+emitter has an offset near zero and anything else in the window drags the
+intensity centroid off it. It is a merged-spot detector, and only a
+non-linear head can use it that way.
+
+Dropping the six costs the mlp 0.9613 -> 0.9571. border_frac and
+z_from_edge are the two with no case in either head; they stay because
+border_frac fires on 20% of boxes here (10% are more than a quarter
+padding) and describes a real condition even though it does not predict
+this label, and because dropping features on one experiment's labels is
+how a feature list gets fitted to a bundle.
 
 READ THE TWO COLUMNS AGAINST EACH OTHER. `col_n_runs` knows the most by
 itself (ROC 0.834 alone -- a hot pixel is bright in every one of ~105
@@ -67,7 +92,7 @@ import numpy as np
 # refuses to score a vector built by a different version of this file.
 NAMES = (
     # contrast
-    'peak', 'log_peak', 'core3', 'annulus_med', 'core_over_annulus',
+    'log_peak', 'core3', 'annulus_med', 'core_over_annulus',
     # lateral shape
     'sigma_xy', 'eccentricity', 'centroid_offset', 'ring2', 'ring4',
     # axial shape, from the FULL column
@@ -120,8 +145,13 @@ def one(core, col, border_frac=0.0):
     cy, cx, cz = ny // 2, nx // 2, nz // 2
     f = {}
 
+    # `pk` is used below as the scale for the radial profile; only its
+    # LOGARITHM is a feature. The raw maximum was one too, until its rank
+    # correlation with the log came back at exactly 1.000000 -- one is a
+    # monotone function of the other, so they cannot differ on any
+    # ranking measure, and removing it moved held-out ROC by +0.0001
+    # (linear) and +0.0008 (mlp).
     pk = float(np.nanmax(core)) if core.size else 0.0
-    f['peak'] = pk
     f['log_peak'] = float(np.log1p(max(pk, 0.0)))
 
     pl = core[:, :, cz]
