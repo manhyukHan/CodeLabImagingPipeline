@@ -22,12 +22,44 @@ INPUTS ARE IN SIGMA ABOVE BACKGROUND. dataset.boxes divides by the
 crop's own mode-and-left-sigma, so a feature means the same thing in a
 dim cell and a bright one. Nothing here re-estimates the background.
 
-THE AXIAL GROUP IS THE POINT. A hot camera pixel is bright in EVERY
-plane of the stack; a real emitter is bright in three to five. That is
-what `col_frac_above_half` and `col_n_runs` measure, and on the only
-labelled set that exists they were the strongest single features by a
-distance -- which is also why the full column is carried alongside the
-core rather than thrown away.
+WHAT ACTUALLY CARRIES THE MODEL, measured on 2,057 human-gated boxes by
+shuffling each feature and watching held-out ROC fall -- LEAVE ONE HYBE
+OUT, because what matters is what it leans on when it meets a round it
+has never seen. Baseline ROC 0.943.
+
+    group                 shuffled together
+    contrast                    +0.277
+    axial (full column)         +0.170
+    lateral shape               +0.076
+    context (border_frac)       -0.001
+
+    feature              alone   shuffled alone
+    log_peak             0.653       +0.104
+    annulus_med          0.563       +0.082
+    core3                0.616       +0.077
+    core_over_annulus    0.816       +0.076
+    ring4                0.652       +0.054
+    sigma_z              0.649       +0.046
+    col_n_runs           0.834       +0.035
+    ...
+    z_fwhm, col_skew, z_from_edge, centroid_offset, border_frac  ~0
+
+READ THE TWO COLUMNS AGAINST EACH OTHER. `col_n_runs` knows the most by
+itself (ROC 0.834 alone -- a hot pixel is bright in every one of ~105
+planes and an emitter in three to five) and contributes little uniquely,
+because the rest of the axial group covers for it. `log_peak` knows
+least of the leaders alone and contributes most, because nothing else
+says how bright. Single-feature AUC ranks what a feature KNOWS;
+permutation ranks what it ALONE brings, and correlated features share
+credit -- which is why the group rows are the ones to trust.
+
+The five inert features are kept anyway. Dropping them would be fitting
+the feature list to one experiment's labels, and border_frac earns its
+place on a bundle whose crops clip more spots than this one does.
+
+THE FULL COLUMN IS WORTH ITS 105 NUMBERS: the axial group is the second
+largest contributor and it is the only one that can see a hot pixel for
+what it is.
 """
 import numpy as np
 
@@ -42,8 +74,24 @@ NAMES = (
     'sigma_z', 'z_fwhm', 'col_frac_above_half', 'col_n_runs',
     'col_skew', 'z_from_edge', 'aspect_z_over_xy',
     # context
-    'border_frac', 'engine_p', 'fit_ok', 'gate_pass',
+    'border_frac',
 )
+
+# NOT HERE, AND NOT BY ACCIDENT: engine_p, fit_ok, gate_pass.
+#
+# They were declared, never populated -- labels() returns coordinates,
+# not the engine's verdict -- so they sat at a constant zero and the
+# model was reading pixels alone. Removing them rather than wiring them
+# up, because gate_pass would smuggle the ROUND in through the back
+# door: the gate passes 0.9% of Hyb_101's candidates and 28.2% of
+# Hyb_107's, a factor of forty, so a model given it can score well by
+# recognising which hybe it is looking at. That is the one thing this
+# model must not learn, and holding out a whole hybe is the only test
+# that would catch it (ROC 0.943 +- 0.033 across eleven, against 0.958
+# on a cell-level split -- close, because there is nothing to catch).
+#
+# Nothing identifying the hybe, FOV, cell or crop is a feature either.
+# The box and the full z column through it are the whole input.
 
 
 def _runs_above(v):
@@ -60,14 +108,11 @@ def _runs_above(v):
     return len(runs), (max(runs) if runs else 0)
 
 
-def one(core, col, border_frac=0.0, engine_p=np.nan,
-        fit_ok=np.nan, gate_pass=np.nan):
+def one(core, col, border_frac=0.0):
     """One box -> one vector, in NAMES order.
 
     `core` and `col` are already background-subtracted and in sigma
-    units (dataset.boxes). `engine_p`, `fit_ok`, `gate_pass` are what the
-    classical engine said about this candidate -- carried so the model
-    can be compared against it and, if it helps, use it.
+    units (dataset.boxes).
     """
     core = np.asarray(core, float)
     col = np.asarray(col, float)
@@ -125,9 +170,6 @@ def one(core, col, border_frac=0.0, engine_p=np.nan,
     f['aspect_z_over_xy'] = f['sigma_z'] / (f['sigma_xy'] + 1e-9)
 
     f['border_frac'] = float(border_frac)
-    f['engine_p'] = float(engine_p) if np.isfinite(engine_p) else 0.0
-    f['fit_ok'] = float(fit_ok) if np.isfinite(fit_ok) else 0.0
-    f['gate_pass'] = float(gate_pass) if np.isfinite(gate_pass) else 0.0
 
     v = np.array([f[n] for n in NAMES], dtype=np.float64)
     # A non-finite feature is a bug upstream, not a value to propagate
@@ -141,10 +183,7 @@ def many(cores, cols, rows=None):
     for i in range(len(cores)):
         r = (rows[i] if rows is not None else {}) or {}
         out[i] = one(cores[i], cols[i],
-                     border_frac=r.get('border_frac', 0.0),
-                     engine_p=r.get('engine_p', np.nan),
-                     fit_ok=r.get('fit_ok', np.nan),
-                     gate_pass=r.get('gate_pass', np.nan))
+                     border_frac=r.get('border_frac', 0.0))
     return out
 
 
