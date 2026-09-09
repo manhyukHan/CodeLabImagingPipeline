@@ -33,6 +33,7 @@ import numpy as np                                          # noqa: E402
 from codelab_pipeline.training import dataset as D           # noqa: E402
 from codelab_pipeline.training import features as F          # noqa: E402
 from codelab_pipeline.localization import psf_bank as PB     # noqa: E402
+from codelab_pipeline.training import model_store as MS  # noqa: E402
 from codelab_pipeline.localization import psf as PSF         # noqa: E402
 
 DEFAULT_VOXEL = (0.208, 0.208, 0.2)
@@ -80,7 +81,25 @@ def analytic_reference(mean, voxel_um, storage_path=None):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('bundle_dir')
-    ap.add_argument('--out', required=True)
+    ap.add_argument('--reviewer', default=None,
+                    help='WHO LABELLED THIS. It names the run -- '
+                         '<reviewer>_<YYYYMMDD-HHMMSS> under <repo>/models '
+                         '-- because a model is calibrated to a person: '
+                         "both Platt fits are against one reviewer's "
+                         'keep/drop, so p is P(THIS reviewer keeps it), not '
+                         'a reviewer-free truth. Two people labelling one '
+                         'bundle make two legitimately different models and '
+                         'a listing that does not say whose is unusable.')
+    ap.add_argument('--out', default=None,
+                    help='where the run is written. Defaults to '
+                         '<repo>/models/<reviewer>_<timestamp>, so a model '
+                         'travels with the code the way the psf library '
+                         'does. A bare name lands under <repo>/models; an '
+                         'absolute path is used as given. Re-training never '
+                         'overwrites -- delete a folder to remove a run.')
+    ap.add_argument('--set-default', action='store_true',
+                    help='pin this run as the one v3 uses when nobody names '
+                         'a model (writes <repo>/models/DEFAULT)')
     ap.add_argument('--heads', default='linear,mlp')
     ap.add_argument('--psf-components', type=int, default=0,
                     help='0 stores only the mean template, which is usually '
@@ -92,6 +111,17 @@ def main(argv=None):
     ap.add_argument('--min-groups', type=int, default=40,
                     help='below this many labelled CELLS the run is treated '
                          'as plumbing, not as a result')
+    ap.add_argument('--template-r', type=int, default=PB.DEFAULT_R,
+                    help='SEARCH template half-width in y and x. The bank is '
+                         'stored at the classifier box size and cut to this '
+                         'for matching (psf_bank.centre_crop). It was a '
+                         'module constant with no way to vary it, which left '
+                         'the open question of 5x5x9 against 7x7x11 '
+                         'unmeasurable. The multispot calibration records '
+                         'the size it was fitted at and refuses another, so '
+                         'a run at a different size gets its own.')
+    ap.add_argument('--template-rz', type=int, default=PB.DEFAULT_RZ,
+                    help='SEARCH template half-depth. See --template-r.')
     ap.add_argument('--storage-path', default=None,
                     help='to compare the measured PSF against the analytic '
                          'calibration in that store')
@@ -121,10 +151,21 @@ def main(argv=None):
     X = F.many(cores, cols, kept)
     y = np.array([r['label'] for r in kept])
     groups = [tuple(r['group']) for r in kept]
+    if not a.out:
+        if not a.reviewer:
+            ap.error('--reviewer is required (or pass --out). A model is '
+                     'calibrated to whoever labelled it, so a run without '
+                     'a name for that person cannot be told apart from '
+                     "anyone else's.")
+        a.out = os.path.join(MS.models_dir(), MS.run_name(a.reviewer))
+    elif not os.path.isabs(a.out) and os.sep not in a.out and '/' not in a.out:
+        a.out = os.path.join(MS.models_dir(), a.out)
     os.makedirs(a.out, exist_ok=True)
+    print(f'writing the run to {a.out}')
 
     report = {'bundle': a.bundle_dir, 'labels': s, 'provisional': provisional,
-              'n_boxes': len(kept), 'heads': {}, 'voxel_um': list(voxel)}
+              'n_boxes': len(kept), 'heads': {}, 'voxel_um': list(voxel),
+              'template_r': a.template_r, 'template_rz': a.template_rz}
 
     from codelab_pipeline.training import classify as C
     print('\nclassifier (split by cell):')
@@ -179,23 +220,24 @@ def main(argv=None):
         # the template is the same kind of artefact as the classifier.
         # Absent multispot verdicts this simply does not write, and the
         # matcher falls back to its sigma threshold.
-        cal, calrep = C.fit_multispot(a.bundle_dir, template=mean.shape
-                                      if False else (2 * PB.DEFAULT_R + 1,
-                                                     2 * PB.DEFAULT_R + 1,
-                                                     2 * PB.DEFAULT_RZ + 1))
+        tpl_shape = (2 * a.template_r + 1, 2 * a.template_r + 1,
+                     2 * a.template_rz + 1)
+        cal, calrep = C.fit_multispot(a.bundle_dir, template=tpl_shape)
         report['multispot'] = calrep
         if cal is None:
-            print(f"
-multispot calibration: {calrep.get('skipped')}")
+            print(f"\nmultispot calibration: {calrep.get('skipped')}")
         else:
             cp = cal.save(os.path.join(a.out, C.MULTISPOT_NAME))
-            print(f"
-multispot calibration from {calrep['n']} judged "
+            print(f"\nmultispot calibration from {calrep['n']} judged "
                   f"matches over {calrep['pillars']} pillars:")
             print(f"   raw PR-AUC {calrep['raw_pr_auc']:.3f}  ->  at p 0.5: "
                   f"precision {calrep['precision_at_half']:.3f}, "
                   f"recall {calrep['recall_at_half']:.3f}")
             print(f'   -> {os.path.basename(cp)}')
+        warn = PB.cosine_warning(ref, n_spots=len(pos))
+        if warn:
+            print('\n   WARNING: ' + warn)
+            report.setdefault('warnings', []).append(warn)
         d = PB.drift(pos, mean)
         print(f'   template {mean.shape}, components {comps.shape[0]}'
               + (f', explained {np.round(var * 100, 1).tolist()}%'
@@ -211,9 +253,19 @@ multispot calibration from {calrep['n']} judged "
                          'drift_median': float(np.median(d)),
                          'analytic_ref': ref}
 
+    # THE MANIFEST IS WRITTEN LAST, over finished artefacts, so it can
+    # never describe a run that did not complete. It binds the three
+    # learned files to each other -- each already refuses the one
+    # mismatch it can see for itself, and none of them can see that they
+    # came from different runs.
     rp = os.path.join(a.out, 'report.json')
     with open(rp, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=1)
+    man = MS.write_manifest(a.out, extra={'bundle': a.bundle_dir,
+                                          'reviewer': a.reviewer})
+    if a.set_default:
+        print(f'   pinned as the default model: {MS.set_default(a.out)}')
+    print(f"   manifest {man['model_id']} over {len(man['files'])} files")
     print(f'\nreport  {rp}')
     return 0
 

@@ -1,0 +1,14 @@
+{
+ "name": "Manhyuk_20260908-185900",
+ "created": "2026-09-09T18:17:02",
+ "files": {
+  "psf_bank.h5": "ef312dc7cecb109e0f560936b03ed947d0d8f353c52e9eee8a7369efb0ce1795",
+  "psf_multispot.json": "0923b7078cc479dd6be23b3dcbabb082c82b3e02130f35b82b48b76015a33460",
+  "report.json": "c063918f1337bab88e490dfb7de40dd046da95a7bdf13a1bebcb201e566d7c94",
+  "spot_classifier_linear.json": "0f0f5d8278b1a88f0de76f9ec04f0ad49bbfa5254cc68329de9c7e70adf7de7f",
+  "spot_classifier_mlp.json": "04cd050263300d41a5d85b8643eb52de6595e7ca4f776a120d8a877b98f29710"
+ },
+ "bundle": "D:/bundles/MP58_RNA_all_4fov",
+ "reviewer": "Manhyuk",
+ "model_id": "69f6194b8b15"
+}

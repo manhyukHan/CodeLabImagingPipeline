@@ -421,6 +421,70 @@ DEFAULT_SIGMA_XY_PX = 0.66
 DEFAULT_SIGMA_Z_PLANES = 2.35
 
 
+# HOW CLOSE THE MEASURED TEMPLATE MUST SIT TO THE CALIBRATED OPTICS.
+#
+# A LOW COSINE IS USUALLY A SHORTAGE OF LABELS, NOT A BROKEN MICROSCOPE,
+# and that is what makes it a useful thing to warn on: the template is a
+# MEAN, so with few spots it is mostly the noise of whichever few were
+# confirmed. MEASURED by titrating the MP58/RNA confirmed set, 20 random
+# draws at each size, against the store's own gaussian_halo calibration:
+#
+#     N spots    cosine     sd        range over 20 draws
+#         5      0.736    0.053      [0.582, 0.813]
+#        10      0.791    0.037      [0.721, 0.857]
+#        20      0.858    0.020      [0.813, 0.899]
+#        40      0.897    0.010      [0.875, 0.911]
+#        80      0.913    0.005      [0.901, 0.924]
+#       160      0.923    0.004      [0.914, 0.928]
+#       640      0.930    0.002      [0.927, 0.935]
+#      1157      0.931
+#
+# It climbs monotonically and PLATEAUS AT 0.931, not at 1.0 -- that
+# residual is real optics-versus-model difference and no amount of
+# labelling closes it, so the bound has to sit below it.
+#
+# 0.90 falls between N=40 and N=80, and at 80 not one of 20 draws came in
+# under it. So "below 0.90" reads as: fewer than about eighty confirmed
+# spots went into this template -- go and verify more -- or, if there are
+# plenty, the calibrated PSF does not describe this data and that is the
+# more interesting problem.
+PSF_COSINE_MIN = 0.90
+
+
+def cosine_warning(analytic_ref, n_spots=None, floor=PSF_COSINE_MIN):
+    """A sentence when the template does not match the optics, else None.
+
+    Says WHICH of the two causes to look at, because the answer is
+    different work: more review, or a re-calibration.
+    """
+    ref = analytic_ref or {}
+    c = ref.get('cosine_to_measured')
+    if c is None:
+        return ('no analytic PSF to compare against -- train_spotmodel was '
+                'run without --storage-path, so nothing checked this '
+                'template against the calibrated optics, and '
+                'resolution_bound falls back to its default anisotropy '
+                "rather than this experiment's.")
+    if float(c) >= float(floor):
+        return None
+    n = int(n_spots) if n_spots else None
+    if n is not None and n < 80:
+        why = (f'{n} confirmed spots went into it, and MEASURED on MP58/RNA '
+               f'a template needs about 80 before this settles (at 40 the '
+               f'cosine is 0.897 +- 0.010, at 80 it is 0.913 +- 0.005). '
+               f'VERIFY MORE SPOTS -- this is very likely a label shortage '
+               f'rather than a microscope problem.')
+    else:
+        why = (f'{n} confirmed spots went into it, which is enough for this '
+               f'to have settled, so the calibrated PSF may not describe '
+               f'this data. Check the store calibration and the voxel size.'
+               if n is not None else
+               'check both the number of confirmed spots and the store '
+               'calibration.')
+    return (f'PSF template cosine to the calibrated optics is {float(c):.3f}, '
+            f'below {float(floor):.2f}. {why}')
+
+
 def resolution_bound(meta=None, lateral_px=MERGE_LATERAL_PX):
     """(lateral px, axial planes) below which two matches are one.
 

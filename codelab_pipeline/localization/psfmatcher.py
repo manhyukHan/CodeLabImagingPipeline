@@ -168,6 +168,22 @@ class PsfMatcherV3Engine(LocalizeEngine):
         self.bank_path = bank
         self._k_sigma = k_sigma
         self._min_distance = int(min_distance)
+        # THE SIZE THE RUN WAS TRAINED AT, unless a caller overrides it.
+        # report.json records template_r/template_rz, so a model trained
+        # at another size is SEARCHED at that size without anyone
+        # remembering to pass a flag -- and the multispot calibration's
+        # own check then agrees instead of refusing.
+        if (r is None or rz is None) and model_dir:
+            import json as _json
+            import os as _os
+            try:
+                with open(_os.path.join(str(model_dir), 'report.json'),
+                          encoding='utf-8') as _f:
+                    _rep = _json.load(_f)
+                r = _rep.get('template_r') if r is None else r
+                rz = _rep.get('template_rz') if rz is None else rz
+            except (OSError, ValueError):
+                pass
         self._r, self._rz, self._voxel_um = r, rz, voxel_um
         self._clf = classifier
         self._why = None
