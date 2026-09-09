@@ -468,6 +468,46 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
           'readout_engine' in src and 'fiducial_engine' not in src)
 
 
+def test_a_learned_spot_is_recognisable_without_a_new_field():
+    print('\nfrom_learned_engine: two existing fields are the signature')
+    from codelab_pipeline.models.spot import (ASpot, from_learned_engine,
+                                              Z_ACCEPTED, Z_REJECTED,
+                                              Z_NOT_FIT)
+
+    def mk(p, z):
+        a = ASpot()
+        a.p_exist, a.z_status = p, z
+        return a
+
+    nan = float('nan')
+    # p_exist is finite ONLY for the learned engine -- every other one
+    # leaves it NaN by contract -- and only that engine arrives already
+    # 3D-fitted. Together they identify it with no column added to a
+    # store that has millions of rows.
+    check('a learned spot is recognised',
+          from_learned_engine(mk(0.93, Z_ACCEPTED)))
+    check('even one the gate would cut -- this is provenance, not quality',
+          from_learned_engine(mk(0.02, Z_ACCEPTED)))
+    check('a v1/v2 refit result is not',
+          not from_learned_engine(mk(nan, Z_ACCEPTED)))
+    check('nor a rejected fit', not from_learned_engine(mk(nan, Z_REJECTED)))
+    check('nor an unexamined spot',
+          not from_learned_engine(mk(nan, Z_NOT_FIT)))
+    check('a dict from the store works the same',
+          from_learned_engine({'p_exist': 0.9, 'z_status': 'accepted'}))
+    check('junk in the field reads as not-learned, never as a crash',
+          not from_learned_engine({'p_exist': 'yes',
+                                   'z_status': 'accepted'}))
+    check('and None is not a spot', not from_learned_engine(None))
+    # THE ONE THING THIS INFERENCE CANNOT DO, stated rather than hidden:
+    # once a v1/v2 re-fit REJECTS a learned spot its z_status is no longer
+    # 'accepted', so a second re-fit will not warn. That is defensible --
+    # the position is already the Gaussian's by then -- but it is an
+    # inference from two fields and not a recorded fact.
+    check('a learned spot whose refit was rejected no longer reads as '
+          'learned', not from_learned_engine(mk(0.93, Z_REJECTED)))
+
+
 def main():
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     for t in (test_p_exist_is_its_own_field,
@@ -476,7 +516,8 @@ def main():
               test_view_cell_gives_every_cell_its_own_background,
               test_nothing_is_dropped_on_p_exist,
               test_load_best_takes_the_report_s_winner,
-              test_the_readout_writes_a_list_and_the_gate_cuts_it):
+              test_the_readout_writes_a_list_and_the_gate_cuts_it,
+              test_a_learned_spot_is_recognisable_without_a_new_field):
         t()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     for f in FAIL:

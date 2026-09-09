@@ -50,7 +50,9 @@ from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import (ASpot, z_status_of as spot_z_status_of,
                                           Z_ACCEPTED as SPOT_Z_ACCEPTED,
                                           Z_REJECTED as SPOT_Z_REJECTED,
-                                          Z_NOT_FIT as SPOT_Z_NOT_FIT)
+                                          Z_NOT_FIT as SPOT_Z_NOT_FIT,
+                                          from_learned_engine as
+                                          spot_from_learned_engine)
 from codelab_pipeline.models.spot_container import DiffUndo, SpotContainer
 from codelab_pipeline.models.allele import AnAllele
 from codelab_pipeline.models.allele_container import AlleleContainer
@@ -6390,6 +6392,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if resolved is None:
             return
         storage_path, fov, hybe, modality, channel, targets = resolved
+        if not self._warn_before_refitting_learned(targets):
+            return
         params = self.localize_3d_displayer.params()
         params['voxel_um'] = self._voxel_um()   # the v2 engine fits in um
 
@@ -6474,6 +6478,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self._localize3d_worker.finished_ok.connect(_done)
         self._localize3d_worker.failed.connect(_fail)
         self._localize3d_worker.start()
+
+    def _warn_before_refitting_learned(self, targets):
+        """Say so before a v1/v2 fit overwrites a learned spot's position.
+
+        NOT A BLOCK. Re-fitting a learned spot with the Gaussian engine is
+        a legitimate thing to do -- comparing the two is exactly how one
+        would check the other -- and the path stays open. What must not
+        happen is doing it by accident and then wondering why the
+        coordinates moved.
+
+        The spots are recognised WITHOUT a new field: a finite p_exist
+        with z_status 'accepted' is the learned engine's signature, since
+        every other engine leaves p_exist NaN by contract and none of them
+        arrives already 3D-fitted. See models/spot.from_learned_engine.
+
+        What a re-fit actually changes is worth naming: the coordinate
+        moves to the Gaussian's answer, z_status is re-decided by that
+        fit's gates, and p_exist is left alone -- so a spot can come back
+        z-REJECTED while still carrying the probability that said it was
+        real, which is two engines disagreeing rather than a
+        contradiction.
+        """
+        learned = [s for s in (targets or []) if spot_from_learned_engine(s)]
+        if not learned:
+            return True
+        n = len(learned)
+        msg = (
+            str(n) + ' of ' + str(len(targets)) + ' selected spot(s) came '
+            'from the LEARNED engine.' + chr(10) + chr(10) +
+            'They already carry a 3D position it fitted, and this runs '
+            'the v1/v2 Gaussian over them again:' + chr(10) +
+            '  - the coordinate moves to the Gaussian answer' + chr(10) +
+            '  - z_status is re-decided by that fit and its gates' + chr(10) +
+            '  - p_exist is left as it is' + chr(10) + chr(10) +
+            'That is a fine way to compare the two. Continue?')
+        ans = QtWidgets.QMessageBox.question(
+            self, '3D Spot Viewer -- re-fit learned spots?', msg,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if ans != QtWidgets.QMessageBox.Yes:
+            self.log(f'3D re-fit cancelled -- {n} learned spot(s) left as '
+                     f'they were.')
+            return False
+        self.log('3D re-fit over ' + str(n) + ' learned spot(s): their '
+                 'coordinates and z_status become the Gaussian fit, '
+                 'p_exist unchanged.')
+        return True
 
     def _view_3d_localize(self):
         """

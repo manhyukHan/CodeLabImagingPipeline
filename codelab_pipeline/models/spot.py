@@ -18,6 +18,42 @@ def z_status_of(spot):
     return v if v in Z_STATUSES else Z_NOT_FIT
 
 
+def from_learned_engine(spot):
+    """Whether a learned engine produced this spot, and no extra field.
+
+    A spot carries no engine name, and adding one would be a column on
+    every row to answer a question two existing fields already settle:
+
+        p_exist is FINITE   only the learned engine reports a calibrated
+                            existence probability; v1, v2 and psf-match
+                            leave it NaN by contract (see
+                            localization/engine.py's LocalizedSpot).
+        z_status ACCEPTED   the learned engine localizes in 3D itself, so
+                            its spots arrive with a fitted Z rather than
+                            waiting for a refinement step.
+
+    Together those are the signature. It is a READ-ONLY inference, used to
+    warn -- a v1/v2 re-fit of a learned spot is a legitimate thing to do
+    and this never blocks it, it just makes sure nobody does it by
+    accident and then wonders why the coordinates moved.
+
+    Tolerant of a dict as well as an ASpot: these cross a store boundary.
+    """
+    if spot is None:
+        return False
+    if isinstance(spot, dict):
+        p = spot.get('p_exist')
+        z = spot.get('z_status')
+    else:
+        p = getattr(spot, 'p_exist', None)
+        z = getattr(spot, 'z_status', None)
+    try:
+        p = float('nan') if p is None else float(p)
+    except (TypeError, ValueError):
+        return False
+    return bool(p == p) and str(z or '') == Z_ACCEPTED
+
+
 class ASpot():
     """
     a spot class
