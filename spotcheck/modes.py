@@ -218,10 +218,10 @@ class Multispot:
         'S skip the WHOLE page, recording nothing   Q quit\n'
         'DEFAULT IS DROP — press a number only for a match that is a REAL, '
         'SEPARATE emitter. The pillar is 15 × 15 × the whole stack, centred '
-        'on a spot everybody already confirmed,\n'
-        'so at least one of these is real. Brightness is σ above the crop '
-        'background and the bar reads the same on every card, so two cards '
-        'that look alike can still be an order of magnitude apart.')
+        'on a spot everybody already confirmed, so at least one is real.\n'
+        'BRIGHTNESS is the MIP at the left — one scale, all the rings on '
+        'it. SHAPE is the ZX cards, each on its own scale so a faint one '
+        'is still readable.')
 
     def __init__(self, bank=None, bundle_dir=None, threshold=None,
                  k_sigma=REVIEW_K_SIGMA):

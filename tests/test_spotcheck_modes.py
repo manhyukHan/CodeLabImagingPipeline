@@ -299,23 +299,91 @@ def test_pillar_pads_rather_than_skips():
           far.shape == (15, 15, 8) and pad2 == 1.0, f'pad {pad2}')
 
 
-def test_scale_comes_from_the_axial_slice():
-    print('\nscale_of: taken from the ZX cut, where background sets it')
-    p = np.zeros((15, 15, 100))
-    p += np.random.default_rng(0).normal(0, 0.2, p.shape)
-    p += 30 * gauss((15, 15, 100), centre=(7, 7, 50))
-    lo, hi = MV.scale_of(p)
-    zx = p[p.shape[0] // 2, :, :]
-    lat = p[:, :, 50]
-    check('the range is the centre ZX slice percentiles',
-          np.isclose(lo, np.nanpercentile(zx.T, 1.0))
-          and np.isclose(hi, np.nanpercentile(zx.T, 99.7)))
-    lo2, hi2 = (np.nanpercentile(lat, 1.0), np.nanpercentile(lat, 99.7))
-    check('which is a TIGHTER floor than the lateral plane would give',
-          lo <= hi and hi < hi2, f'ZX {lo:.2f}..{hi:.2f} vs '
-                                 f'lateral {lo2:.2f}..{hi2:.2f}')
-    flat = MV.scale_of(np.full((5, 5, 5), np.nan))
-    check('an all-NaN pillar does not raise', flat == (0.0, 1.0), str(flat))
+def test_the_mip_scale_separates_the_matches():
+    print('\nmip_scale: 56% of the rings used to sit on identical white')
+    rng = np.random.default_rng(0)
+    p = rng.normal(0, 0.2, (15, 15, 100))
+    p += 40 * gauss((15, 15, 100), centre=(7, 4, 30))     # bright match
+    p += 6 * gauss((15, 15, 100), centre=(7, 11, 60))     # faint match
+    mip = p.max(axis=2)
+    vals = [float(mip[7, 4]), float(mip[7, 11])]
+    lo, hi = MV.mip_scale(mip, vals)
+    frac = [(v - lo) / (hi - lo) for v in vals]
+    check('the brightest match does NOT saturate', max(frac) < 1.0,
+          f'{max(frac):.2f} of the ramp')
+    check('and the faint one is still well off the floor', min(frac) > 0.05,
+          f'{min(frac):.2f} of the ramp')
+    check('so the two are plainly different greys',
+          max(frac) - min(frac) > 0.3,
+          f'{min(frac):.2f} vs {max(frac):.2f}')
+    # A ceiling from a slice percentile is what put them both on white.
+    zx = p[7, :, :].T
+    zhi = float(np.nanpercentile(zx, 99.7))
+    zlo = float(np.nanpercentile(zx, 1.0))
+    old = [(v - zlo) / (zhi - zlo) for v in vals]
+    check('the old centre-ZX ceiling clipped at least one of them',
+          max(old) >= 1.0, f'{[round(o, 2) for o in old]}')
+    check('with no matches at all it falls back to a percentile',
+          MV.mip_scale(mip)[1] <= float(np.nanmax(mip)) + 1e-9)
+    check('an all-NaN MIP does not raise',
+          MV.mip_scale(np.full((4, 4), np.nan)) == (0.0, 1.0))
+    flat = MV.mip_scale(np.zeros((4, 4)), [0.0])
+    check('a flat MIP gets a usable range, never an inverted one',
+          flat[1] > flat[0], str(flat))
+
+
+def test_each_card_is_on_its_own_scale():
+    print('\ncard_scale: the shared scale hid 38% of the cards')
+    # A bright match and a faint one in the same pillar -- which is the
+    # ordinary case, not a corner one: MEASURED over 487 cards, the seed
+    # peaks at 8.3 sigma and a rank-4 match at 3.2, and 38% of all cards
+    # never reached the shared ceiling at all.
+    p = np.zeros((15, 15, 90))
+    p += np.random.default_rng(4).normal(0, 1.0, p.shape)
+    p += 40 * gauss((15, 15, 90), centre=(7, 4, 30))     # bright
+    p += 4 * gauss((15, 15, 90), centre=(7, 11, 60))     # faint
+    fig = Figure(figsize=(15, 5.6), dpi=100)
+    hits = [(7.0, 4.0, 30.0, 0.9), (7.0, 11.0, 60.0, 0.5)]
+    art = MV.draw_pillar(fig, p, hits)
+
+    shared = art['scale']
+    bright, faint = art['cards'][0], art['cards'][1]
+    mip = p.max(axis=2)
+    check('the MIP keeps the one shared scale',
+          shared == MV.mip_scale(mip, [float(mip[7, 4]), float(mip[7, 11])]),
+          str(tuple(round(v, 2) for v in shared)))
+    check('but the two cards do NOT share a scale',
+          bright['scale'] != faint['scale'],
+          f"{tuple(round(v,1) for v in bright['scale'])} vs "
+          f"{tuple(round(v,1) for v in faint['scale'])}")
+    check('the faint card gets a ceiling it can actually reach',
+          faint['scale'][1] < bright['scale'][1]
+          and faint['peak'] >= faint['scale'][1],
+          f"hi {faint['scale'][1]:.1f}, peak {faint['peak']:.1f}")
+    # THE POINT OF IT. On the shared scale the faint card's brightest
+    # voxel lands in the lower part of the ramp and its shape is grey on
+    # grey; on its own it uses the full ramp.
+    used_shared = (faint['peak'] - shared[0]) / (shared[1] - shared[0])
+    check('on the shared scale it would not have reached white',
+          used_shared < 1.0, f'{100 * used_shared:.0f}% of the ramp')
+    # BRIGHTNESS IS NOT PRINTED HERE, and must not be. It is the MIP's
+    # job, and a card that has to be READ rather than looked at costs a
+    # reviewer seconds on every one of 1,159 pillars.
+    t = faint['title'].get_text()
+    check('the card prints no brightness number',
+          'peak' not in t and 'σ' not in t, t.replace('\n', ' | '))
+    check('but the peak is still there for a caller',
+          bright['peak'] > faint['peak'],
+          f"{bright['peak']:.1f} vs {faint['peak']:.1f}")
+    check('the bar names itself as the MIP\'s, not the cards\'',
+          'MIP' in art['cax'].get_ylabel(), art['cax'].get_ylabel())
+    check('each card still names the y it was cut at',
+          all('own y' in art['cards'][i]['title'].get_text() for i in (0, 1)))
+
+    # An all-NaN window must not raise or produce an inverted range.
+    lo, hi, pk = MV.card_scale(np.full((5, 5), np.nan))
+    check('an empty window does not raise', (lo, hi, pk) == (0.0, 1.0, 0.0),
+          str((lo, hi, pk)))
 
 
 def test_every_match_is_marked_and_the_bar_is_there():
@@ -604,7 +672,8 @@ def main():
               test_the_two_reviews_never_share_a_file,
               test_done_tracking_survives_a_renumbering,
               test_pillar_pads_rather_than_skips,
-              test_scale_comes_from_the_axial_slice,
+              test_the_mip_scale_separates_the_matches,
+              test_each_card_is_on_its_own_scale,
               test_every_match_is_marked_and_the_bar_is_there,
               test_restyle_moves_no_pixels,
               test_positions_are_crop_local_and_come_from_the_pillar,
