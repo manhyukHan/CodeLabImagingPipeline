@@ -7868,6 +7868,14 @@ class MainWindow(QtWidgets.QMainWindow):
         min_distance = sp.MinDistanceSpinBox.value()
         pad = sp.PadSpinBox.value()
         try:
+            # ONE BUTTON, TWO ENGINES. The anchor path takes a threshold
+            # and a min distance; the learned one takes a model. Routing
+            # on the mode rather than offering two buttons means a person
+            # cannot press the one their mode is not on.
+            if sp.selected_engine_is_learned():
+                self._run_v3_auto_detect(sp, storage_path, fov, hybe,
+                                         modality, channel, pad)
+                return
             self._run_spot_auto_detect_body(sp, storage_path, fov, hybe, modality, channel, min_distance, pad)
         except ValueError as e:
             # threshold_abs()'s own parse errors -- bad text in the
@@ -7881,6 +7889,143 @@ class MainWindow(QtWidgets.QMainWindow):
             # would look identical to "nothing happened" -- exactly what
             # was reported ("still didn't appear"). Surface it for real.
             QtWidgets.QMessageBox.critical(self, 'Run Auto-Detect error', f'{type(e).__name__}: {e}')
+
+    def _v3_engine(self):
+        """The learned engine for the model the panel names, or None.
+
+        Built fresh per run rather than cached: the model combo can move
+        between runs, and an engine holding last run's weights while the
+        combo says otherwise is the kind of disagreement nobody would
+        think to check.
+        """
+        from codelab_pipeline.localization.engine import make_engine
+        sp = self.ui.SpotLocalizationPanel
+        model_dir = sp.selected_model_dir()
+        if not model_dir:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Automatic Spot Localization',
+                'No model selected.\n\nThere are no trained runs under '
+                '<repo>/models yet, or none is picked. "Make new model..." '
+                'builds a review bundle, opens Spot Check on it, and trains '
+                'one from your own verdicts.')
+            return None
+        from codelab_pipeline.training import model_store as MS
+        problems = MS.verify(model_dir)
+        if problems:
+            # A MANIFEST MISMATCH IS SHOWN, NOT ENFORCED. A hand-made
+            # folder is legitimate and simply carries no guarantee; what
+            # would be wrong is running one silently.
+            self.log('model ' + os.path.basename(model_dir) + ': '
+                     + '; '.join(problems))
+        try:
+            return make_engine('v3-psfmatcher', model_dir=model_dir)
+        except Exception as exc:                            # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self, 'Run Automatic Spot Localization',
+                f'{os.path.basename(model_dir)} could not be loaded:\n\n'
+                f'{type(exc).__name__}: {exc}')
+            return None
+
+    def _run_v3_auto_detect(self, sp, storage_path, fov, hybe, modality,
+                            channel, pad):
+        """Localize with the learned engine. One call, pixels to spots.
+
+        NOTHING IS GATED HERE. The engine returns every candidate with its
+        p, and the p-gate is a separate, posterior press -- so the
+        histogram a person picks a threshold from is the histogram of
+        exactly what a self-filtering run would have thrown away before
+        they could look at it.
+
+        CELL VIEW HANDS THE ENGINE THE MASK, not a masked stack. Its
+        regions() takes the background from the cell's OWN pixels while
+        _boxes cuts from the unmasked array, which is the same split
+        cell_crop already makes for the Gaussian fit and for the same
+        reason: a spot on the boundary has its wings across the mask, and
+        masking them pulls the fitted centre inward (MEASURED 0.197 px,
+        tests/test_fit_sees_past_the_mask.py).
+        """
+        import numpy as _np
+        engine = self._v3_engine()
+        if engine is None:
+            return
+        append = sp.AppendModeCheckBox.isChecked()
+
+        if sp.current_view() != 'cell':
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Automatic Spot Localization',
+                'The learned engine needs a Z-STACK, and FOV view reads the '
+                'MIP.\n\nPick a cell (Cell view) and run it there. A '
+                'FOV-wide run would also take one background for cells that '
+                'differ in stain uptake and focus, which is the thing this '
+                "engine's cell view exists to avoid.")
+            return
+        cell = self._selected_spot_cell()
+        if cell is None:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Automatic Spot Localization',
+                'Select a cell first (Cell view).')
+            return
+        fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
+        crop = localization.cell_crop(
+            cell, hybe, channel, storage_path, fov, pad, modality=modality,
+            fov_matrices=fov_matrices,
+            resolver=self._frame_resolver(cell, fov))
+        if crop is None:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Automatic Spot Localization',
+                f'Cell {cell.id}: no crop for {hybe}.')
+            return
+        stack = crop.get('stacks_unmasked')
+        if stack is None or _np.asarray(stack).size == 0:
+            self.log(f'{hybe} ch{channel}: no Z-stack for this crop.')
+            return
+        # 1 inside the cell, 0 outside -- cell_crop's masked copy is NaN
+        # beyond the mask, so this recovers the mask without re-reading it.
+        labels = _np.isfinite(_np.asarray(crop['img'], float)).astype(int)
+
+        spots = engine.localize(_np.asarray(stack, float), labels=labels,
+                                n_max=None)
+        rxmin, rymin = crop['rxmin'], crop['rymin']
+        H = self._matrix_to_shared(hybe, modality, cell, fov)
+        Hz = crop.get('Hz') or 0.0
+        new_spots = []
+        for s in spots:
+            raw_y, raw_x = float(s.y) + rymin, float(s.x) + rxmin
+            if H is not None:
+                cy, cx, _ = H @ _np.array([raw_y, raw_x, 1.0])
+            else:
+                cy, cx = raw_y, raw_x
+            spot = ASpot()
+            spot.modality = modality or analysis_store.modality_of(storage_path)
+            spot.set_metadata(
+                fov=fov, hybe=hybe, channel=channel, cell=cell.id,
+                adj_coordinate=(float(cy), float(cx), float(s.z) + float(Hz)),
+                raw_coordinate=(raw_y, raw_x, float(s.z)),
+                size=0.0,
+                brightness=(float(s.amplitude)
+                            if _np.isfinite(s.amplitude) else 0.0),
+                # THE ENGINE LOCALIZES IN 3D, so its spots arrive with a Z
+                # that was fitted -- 'accepted', not 'not_fit'. A learned
+                # spot has no separate 3D-refinement step to wait for, and
+                # leaving it 'not_fit' would make the 3D viewer report an
+                # unasked question about an answer already given.
+                z_status=SPOT_Z_ACCEPTED,
+                p_exist=float(s.p_exist))
+            new_spots.append(spot)
+
+        fp = self._begin_spot_edit(cell.fov)
+        self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
+        self._commit_spot_edit(cell.fov, fp)
+        pe = _np.asarray([s.p_exist for s in spots], float)
+        n_conf = int((pe >= 0.5).sum()) if pe.size else 0
+        self.log(f'Cell {cell.id}, {hybe} ch{channel}: '
+                 f'{len(new_spots)} spot(s) from '
+                 f'{os.path.basename(sp.selected_model_dir() or "?")}'
+                 f'{", appended" if append else ""}. '
+                 f'{n_conf} at p >= 0.5 -- NOTHING is gated yet; '
+                 f'"Gate Spots..." is where you cut.')
+        self._load_spot_crop_for_display()
+        self._refresh_spot_cell_list()
 
     def _run_spot_auto_detect_body(self, sp, storage_path, fov, hybe, modality, channel, min_distance, pad):
         append = sp.AppendModeCheckBox.isChecked()
