@@ -103,8 +103,16 @@ def rows(bundle_dir, include_contested=True, include_added=True):
                     channel=int(irow['channel']), cell=int(irow['cell']),
                     group=(int(irow['fov']), int(irow['cell'])),
                     store=e.get('store'))
+        # UNDETERMINED IS NOT A NEGATIVE. It is a spot every reviewer who
+        # saw it ABSTAINED on (Shift+N in the app), and it rides here on
+        # label -1 with contested for the same reason: -1 is what every
+        # caller already filters out of training, so a bucket that must
+        # never be trained on cannot be forgotten into the set by a
+        # caller that has not heard of it. `origin` says which it is --
+        # people disagreeing and people declining to answer are different
+        # facts, and only the first is a ceiling on accuracy.
         for bucket, label in (('positive', 1), ('negative', 0),
-                              ('contested', -1)):
+                              ('contested', -1), ('undetermined', -1)):
             if label == -1 and not include_contested:
                 continue
             for (y, x, z) in e.get(bucket) or []:
@@ -214,10 +222,12 @@ def summary(label_rows):
     n = len(label_rows)
     pos = sum(1 for r in label_rows if r['label'] == 1)
     neg = sum(1 for r in label_rows if r['label'] == 0)
-    con = sum(1 for r in label_rows if r['label'] == -1)
+    con = sum(1 for r in label_rows if r.get('origin') == 'contested')
+    und = sum(1 for r in label_rows if r.get('origin') == 'undetermined')
     add = sum(1 for r in label_rows if r.get('origin') == 'added')
     return dict(
-        n=n, positive=pos, negative=neg, contested=con, added=add,
+        n=n, positive=pos, negative=neg, contested=con, undetermined=und,
+        added=add,
         groups=len({tuple(r['group']) for r in label_rows}),
         crops=len({r['key'] for r in label_rows}),
         hybes=sorted({r['hybe'] for r in label_rows}),

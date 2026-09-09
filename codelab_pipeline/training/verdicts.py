@@ -195,13 +195,20 @@ class VerdictLog:
         found = self._latest.get((key, int(page)))
         if found is None:
             return None
+        # == 1, NOT truthiness. An abstention is keep == -1, which is
+        # perfectly truthy, so `if e.get('keep')` would bring a card the
+        # reviewer explicitly refused to judge back onto the screen as an
+        # ACCEPTED one -- and one more Space would then file their
+        # abstention as a confirmed yes.
         return {'accepted': [int(e['i']) for e in (found.get('shown') or [])
-                             if e.get('keep')],
+                             if int(e.get('keep', 0)) == 1],
+                'unsure': [int(e['i']) for e in (found.get('shown') or [])
+                           if int(e.get('keep', 0)) < 0],
                 'added': [(float(a['y']), float(a['x']))
                           for a in (found.get('added') or [])]}
 
     def commit(self, row, page, page_ix, cands, accepted, added=(),
-               seconds=None, bundle=None, store=None):
+               unsure=(), seconds=None, bundle=None, store=None):
         """Record one judged page.
 
         row       the bundle index row for this crop (key, fov, hybe,
@@ -211,12 +218,35 @@ class VerdictLog:
                   stored by COORDINATE rather than by position
         accepted  the indices the reviewer kept
         added     [(y, x), ...] crop-local, spots no candidate covered
+        unsure    the indices the reviewer ABSTAINED on -- keep = -1
 
         Everything needed to re-cut the pixels and to identify each label
         goes into the line. Nothing refers to the bundle except as
         provenance.
+
+        KEEP HAS THREE VALUES, NOT TWO. 1 kept, 0 shown-and-not-kept, -1
+        abstained. The default is drop, which is what keeps 100k
+        judgements from being 100k clicks -- but it also means a reviewer
+        who is sure about three cards and unsure about the fourth had
+        only two moves, and both threw information away: Space filed the
+        unsure one as a CONFIDENT negative, and S discarded the three
+        they were sure about along with it.
+
+        MEASURED on the 2,068 labels of MP58/RNA: 41% of pages are mixed,
+        so per-card discrimination is what reviewers actually do, and 25%
+        of all negatives sit inside the p band where kept and dropped
+        spots overlap ([0.382, 0.614], holding 227 negatives against 376
+        positives). Some unknown share of those 227 are this exact
+        mistake, and negatives are the half that teaches a detector what
+        to reject.
+
+        An abstention is NOT a third class to train on and not a weak
+        negative. labels() drops it from `seen` entirely, so it counts as
+        "this person did not judge this spot" -- the honest reading, and
+        the one that lets a second reviewer's yes stand on its own.
         """
         keep = set(int(i) for i in accepted)
+        skip = set(int(i) for i in unsure) - keep
         shown = []
         for i in page_ix:
             i = int(i)
@@ -227,7 +257,7 @@ class VerdictLog:
                           'y': round(float(y), 3), 'x': round(float(x), 3),
                           'z': round(float(z), 3), 'p': round(float(p), 4),
                           'fit_ok': int(fit_ok), 'gate': int(gate),
-                          'keep': 1 if i in keep else 0})
+                          'keep': 1 if i in keep else -1 if i in skip else 0})
         rec = {'key': str(row['key']),
                'fov': int(row['fov']), 'hybe': str(row['hybe']),
                'channel': int(row['channel']), 'cell': int(row['cell']),
@@ -450,10 +480,20 @@ def labels(bundle_dir):
 
     {key: {'crop': {...}, 'fov':, 'hybe':, 'channel':, 'cell':, 'store':,
            'positive': [(y,x,z), ...], 'negative': [...],
-           'contested': [...], 'added': [(y,x), ...],
+           'contested': [...], 'undetermined': [...],
+           'added': [(y,x), ...],
            'added_votes': {(y,x): (added_by, reviewers)},
            'reviewers': n, 'votes': {(y,x,z): (kept, seen)}}}
     all crop-local; full_frame() converts.
+
+    FOUR BUCKETS, AND THE LAST TWO ARE NOT THE SAME THING. `contested` is
+    a spot people DISAGREED about -- some kept it, some did not.
+    `undetermined` is a spot everyone who saw it ABSTAINED on (Shift+N in
+    the app): nobody said yes and nobody said no. The first is the honest
+    ceiling on any model's accuracy; the second is a spot that was never
+    judged at all, and treating it as a negative -- which is what the
+    default-is-drop rule did before abstention existed -- puts a
+    confident label on the examples a person could not call.
 
     TALLIED PER SPOT, not per record. Two reviewers judging one page is
     the point of overlapping assignments -- it is how agreement gets
@@ -486,9 +526,25 @@ def labels(bundle_dir):
         c = coord.setdefault(key, {})
         for e in rec.get('shown') or []:
             sk = _spot_key(e['y'], e['x'], e['z'])
-            kept, seen = t.get(sk, (0, 0))
-            t[sk] = (kept + (1 if e.get('keep') else 0), seen + 1)
             c[sk] = (float(e['y']), float(e['x']), float(e['z']))
+            v = int(e.get('keep', 0))
+            kept, seen = t.get(sk, (0, 0))
+            if v < 0:
+                # AN ABSTENTION IS NOT A VOTE. It does not move `kept`
+                # and it does not move `seen`, so a spot one person
+                # skipped and another kept is a clean 1-of-1 positive
+                # rather than a contested 1-of-2. The entry is still
+                # created, so a spot EVERY reviewer abstained on is
+                # seen == 0 and lands in `undetermined` instead of
+                # vanishing -- an unlabelled spot nobody could judge is
+                # a fact worth keeping, and it is the set to look at
+                # again.
+                #
+                # `if e.get('keep')` would have counted it as a keep:
+                # -1 is truthy.
+                t[sk] = (kept, seen)
+            else:
+                t[sk] = (kept + (1 if v else 0), seen + 1)
         # ADDED SPOTS ARE VOTED ON TOO. They used to be concatenated
         # straight from every record, so one missed emitter that three
         # reviewers all marked entered the training set three times --
@@ -516,20 +572,24 @@ def labels(bundle_dir):
         e = dict(meta.get(key) or {})
         clusters = _cluster_added(add_who.get(key, []))
         nrev = len(who.get(key, ()))
-        e.update(positive=[], negative=[], contested=[],
+        e.update(positive=[], negative=[], contested=[], undetermined=[],
                  added=sorted(c for c, _w in clusters),
                  added_votes={c: (len(w), nrev) for c, w in clusters},
                  reviewers=nrev, votes={})
         for sk, (kept, seen) in t.items():
             xyz = coord[key][sk]
             e['votes'][xyz] = (kept, seen)
-            if kept == seen:
+            if seen == 0:
+                # Everyone who saw it abstained. Not a negative: nobody
+                # said no. Not contested either: nobody disagreed.
+                e['undetermined'].append(xyz)
+            elif kept == seen:
                 e['positive'].append(xyz)
             elif kept == 0:
                 e['negative'].append(xyz)
             else:
                 e['contested'].append(xyz)
-        for b in ('positive', 'negative', 'contested'):
+        for b in ('positive', 'negative', 'contested', 'undetermined'):
             e[b].sort()
         out[key] = e
     return out
@@ -593,10 +653,13 @@ def multispot_labels(bundle_dir):
         c = coord.setdefault((key, sk), {})
         for e in rec.get('shown') or []:
             hk = _spot_key(e['y'], e['x'], e['z'])
-            kept, seen = t.get(hk, (0, 0))
-            t[hk] = (kept + (1 if e.get('keep') else 0), seen + 1)
             c[hk] = (float(e['y']), float(e['x']), float(e['z']),
                      float(e.get('p', 0.0)))
+            # keep == -1 is an ABSTENTION and is truthy; see labels().
+            v = int(e.get('keep', 0))
+            kept, seen = t.get(hk, (0, 0))
+            t[hk] = (kept, seen) if v < 0 else (kept + (1 if v else 0),
+                                                seen + 1)
         a = adds.setdefault((key, sk), [])
         for e in rec.get('added') or []:
             a.append((float(e['y']), float(e['x']), rec.get('reviewer')))
@@ -604,11 +667,13 @@ def multispot_labels(bundle_dir):
     for (key, sk), t in tally.items():
         pillar = out[key].setdefault('pillars', {}).setdefault(
             sk, {'seed': seeds[(key, sk)], 'positive': [], 'negative': [],
-                 'contested': [], 'added': [], 'reviewers': 0})
+                 'contested': [], 'undetermined': [], 'added': [],
+                 'reviewers': 0})
         pillar['reviewers'] = max((seen for _k, (_kept, seen) in t.items()),
                                   default=0)
         for hk, (kept, seen) in sorted(t.items()):
-            bucket = ('positive' if kept == seen else
+            bucket = ('undetermined' if seen == 0 else
+                      'positive' if kept == seen else
                       'negative' if kept == 0 else 'contested')
             pillar[bucket].append(coord[(key, sk)][hk])
         pts = adds.get((key, sk), [])

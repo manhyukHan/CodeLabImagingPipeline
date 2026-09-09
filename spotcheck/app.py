@@ -22,6 +22,11 @@ labelled result rather than an absence.
 
 KEYS
   1 2 3 4     toggle that card (keep / drop). Default is drop.
+  Shift+1..4  mark that card UNSURE -- not kept, and NOT a negative.
+              Everything else on the page still commits normally, so a
+              reviewer sure about three cards and stuck on the fourth no
+              longer has to choose between filing a guess and throwing
+              the other three away. See verdicts.commit.
   Space       commit the page and go to the next
   Backspace   previous page (its verdict can be re-committed; the later
               line wins and both survive)
@@ -79,6 +84,16 @@ from spotcheck import modes as MODES                       # noqa: E402
 # a new spot. A real emitter is ~1.3 px wide and the drawn circle has
 # radius 3.8, so anything inside the circle a person was aiming at snaps.
 ADD_SNAP_PX = 4.0
+
+# WHAT Shift+1 ACTUALLY ARRIVES AS. Qt reports the character a
+# keystroke produces, not the unshifted key, so on a US or Korean
+# layout Shift+1 is Key_Exclam and a check for `Key_1 with
+# ShiftModifier` never fires -- the abstain key would simply do
+# nothing, silently, on the machines this runs on. Reading the text
+# covers those; _digit_slot still falls back to the key code for the
+# layouts that do report a digit.
+SHIFTED_DIGITS = {'!': 1, '@': 2, '#': 3, '$': 4, '%': 5,
+                  '^': 6, '&': 7, '*': 8, '(': 9}
 
 # How many candidates per cell a reviewer is asked to judge, by default.
 #
@@ -484,7 +499,8 @@ class SpotCheck(QtWidgets.QMainWindow):
         if s is None:
             return
         self._draft[(str(s['row']['key']), int(s['page']))] = (
-            set(s['accepted']), list(s['added']))
+            set(s['accepted']), list(s['added']),
+            set(s.get('unsure') or ()))
 
     def _load(self):
         item = self.queue.current()
@@ -508,8 +524,10 @@ class SpotCheck(QtWidgets.QMainWindow):
         draft = self._draft.get((str(s['row']['key']), int(s['page'])))
         prior_acc = s.pop('prior_accepted', None) or set()
         prior_add = s.pop('prior_added', None) or []
+        prior_uns = s.pop('prior_unsure', None) or set()
         s['accepted'] = set(draft[0]) if draft else set(prior_acc)
         s['added'] = list(draft[1]) if draft else list(prior_add)
+        s['unsure'] = set(draft[2]) if draft else set(prior_uns)
         self._state = s
         self._adding = False
         self._outside = False
@@ -545,7 +563,8 @@ class SpotCheck(QtWidgets.QMainWindow):
         s = dict(self._state)
         s['snapped'] = self._snapped
         if restyle_only and self._art is not None:
-            self.mode.restyle(self._art, s['accepted'])
+            self.mode.restyle(self._art, s['accepted'],
+                              s.get('unsure') or ())
             if not self._blit():
                 self.canvas.draw_idle()
         else:
@@ -608,6 +627,12 @@ class SpotCheck(QtWidgets.QMainWindow):
 
     def _set_status(self, s):
         kept = ', '.join(f'#{i + 1}' for i in sorted(s['accepted'])) or 'none'
+        # NAMED, NOT COUNTED. An abstention is the one state a
+        # reviewer sets and then cannot see from the picture alone --
+        # grey against the engine's own blue on a grayscale card --
+        # so the status line spells out which cards carry it.
+        unsure = ', '.join(f'#{i + 1}'
+                           for i in sorted(s.get('unsure') or ()))
         if self._art is not None:
             self.header.setText(
                 self._art['header_text']
@@ -627,7 +652,8 @@ class SpotCheck(QtWidgets.QMainWindow):
                if self._offpage else '')
             + f'queue {self.queue.i + 1}/{len(self.queue)}   '
             f'|  keeping: {kept}   '
-            f'|  added: {len(s["added"])}   '
+            + (f'|  UNSURE: {unsure}   ' if s.get('unsure') else '')
+            + f'|  added: {len(s["added"])}   '
             + ('|  CLICK THE CELL TO ADD A SPOT (Esc cancels)'
                if self._adding else ''))
 
@@ -754,6 +780,30 @@ class SpotCheck(QtWidgets.QMainWindow):
         """Which page of this crop judges candidate `i` (1-based)."""
         return self.mode.page_of(self._state, i, self.per_page)
 
+    @staticmethod
+    def _is_shifted(e):
+        return bool(e.modifiers() & QtCore.Qt.ShiftModifier) or \
+            (e.text() in SHIFTED_DIGITS)
+
+    @staticmethod
+    def _digit_slot(e):
+        """Which card a keystroke names, 0-based, or None.
+
+        Reads the CHARACTER first and the key code second, because
+        Shift+1 arrives as Key_Exclam on the layouts this runs on -- see
+        SHIFTED_DIGITS. A key code check alone would leave the abstain
+        key doing nothing at all, with no error and no clue.
+        """
+        t = e.text()
+        if t in SHIFTED_DIGITS:
+            return SHIFTED_DIGITS[t] - 1
+        if len(t) == 1 and '1' <= t <= '9':
+            return int(t) - 1
+        k = e.key()
+        if QtCore.Qt.Key_1 <= k <= QtCore.Qt.Key_9:
+            return k - QtCore.Qt.Key_1
+        return None
+
     def keyPressEvent(self, e):
         s = self._state
         k = e.key()
@@ -792,11 +842,20 @@ class SpotCheck(QtWidgets.QMainWindow):
             self.queue.advance(-1); self._load(); return
         if s is None:
             return
-        if QtCore.Qt.Key_1 <= k <= QtCore.Qt.Key_9:
-            slot = k - QtCore.Qt.Key_1
+        slot = self._digit_slot(e)
+        if slot is not None:
             if slot < len(s['ix']):
                 i = s['ix'][slot]
-                s['accepted'].symmetric_difference_update({i})
+                if self._is_shifted(e):
+                    # ABSTAIN. The card is neither kept nor filed as a
+                    # confident negative -- see verdicts.commit for what
+                    # keep == -1 means and why the alternative was to
+                    # throw away the rest of the page with S.
+                    s['unsure'].symmetric_difference_update({i})
+                    s['accepted'].discard(i)
+                else:
+                    s['accepted'].symmetric_difference_update({i})
+                    s['unsure'].discard(i)
                 # AND DROP THE SNAP BANNER. "clicked ON candidate #3 --
                 # kept it" was rebuilt from _snapped on every restyle, so
                 # pressing 3 to drop that very candidate left one status

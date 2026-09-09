@@ -39,6 +39,8 @@ CMAP = 'gray'
 MARK_C = '#00c0ff'          # a match psf-match proposes
 CHOSEN_C = '#00e676'        # one the reviewer has kept
 SEED_C = '#ffd400'          # the candidate the pillar was centred on
+UNSURE_C = '#9e9e9e'        # one the reviewer declined to judge
+UNSURE_LS = (0, (3, 2))
 ZHALF = 16                  # planes either side of a match in its close-up
 # Radius on the YX MIP, IN IMAGE PIXELS. The pillar is 15 px across and
 # can hold seven candidates; a ring sized to be a comfortable click
@@ -82,7 +84,7 @@ def scale_of(pillar, lo_pct=1.0, hi_pct=99.7):
 
 
 def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
-                zhalf=ZHALF, pad_frac=0.0, added=()):
+                zhalf=ZHALF, pad_frac=0.0, added=(), unsure=()):
     """Render one pillar and all its candidates. Returns an `art` dict.
 
     `hits` are (y, x, z, p) in PILLAR coordinates -- psf-match searches
@@ -103,6 +105,7 @@ def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
     lo, hi = scale_of(p)
     hits = list(hits)
     accepted = set(accepted)
+    unsure = set(unsure) - accepted
     ncol = max(1, len(hits))
 
     # THE MIP KEEPS ITS SIZE whatever the candidate count. Scaling it
@@ -125,8 +128,9 @@ def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
         axm.plot(seed_yx[1], seed_yx[0], '+', color=SEED_C, ms=13, mew=1.8,
                  zorder=4)
     for i, (hy, hx, hz, hp) in enumerate(hits):
-        col = CHOSEN_C if i in accepted else MARK_C
-        c = Circle((hx, hy), MARK_R, fill=False, ec=col, lw=1.6, zorder=6)
+        col = _colour(i, accepted, unsure)
+        c = Circle((hx, hy), MARK_R, fill=False, ec=col, lw=1.6, zorder=6,
+                   ls=UNSURE_LS if i in unsure else 'solid')
         axm.add_patch(c)
         # A white stroke under the number: on a grayscale stack a bare
         # glyph disappears into whatever it lands on.
@@ -165,31 +169,48 @@ def draw_pillar(fig, pillar, hits, header='', accepted=(), seed_yx=None,
         ax = fig.add_subplot(grid[0, i])
         ax.imshow(p[iy, :, z0:z1].T, cmap=CMAP, vmin=lo, vmax=hi,
                   aspect='auto', interpolation='nearest')
-        m, = ax.plot(hx, hz - z0, 'o', mfc='none', ms=13, mew=1.9,
-                     mec=CHOSEN_C if i in accepted else MARK_C)
+        col = _colour(i, accepted, unsure)
+        m, = ax.plot(hx, hz - z0, 'o', mfc='none', ms=13, mew=1.9, mec=col)
         ax.set_xticks([]); ax.set_yticks([])
-        col = CHOSEN_C if i in accepted else MARK_C
         for sp in ax.spines.values():
             sp.set_color(col); sp.set_linewidth(1.4)
-        ttl = ax.set_title(f'{i + 1}   z={hz:.1f}   p={hp:.2f}\n'
-                           f'ZX at its own y={hy:.1f}',
+            sp.set_linestyle(UNSURE_LS if i in unsure else 'solid')
+        ttl = ax.set_title(f'{i + 1}   z={hz:.1f}   p={hp:.2f}'
+                           + ('   ? UNSURE' if i in unsure else '')
+                           + f'\nZX at its own y={hy:.1f}',
                            fontsize=8.5, pad=4, color=col)
         art['cards'][i].update(ax=ax, marker=m, title=ttl, z0=z0)
     return art
 
 
-def restyle(art, accepted):
+def _colour(i, accepted, unsure):
+    return (CHOSEN_C if i in accepted else
+            UNSURE_C if i in unsure else MARK_C)
+
+
+def restyle(art, accepted, unsure=()):
     """Recolour for a changed set of keeps. No pixel is redrawn."""
     accepted = set(accepted)
+    unsure = set(unsure) - accepted
     for i, card in art['cards'].items():
-        col = CHOSEN_C if i in accepted else MARK_C
+        col = _colour(i, accepted, unsure)
+        ls = UNSURE_LS if i in unsure else 'solid'
         card['mark'].set_edgecolor(col)
+        card['mark'].set_linestyle(ls)
         card['num'].set_color(col)
         if 'marker' in card:
             card['marker'].set_markeredgecolor(col)
             card['title'].set_color(col)
+            # THE WORD, NOT ONLY THE COLOUR. Grey against cyan is a fine
+            # distinction on a grayscale page, and a reviewer who has
+            # just pressed Shift+3 needs to see that it landed.
+            head, _, tail = card['title'].get_text().partition('\n')
+            head = head.split('   ? UNSURE')[0]
+            card['title'].set_text(
+                head + ('   ? UNSURE' if i in unsure else '')
+                + ('\n' + tail if tail else ''))
             for sp in card['ax'].spines.values():
-                sp.set_color(col)
+                sp.set_color(col); sp.set_linestyle(ls)
     return art['fig']
 
 

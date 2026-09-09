@@ -56,6 +56,13 @@ CMAP = 'gray'
 # to hunt for it, while cyan is a hue the data never has.
 PASS_C, REJ_C, NOFIT_C = '#ffd400', '#00c0ff', '#ff3b30'
 CHOSEN_C = '#00e676'      # what the REVIEWER accepted, over the engine's colour
+# WHAT THE REVIEWER DECLINED TO JUDGE. It has to be distinct from all
+# FOUR of the states already on screen -- green kept, and yellow/blue/red
+# for the engine's own provenance, which is what an unkept card still
+# shows. Grey is the one hue not in use, and the dashes carry the meaning
+# without a legend: an unfinished edge, not a verdict.
+UNSURE_C = '#9e9e9e'
+UNSURE_LS = (0, (3, 2))
 PER_PAGE = 4
 
 # Draw order on the cell overview. Candidates are drawn in index order and
@@ -147,6 +154,7 @@ def _frame(ax):
 
 
 def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
+              unsure=(),
               added=(), page=0, npage=1, per_page=PER_PAGE, n_total=None):
     """Render one page into `fig` (which is cleared first).
 
@@ -165,6 +173,7 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
                 if finite.size else (0.0, 1.0))
     page_ix = list(page_ix)
     accepted = set(accepted)
+    unsure = set(unsure) - accepted
     ncol = max(1, per_page)
 
     # THE ARTISTS A TOGGLE TOUCHES, captured as they are made.
@@ -191,7 +200,8 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
     for i, c in enumerate(cands):
         y, x = float(c[0]), float(c[1])
         here = i in page_ix
-        col = CHOSEN_C if i in accepted else candidate_colour(c)
+        col = (CHOSEN_C if i in accepted else
+               UNSURE_C if i in unsure else candidate_colour(c))
         # ONE MEANING PER CHANNEL.
         #   colour     what the engine said -- yellow gate-pass, blue
         #              fitted-but-rejected, red anchored-with-no-fit,
@@ -298,7 +308,9 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
         yx, (dy, dx) = _window2d(st, iy, ix, iz, HALF, vlo)
         zxi, (dz, _dx2) = _windowzx(st, iy, ix, iz, HALF, ZHALF, vlo)
         chosen = i in accepted
-        col = CHOSEN_C if chosen else candidate_colour(c)
+        skipped = i in unsure
+        col = (CHOSEN_C if chosen else
+               UNSURE_C if skipped else candidate_colour(c))
         iz_shown = int(np.clip(iz, 0, st.shape[2] - 1))
 
         card = grid[0, slot].subgridspec(2, 1, height_ratios=[1.0, 0.34],
@@ -306,14 +318,15 @@ def draw_page(fig, stack, mask, cands, page_ix, header='', accepted=(),
         ax1 = fig.add_subplot(card[0])
         ax1.imshow(yx, cmap=CMAP, vmin=vlo, vmax=vhi, interpolation='nearest')
         ccirc = Circle((x - dx, y - dy), 2.9, fill=False, ec=col,
-                       lw=2.2 if chosen else 1.3)
+                       lw=2.2 if chosen else 1.3,
+                       ls=UNSURE_LS if skipped else 'solid')
         ax1.add_patch(ccirc)
         # The title names the plane that was DRAWN. It used to name the
         # candidate's own rounded z even when that plane does not exist --
         # "YX @ z=-4" over a picture of plane 0 -- which is the one number
         # on the card a reviewer would quote.
         ctitle = ax1.set_title(f'[{slot + 1}]  #{i + 1}  YX @ z={iz_shown}'
-                               + ('   ✓ KEEP' if chosen else ''),
+                               + _card_tag(chosen, skipped),
                                fontsize=6.6, pad=1.8, color=col, weight='bold')
         _frame(ax1)
 
@@ -380,7 +393,14 @@ def mutable_artists(art):
     return out
 
 
-def restyle(art, accepted):
+def _card_tag(chosen, skipped):
+    """The word after a card's title, which is the only place a state is
+    SPELLED OUT rather than coloured. A reviewer who cannot tell the
+    greys apart still reads this."""
+    return '   ✓ KEEP' if chosen else '   ? UNSURE' if skipped else ''
+
+
+def restyle(art, accepted, unsure=()):
     """Update only what a keep-toggle changes: colours, widths, the tick.
     Returns the figure, already re-styled.
 
@@ -404,20 +424,25 @@ def restyle(art, accepted):
     draw_page -- it is rare, and a click is already a slow gesture.
     """
     accepted = set(accepted)
+    unsure = set(unsure) - accepted
     for i, (circ, num) in art['overview'].items():
         here = i in art['page_ix']
-        col = CHOSEN_C if i in accepted else candidate_colour(art['cands'][i])
+        col = (CHOSEN_C if i in accepted else
+               UNSURE_C if i in unsure else candidate_colour(art['cands'][i]))
         circ.set_edgecolor(col)
         num.set_color(col)
     for i, (ccirc, ctitle, cmark, ctext, slot, iz) in art['cards'].items():
         chosen = i in accepted
-        col = CHOSEN_C if chosen else candidate_colour(art['cands'][i])
+        skipped = i in unsure
+        col = (CHOSEN_C if chosen else
+               UNSURE_C if skipped else candidate_colour(art['cands'][i]))
         ccirc.set_edgecolor(col)
         ccirc.set_linewidth(2.2 if chosen else 1.3)
+        ccirc.set_linestyle(UNSURE_LS if skipped else 'solid')
         cmark.set_markeredgecolor(col)
         cmark.set_markeredgewidth(2.2 if chosen else 1.3)
         ctitle.set_color(col)
         ctitle.set_text(f'[{slot + 1}]  #{i + 1}  YX @ z={iz}'
-                        + ('   ✓ KEEP' if chosen else ''))
+                        + _card_tag(chosen, skipped))
         ctext.set_color(col)
     return art['fig']

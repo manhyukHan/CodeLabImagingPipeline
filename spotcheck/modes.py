@@ -106,9 +106,11 @@ class PassFail:
     name = 'passfail'
     label = 'Pass / fail — is each candidate a real spot?'
     log_kind = V.DEFAULT_KIND
-    help_text = ('1-4 keep/drop   Space commit+next   Backspace back   '
+    help_text = ('1-4 keep/drop   Shift+1-4 UNSURE (not judged — neither a '
+                 'keep nor a negative)   Space commit+next   '
+                 'Backspace back\n'
                  'A add missed (then click the cell)   U undo add   '
-                 'S skip unlabelled   Q quit          '
+                 'S skip the WHOLE page, recording nothing   Q quit      '
                  'DEFAULT IS DROP — press a number only for a real spot\n'
                  + VIEW.PANEL_LEGEND)
 
@@ -159,6 +161,8 @@ class PassFail:
                     npage=len(VIEW.pages_of(shown_n, per_page)),
                     store=meta.get('storage_path'), n_total=n_total,
                     prior_accepted=set(prior['accepted']) if prior else set(),
+                    prior_unsure=set(prior.get('unsure') or ())
+                    if prior else set(),
                     prior_added=list(prior['added']) if prior else [],
                     revisited=bool(prior))
 
@@ -168,6 +172,7 @@ class PassFail:
                   f"ch{int(row['channel'])}   cell {int(row['cell'])}")
         return VIEW.draw_page(fig, s['stack'], s['mask'], s['cands'], s['ix'],
                               header=header, accepted=s['accepted'],
+                              unsure=s.get('unsure') or (),
                               added=s['added'], page=s['page'],
                               npage=s['npage'], per_page=per_page,
                               n_total=s['n_total'])
@@ -183,7 +188,8 @@ class PassFail:
 
     def commit(self, log, s, seconds):
         return log.commit(s['row'], s['page'], s['ix'], s['cands'],
-                          s['accepted'], added=s['added'], seconds=seconds,
+                          s['accepted'], added=s['added'],
+                          unsure=s.get('unsure') or (), seconds=seconds,
                           bundle=os.path.basename(s['shard']),
                           store=s['store'])
 
@@ -206,9 +212,10 @@ class Multispot:
     # of this was cut off mid-sentence at 1750 px, and it is the line that
     # says what the reviewer is looking at.
     help_text = (
-        '1-9 keep/drop a match   Space commit+next   Backspace back   '
+        '1-9 keep/drop a match   Shift+1-9 UNSURE (not judged — neither a '
+        'keep nor a negative)   Space commit+next   Backspace back\n'
         'A add one psf-match missed (then click the MIP)   U undo add   '
-        'S skip unlabelled   Q quit\n'
+        'S skip the WHOLE page, recording nothing   Q quit\n'
         'DEFAULT IS DROP — press a number only for a match that is a REAL, '
         'SEPARATE emitter. The pillar is 15 × 15 × the whole stack, centred '
         'on a spot everybody already confirmed,\n'
@@ -335,7 +342,7 @@ class Multispot:
                 for h in hits]
         prior = self._priors(log).get(
             (str(row['key']), V.multispot_key(sy, sx, sz)))
-        acc, add = set(), []
+        acc, unsure_ix, add = set(), set(), []
         if prior:
             # Priors are stored CROP-local; the page works in pillar
             # coordinates, so they come back through the same origin.
@@ -343,8 +350,16 @@ class Multispot:
             for e in prior.get('shown') or []:
                 py, px = float(e['y']) - y0, float(e['x']) - x0
                 near = _nearest(rows, py, px)
-                if e.get('keep') and near is not None:
+                if near is None:
+                    continue
+                # == 1 and < 0, never truthiness: an abstention is
+                # keep == -1, which is truthy, and would come back
+                # onto the screen as a keep the reviewer never made.
+                v = int(e.get('keep', 0))
+                if v == 1:
                     acc.add(near)
+                elif v < 0:
+                    unsure_ix.add(near)
             add = [(float(a['y']) - y0, float(a['x']) - x0)
                    for a in prior.get('added') or []]
         meta, _n, _v = B.read_meta(shard)
@@ -354,8 +369,8 @@ class Multispot:
                     seed=seed, origin=origin, pad_frac=float(pad),
                     bg=float(bg), sigma=float(sigma),
                     depth=int(st.shape[2]),
-                    prior_accepted=acc, prior_added=add,
-                    revisited=bool(prior))
+                    prior_accepted=acc, prior_unsure=unsure_ix,
+                    prior_added=add, revisited=bool(prior))
 
     def draw(self, fig, s, per_page):
         row = s['row']
@@ -370,6 +385,7 @@ class Multispot:
         hits = [(c[0], c[1], c[2], c[3]) for c in s['cands']]
         return MVIEW.draw_pillar(fig, s['stack'], hits, header=header,
                                  accepted=s['accepted'],
+                                 unsure=s.get('unsure') or (),
                                  seed_yx=(sy - y0, sx - x0),
                                  pad_frac=s['pad_frac'], added=s['added'])
 
@@ -383,12 +399,13 @@ class Multispot:
         row, y0, x0 = s['row'], s['origin'][0], s['origin'][1]
         sy, sx, sz = s['seed']
         keep = set(int(i) for i in s['accepted'])
+        skip = set(int(i) for i in (s.get('unsure') or ())) - keep
         # STORED CROP-LOCAL, like every other verdict in this repo, so
         # full_frame() and recut() work on these records unchanged and a
         # coordinate means the same thing in both files.
         shown = [{'i': i, 'y': round(c[0] + y0, 3), 'x': round(c[1] + x0, 3),
                   'z': round(c[2], 3), 'p': round(c[3], 4),
-                  'keep': 1 if i in keep else 0}
+                  'keep': 1 if i in keep else -1 if i in skip else 0}
                  for i, c in enumerate(s['cands'])]
         rec = {'key': str(row['key']),
                'fov': int(row['fov']), 'hybe': str(row['hybe']),
