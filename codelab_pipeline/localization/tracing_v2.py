@@ -343,7 +343,7 @@ class V2Params(object):
     def __init__(self, voxel_um=DEFAULT_VOXEL_UM, psf_family=None,
                  psf_shape=None, psf_label='', fiducial_gates=None,
                  readout_gates=None, qc_shift=True,
-                 readout_engine=None, min_p_exist=None):
+                 readout_engine=None, min_p_exist=None, min_p3=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
         # None = no calibrated PSF, so the readout sigma is fitted per spot
         # like the fiducial's. Supported, but it gives up both the accuracy
@@ -378,6 +378,21 @@ class V2Params(object):
         # does: cut before the write, never carried past it.
         self.min_p_exist = (None if min_p_exist is None
                             else float(min_p_exist))
+        # AND THE MATCHER'S OWN GATE, AS A CALIBRATED PROBABILITY. The
+        # engine's shipped Platt pair turns its raw NCC remap into one,
+        # so this is 0.5 by construction rather than 0.732 by
+        # measurement -- and it is applied HERE rather than written back
+        # into the spot, because p and p_exist each mean exactly one
+        # thing and a gate is where a decision belongs.
+        #
+        # THE TWO GATES ARE NOT THE SAME QUESTION and neither replaces
+        # the other. The classifier answers P(a reviewer keeps this |
+        # it is a candidate), from pass/fail labels, per BOX -- so
+        # siblings out of one box share it. The calibrated matcher score
+        # answers P(a reviewer calls this real | it is a match beside a
+        # confirmed spot), from multispot labels, per MATCH -- which is
+        # the only one of the two that can tell siblings apart.
+        self.min_p3 = None if min_p3 is None else float(min_p3)
 
     @property
     def has_psf(self):
@@ -656,6 +671,16 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     # (psfmatcher.is_refined says why: MEASURED, 3 of the 4 such spots in
     # 613 labels were real), and it stays an ASpot with its p_exist. What
     # it does not get is a position it does not have.
+    # The matcher's own gate, on its calibrated score where the model
+    # ships one. No calibration -> no gate here, and the matcher's sigma
+    # threshold is the only cut, which is what it was before this existed.
+    cal = getattr(p.readout_engine, 'multispot_cal', None)
+    if p.min_p3 is not None and cal is not None:
+        before = len(kept)
+        kept = [c for c in kept
+                if np.isfinite(c.p) and float(cal.score(c.p)) >= p.min_p3]
+        if debug is not None:
+            debug[hybe]['readout_n_below_p3'] = before - len(kept)
     n_pre = len(kept)
     kept = [c for c in kept if PSFM.is_refined(c)]
     if debug is not None:
