@@ -292,7 +292,20 @@ def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
                                    modality=modality,
                                    resolver=resolver)
              if c[0] in wanted]
-    path = os.path.join(str(out_dir), f'fov{int(fov):03d}__{hybe}__{tag}.h5')
+    # THE CHANNEL IS PART OF THE NAME, and leaving it out silently
+    # destroyed data. Everything INSIDE a shard already separates
+    # channels -- bundle.crop_key writes 'fov007|Hyb_101|ch635|cell13',
+    # the index carries a 'channel' field, verdicts record it and
+    # dataset.rows() rides it -- so two channels can live in one bundle
+    # directory and every reader already handles them. The one thing
+    # that could not was this filename: a second build into the same
+    # --out produced the SAME name, and BundleWriter's os.replace
+    # overwrote the first channel's shard entirely. Not a mix-up of
+    # pixels -- the earlier channel simply vanished, and the bundle
+    # still looked complete.
+    path = os.path.join(str(out_dir),
+                        f'fov{int(fov):03d}__{hybe}__ch{int(channel)}'
+                        f'__{tag}.h5')
     info = dict(meta or {})
     info.update(fov=int(fov), hybe=str(hybe), channel=int(channel),
                 pad=int(pad),

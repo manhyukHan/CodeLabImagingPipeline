@@ -203,7 +203,7 @@ def main(argv=None):
         return 0
 
     os.makedirs(str(a.out), exist_ok=True)
-    manifest = dict(
+    run = dict(
         storage_path=store, out=str(a.out), channel=int(a.channel),
         hybes=hybes, hybe_datatypes=dts, datatypes=str(a.datatypes),
         fovs=fovs, fov_seed=seed, fov_pool=str(a.fov_pool),
@@ -212,6 +212,28 @@ def main(argv=None):
         engine='anchor-v2', anchor=dict(E.GENEROUS_ANCHOR),
         started=time.strftime('%Y-%m-%dT%H:%M:%S'))
     mpath = os.path.join(str(a.out), 'bundle_manifest.json')
+    # ONE BUNDLE, ONE MANIFEST, ONE ENTRY PER RUN. A bundle may now hold
+    # several channels (each build adds shards named for its own), and a
+    # manifest that was simply rewritten described only the last one --
+    # so a two-channel bundle claimed to be a one-channel bundle, and
+    # the reviewer's own record of what they were reviewing was wrong.
+    # The newest run stays at the top level so every existing reader
+    # keeps working unchanged; `runs` is what makes the file true.
+    manifest = dict(run)
+    prior = []
+    try:
+        with open(mpath, encoding='utf-8') as f:
+            was = json.load(f)
+        prior = list(was.get('runs') or [])
+        if not prior and was.get('channel') is not None:
+            prior = [{k: v for k, v in was.items() if k != 'runs'}]
+    except Exception:                                        # noqa: BLE001
+        prior = []
+    # Same channel built again REPLACES its own entry rather than
+    # stacking duplicates: the shards were just overwritten too.
+    prior = [r for r in prior if int(r.get('channel', -1)) != int(a.channel)]
+    manifest['runs'] = prior + [run]
+    manifest['channels'] = sorted({int(r['channel']) for r in manifest['runs']})
     # Written BEFORE the run, so an interrupted bundle still says what it
     # was trying to be. Completion is stamped on at the end.
     with open(mpath, 'w', encoding='utf-8') as f:

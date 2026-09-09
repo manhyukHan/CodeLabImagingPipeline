@@ -376,74 +376,10 @@ class ProcWorker(QtCore.QThread):
             self.failed.emit(f'{type(e).__name__}: {e}')
 
 
-class StreamingProcWorker(QtCore.QThread):
-    """
-    Run ONE external command and stream its stdout back, line by line.
-
-    The third worker shape here, and the one the other two cannot cover:
-    FnWorker runs a callable in this process, ProcWorker runs picklable
-    jobs in a pool, and neither can host a command-line tool that
-    reports its own progress on stdout. Bundle building is exactly that
-    -- tools/build_bundle.py already prints `[done/total]` lines, and it
-    is a SEPARATE PROGRAM whose whole point is that it does not share
-    this process's h5py lock.
-
-    WHY NOT subprocess.run. This started as a blocking `run()` on the GUI
-    thread with a comment admitting it. On a real six-FOV MP58 bundle
-    that freezes the entire application for the length of the build --
-    every panel, every viewer, the log itself -- for work that has
-    nothing to do with the rest of the app and holds none of its state.
-
-    `-u` is added to the interpreter by the caller: without it Python
-    block-buffers a pipe and the progress lines arrive in 8 KB clumps at
-    the end, which is a progress bar that jumps from 0 to done.
-
-    Cancellation is deliberately NOT offered. The child writes a bundle
-    directory and its own manifest; killing it midway would leave a
-    half-written cache that looks finished. It is cheap to rebuild and
-    harmless to leave running.
-    """
-    line = QtCore.pyqtSignal(str)                # one stdout line
-    progress = QtCore.pyqtSignal(int, int)       # (done, total)
-    finished_ok = QtCore.pyqtSignal(int)         # exit code
-    failed = QtCore.pyqtSignal(str)
-
-    # '  [  12/ 666] fov007 Hyb_101 ...' -- build_bundle's own format
-    _PROGRESS = re.compile(r'^\s*\[\s*(\d+)\s*/\s*(\d+)\s*\]')
-
-    def __init__(self, cmd, cwd=None):
-        super().__init__()
-        self.cmd = list(cmd)
-        self.cwd = cwd
-
-    def run(self):
-        try:
-            proc = subprocess.Popen(
-                self.cmd, cwd=self.cwd, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, bufsize=1,
-                encoding='utf-8', errors='replace')
-        except Exception as e:                              # noqa: BLE001
-            self.failed.emit(f'{type(e).__name__}: {e}')
-            return
-        try:
-            for raw in proc.stdout:
-                text = raw.rstrip()
-                m = self._PROGRESS.match(text)
-                if m:
-                    self.progress.emit(int(m.group(1)), int(m.group(2)))
-                if text:
-                    self.line.emit(text)
-            proc.wait()
-        except Exception as e:                              # noqa: BLE001
-            self.failed.emit(f'{type(e).__name__}: {e}')
-            return
-        finally:
-            try:
-                if proc.stdout is not None:
-                    proc.stdout.close()
-            except Exception:                               # noqa: BLE001
-                pass
-        self.finished_ok.emit(int(proc.returncode or 0))
+# Lives in ui/ so ui/model_build_dialog.py can use the same one;
+# re-exported here because this module is where it was born and
+# where its callers still name it.
+from ui.proc_stream import StreamingProcWorker    # noqa: E402
 
 
 class ClassicalSegmentWorker(QtCore.QThread):
@@ -1370,9 +1306,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
         self._active_ingestions = []     # live IngestionWorkers, any modality -- see _wire_ingestion_ui_guard
         self._ingestion_progress = {}    # {worker: (done, total)} -- the one ProgressBar shows the aggregate
-        # The background bundle build, or None. One at a time: two
-        # would race for the same NAS reads and for one progress bar.
-        self._bundle_worker = None
+        self._model_build_dialog = None   # see _make_new_model
         # {(modality, fov): set(hybe folders)} -- PER-FOV ingestion
         # readiness, the FOV-level view active_hybe_list deliberately is
         # not (that list is modality-level, any-FOV grain). Fed live by
@@ -7186,164 +7120,53 @@ class MainWindow(QtWidgets.QMainWindow):
                  f'"Gate Spots..." is what removes them.')
 
     def _make_new_model(self):
-        """Build a review bundle, open Spot Check on it, then train.
+        """Open the Build model window -- bundle, review, train, result.
 
-        THE THREE STEPS WERE THREE SHELL COMMANDS a person had to be told.
-        Nothing here is new machinery -- tools/build_bundle.py and
-        spotcheck already do the work -- but a model a user can only make
-        by being handed a command line is a model most users will not
-        make, and "train it on your own experiment" was the whole promise.
-
-        The bundle path is handed to Spot Check as its default. The
-        REVIEWER NAME AND THE MODE ARE NOT: the reviewer names their own
-        verdict file, and typing it is what keeps one person's labels from
-        landing in another's on a shared folder.
+        WHAT THIS REPLACED was three QInputDialogs that ended at step two
+        of three: the bundle built while the whole app was frozen, Spot
+        Check was offered, and the training command was printed to the
+        log for a person to type. The window owns every step now and
+        runs each long one in the background; it is cached here so
+        closing it hides it and a running build keeps reporting into it.
         """
-        from PyQt5 import QtWidgets as W
+        from ui.model_build_dialog import ModelBuildDialog
+        dlg = getattr(self, '_model_build_dialog', None)
+        if dlg is None:
+            here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ip = self.ui.IngestionPanel
+            dlg = ModelBuildDialog(
+                self._model_build_sources(),
+                self._parse_fov_list(ip.FovListLineEdit.text()),
+                self._storage_path_for_modality, here, parent=self)
+            dlg.logged.connect(self.log)
+            dlg.model_trained.connect(self._on_model_trained)
+            self._model_build_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _model_build_sources(self):
+        """[(modality, folder, readout_name, channel, is_fiducial)] from
+        the parsed layouts -- the same rows, in the same order and with
+        the same labels, as the Analysis tab's source list."""
+        out = []
+        for modality, records in (self.hybe_records_by_modality or {}).items():
+            for r in records:
+                fid = r.get('fiducial_channel')
+                name = str(r.get('readout_name') or '')
+                for ch in r.get('channels', []):
+                    out.append((modality, r['folder'], name, int(ch),
+                                ch == fid))
+        return out
+
+    def _on_model_trained(self, run_dir):
+        """A run landed under <repo>/models: show it in the combo."""
+        self._refresh_model_list()
         sp = self.ui.SpotLocalizationPanel
-        # THE STORE IS THE SELECTED HYBE'S OWN, not a window-wide one.
-        # This window HAS no storage_path attribute: each modality carries
-        # its own, and this panel's hybe combo can name a hybe from any of
-        # them. Asking the modality is the only way to reach the store a
-        # bundle would actually be cut from -- reading self.storage_path
-        # here silently answered None and made this button always refuse.
-        modality = sp.current_hybe_modality()
-        storage_path = self._storage_path_for_modality(modality)
-        if not storage_path:
-            self.log('Pick a hybe whose modality has a storage path first '
-                     '-- a bundle is cut from one store.')
-            return
-        channel_text = sp.ChannelComboBox.currentText().strip()
-        if not channel_text:
-            self.log('Pick a channel first: a bundle is one channel wide.')
-            return
-        store_name = os.path.basename(
-            os.path.normpath(str(storage_path))) or 'store'
-        default_out = os.path.join(
-            os.path.dirname(os.path.abspath(storage_path)),
-            'review_bundles', store_name + '_ch' + channel_text)
-        out, ok = W.QInputDialog.getText(
-            self, 'Make new model -- 1 of 3: build a review bundle',
-            'A bundle is a read-only copy of cell crops for reviewing.\n'
-            'It is a CACHE: verdicts carry their own coordinates, so the\n'
-            'bundle can be deleted once its labels are collected.\n\n'
-            'Where to build it:', text=default_out)
-        if not ok or not str(out).strip():
-            return
-        out = str(out).strip()
-        n_fov, ok = W.QInputDialog.getInt(
-            self, 'Make new model -- 1 of 3',
-            'How many FOVs to draw (at random, seeded)?\n\n'
-            'Fewer FOVs and more hybes is the better trade: a model needs\n'
-            'the experiment\'s RANGE, and cells within one FOV share a\n'
-            'background, a segmentation and a focus position.',
-            4, 1, 1000)
-        if not ok:
-            return
-        self.log(f'Building a review bundle into {out} ...')
-        self._start_bundle_build(storage_path, out, int(channel_text),
-                                 n_fov)
-
-    def _start_bundle_build(self, storage_path, out, channel, n_fovs):
-        """Build a bundle in the BACKGROUND, on this panel's progress bar.
-
-        Nothing here touches the session: the child reads the store and
-        writes a new directory, and the app keeps its own store, cells,
-        spots and viewers untouched for the whole build. So the only
-        thing the GUI has to do is show how far along it is.
-        """
-        import sys as _sys
-        if getattr(self, '_bundle_worker', None) is not None:
-            self.log('A bundle build is already running -- one at a time, '
-                     'so the two do not fight over the same NAS reads.')
-            return
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # -u: unbuffered, or the child's progress lines sit in an 8 KB
-        # pipe buffer and the bar jumps straight from empty to done.
-        cmd = [_sys.executable, '-u',
-               os.path.join(here, 'tools', 'build_bundle.py'),
-               str(storage_path), '--out', out,
-               '--channel', str(int(channel)),
-               '--n-fovs', str(int(n_fovs))]
-        self.log('  ' + ' '.join(cmd))
-        sp = self.ui.SpotLocalizationPanel
-        sp.ProgressBar.setMaximum(0)         # busy until the first count
-        sp.ProgressBar.setValue(0)
-        sp.MakeModelPushButton.setEnabled(False)
-
-        w = StreamingProcWorker(cmd, cwd=here)
-        self._bundle_worker = w
-        w.line.connect(lambda t: self.log('  ' + t))
-        w.progress.connect(self._on_bundle_progress)
-        w.finished_ok.connect(
-            lambda code: self._on_bundle_done(code, storage_path, out))
-        w.failed.connect(lambda why: self._on_bundle_done(-1, storage_path,
-                                                          out, why))
-        w.start()
-        self.log('Building in the background -- the app stays usable. '
-                 'Progress is on the Spot Localization bar.')
-
-    def _on_bundle_progress(self, done, total):
-        sp = self.ui.SpotLocalizationPanel
-        sp.ProgressBar.setMaximum(max(int(total), 1))
-        sp.ProgressBar.setValue(int(done))
-
-    def _on_bundle_done(self, code, storage_path, out, why=''):
-        sp = self.ui.SpotLocalizationPanel
-        sp.MakeModelPushButton.setEnabled(True)
-        sp.ProgressBar.setMaximum(1)
-        sp.ProgressBar.setValue(0)
-        w = getattr(self, '_bundle_worker', None)
-        self._bundle_worker = None
-        if w is not None:
-            w.deleteLater()
-        if why:
-            self.log('  bundle build failed to start: ' + why)
-            return
-        if int(code) != 0:
-            self.log(f'  bundle build failed (exit {code}). The lines above '
-                     f'are the build\'s own output.')
-            return
-        self.log(f'  bundle ready: {out}')
-        self._offer_spotcheck(storage_path, out)
-
-    def _offer_spotcheck(self, storage_path, bundle_dir):
-        """Open Spot Check on a bundle, with the path filled in."""
-        from PyQt5 import QtWidgets as W
-        import subprocess
-        import sys as _sys
-        if W.QMessageBox.question(
-                self, 'Make new model -- 2 of 3: review it',
-                f'The bundle is built:\n{bundle_dir}\n\n'
-                'Spot Check opens on it. You type your OWN name and pick '
-                'the review:\n'
-                '  pass/fail   is each candidate a real spot\n'
-                '  multispot   how many are in the pillar around a '
-                'confirmed one\n\n'
-                'Your name goes on your verdict file, so several people '
-                'can share\none bundle folder, and on the model you train '
-                'from it.\n\nOpen Spot Check now?',
-                W.QMessageBox.Yes | W.QMessageBox.No) != W.QMessageBox.Yes:
-            self.log(f'  review it later with:  python -m spotcheck.app '
-                     f'"{bundle_dir}"')
-            return
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # The bundle path is the default; the reviewer name and the mode
-        # are deliberately NOT passed, so the startup dialog asks for both.
-        cmd = [_sys.executable, '-m', 'spotcheck.app', str(bundle_dir)]
-        try:
-            subprocess.Popen(cmd, cwd=here)
-        except Exception as exc:                            # noqa: BLE001
-            self.log(f'  could not launch Spot Check: '
-                     f'{type(exc).__name__}: {exc}')
-            return
-        self.log('  Spot Check opened. When you have reviewed enough, train '
-                 'with:')
-        self.log(f'    python tools/train_spotmodel.py "{bundle_dir}" '
-                 f'--reviewer <your name> --storage-path '
-                 f'"{storage_path}"')
-        self.log('  then press "Make new model..." again -- the model list '
-                 'refreshes from <repo>/models.')
+        if hasattr(sp, 'populate_models'):
+            from codelab_pipeline.training import model_store as MS
+            sp.populate_models(MS.available(), select=run_dir)
+        self.log('model list refreshed: ' + os.path.basename(str(run_dir)))
 
     def _spot_crop_for_gate(self, fov, hybe, modality, channel, pad=None):
         """A crop_of(spot) the p-gate dialog can draw examples with.

@@ -130,30 +130,31 @@ def test_the_gui_wiring():
     print('the GUI side')
     import inspect
     from windows.main_window import MainWindow as MW
+    from ui import model_build_dialog as MB
 
-    src = inspect.getsource(MW._start_bundle_build)
-    check('the blocking subprocess.run is gone',
-          'subprocess.run' not in src)
-    check('it uses the streaming worker', 'StreamingProcWorker' in src)
-    check("the child interpreter is unbuffered ('-u')", "'-u'" in src)
-    check('it drives the Spot Localization progress bar',
-          'SpotLocalizationPanel' in src and 'ProgressBar' in src)
-    check('a second build is refused while one runs',
-          '_bundle_worker' in src and 'already running' in src)
-    check('the button is disabled for the duration',
-          'MakeModelPushButton.setEnabled(False)' in src)
+    src = inspect.getsource(MW._make_new_model)
+    check('the blocking subprocess.run is gone from the main window',
+          'subprocess.run' not in inspect.getsource(MW))
+    check('Build model... opens the dialog and caches it',
+          'ModelBuildDialog' in src and '_model_build_dialog' in src)
+    check('the dialog logs into the main log and refreshes the model list',
+          'dlg.logged.connect(self.log)' in src
+          and 'model_trained.connect' in src)
 
-    done = inspect.getsource(MW._on_bundle_done)
-    check('the button comes back on every exit path',
-          'MakeModelPushButton.setEnabled(True)' in done)
-    check('spot check is offered only on success',
-          done.index('if int(code) != 0') < done.index('_offer_spotcheck'))
-    check('the worker slot is cleared so another build can start',
-          '_bundle_worker = None' in done)
-
-    prog = inspect.getsource(MW._on_bundle_progress)
-    check('progress sets both the maximum and the value',
-          'setMaximum' in prog and 'setValue' in prog)
+    dsrc = inspect.getsource(MB.ModelBuildDialog)
+    check('the dialog builds with the streaming worker',
+          'StreamingProcWorker' in dsrc)
+    check("the child interpreter is unbuffered ('-u')", "'-u'" in dsrc)
+    check('a second job is refused while one runs',
+          'one at a time' in dsrc)
+    check('the real FOV pool is passed, not the 1-41 default',
+          "'--fov-pool'" in dsrc)
+    check('the same explicit FOV list goes to every channel',
+          "'--fovs'" in dsrc)
+    check('training runs from the app now',
+          'train_spotmodel.py' in dsrc and "'--reviewer'" in dsrc)
+    check('closing hides; a running build keeps reporting',
+          'event.ignore()' in dsrc and 'self.hide()' in dsrc)
 
     # The regex has to match build_bundle's real format.
     fmt = '  [%4d/%4d] fov007 Hyb_101   3 crops   12 cand' % (12, 666)

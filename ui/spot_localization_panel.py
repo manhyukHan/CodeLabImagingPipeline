@@ -233,10 +233,11 @@ class SpotLocalizationPanelUI(object):
             'threshold, and removes what falls below it -- the same shape '
             'as Remove Z-Rejected, on a different number.')
         learnedLayout.addWidget(self.PreviewPGatePushButton)
-        self.MakeModelPushButton = QtWidgets.QPushButton('Make new model...')
+        self.MakeModelPushButton = QtWidgets.QPushButton('Build model...')
         self.MakeModelPushButton.setToolTip(
-            'Build a review bundle, review it, and train a model on your own '
-            'experiment and your own judgement.')
+            'One window for the whole thing: pick sources and FOVs, build '
+            'a review bundle in the background, open Spot Check on it, '
+            'train, and read the result.')
         learnedLayout.addWidget(self.MakeModelPushButton)
         self.ModeStackedWidget.addWidget(learnedPage)
 
