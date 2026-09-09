@@ -381,6 +381,86 @@ def test_load_best_takes_the_report_s_winner():
               (raised or '')[:90])
 
 
+def test_the_readout_writes_a_list_and_the_gate_cuts_it():
+    print('\ntracing: fiducial stays one, readout becomes many, p_exist gates')
+    from codelab_pipeline.localization import tracing_v2 as T2
+    from codelab_pipeline.models.allele import AnAllele
+    from codelab_pipeline.analysis import polymer as P
+
+    # TWO REAL LOCI IN ONE HYBE -- sister chromatids, which AnAllele has
+    # always modelled (polymer_adj is a LIST per hybe) and v2 has never
+    # produced, because fit_readout returns exactly one fit.
+    if not os.path.exists('D:/models/mp58_rna/report.json'):
+        check('the real model directory is present', False, 'skipped')
+        return
+    rng = np.random.default_rng(2)
+    cube = rng.normal(300, 6, (40, 40, 40))
+    cube += gauss((40, 40, 40), centre=(20, 15, 20), amp=600)
+    cube += gauss((40, 40, 40), centre=(20, 25, 20), amp=450)
+    eng = E.make_engine('v3-psfmatcher', model_dir='D:/models/mp58_rna')
+
+    # The builder's own frame closure, stubbed: this test is about the
+    # SHAPE that gets written, not about the alignment.
+    def shared(h, yf, xf, zf, ymin, xmin):
+        return (yf + ymin, xf + xmin, zf)
+
+    def run(t):
+        p = T2.V2Params(readout_engine=eng, min_p_exist=t)
+        a = AnAllele()
+        a.polymer_adj, a.polymer_raw = {}, {}
+        ok, why = T2._readout_multi(a, 'H', cube, 20.0, p, 0.0, 0.0, 0.0,
+                                    100, 200, shared)
+        return a, ok, why
+
+    a, ok, _why = run(None)
+    cands = a.polymer_adj['H']
+    check('the readout writes a LIST, not a single fit', len(cands) > 1,
+          f'{len(cands)} candidates')
+    check('and every entry is still a 4-tuple -- no contract moved',
+          all(len(c) == 4 for c in cands), str(len(cands[0])))
+    check('both planted loci are in it',
+          {15, 25} <= {round(c[1] - 200) for c in cands},
+          str(sorted({round(c[1] - 200) for c in cands})[:8]))
+    check('amplitude is finite, so max_brightness is a defined comparison',
+          all(np.isfinite(c[3]) for c in cands))
+
+    # THE GATE IS POSTERIOR AND CUTS BEFORE THE WRITE -- the same shape as
+    # max_uncert, on a different number, and p_exist is never stored.
+    a5, _ok5, _w5 = run(0.5)
+    a9, _ok9, _w9 = run(0.999999)
+    n0, n5, n9 = len(cands), len(a5.polymer_adj['H']), len(a9.polymer_adj['H'])
+    check('a threshold cuts the list', n0 > n5 > n9, f'{n0} -> {n5} -> {n9}')
+    check('the brightest locus survives every threshold',
+          round(a9.polymer_adj['H'][0][1] - 200) == 15,
+          str(round(a9.polymer_adj['H'][0][1] - 200)))
+    check('p_exist is NOT in the stored tuple',
+          all(len(c) == 4 for c in a5.polymer_adj['H']))
+    _aa, ok_all, why_all = run(1.0)
+    check('a threshold that keeps nothing REJECTS the hybe with a reason',
+          not ok_all and 'p_exist' in why_all, why_all[:60])
+
+    saved = a5.save()
+    pos, amp, n_cand = P.collapse_polymer(saved, ['H'])
+    # save() rounds every float to 2dp on the way out, so the comparison
+    # is against the SAVED candidates and not the in-memory ones.
+    check('collapse_polymer counts them and picks the brightest',
+          n_cand[0] == n5
+          and abs(amp[0] - max(c[3] for c in saved['polymer_adj']['H'])) < 1e-9,
+          f'n_cand {n_cand[0]}, amp {amp[0]:.1f}')
+
+    # AND THE FIDUCIAL IS UNTOUCHED. One tuple per hybe is its contract:
+    # a second fiducial candidate is not a second alignment, it is an
+    # ambiguity, and fiducial_trace_adj holds one tuple for that reason.
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(here, 'codelab_pipeline', 'localization',
+                            'tracing_v2.py'), encoding='utf-8').read()
+    line = src[src.index('allele.fiducial_trace_adj[hybe] ='):].split('\n')[0]
+    check('fiducial_trace_adj is still assigned ONE tuple, not a list',
+          not line.split('=', 1)[1].strip().startswith('['), line[:72])
+    check('and the engine is consulted on the readout side only',
+          'readout_engine' in src and 'fiducial_engine' not in src)
+
+
 def main():
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     for t in (test_p_exist_is_its_own_field,
@@ -388,7 +468,8 @@ def main():
               test_the_engine_scores_the_box_the_model_was_trained_on,
               test_view_cell_gives_every_cell_its_own_background,
               test_nothing_is_dropped_on_p_exist,
-              test_load_best_takes_the_report_s_winner):
+              test_load_best_takes_the_report_s_winner,
+              test_the_readout_writes_a_list_and_the_gate_cuts_it):
         t()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     for f in FAIL:

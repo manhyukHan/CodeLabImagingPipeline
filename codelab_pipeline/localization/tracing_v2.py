@@ -342,7 +342,8 @@ class V2Params(object):
 
     def __init__(self, voxel_um=DEFAULT_VOXEL_UM, psf_family=None,
                  psf_shape=None, psf_label='', fiducial_gates=None,
-                 readout_gates=None, qc_shift=True):
+                 readout_gates=None, qc_shift=True,
+                 readout_engine=None, min_p_exist=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
         # None = no calibrated PSF, so the readout sigma is fitted per spot
         # like the fiducial's. Supported, but it gives up both the accuracy
@@ -353,6 +354,30 @@ class V2Params(object):
         self.fiducial_gates = dict(FIDUCIAL_GATES, **(fiducial_gates or {}))
         self.readout_gates = dict(READOUT_GATES, **(readout_gates or {}))
         self.qc_shift = bool(qc_shift)
+        # THE READOUT MAY BE LOCALIZED BY A LEARNED ENGINE, and only the
+        # readout. The fiducial's job is to place this hybe's frame
+        # against the reference, which is a question with ONE answer per
+        # hybe -- a second fiducial candidate is not a second alignment,
+        # it is an ambiguity, and fiducial_trace_adj carries one tuple
+        # per hybe precisely because that is the contract. So the
+        # fiducial phase is untouched by this and always fits one.
+        #
+        # The readout is the opposite: two real loci in one hybe (sister
+        # chromatids) are a fact this pipeline already models --
+        # polymer_adj holds a LIST per hybe and AnAllele's own docstring
+        # says they are kept side by side and never pruned against each
+        # other. v2 has only ever written lists of length one because
+        # fit_readout returns one fit. A multispot engine here fills the
+        # shape that was always declared.
+        self.readout_engine = readout_engine
+        # NOTHING IS STORED ON p_exist, and that is deliberate. The
+        # allele's 4-tuples are (y, x, z, amplitude) and stay that way --
+        # widening them would change a persisted contract for a number
+        # that has already done its job by the time a candidate is
+        # written. So p_exist gates HERE, exactly the way max_uncert
+        # does: cut before the write, never carried past it.
+        self.min_p_exist = (None if min_p_exist is None
+                            else float(min_p_exist))
 
     @property
     def has_psf(self):
@@ -584,6 +609,60 @@ def fit_fiducial_from(cube, seed, p):
         max_sigma_z_um=FIDUCIAL_MAX_SIGMA_Z_UM,
         fit_radius_um=FIDUCIAL_FIT_RADIUS_UM,
         background='linear', apply_gates=False)
+
+
+def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
+                   to_shared, debug=None):
+    """Every readout candidate in one crop, via a learned engine.
+
+    Returns (wrote_anything, reason). Fills polymer_adj / polymer_raw with
+    a LIST -- the shape AnAllele has always declared and v2 has never
+    used, because fit_readout returns one fit.
+
+    THE p_exist GATE IS HERE AND ONLY HERE. A candidate below the
+    threshold is dropped before anything is written, so the stored tuple
+    stays (y, x, z, amplitude) and no persisted contract moves for a
+    number whose whole job is finished at this line. That is how
+    max_uncert already works one function up.
+
+    amplitude is the engine's own -- for v3 a MEASURED PEAK above the
+    region background, not a fitted Gaussian amplitude (psfmatcher.
+    _peak_above says why). analysis.polymer.max_brightness compares it,
+    so it has to be finite and comparable within this crop; it is not a
+    quantity to compare against a v1/v2 amplitude from another run.
+    """
+    try:
+        cands = p.readout_engine.localize(cube, seed_yxz=None, n_max=None)
+    except Exception as exc:                                # noqa: BLE001
+        # A tracing run must not die on one crop. Same rule the rest of
+        # this module keeps: a hybe that cannot be fitted is a rejected
+        # hybe with a reason, never an exception out of a worker.
+        return False, f'readout engine failed: {type(exc).__name__}: {exc}'
+    if not cands:
+        return False, 'readout found nothing'
+
+    from . import p_gate as PG
+    t = p.min_p_exist
+    kept = cands if t is None else PG.apply(cands, t, which=PG.CALIBRATED)
+    if debug is not None:
+        debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
+        debug[hybe]['readout_n_before_p_gate'] = len(cands)
+    if not kept:
+        return False, (f'readout: every candidate below p_exist {t:g}'
+                       if t is not None else 'readout found nothing')
+
+    adj, raw = [], []
+    for c in kept:
+        sy, sx, sz = to_shared(hybe, c.y, c.x, c.z, ymin, xmin)
+        adj.append((float(sy + dy), float(sx + dx), float(sz + dz),
+                    float(c.amplitude)))
+        raw.append((float(c.y + ymin), float(c.x + xmin), float(c.z),
+                    float(c.amplitude)))
+    allele.polymer_adj[hybe] = adj
+    allele.polymer_raw[hybe] = raw
+    if debug is not None:
+        debug[hybe]['readout_centroids'] = [(c.x, c.y, c.z) for c in kept]
+    return True, ''
 
 
 def fit_readout(cube, z_centre, p):
@@ -1106,6 +1185,22 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug[hybe]['readout_seed'] = _seed(
                 cube, z_r, p.voxel_um,
                 _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
+        if p.readout_engine is not None:
+            # THE LEARNED PATH. One call, every readout candidate in this
+            # crop, then a posterior p_exist cut -- the same shape as the
+            # max_uncert gate below, applied to a different number.
+            # `_to_shared` is the builder's own closure -- it carries this
+            # run's resolver, fov matrices, modality and cell -- so it is
+            # passed in rather than reached for. A module-level helper
+            # that rebuilt that mapping would be a second implementation
+            # of the frame conversion, which is the divergence this
+            # codebase keeps having to hunt down.
+            done, why_multi = _readout_multi(allele, hybe, cube, z_r, p,
+                                             dy, dx, dz, ymin, xmin,
+                                             _to_shared, debug)
+            if not done:
+                allele.rejected_hybes[hybe] = why_multi
+            continue
         r = fit_readout(cube, z_r, p)
         ok, why = gate(r, cube, p.readout_gates, p.voxel_um)
         # Same as the fiducial: before the reject, so a gated-out readout
