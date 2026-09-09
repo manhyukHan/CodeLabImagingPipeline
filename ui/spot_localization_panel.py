@@ -87,94 +87,191 @@ class SpotLocalizationPanelUI(object):
 
     def setupUi(self, Widget):
         """
-        Layout order (per explicit request): Modality -> Hybe -> Channel ->
-        Threshold%/Absolute pair -> Min distance/Pad pair -> FOV -> Append
-        Mode -> Run Auto-Detect -> [Refresh/Show Displayer/3D Localization]
-        -> the 3 list views -> [Remove Transient/Remove Unassigned/Remove
-        all] -> [Undo/Redo] -> Save View -> (info label, progress, log).
+        Layout order, rebuilt around the fact that there are now TWO KINDS
+        of localization and they need different controls:
+
+          1  Hybe | Channel | FOV        what to look at
+          2  Append mode | Cell padding  global, both kinds
+          3  Mode + a stacked page       v1/v2 want anchor thresholds;
+                                         v3/v4 want a model and a p-gate
+          -  Run                         one button, two connections
+          4  Refresh | Crop displayer | 3D Spot Viewer
+          -  the three lists, remove/undo/save, info, progress
+
+        THE THRESHOLDS WERE NEVER GLOBAL. Threshold %, absolute and min
+        distance are the ANCHOR step's parameters -- where to start a
+        Gaussian fit -- and a learned engine has no anchor step to point
+        them at. Leaving them on screen under v3 would offer numbers that
+        do nothing. Append mode and cell padding are genuinely shared: one
+        says whether a run replaces the view, the other how much context a
+        cell crop carries, and both are true of any engine.
         """
         Widget.setObjectName('SpotLocalizationPanel')
         layout = QtWidgets.QVBoxLayout(Widget)
 
-        form = QtWidgets.QFormLayout()
-        layout.addLayout(form)
-
-        # -- Hybe | Channel -- no separate Modality selector: HybeComboBox
-        # itself offers every configured modality's hybes at once (see
-        # populate_hybe_choices), each item tagged with its own owning
-        # modality, so there's nothing left for a modality picker to do
-        # here.
+        # ---- 1. what to look at -----------------------------------------
+        # Hybe, channel and FOV name the pixels. They were three rows with
+        # a form label each; one row is what they are.
+        scopeRow = QtWidgets.QWidget()
+        scopeLayout = QtWidgets.QHBoxLayout(scopeRow)
+        scopeLayout.setContentsMargins(0, 0, 0, 0)
+        scopeLayout.addWidget(QtWidgets.QLabel('Hybe:'))
+        # No separate Modality selector: HybeComboBox itself offers every
+        # configured modality's hybes at once (see populate_hybe_choices),
+        # each item tagged with its own owning modality.
         self.HybeComboBox = QtWidgets.QComboBox()
-        form.addRow('Hybe:', self.HybeComboBox)
-
+        self.HybeComboBox.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                        QtWidgets.QSizePolicy.Fixed)
+        scopeLayout.addWidget(self.HybeComboBox, 3)
+        scopeLayout.addWidget(QtWidgets.QLabel('Channel:'))
         self.ChannelComboBox = QtWidgets.QComboBox()
-        form.addRow('Channel:', self.ChannelComboBox)
+        scopeLayout.addWidget(self.ChannelComboBox, 1)
+        scopeLayout.addWidget(QtWidgets.QLabel('FOV:'))
+        self.FovSpinBox = QtWidgets.QSpinBox()
+        # BOUNDED TO WHAT EXISTS, once the store is known -- see
+        # set_fov_range. The range starts at 1..1 rather than 1..100000
+        # because an unbounded spinbox lets a person walk to a FOV the
+        # experiment does not have, and every read after that fails
+        # somewhere further down with a message about a missing file.
+        self.FovSpinBox.setRange(1, 1)
+        self.FovSpinBox.setValue(1)
+        scopeLayout.addWidget(self.FovSpinBox)
+        layout.addWidget(scopeRow)
 
-        # -- Threshold (%) | Threshold (absolute) -- kept live-linked,
-        # see MainWindow._sync_threshold_from_percent/_from_absolute.
-        thresholdRow = QtWidgets.QWidget()
-        thresholdLayout = QtWidgets.QHBoxLayout(thresholdRow)
-        thresholdLayout.setContentsMargins(0, 0, 0, 0)
-        self.ThresholdPercentLineEdit = QtWidgets.QLineEdit('50')
-        self.ThresholdPercentLineEdit.setPlaceholderText('% of scope max, e.g. 50')
-        thresholdLayout.addWidget(QtWidgets.QLabel('Threshold (% of scope max):'))
-        thresholdLayout.addWidget(self.ThresholdPercentLineEdit)
-        self.ThresholdAbsoluteLineEdit = QtWidgets.QLineEdit()
-        self.ThresholdAbsoluteLineEdit.setPlaceholderText('absolute value -- kept in sync with % above')
-        thresholdLayout.addWidget(QtWidgets.QLabel('Absolute value:'))
-        thresholdLayout.addWidget(self.ThresholdAbsoluteLineEdit)
-        form.addRow(thresholdRow)
-
-        # -- Min distance | Cell crop padding --
-        distancePadRow = QtWidgets.QWidget()
-        distancePadLayout = QtWidgets.QHBoxLayout(distancePadRow)
-        distancePadLayout.setContentsMargins(0, 0, 0, 0)
-        self.MinDistanceSpinBox = QtWidgets.QSpinBox()
-        self.MinDistanceSpinBox.setRange(1, 100)
-        self.MinDistanceSpinBox.setValue(3)
-        distancePadLayout.addWidget(QtWidgets.QLabel('Min distance (px):'))
-        distancePadLayout.addWidget(self.MinDistanceSpinBox)
+        # ---- 2. global to every engine ----------------------------------
+        globalRow = QtWidgets.QWidget()
+        globalLayout = QtWidgets.QHBoxLayout(globalRow)
+        globalLayout.setContentsMargins(0, 0, 0, 0)
+        self.AppendModeCheckBox = QtWidgets.QCheckBox(
+            'Append Mode (a run adds to the current view instead of '
+            'replacing it)')
+        globalLayout.addWidget(self.AppendModeCheckBox)
+        globalLayout.addStretch(1)
+        globalLayout.addWidget(
+            QtWidgets.QLabel('Cell crop padding (px, Cell view only):'))
         self.PadSpinBox = QtWidgets.QSpinBox()
         self.PadSpinBox.setRange(0, 100)
         self.PadSpinBox.setValue(10)
-        distancePadLayout.addWidget(QtWidgets.QLabel('Cell crop padding (px, Cell view only):'))
-        distancePadLayout.addWidget(self.PadSpinBox)
-        form.addRow(distancePadRow)
+        globalLayout.addWidget(self.PadSpinBox)
+        layout.addWidget(globalRow)
 
-        # -- FOV spinbox --
-        fovRow = QtWidgets.QWidget()
-        fovRowLayout = QtWidgets.QHBoxLayout(fovRow)
-        fovRowLayout.setContentsMargins(0, 0, 0, 0)
-        self.FovSpinBox = QtWidgets.QSpinBox()
-        self.FovSpinBox.setRange(1, 100000)
-        self.FovSpinBox.setValue(1)
-        fovRowLayout.addWidget(QtWidgets.QLabel('FOV:'))
-        fovRowLayout.addWidget(self.FovSpinBox)
-        fovRowLayout.addStretch()
-        layout.addWidget(fovRow)
+        # ---- 3. mode, and the controls that belong to it ----------------
+        modeRow = QtWidgets.QWidget()
+        modeLayout = QtWidgets.QHBoxLayout(modeRow)
+        modeLayout.setContentsMargins(0, 0, 0, 0)
+        modeLayout.addWidget(QtWidgets.QLabel('Mode:'))
+        self.EngineComboBox = QtWidgets.QComboBox()
+        # ONE VOCABULARY WITH THE TRACING PANEL -- tracing_v2.ROUTE_*. The
+        # 3D-localization popup's combo used to store 'gaussian' for the v1
+        # route while its own label read 'v1 gaussian'.
+        from codelab_pipeline.localization import tracing_v2 as _R
+        self.EngineComboBox.addItem('v1 (anchor + bounded gaussian)',
+                                    _R.ROUTE_V1)
+        self.EngineComboBox.addItem('v2-anchor-fit (anchor + PSF fit)',
+                                    _R.ROUTE_V2)
+        self.EngineComboBox.addItem('v3-psfmatcher (learned, automatic)',
+                                    _R.ROUTE_V3)
+        self.EngineComboBox.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                          QtWidgets.QSizePolicy.Fixed)
+        modeLayout.addWidget(self.EngineComboBox, 1)
+        layout.addWidget(modeRow)
 
-        # -- Append mode --
-        self.AppendModeCheckBox = QtWidgets.QCheckBox(
-            'Append Mode (Run Auto-Detect adds to the current view instead of replacing it)')
-        layout.addWidget(self.AppendModeCheckBox)
+        # A PAGE SWAP, NOT A GREY-OUT. Each page keeps its own values while
+        # hidden, so switching away and back restores exactly what was
+        # there -- the same rule ChromatinTracingPanel follows, and for the
+        # same reason: a pixel threshold and a model choice are not two
+        # spellings of one number.
+        self.ModeStackedWidget = QtWidgets.QStackedWidget()
+        layout.addWidget(self.ModeStackedWidget)
 
-        # -- Run auto-detect --
+        # page 0: the anchor engines (v1, v2)
+        anchorPage = QtWidgets.QWidget()
+        anchorLayout = QtWidgets.QVBoxLayout(anchorPage)
+        anchorLayout.setContentsMargins(0, 0, 0, 0)
+        thresholdRow = QtWidgets.QWidget()
+        thresholdLayout = QtWidgets.QHBoxLayout(thresholdRow)
+        thresholdLayout.setContentsMargins(0, 0, 0, 0)
+        # Threshold % and absolute stay live-linked, see MainWindow's
+        # _sync_threshold_from_percent / _from_absolute.
+        thresholdLayout.addWidget(
+            QtWidgets.QLabel('Threshold (% of scope max):'))
+        self.ThresholdPercentLineEdit = QtWidgets.QLineEdit('50')
+        self.ThresholdPercentLineEdit.setPlaceholderText(
+            '% of scope max, e.g. 50')
+        thresholdLayout.addWidget(self.ThresholdPercentLineEdit)
+        thresholdLayout.addWidget(QtWidgets.QLabel('Absolute:'))
+        self.ThresholdAbsoluteLineEdit = QtWidgets.QLineEdit()
+        self.ThresholdAbsoluteLineEdit.setPlaceholderText(
+            'absolute value -- kept in sync with % above')
+        thresholdLayout.addWidget(self.ThresholdAbsoluteLineEdit)
+        thresholdLayout.addWidget(QtWidgets.QLabel('Min distance (px):'))
+        self.MinDistanceSpinBox = QtWidgets.QSpinBox()
+        self.MinDistanceSpinBox.setRange(1, 100)
+        self.MinDistanceSpinBox.setValue(3)
+        thresholdLayout.addWidget(self.MinDistanceSpinBox)
+        anchorLayout.addWidget(thresholdRow)
+        self.ModeStackedWidget.addWidget(anchorPage)
+
+        # page 1: the learned engines (v3, and v4 when it arrives)
+        learnedPage = QtWidgets.QWidget()
+        learnedLayout = QtWidgets.QHBoxLayout(learnedPage)
+        learnedLayout.setContentsMargins(0, 0, 0, 0)
+        learnedLayout.addWidget(QtWidgets.QLabel('Model:'))
+        self.ModelComboBox = QtWidgets.QComboBox()
+        self.ModelComboBox.setToolTip(
+            'A trained run under <repo>/models, named for whoever labelled '
+            'it. Both calibrations in a run are fitted against ONE '
+            "reviewer's keep/drop, so whose it is matters.")
+        self.ModelComboBox.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                         QtWidgets.QSizePolicy.Fixed)
+        learnedLayout.addWidget(self.ModelComboBox, 1)
+        self.PreviewPGatePushButton = QtWidgets.QPushButton(
+            'Preview p histogram...')
+        self.PreviewPGatePushButton.setToolTip(
+            'The posterior gate. Shows the distribution of p over the spots '
+            'currently in view, with examples from either side of a '
+            'threshold, and removes what falls below it -- the same shape '
+            'as Remove Z-Rejected, on a different number.')
+        learnedLayout.addWidget(self.PreviewPGatePushButton)
+        self.MakeModelPushButton = QtWidgets.QPushButton('Make new model...')
+        self.MakeModelPushButton.setToolTip(
+            'Build a review bundle, review it, and train a model on your own '
+            'experiment and your own judgement.')
+        learnedLayout.addWidget(self.MakeModelPushButton)
+        self.ModeStackedWidget.addWidget(learnedPage)
+
+        # ---- the run button ---------------------------------------------
+        # ONE BUTTON, TWO CONNECTIONS. What it runs depends on the mode; a
+        # second button would let a person press the one the mode is not on.
         self.AutoDetectPushButton = QtWidgets.QPushButton('Run Auto-Detect')
         layout.addWidget(self.AutoDetectPushButton)
 
-        # -- Refresh cell list | Show spot crop displayer | 3D localization --
+        # ---- 4. viewers --------------------------------------------------
         actionRow = QtWidgets.QWidget()
         actionLayout = QtWidgets.QHBoxLayout(actionRow)
         actionLayout.setContentsMargins(0, 0, 0, 0)
-        self.RefreshCellListPushButton = QtWidgets.QPushButton('Refresh Cell List')
+        self.RefreshCellListPushButton = QtWidgets.QPushButton(
+            'Refresh Cell List')
         actionLayout.addWidget(self.RefreshCellListPushButton)
-        self.ShowDisplayerPushButton = QtWidgets.QPushButton('Show Spot Crop Displayer')
+        self.ShowDisplayerPushButton = QtWidgets.QPushButton(
+            'Show Spot Crop Displayer')
         self.ShowDisplayerPushButton.setCheckable(True)
         actionLayout.addWidget(self.ShowDisplayerPushButton)
-        self.Show3DLocalizationPushButton = QtWidgets.QPushButton('3D Localization...')
+        # '3D Localization' named a v1/v2 ACTION. A learned engine localizes
+        # in 3D on its own, so for those spots this window is a VIEWER --
+        # and it is a viewer for the others too, because whatever produced
+        # a spot, the window shows a coordinate and a z_status and those
+        # are the same objects either way. It can still re-fit, which is
+        # why the name had to stop claiming that is what it is for.
+        self.Show3DLocalizationPushButton = QtWidgets.QPushButton(
+            '3D Spot Viewer...')
         self.Show3DLocalizationPushButton.setCheckable(True)
         actionLayout.addWidget(self.Show3DLocalizationPushButton)
         layout.addWidget(actionRow)
+
+        self.EngineComboBox.currentIndexChanged.connect(
+            lambda _i: self.apply_mode_visibility())
+        self.apply_mode_visibility()
 
         # -- FOV listview | Cell/FOV-view listview | Spot listview --
         listsRow = QtWidgets.QWidget()
@@ -277,6 +374,77 @@ class SpotLocalizationPanelUI(object):
         layout.addStretch(1)
 
         self.HybeComboBox.currentIndexChanged.connect(self._on_hybe_changed)
+
+    # -- mode ---------------------------------------------------------------
+
+    def selected_engine(self):
+        """The route this panel names -- tracing_v2.ROUTE_*."""
+        from codelab_pipeline.localization import tracing_v2 as R
+        data = self.EngineComboBox.currentData()
+        return R.route(data if data else self.EngineComboBox.currentText())
+
+    def selected_engine_is_learned(self):
+        """True for v3 (and v4 when it lands): no anchor step to configure."""
+        from codelab_pipeline.localization import tracing_v2 as R
+        return R.is_v3(self.selected_engine())
+
+    def apply_mode_visibility(self):
+        """Show the page that belongs to the chosen mode."""
+        learned = self.selected_engine_is_learned()
+        self.ModeStackedWidget.setCurrentIndex(1 if learned else 0)
+        self.AutoDetectPushButton.setText(
+            'Run Automatic Spot Localization' if learned
+            else 'Run Auto-Detect')
+        return learned
+
+    def set_fov_range(self, n_fovs, keep=True):
+        """Bound the FOV spinbox to the FOVs this experiment HAS.
+
+        Every FOV spinbox in this app was 1..100000, so a person could
+        walk to a FOV the store does not contain and the failure surfaced
+        somewhere much further down as a missing file. A spinbox that
+        cannot name a FOV that does not exist is the cheapest place to
+        say so.
+
+        `keep` clamps the current value into the new range rather than
+        letting Qt do it silently at the next edit.
+        """
+        n = max(1, int(n_fovs or 1))
+        cur = int(self.FovSpinBox.value())
+        self.FovSpinBox.setRange(1, n)
+        if keep:
+            self.FovSpinBox.setValue(min(max(cur, 1), n))
+        self.FovSpinBox.setToolTip(
+            f'1 to {n} -- the FOVs this experiment has')
+        return n
+
+    def populate_models(self, runs, select=None):
+        """Fill the model combo from model_store.available().
+
+        A run with PROBLEMS is listed with them rather than hidden: a
+        person choosing a model is exactly who should see that one of its
+        files no longer matches its manifest.
+        """
+        self.ModelComboBox.blockSignals(True)
+        self.ModelComboBox.clear()
+        for r in runs or ():
+            bits = [r['name']]
+            if r.get('is_default'):
+                bits.append('(default)')
+            if not r.get('has_multispot'):
+                bits.append('- no multispot calibration')
+            if r.get('problems'):
+                bits.append('!! ' + r['problems'][0])
+            self.ModelComboBox.addItem('  '.join(bits), r['path'])
+        if select:
+            i = self.ModelComboBox.findData(select)
+            if i >= 0:
+                self.ModelComboBox.setCurrentIndex(i)
+        self.ModelComboBox.blockSignals(False)
+        return self.ModelComboBox.count()
+
+    def selected_model_dir(self):
+        return self.ModelComboBox.currentData()
 
     def populate_hybe_choices(self, total_active_hybe_list):
         """

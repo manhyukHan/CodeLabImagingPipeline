@@ -2850,9 +2850,27 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         ip, ap, sp = self.ui.IngestionPanel, self.ui.AlignmentPanel, self.ui.SpotLocalizationPanel
         fov_list = self._parse_fov_list(ip.FovListLineEdit.text())
-        spinboxes = [ap.SameModalityFovSpinBox, ap.SameModalityOverlayFovSpinBox,
-                     ap.CrossModalFovSpinBox, ap.CrossModalOverlayFovSpinBox,
-                     ap.CellFovSpinBox, ap.CellOverlayFovSpinBox, sp.FovSpinBox]
+        # EVERY FOV SPINBOX IN THE APP, not the seven this listed. Four
+        # were never bounded at all -- cell segmentation, cytoplasm, the
+        # allele picker and the ingestion viewer -- so on those a person
+        # could still walk to a FOV the experiment does not have and get
+        # the downstream missing-file message this method exists to
+        # prevent. Reached by NAME rather than by a hand-kept list, so a
+        # panel that grows another one is covered without an edit here.
+        # EVERY panel the ui carries, by attribute, so a panel that grows
+        # a FOV spinbox is covered without an edit here and a panel that
+        # is renamed does not silently drop out of the sweep.
+        panels = [getattr(self.ui, n) for n in dir(self.ui)
+                  if n.endswith('Panel') and getattr(self.ui, n, None)
+                  is not None]
+        spinboxes = []
+        for panel in panels:
+            for name in dir(panel):
+                if 'fov' not in name.lower() or 'SpinBox' not in name:
+                    continue
+                sb = getattr(panel, name, None)
+                if isinstance(sb, QtWidgets.QSpinBox):
+                    spinboxes.append(sb)
         if not fov_list:
             for sb in spinboxes:
                 sb.setRange(1, 100000)
