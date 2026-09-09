@@ -28,16 +28,34 @@ import numpy as np
 
 LocalizedSpot = namedtuple(
     'LocalizedSpot',
-    ['y', 'x', 'z', 'p', 'amplitude', 'sigma_y', 'sigma_x', 'sigma_z', 'offset'])
+    ['y', 'x', 'z', 'p', 'amplitude', 'sigma_y', 'sigma_x', 'sigma_z',
+     'offset', 'p_exist'],
+    defaults=(float('nan'),))
 LocalizedSpot.__doc__ = """One emitter: (y, x, z) crop-local sub-pixel, plus p.
 
 `p` IS NOT A PROBABILITY. It is a per-engine quality scalar in (0, 1],
 higher is better, comparable only WITHIN one engine and one
 parameterisation. Its job is to rank candidates -- to order a review
 queue and to cut an obviously-dead tail -- not to be believed as a
-calibrated confidence. Each engine documents how it computes p; a
-learned engine may return a real calibrated probability, in which case
-say so there rather than assuming it here.
+calibrated confidence. Each engine documents how it computes p.
+
+`p_exist` IS ONE, and it is a SEPARATE FIELD for exactly that reason. It
+is the probability that a spot is here at all, from a classifier trained
+on human verdicts with a proper scoring rule and Platt-scaled on
+held-out cells -- so it is comparable across engines, across bundles and
+against a threshold a person picks off a histogram. NaN means this
+engine does not produce one.
+
+PUTTING IT IN `p` WOULD HAVE BEEN THE CHEAP MOVE AND IT IS THE WRONG
+ONE. Four engines already write four different meanings into `p` --
+a constant 1.0, a contrast, an occupancy-times-CI product, an affine
+NCC -- and they are already stored under one column name in the review
+bundle and the verdict log, where nothing downstream can tell them
+apart. A fifth meaning in the same slot would make a posterior p-gate
+LOOK applicable to v1 and v2, where the number it reads is not a
+probability and the threshold a person chose on v3 means nothing. With a
+separate field the gate is simply unavailable there: NaN is not a
+threshold you can set.
 
 The remaining fields are Gaussian-shaped and may be NaN for an engine
 that does not fit a Gaussian (a learned detector returns positions and
@@ -46,13 +64,14 @@ p, and has no sigma to report). Never require them.
 
 
 def _spot(y, x, z, p, amplitude=float('nan'), sigma_y=float('nan'),
-          sigma_x=float('nan'), sigma_z=float('nan'), offset=float('nan')):
+          sigma_x=float('nan'), sigma_z=float('nan'), offset=float('nan'),
+          p_exist=float('nan')):
     """LocalizedSpot with the shape fields defaulted -- so an engine that
     has no Gaussian to report does not have to invent one."""
     return LocalizedSpot(y=float(y), x=float(x), z=float(z), p=float(p),
                          amplitude=float(amplitude), sigma_y=float(sigma_y),
                          sigma_x=float(sigma_x), sigma_z=float(sigma_z),
-                         offset=float(offset))
+                         offset=float(offset), p_exist=float(p_exist))
 
 
 class LocalizeEngine:
@@ -603,11 +622,25 @@ class PsfMatchEngine(LocalizeEngine):
                 for (y, x, z, s) in hits]
 
 
+def _v3():
+    """The learned engine, imported on demand.
+
+    It reads the training package (features, the box window, the
+    classifier) and training.dataset reads THIS module for
+    background_mode, so a module-level import here is a cycle. Deferring
+    it to first use costs one dict lookup and keeps both directions
+    legal.
+    """
+    from .psfmatcher import PsfMatcherV3Engine
+    return PsfMatcherV3Engine
+
+
 ENGINES = {
     GaussianLocalizeEngine.name: GaussianLocalizeEngine,
     AnchorFitEngine.name: AnchorFitEngine,
     AnchorFitV2Engine.name: AnchorFitV2Engine,
     PsfMatchEngine.name: PsfMatchEngine,
+    'v3-psfmatcher': _v3,
 }
 
 
@@ -617,4 +650,7 @@ def make_engine(name, **params):
         cls = ENGINES[name]
     except KeyError:
         raise ValueError(f'unknown localize engine {name!r} -- known: {sorted(ENGINES)}')
+    # A value may be a class or a thunk that imports one; see _v3.
+    if not isinstance(cls, type):
+        cls = cls()
     return cls(**params)

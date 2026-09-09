@@ -145,7 +145,15 @@ class SpotClassifier:
             if self.head == 'conv':
                 t = torch.as_tensor(np.asarray(boxes, np.float32))
             else:
-                t = torch.as_tensor(np.asarray(self.std(X), np.float32))
+                # NO STANDARDISER MEANS IDENTITY, not a crash. load()
+                # already builds one with std=None whenever the saved
+                # document carries none -- that is the conv path today,
+                # but nothing stops a feature head from being built
+                # without one, and `self.std(X)` on None is a
+                # TypeError raised from inside scoring rather than an
+                # answer or a refusal.
+                t = torch.as_tensor(np.asarray(
+                    X if self.std is None else self.std(X), np.float32))
             return self.model(t).flatten().numpy()
 
     def score(self, X=None, boxes=None):
@@ -339,3 +347,102 @@ def train(X, boxes, y, groups, head='linear', epochs=400, lr=0.02,
               f"  p in [{report['p_min']:.3f}, {report['p_max']:.3f}]"
               f"  says yes to {100 * report['predicted_positive_frac']:.0f}%")
     return clf, report
+
+
+REPORT_NAME = 'report.json'
+
+
+def load_best(model_dir, report=REPORT_NAME, prefer=None):
+    """The trained head a run's own numbers chose. (classifier, why).
+
+    NOTHING IN THIS REPO LOADED A TRAINED CLASSIFIER BEFORE THIS. train
+    wrote spot_classifier_<head>.json and report.json and stopped; the
+    only caller of SpotClassifier.load was a test. So the existence
+    probability the whole training stack exists to produce reached no
+    engine, no gate and no z_status -- it was a file on disk.
+
+    THE CHOICE IS THE REPORT'S, NOT A CONSTANT. train stores every head
+    it was asked for and records no winner, so a hard-coded 'mlp' here
+    would be a number that stops tracking the data the moment anyone
+    re-trains. This reads held-out PR-AUC out of the run's own report and
+    takes the best, which follows a re-train for free.
+
+    THREE WAYS A SAVED HEAD IS REFUSED, all of them seen in the one model
+    directory that exists (D:/models/mp58_rna):
+
+      it is not in the report          spot_classifier_conv.json is there
+                                       and conv is not, because the last
+                                       run was --heads linear,mlp. A file
+                                       nobody measured is not a candidate.
+
+      its features are not ours        that same conv file records 21
+                                       feature names against features.
+                                       NAMES' 16. Scoring it would read
+                                       the wrong column for every one.
+
+      the run called it degenerate     all_fail / all_pass / degenerate
+                                       are already in the report; a head
+                                       that predicts one class is not a
+                                       probability, whatever its AUC.
+
+    `prefer` names a head to take if it is usable, for pinning a
+    comparison. It never overrides a refusal.
+    """
+    d = str(model_dir)
+    rp = os.path.join(d, report)
+    with open(rp, encoding='utf-8') as f:
+        rep = json.load(f)
+    heads = rep.get('heads') or {}
+    if not heads:
+        raise ValueError(f'{rp} records no trained head')
+
+    usable, refused = [], []
+    for name, h in sorted(heads.items()):
+        path = h.get('path') or os.path.join(d, f'spot_classifier_{name}.json')
+        if not os.path.exists(path):
+            path = os.path.join(d, f'spot_classifier_{name}.json')
+        if not os.path.exists(path):
+            refused.append((name, 'no saved file'))
+            continue
+        if h.get('degenerate') or h.get('all_fail') or h.get('all_pass'):
+            refused.append((name, 'the run called it degenerate'))
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                feats = (json.load(f).get('meta') or {}).get('features')
+        except (OSError, ValueError):
+            refused.append((name, 'unreadable'))
+            continue
+        if feats is not None and tuple(feats) != tuple(F.NAMES):
+            refused.append((name, f'{len(feats)} features, not our '
+                                  f'{len(F.NAMES)}'))
+            continue
+        auc = h.get('val_pr_auc')
+        if auc is None:
+            refused.append((name, 'no held-out PR-AUC'))
+            continue
+        usable.append((float(auc), name, path))
+
+    # And the files sitting in the directory that the report never mentions.
+    for n in sorted(os.listdir(d)):
+        if n.startswith('spot_classifier_') and n.endswith('.json'):
+            head = n[len('spot_classifier_'):-len('.json')]
+            if head not in heads:
+                refused.append((head, 'not in the report'))
+    if not usable:
+        raise ValueError(
+            f'{rp} has no usable head. Refused: '
+            + '; '.join(f'{n} ({why})' for n, why in refused))
+    usable.sort(key=lambda t: (-t[0], t[1]))
+    if prefer:
+        for auc, name, path in usable:
+            if name == str(prefer):
+                usable = [(auc, name, path)] + [u for u in usable
+                                                if u[1] != name]
+                break
+    auc, name, path = usable[0]
+    why = {'head': name, 'val_pr_auc': auc, 'path': path,
+           'considered': {n: a for a, n, _p in usable},
+           'refused': dict(refused),
+           'report': rp, 'bundle': rep.get('bundle')}
+    return SpotClassifier.load(path), why
