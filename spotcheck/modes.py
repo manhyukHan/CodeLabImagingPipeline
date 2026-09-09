@@ -68,36 +68,63 @@ ADDED_SEED_Z = -1.0
 
 BANK_NAME = 'psf_bank.h5'
 
+# TWO MATCHES CLOSER THAN THE OPTICS CAN RESOLVE ARE ONE MATCH.
+#
+# This page exists to find merged spots, which is exactly the appetite
+# that has to be bounded: a matched filter will happily place two peaks
+# a pixel apart and there is no evidence in the image that they are two
+# things. 2 px laterally is the hard floor -- MEASURED from the store's
+# own calibration, sigma_xy is 0.66 px and sigma_z is 2.35 planes, so
+# 2 px is 3.0 sigma_xy and a comfortable margin over the limit.
+#
+# AND THE SAME NUMBER OF SIGMA AXIALLY, which is not the same number of
+# voxels. A LATERAL-ONLY bound looks right and is not: MEASURED over
+# 2,639 match pairs from 300 pillars, 135 sit within 2 px laterally and
+# 130 OF THOSE ARE MORE THAN 5 PLANES APART IN z -- median 17.3 planes,
+# which is 7 sigma_z. Merging them would not be declining to over-
+# resolve, it would be throwing away pairs the microscope resolves
+# perfectly well, just along the axis with the coarser sigma. So the
+# bound is 3.0 sigma in BOTH directions: 2.0 px and 7.1 planes.
+#
+# skimage's peak_local_max already enforces min_distance=3, but in the
+# L-infinity sense over y, x AND z alike -- so it suppresses a pair 2 px
+# apart laterally while letting through a pair at the SAME (y, x) eleven
+# planes apart. This is the bound that is shaped like the PSF.
+MERGE_LATERAL_PX = 2.0
+MERGE_AXIAL_PLANES = 7.1
+# Falls back to these when a bank carries no analytic reference to take
+# the anisotropy from; see Multispot._resolution.
+DEFAULT_SIGMA_XY_PX = 0.66
+DEFAULT_SIGMA_Z_PLANES = 2.35
+
 # HOW MANY SIGMA A MATCH MUST CLEAR TO BE PUT IN FRONT OF A PERSON.
 #
-# LOOSER THAN DETECTION, DELIBERATELY, because the costs are not the same
-# ones. In the pipeline a false peak becomes a spot; here it becomes a
-# card the reviewer does not press, and the default is drop -- so a
-# proposal nobody keeps costs zero keystrokes. A match never proposed
-# costs a label, and the reviewer can only get it back by noticing the
-# omission and adding it by hand.
+# THE SAME AS DETECTION, and it took a bug fix to get there. This was 4.0
+# -- deliberately looser than psf_bank.K_SIGMA, on the argument that a
+# proposal nobody keeps costs zero keystrokes while a proposal never made
+# costs a label. That argument was sound and the number under it was
+# wrong: it came from a search that could only report positions in the
+# central 9 x 9 of the pillar, so the recovery it was buying looseness to
+# fix was being lost to geometry, not to the threshold.
 #
-# MEASURED on 200 confirmed-spot pillars of MP58/RNA, 15 x 15 x 105, with
-# the 7 x 7 x 11 template cut from D:/models/mp58_rna/psf_bank.h5. "seed
-# found" is a match within 2 px of the spot pass/fail already confirmed
-# -- a pillar showing NOTHING there is a page that cannot be judged:
+# RE-MEASURED on 200 confirmed-spot pillars with the corrected 15 x 15
+# search. "seed found" is a match within 2 px of the spot pass/fail
+# already confirmed -- a pillar blank there is a page nobody can judge:
 #
-#     k     seed found      0      1      2      3     4+   mean
-#    3.0        98.0%     2.0%  10.5%  20.0%  24.5%  43.0%  2.96
-#    3.5        96.5%     3.5%  22.5%  25.5%  25.0%  23.5%  2.42
-#    4.0        95.5%     4.5%  32.0%  32.0%  18.0%  13.5%  2.04
-#    4.5        93.5%     6.5%  44.0%  28.0%  13.0%   8.5%  1.73
-#    5.0        92.5%     7.5%  52.5%  25.0%  10.5%   4.5%  1.52
+#     k     seed found   mean cards    pages with 6+ cards
+#    4.0        99.5%       4.33              29%
+#    4.5        98.5%       3.51              16%
+#    5.0        97.5%       2.90              10%
+#    5.5        94.5%       2.52               8%
+#    6.0        91.5%       2.18               7%
 #
-# 4.0 is the trade taken: 95.5% of pillars propose the spot that is known
-# to be there, two cards on an average page, and 4+ cards on one page in
-# seven. At the detection default of 5.0 one pillar in thirteen comes up
-# blank on a spot everybody already confirmed. Below 4.0 the page fills
-# with cards faster than the recovery improves.
-#
-# THIS IS NOT psf_bank.K_SIGMA AND MUST NOT BECOME IT. That default
-# governs what the pipeline calls a spot with nobody watching.
-REVIEW_K_SIGMA = 4.0
+# 5.0 recovers the seed MORE OFTEN than 4.0 did before the fix (97.5%
+# against 95.5%) on a page carrying three cards instead of four and a
+# third. Staying at 4.0 would spend a card and a half per page on the
+# 46% of matches that sit 6+ px from the seed at p 0.675 and 3.2 sigma --
+# and a page that takes ten seconds to read is not a better review, it is
+# a slower one.
+REVIEW_K_SIGMA = 5.0
 
 
 class PassFail:
@@ -259,6 +286,29 @@ class Multispot:
                                        k_sigma=self.k_sigma)
         return self._engine
 
+    def _resolution(self):
+        """(lateral px, axial planes) below which two matches are one.
+
+        Taken from the BANK'S OWN analytic reference where it has one, so
+        a bank measured on a different objective or a different z step
+        brings its own anisotropy rather than inheriting MP58's. The
+        lateral bound stays MERGE_LATERAL_PX -- it is the number that was
+        chosen -- and the axial bound is the same count of sigma.
+        """
+        lat = float(MERGE_LATERAL_PX)
+        ref = (self.engine.meta or {}).get('analytic_ref') or {}
+        pr = ref.get('params') or {}
+        vx = (self.engine.meta or {}).get('voxel_um')
+        try:
+            sxy = float(pr['sigma_xy_um']) / float(vx[0])
+            sz = float(pr['sigma_z_um']) / float(vx[2])
+            if sxy > 0 and sz > 0:
+                return lat, lat * (sz / sxy)
+        except (KeyError, TypeError, IndexError, ZeroDivisionError,
+                ValueError):
+            pass
+        return lat, float(MERGE_AXIAL_PLANES)
+
     # -- the queue -------------------------------------------------------
 
     def all_items(self, bundle_dir, per_page, max_per_crop):
@@ -330,7 +380,51 @@ class Multispot:
         bg, sigma = background_mode(st)
         pillar, origin, pad = MVIEW.pillar_at(st, sy, sx, half=PILLAR_HALF,
                                               background=bg, sigma=sigma)
-        hits = self.engine.localize(pillar, n_max=None)
+        # SEARCH WIDER THAN YOU SHOW, by exactly the template's own
+        # half-width. ncc() scores only where the template FITS, so a
+        # search run on the 15 x 15 pillar can only report positions in
+        # its central 9 x 9 -- 36% of the area -- and a match outside
+        # that does not go missing, it gets reported AT THE BOUNDARY.
+        #
+        # MEASURED on 300 pillars / 565 matches: 152 sat on the boundary
+        # (26.9% of all matches, and 149 of the 278 NON-SEED ones, 54%),
+        # 36% of pillars had at least one, and on 8.7% the pillar's
+        # BRIGHTEST pixel was somewhere the search could not report at
+        # all. Two matches pinned to the same boundary pixel at different
+        # z read as two objects; they were one object, outside the box.
+        # It is the extra matches this whole review is about, so more
+        # than half the question was being asked at the wrong place.
+        #
+        # Padding the pillar would fix the geometry with fabricated
+        # voxels. The crop is bigger than the pillar, so cutting a margin
+        # from the CROP fixes it with real ones -- the template sees the
+        # data that is actually there, and pillar_at still pads only
+        # where the crop itself runs out.
+        r = int(np.asarray(self.engine.templates[0]).shape[0] // 2)
+        wide, worigin, _wpad = MVIEW.pillar_at(
+            st, sy, sx, half=PILLAR_HALF + r, background=bg, sigma=sigma)
+        hits = self.engine.localize(wide, n_max=None)
+        # Back into the pillar the reviewer sees, and only what lands in
+        # it: the margin is search support, not extra field of view.
+        # wide-local -> crop -> display-local, which is a shift of
+        # (worigin - origin) and NOT its negative. The wrong sign moves
+        # every match by 2r in the same direction and still returns
+        # plausible-looking matches at plausible depths -- caught only
+        # because test_spotcheck_modes PLANTS its emitters and checks
+        # where they came back.
+        n_disp = 2 * PILLAR_HALF + 1
+        hits = [h for h in
+                (_shift(h, worigin[0] - origin[0], worigin[1] - origin[1])
+                 for h in hits)
+                if -0.5 <= h.y <= n_disp - 0.5 and -0.5 <= h.x <= n_disp - 0.5]
+        lat, ax = self._resolution()
+
+        def _bright(h):
+            return float(pillar[int(np.clip(round(h.y), 0, n_disp - 1)),
+                                int(np.clip(round(h.x), 0, n_disp - 1)),
+                                int(np.clip(round(h.z), 0,
+                                            pillar.shape[2] - 1))])
+        hits = _merge_unresolvable(hits, _bright, lat, ax)
         hits.sort(key=lambda h: -float(h.p))
         n_found = len(hits)
         hits = hits[:MAX_HITS]
@@ -438,6 +532,38 @@ class Multispot:
         self._priors(log)[(rec['key'],
                            V.multispot_key(sy, sx, sz))] = rec
         return out
+
+
+def _merge_unresolvable(hits, brightness, lateral_px=MERGE_LATERAL_PX,
+                        axial_planes=MERGE_AXIAL_PLANES):
+    """Collapse matches the optics cannot separate. BRIGHTEST SURVIVES.
+
+    `brightness` returns the image value at a hit -- not its NCC score.
+    Those two rank a pair differently 42% of the time, and "which of
+    these is the real spot" is a question about the picture, not about
+    which position the filter liked best.
+
+    Greedy from the brightest down, so a survivor is never suppressed by
+    something dimmer that it in turn suppresses.
+    """
+    out = []
+    for h in sorted(hits, key=lambda k: -float(brightness(k))):
+        if any(np.hypot(h.y - k.y, h.x - k.x) < lateral_px
+               and abs(h.z - k.z) < axial_planes for k in out):
+            continue
+        out.append(h)
+    return out
+
+
+def _shift(hit, dy, dx):
+    """The same match, in the display pillar's coordinates.
+
+    A LocalizedSpot is a namedtuple, so this replaces two fields and
+    keeps every other one -- including the NaN Gaussian fields, which
+    psf-match sets deliberately and a hand-rebuilt spot would quietly
+    turn into zeros.
+    """
+    return hit._replace(y=float(hit.y) + dy, x=float(hit.x) + dx)
 
 
 def _nearest(rows, y, x, within=1.0):

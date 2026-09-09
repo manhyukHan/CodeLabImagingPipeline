@@ -178,6 +178,97 @@ def test_the_search_region_this_buys():
 
 # -- the two verdict files ------------------------------------------------
 
+def test_a_match_near_the_pillar_edge_is_not_pinned_to_the_boundary():
+    print('\nthe margin: ncc scores only where the template FITS')
+    with tempfile.TemporaryDirectory() as d:
+        # An emitter at pillar x = 13, which is OUTSIDE the 9 x 9 box a
+        # 7 x 7 template can report inside a 15 x 15 pillar. Searched on
+        # the pillar alone it does not go missing -- it comes back AT THE
+        # BOUNDARY, x = 11, two pixels from where it is.
+        rng = np.random.default_rng(7)
+        h = w = 60
+        st = rng.normal(300, 6, (h, w, 60))
+        seed = (30.0, 30.0, 30.0)
+        near_edge = (30.0, 36.0, 30.0)          # pillar x = 7 + 6 = 13
+        for (py, px, pz) in (seed, near_edge):
+            st += 260 * gauss((h, w, 60), centre=(py, px, pz))
+        with B.BundleWriter(os.path.join(d, 'fov001__Hyb_001__c000.h5'),
+                            meta={'storage_path': os.path.join(d, 'nostore'),
+                                  'hybe': 'Hyb_001', 'channel': 555,
+                                  'pad': 14}) as bw:
+            bw.add(1, 'Hyb_001', 555, 1, st.astype(np.uint16),
+                   np.ones((h, w), np.uint8), 0, 0,
+                   [(seed[0], seed[1], seed[2], 0.95, 1, 1, '')])
+        seed_passfail(d)
+        bank = make_bank(os.path.join(d, 'psf_bank.h5'))
+        mode = M.Multispot(bank=bank, bundle_dir=d)
+        log = V.VerdictLog(d, 'ann', session='s1', kind=mode.log_kind)
+        q = A.Queue(d, log, mode=mode, reviewer='ann', shuffle=False)
+        s = mode.load(q.items[0], log, 4, 8)
+        xs = sorted(round(c[1], 1) for c in s['cands'])
+        check('the edge emitter is found at all', len(s['cands']) >= 2,
+              f'{len(s["cands"])} matches at x={xs}')
+        found = [x for x in xs if x > 11.5]
+        check('AT ITS OWN x, not pinned to the old boundary x=11',
+              bool(found) and abs(found[0] - 13.0) < 1.0,
+              f'x={xs}, want one near 13.0')
+        check('and the seed is still at the pillar centre',
+              any(abs(c[1] - 7.0) < 1.0 for c in s['cands']), str(xs))
+        # The margin is search support, never extra field of view: a
+        # match outside the 15 x 15 must not appear on a page that does
+        # not show it.
+        check('nothing outside the displayed pillar is reported',
+              all(-0.5 <= c[0] <= 14.5 and -0.5 <= c[1] <= 14.5
+                  for c in s['cands']),
+              str([(round(c[0], 1), round(c[1], 1)) for c in s['cands']]))
+        # And the coordinates must still land in the crop correctly --
+        # the shift has a sign, and the wrong one moves every match by
+        # 2r while still looking entirely plausible.
+        y0, x0 = s['origin']
+        crop_x = sorted(round(c[1] + x0) for c in s['cands'])
+        check('crop coordinates match where the emitters were planted',
+              30 in crop_x and 36 in crop_x,
+              f'{crop_x}, planted [30, 36]')
+
+
+def test_two_matches_the_optics_cannot_separate_are_one():
+    print('\nthe resolution bound: 2 px laterally, and the SAME sigma in z')
+    from collections import namedtuple
+    H = namedtuple('H', 'y x z p')
+    bright = {(7.0, 7.0, 30.0): 9.0, (7.5, 7.5, 31.0): 4.0,
+              (7.0, 7.0, 50.0): 6.0, (12.0, 7.0, 30.0): 5.0}
+    hits = [H(*k, 0.5) for k in bright]
+
+    def b(h):
+        return bright[(h.y, h.x, h.z)]
+    kept = M._merge_unresolvable(hits, b, 2.0, 7.1)
+    got = {(h.y, h.x, h.z) for h in kept}
+    check('a pair inside the bound in BOTH directions collapses',
+          (7.5, 7.5, 31.0) not in got, str(sorted(got)))
+    check('and THE BRIGHTER ONE is the survivor',
+          (7.0, 7.0, 30.0) in got, str(sorted(got)))
+    # THE PART A LATERAL-ONLY BOUND WOULD GET WRONG. MEASURED over 2,639
+    # pairs, 135 sit within 2 px laterally and 130 of those are more than
+    # 5 planes apart -- median 17.3, which is 7 sigma_z. Those are
+    # resolved, just along the coarser axis.
+    check('the same (y, x) far apart in z SURVIVES -- that is resolved',
+          (7.0, 7.0, 50.0) in got, str(sorted(got)))
+    check('and so does a lateral neighbour outside the bound',
+          (12.0, 7.0, 30.0) in got, str(sorted(got)))
+    check('nothing left violates the bound',
+          all(not (np.hypot(a.y - c.y, a.x - c.x) < 2.0
+                   and abs(a.z - c.z) < 7.1)
+              for i, a in enumerate(kept) for c in kept[i + 1:]))
+    # Greedy from the brightest, so a survivor is never suppressed by
+    # something dimmer that it in turn suppresses.
+    chain = [H(0.0, 0.0, 0.0, 0.5), H(0.0, 1.5, 0.0, 0.5),
+             H(0.0, 3.0, 0.0, 0.5)]
+    val = {0.0: 1.0, 1.5: 5.0, 3.0: 2.0}
+    kept2 = M._merge_unresolvable(chain, lambda h: val[h.x], 2.0, 7.1)
+    check('a chain keeps only the brightest of it',
+          [h.x for h in kept2] == [1.5], str([h.x for h in kept2]))
+
+
 def test_the_two_reviews_never_share_a_file():
     print('\nverdict kinds: one folder, two questions, two files')
     with tempfile.TemporaryDirectory() as d:
@@ -658,9 +749,16 @@ def test_mode_factory_and_defaults():
     ms = M.make_mode('multispot', bundle_dir='.', k_sigma=3.25)
     check('the review threshold is a parameter, not a constant',
           ms.k_sigma == 3.25, str(ms.k_sigma))
-    check('and its default is LOOSER than the pipeline detection default',
-          M.REVIEW_K_SIGMA < PB.K_SIGMA,
-          f'review {M.REVIEW_K_SIGMA} < pipeline {PB.K_SIGMA}')
+    # It USED to be looser than the pipeline's, to buy back a seed
+    # recovery the 9 x 9 search was losing to geometry. With the search
+    # corrected, 5.0 recovers the seed more often than 4.0 did before
+    # (97.5% against 95.5%) on a lighter page, so the looseness bought
+    # nothing but cards.
+    check('the review threshold is the measured one, not an inherited guess',
+          M.REVIEW_K_SIGMA == 5.0, str(M.REVIEW_K_SIGMA))
+    check('a resolution bound exists at all',
+          M.MERGE_LATERAL_PX == 2.0 and M.MERGE_AXIAL_PLANES > M.MERGE_LATERAL_PX,
+          f'{M.MERGE_LATERAL_PX} px, {M.MERGE_AXIAL_PLANES} planes')
     check('the two modes write to different kinds',
           M.PassFail.log_kind != M.Multispot.log_kind)
 
@@ -669,6 +767,8 @@ def main():
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     for t in (test_template_is_cut_to_the_search_size,
               test_the_search_region_this_buys,
+              test_a_match_near_the_pillar_edge_is_not_pinned_to_the_boundary,
+              test_two_matches_the_optics_cannot_separate_are_one,
               test_the_two_reviews_never_share_a_file,
               test_done_tracking_survives_a_renumbering,
               test_pillar_pads_rather_than_skips,
