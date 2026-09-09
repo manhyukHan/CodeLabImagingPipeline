@@ -14,16 +14,29 @@ evidence they would choose from: the histogram this module draws is the
 histogram of the very numbers a pre-filtered engine would have thrown
 away.
 
-IT IS AVAILABLE ONLY WHERE p_exist IS. LocalizedSpot.p is a per-engine
-quality scalar -- a constant 1.0 for the Gaussian engine, a contrast for
-anchor-v1, an occupancy-times-CI product for anchor-v2, an affine NCC for
-psf-match -- and a threshold set on one of those means nothing on
-another and is not a probability on any of them. p_exist is the
-classifier's calibrated existence probability and NaN everywhere else,
-so `available()` answers honestly and a caller that respects it cannot
-offer a gate that would be meaningless. THIS IS WHY p_exist IS ITS OWN
-FIELD: in a shared `p` slot the gate would look applicable to v1 and v2
-and would silently be nonsense there.
+IT GATES ON WHATEVER NUMBER THE RESULT HAS, AND SAYS WHICH ONE. Every
+engine reports something in (0, 1] that ranks its own candidates, so
+thresholding is mechanically fine everywhere -- and refusing to open on
+v1 and v2 would be this module deciding for a person what they are
+allowed to look at. What it must never do is let the two be CONFUSED:
+
+    p_exist   the classifier's calibrated existence probability. A
+              threshold on it means the same thing on any run, any
+              bundle, any engine that produces one. v3 only.
+
+    p         a per-engine quality scalar -- a constant 1.0 for the
+              Gaussian engine, a contrast for anchor-v1, an
+              occupancy-times-CI product for anchor-v2, an affine NCC
+              for psf-match. Ranks within one engine and one
+              parameterisation, and means nothing across them.
+
+`quantity()` names which of the two a result set carries and every other
+function here takes that answer, so a threshold is always attached to a
+named quantity rather than floating free. The dialog prints it on the
+axis. In practice v1's p is 1.0 for everything -- its histogram is one
+bar and a threshold does nothing, which the picture shows better than a
+refusal would -- and v2's is a ranking nobody has calibrated; that is a
+reason not to USE the gate there, not a reason to hide it.
 
 WHAT THE DEFAULT IS, AND WHY IT IS NOT 0.5 BY FIAT. The classifier saves
 its own operating point (SpotClassifier.threshold, 0.5 today) and that
@@ -49,92 +62,139 @@ DEFAULT_THRESHOLD = 0.5
 DEFAULT_BINS = 50
 
 
-def p_of(spot):
-    """A spot's calibrated existence probability, or NaN.
+CALIBRATED = 'p_exist'
+QUALITY = 'p'
 
-    Tolerant of a plain tuple or dict as well as a LocalizedSpot, because
-    this runs on things that have crossed a store boundary as often as on
-    live objects.
+
+def _field(spot, name):
+    """One numeric field off a LocalizedSpot, a dict or anything else.
+
+    Tolerant because this runs on things that have crossed a store
+    boundary as often as on live objects.
     """
     if spot is None:
         return float('nan')
-    if isinstance(spot, dict):
-        v = spot.get('p_exist')
-    else:
-        v = getattr(spot, 'p_exist', None)
+    v = spot.get(name) if isinstance(spot, dict) else getattr(spot, name, None)
     try:
         return float('nan') if v is None else float(v)
     except (TypeError, ValueError):
         return float('nan')
 
 
-def values(spots):
-    """Every finite p_exist in `spots`, as an array. May be empty."""
-    v = np.asarray([p_of(s) for s in (spots or ())], float)
+def quantity(spots):
+    """Which number this result set can be gated on, or None.
+
+    ONE QUANTITY FOR THE WHOLE SET, never a per-spot fallback. Mixing a
+    calibrated probability and a quality score into one histogram would
+    put two different scales on one axis and let a threshold mean
+    different things for different spots in the same run -- the exact
+    confusion this module exists to prevent. p_exist wins when ANY spot
+    has one; otherwise p.
+    """
+    for s in (spots or ()):
+        if np.isfinite(_field(s, CALIBRATED)):
+            return CALIBRATED
+    for s in (spots or ()):
+        if np.isfinite(_field(s, QUALITY)):
+            return QUALITY
+    return None
+
+
+def is_calibrated(spots):
+    """Whether the number being gated is a probability or a ranking."""
+    return quantity(spots) == CALIBRATED
+
+
+def p_of(spot, which=None):
+    """The gated value of one spot, or NaN.
+
+    `which` names the quantity; without it, p_exist if the spot has one
+    and p otherwise -- which is right for a single spot and wrong for a
+    set, so set-level callers resolve it once with quantity().
+    """
+    if which is None:
+        v = _field(spot, CALIBRATED)
+        return v if np.isfinite(v) else _field(spot, QUALITY)
+    return _field(spot, which)
+
+
+def values(spots, which=None):
+    """Every finite gated value in `spots`, as an array. May be empty."""
+    which = which or quantity(spots)
+    if which is None:
+        return np.zeros(0)
+    v = np.asarray([_field(s, which) for s in (spots or ())], float)
     return v[np.isfinite(v)] if v.size else v
 
 
 def available(spots):
-    """Whether a p-gate means anything for this result set.
+    """Whether ANY number here can be thresholded at all.
 
-    False for v1, v2 and psf-match, whose p is a quality score and whose
-    p_exist is NaN -- a caller should not offer the dialog at all rather
-    than offer a threshold on numbers that are not probabilities.
+    True for every engine that reported something finite. False only for
+    an empty result -- see quantity() for which number it would be, and
+    is_calibrated() for whether that number is a probability.
     """
     return bool(values(spots).size)
 
 
-def deny(spot, threshold=DEFAULT_THRESHOLD):
+def deny(spot, threshold=DEFAULT_THRESHOLD, which=None):
     """True when this spot falls below the threshold.
 
-    A spot with NO p_exist is NEVER denied. The gate is not applicable to
-    it, and treating "this engine does not answer that question" as "the
-    answer is no" would silently delete every spot from every other
-    engine the moment a caller forgot to check available().
+    A spot with NO value for the gated quantity is NEVER denied. Whether
+    it is a v1 spot in a v3 result or a v3 candidate the matcher never
+    scored, "this number is absent" is not "this number is low", and
+    treating it as low would silently delete spots nobody judged.
     """
-    p = p_of(spot)
+    p = p_of(spot, which)
     return bool(np.isfinite(p) and p < float(threshold))
 
 
-def apply(spots, threshold=DEFAULT_THRESHOLD):
+def apply(spots, threshold=DEFAULT_THRESHOLD, which=None):
     """The survivors, in the order they came in."""
-    return [s for s in (spots or ()) if not deny(s, threshold)]
+    which = which or quantity(spots)
+    return [s for s in (spots or ()) if not deny(s, threshold, which)]
 
 
-def annotate(spots, threshold=DEFAULT_THRESHOLD):
-    """[(spot, p_exist, denied), ...] -- what the gate did, not only what
+def annotate(spots, threshold=DEFAULT_THRESHOLD, which=None):
+    """[(spot, value, denied), ...] -- what the gate did, not only what
     it removed. The dialog draws its examples from this."""
+    which = which or quantity(spots)
     t = float(threshold)
     out = []
     for s in (spots or ()):
-        p = p_of(s)
+        p = p_of(s, which)
         out.append((s, p, bool(np.isfinite(p) and p < t)))
     return out
 
 
-def histogram(spots, bins=DEFAULT_BINS, lo=0.0, hi=1.0):
-    """(counts, edges) over [0, 1] -- the picture the threshold is picked from.
+def histogram(spots, bins=DEFAULT_BINS, lo=0.0, hi=1.0, which=None):
+    """(counts, edges) over [0, 1] -- the picture a threshold is picked from.
 
-    The range is FIXED at [0, 1] rather than taken from the data. A
-    probability's axis is the unit interval, and an auto-range would
-    redraw the same distribution differently every time a run happened to
-    contain no confident spots, which is exactly when a person most needs
-    to see that the mass is all at the bottom.
+    The range is FIXED at [0, 1] rather than taken from the data. Both
+    quantities live in (0, 1] by contract, and an auto-range would redraw
+    the same distribution differently every time a run happened to
+    contain nothing confident -- which is exactly when a person most
+    needs to see that the mass is all at the bottom. It is also what
+    makes v1 legible: a single bar at 1.0 says "this engine ranks
+    nothing" far more plainly than an axis rescaled around it.
     """
-    v = values(spots)
+    v = values(spots, which)
     if not v.size:
         return np.zeros(int(bins), dtype=int), np.linspace(lo, hi, int(bins) + 1)
     counts, edges = np.histogram(v, bins=int(bins), range=(float(lo), float(hi)))
     return counts, edges
 
 
-def summary(spots, threshold=DEFAULT_THRESHOLD):
+def summary(spots, threshold=DEFAULT_THRESHOLD, which=None):
     """What a threshold costs, in the numbers a person is deciding with."""
-    all_v = np.asarray([p_of(s) for s in (spots or ())], float)
+    which = which or quantity(spots)
+    all_v = np.asarray([p_of(s, which) for s in (spots or ())], float)
     v = all_v[np.isfinite(all_v)]
     t = float(threshold)
     kept = int((v >= t).sum())
     return dict(
+        quantity=which,
+        calibrated=(which == CALIBRATED),
         threshold=t,
         n_total=int(all_v.size),
         n_scored=int(v.size),
@@ -142,12 +202,19 @@ def summary(spots, threshold=DEFAULT_THRESHOLD):
         n_kept=kept,
         n_denied=int(v.size - kept),
         kept_frac=(kept / v.size) if v.size else float('nan'),
+        # A DEGENERATE COLUMN IS WORTH SAYING OUT LOUD. v1 reports a
+        # constant 1.0, so every threshold at or below it keeps
+        # everything and every threshold above it keeps nothing -- there
+        # is no operating point in between, and a person staring at one
+        # bar deserves to be told that rather than left to infer it.
+        degenerate=bool(v.size and float(v.min()) == float(v.max())),
         p_median=float(np.median(v)) if v.size else float('nan'),
         p_min=float(v.min()) if v.size else float('nan'),
         p_max=float(v.max()) if v.size else float('nan'))
 
 
-def examples(spots, threshold=DEFAULT_THRESHOLD, n=4, rng=None, band=None):
+def examples(spots, threshold=DEFAULT_THRESHOLD, n=4, rng=None, band=None,
+             which=None):
     """A random sample of spots to LOOK at for a chosen threshold.
 
     Returns (kept, denied): `n` of each, drawn at random rather than by
@@ -161,9 +228,10 @@ def examples(spots, threshold=DEFAULT_THRESHOLD, n=4, rng=None, band=None):
     reading four particular spots as the whole distribution.
     """
     rng = np.random.default_rng() if rng is None else rng
+    which = which or quantity(spots)
     t = float(threshold)
     kept, denied = [], []
-    for s, p, d in annotate(spots, t):
+    for s, p, d in annotate(spots, t, which):
         if not np.isfinite(p):
             continue
         if band is not None and abs(p - t) > float(band):

@@ -45,26 +45,63 @@ def spots(ps):
     return [E._spot(i, i, i, 0.5, p_exist=p) for i, p in enumerate(ps)]
 
 
-def test_it_is_unavailable_where_p_is_not_a_probability():
-    print('\navailable(): the gate refuses to look applicable to v1 and v2')
-    check('a v3 result offers it', G.available(spots([0.1, 0.9])))
-    # Every other engine leaves p_exist NaN, which is not a threshold.
+def test_it_names_the_quantity_rather_than_refusing_it():
+    print('\nquantity(): every engine can be gated; only one is a probability')
+    # Every engine reports SOMETHING in (0, 1], so a histogram is always
+    # drawable. Refusing to open on v1 and v2 would be this module
+    # deciding what a person may look at.
     quality_only = [E._spot(0, 0, 0, 1.0), E._spot(1, 1, 1, 0.42)]
-    check('a v1/v2/psf-match result does NOT',
-          not G.available(quality_only))
-    check('nor does an empty result', not G.available([]))
-    check('nor does None', not G.available(None))
-    # AND THE UNSCORED ARE NEVER DELETED.
+    check('a v3 result gates on the calibrated probability',
+          G.quantity(spots([0.1, 0.9])) == G.CALIBRATED)
+    check('a v1/v2/psf-match result gates on its own p, and is OFFERED',
+          G.quantity(quality_only) == G.QUALITY
+          and G.available(quality_only))
+    check('and is flagged as NOT calibrated',
+          not G.is_calibrated(quality_only)
+          and G.is_calibrated(spots([0.5])))
+    check('an empty result has no quantity at all',
+          G.quantity([]) is None and not G.available([]))
+    check('nor does None', G.quantity(None) is None)
+
+    # ONE QUANTITY FOR THE WHOLE SET. A per-spot fallback would put a
+    # calibrated probability and a quality ranking on one axis.
     mixed = spots([0.9, 0.1]) + quality_only
+    check('a mixed set resolves to p_exist, not one column each',
+          G.quantity(mixed) == G.CALIBRATED)
+    v = G.values(mixed)
+    check('and only the spots that HAVE it are in the histogram',
+          sorted(np.round(v, 3)) == [0.1, 0.9], str(sorted(np.round(v, 3))))
+
+    # A SPOT WITHOUT THE GATED QUANTITY IS NEVER DENIED.
     kept = G.apply(mixed, 0.5)
-    check('a spot with no p_exist is never denied',
-          len(kept) == 3 and all(np.isnan(G.p_of(s)) or s.p_exist >= 0.5
-                                 for s in kept),
-          f'{len(kept)} of {len(mixed)} kept')
+    check('a spot with no value for the gated quantity survives',
+          len(kept) == 3, f'{len(kept)} of {len(mixed)}')
+    check('specifically: the confident one plus both unscored ones',
+          [round(G.p_of(k, G.CALIBRATED), 3) for k in kept][0] == 0.9
+          and sum(1 for k in kept
+                  if not np.isfinite(G.p_of(k, G.CALIBRATED))) == 2)
     s = G.summary(mixed, 0.5)
-    check('and the summary counts it as unscored, not as denied',
+    check('the summary counts them as unscored, not as denied',
           s['n_unscored'] == 2 and s['n_denied'] == 1,
           f"unscored {s['n_unscored']}, denied {s['n_denied']}")
+    check('and it names the quantity it used',
+          s['quantity'] == G.CALIBRATED and s['calibrated'] is True)
+
+
+def test_a_constant_column_is_called_degenerate():
+    print('\nsummary(): v1 reports 1.0 for everything, and that is worth saying')
+    v1 = [E._spot(i, i, i, 1.0) for i in range(6)]
+    s = G.summary(v1, 0.5)
+    check('it gates on p and says so',
+          s['quantity'] == G.QUALITY and not s['calibrated'])
+    check('every threshold at or below 1.0 keeps everything',
+          s['n_kept'] == 6 and G.summary(v1, 1.0)['n_kept'] == 6)
+    check('and anything above keeps nothing',
+          len(G.apply(v1, 1.0000001)) == 0)
+    check('DEGENERATE is flagged -- there is no operating point',
+          s['degenerate'] is True, f"min {s['p_min']} max {s['p_max']}")
+    check('a real distribution is not flagged',
+          G.summary(spots([0.1, 0.9]), 0.5)['degenerate'] is False)
 
 
 def test_the_threshold_does_what_it_says():
@@ -197,13 +234,16 @@ def test_the_dialog():
     d.close()
 
     # THE UNAVAILABLE CASE SAYS SO IN WORDS.
-    d2 = PGateDialog([E._spot(0, 0, 0, 1.0)], threshold=0.5)
+    d2 = PGateDialog([E._spot(i, i, i, 1.0) for i in range(4)],
+                     threshold=0.5)
     d2.show()
     for _ in range(2):
         app.processEvents()
-    check('a v1/v2 result gets an explanation, not an empty histogram',
-          'NO CALIBRATED PROBABILITY' in d2.head.text(),
-          d2.head.text()[:60])
+    check('a v1/v2 result OPENS, and is warned about in words',
+          'not a probability' in d2.warn.text().lower()
+          and 'kept' in d2.head.text(), d2.warn.text()[:70])
+    check('and its degenerate column is called out',
+          'ranks nothing' in d2.warn.text(), d2.warn.text()[-60:])
     d2.close()
 
     # And with no pixel source it still works.
@@ -220,7 +260,8 @@ def test_the_dialog():
 
 def main():
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-    for t in (test_it_is_unavailable_where_p_is_not_a_probability,
+    for t in (test_it_names_the_quantity_rather_than_refusing_it,
+              test_a_constant_column_is_called_degenerate,
               test_the_threshold_does_what_it_says,
               test_the_histogram_is_the_evidence,
               test_examples_are_drawn_where_a_threshold_is_decided,

@@ -210,6 +210,12 @@ def pack_spots(grp, dicts):
     _write(grp, 'table', tab, compress=True)
     for k, v in strs.items():
         _write(grp, k, np.asarray(v, dtype=_STR))
+    # A SEPARATE DATASET, not a column in `table`. The compound dtype is
+    # written per file, so adding a field to it would make every store
+    # written before today unreadable by this same reader -- z_status is
+    # here for exactly that reason and this follows it.
+    _write(grp, 'p_exist', np.asarray(
+        [float(d.get('p_exist', np.nan)) for d in dicts], dtype=np.float64))
     widths = np.asarray([len(c) for c in mix], dtype=np.int8)
     _write(grp, 'mix_vals', np.concatenate(mix) if mix else np.empty(0))
     _write(grp, 'mix_width', widths)
@@ -223,6 +229,11 @@ def unpack_spots(grp):
     # dataset, and those spots are exactly the ones nobody has fitted a
     # Z for, so absence IS the default rather than an error.
     zst = grp['z_status'][()] if 'z_status' in grp else None
+    # Absent in every store written before v3 existed, and absence means
+    # "no engine answered that question here" -- which is NaN, not 0.0.
+    # Reading it as 0.0 would make every historic spot look like a
+    # confident negative to the p-gate.
+    pex = grp['p_exist'][()] if 'p_exist' in grp else None
     mvals, mwidth, off = grp['mix_vals'][()], grp['mix_width'][()], grp['mix_off'][()]
     mstart = np.concatenate([[0], np.cumsum(mwidth)])
     out = []
@@ -239,6 +250,7 @@ def unpack_spots(grp):
             'linked': bool(tab['linked'][i]),
             'linked_at': la if la else None,
             'z_status': (_rd(zst[i]) if zst is not None else 'not_fit'),
+            'p_exist': (float(pex[i]) if pex is not None else float('nan')),
             'mixture_centroids': tuple(tuple(mvals[mstart[j]:mstart[j + 1]])
                                        for j in range(off[i], off[i + 1]))})
     return out

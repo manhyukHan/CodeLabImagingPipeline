@@ -60,13 +60,20 @@ class PGateDialog(QtWidgets.QDialog):
         self.head = QtWidgets.QLabel()
         self.head.setWordWrap(True)
         lay.addWidget(self.head)
+        self.warn = QtWidgets.QLabel()
+        self.warn.setWordWrap(True)
+        self.warn.setObjectName('quantity_note')
+        self.warn.setStyleSheet('color:#7a5200; background:#fff6e0;'
+                                ' padding:4px; border:1px solid #e8d9a8;')
+        lay.addWidget(self.warn)
 
         self.fig = Figure(figsize=(9.4, 2.4), dpi=100)
         self.canvas = FigureCanvasQTAgg(self.fig)
         lay.addWidget(self.canvas, 2)
 
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel('Keep spots with p ≥'))
+        self.klabel = QtWidgets.QLabel('Keep spots with p ≥')
+        row.addWidget(self.klabel)
         self.edit = QtWidgets.QLineEdit(f'{float(threshold):.3f}')
         self.edit.setObjectName('threshold')
         self.edit.setMaximumWidth(90)
@@ -127,19 +134,41 @@ class PGateDialog(QtWidgets.QDialog):
         t = self.threshold()
         s = G.summary(self._spots, t)
         if not G.available(self._spots):
-            self.head.setText(
-                'THIS RESULT HAS NO CALIBRATED PROBABILITY. Only the learned '
-                'engine (v3-psfmatcher) produces one; v1, v2 and psf-match '
-                'report a per-engine quality score instead, and a threshold '
-                'on those is not a threshold on a probability. Nothing here '
-                'would mean anything.')
+            self.head.setText('This result has no spots to gate.')
         else:
+            q = s['quantity']
             self.head.setText(
-                f"{s['n_kept']} of {s['n_scored']} spots kept at p ≥ "
+                f"{s['n_kept']} of {s['n_scored']} spots kept at {q} ≥ "
                 f"{t:.3f}   ({100 * s['kept_frac']:.1f}%)"
-                + (f"   ·   {s['n_unscored']} carry no probability and are "
-                   f"NOT denied" if s['n_unscored'] else '')
-                + f"   ·   p median {s['p_median']:.3f}")
+                + (f"   ·   {s['n_unscored']} have no {q} and are NOT denied"
+                   if s['n_unscored'] else '')
+                + f"   ·   median {s['p_median']:.3f}")
+        # NAME THE QUANTITY, DO NOT REFUSE IT. Thresholding a v1 or v2
+        # result is mechanically fine; what would be wrong is letting
+        # someone read a per-engine ranking as a probability, or carry a
+        # threshold chosen on one across to the other. So the warning is
+        # about MEANING, and the picture is drawn either way.
+        if not G.available(self._spots):
+            self.warn.setText('')
+        elif s['calibrated']:
+            self.warn.setText(
+                'p_exist — a CALIBRATED probability that a spot is here, from '
+                'a classifier trained on human verdicts and Platt-scaled on '
+                'held-out cells. Its ranking is sound (93.5% at 0.5 on 2,068 '
+                'labels); its absolute scale is optimistic, because early '
+                'stopping and the calibration share one validation split. '
+                'Read the picture, not the number 0.5.')
+        else:
+            extra = (' Every value here is identical, so no threshold '
+                     'separates anything — this engine ranks nothing.'
+                     if s['degenerate'] else '')
+            self.warn.setText(
+                f"p — a per-ENGINE quality score, NOT a probability. It ranks "
+                f"candidates within this one engine and this one "
+                f"parameterisation; a threshold chosen here does not carry to "
+                f"another engine or another run.{extra}")
+        q = G.quantity(self._spots)
+        self.klabel.setText(f'Keep spots with {q or "p"} ≥')
         self._draw_hist(t)
         self._draw_examples()
 
@@ -155,8 +184,11 @@ class PGateDialog(QtWidgets.QDialog):
                color='#00a05a', label='kept')
         ax.axvline(t, color='#d33', lw=1.6)
         ax.set_xlim(0, 1)
-        ax.set_xlabel('p — probability a spot is here (calibrated)',
-                      fontsize=8)
+        q = G.quantity(self._spots) or G.CALIBRATED
+        ax.set_xlabel(
+            'p_exist — calibrated probability a spot is here' if q == G.CALIBRATED
+            else "p — this engine's own quality ranking (not a probability)",
+            fontsize=8)
         ax.set_ylabel('spots', fontsize=8)
         ax.tick_params(labelsize=7)
         # A LOG COUNT AXIS, because the distribution is strongly bimodal

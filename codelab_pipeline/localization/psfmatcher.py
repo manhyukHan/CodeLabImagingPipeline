@@ -67,6 +67,31 @@ DEDUP_PX = 2.0
 VIEWS = ('cell', 'fov')
 
 
+def _peak_above(stack, y, x, z, background):
+    """The image value at a found position, above this region's background.
+
+    A MEASURED PEAK, NOT A FITTED AMPLITUDE. psf-match runs no Gaussian,
+    so there is no fitted amplitude and LocalizedSpot.amplitude is NaN by
+    design -- but AnAllele.polymer_adj carries a 4-tuple whose last
+    element is what analysis.polymer.max_brightness compares, and NaN
+    there does not raise. It makes the comparison undefined and the
+    selector silently returns whichever candidate came first: MEASURED on
+    real v3 output, exactly that happened, and the collapsed position was
+    "the first one" dressed up as "the brightest one".
+
+    Raw counts above this region's background, which is comparable
+    between candidates of the same region and is at least the right KIND
+    of quantity for that slot.
+    """
+    st = np.asarray(stack, float)
+    h, w, d = st.shape
+    iy = int(np.clip(round(float(y)), 0, h - 1))
+    ix = int(np.clip(round(float(x)), 0, w - 1))
+    iz = int(np.clip(round(float(z)), 0, d - 1))
+    v = float(st[iy, ix, iz])
+    return v - float(background) if np.isfinite(v) else float('nan')
+
+
 class PsfMatcherV3Engine(LocalizeEngine):
     """The learned engine. One call: pixels in, coordinates and p out.
 
@@ -306,5 +331,8 @@ class PsfMatcherV3Engine(LocalizeEngine):
                 win, seed_yxz=(y - y0, x - x0, z), n_max=1)
         if hits:
             hh = hits[0]
-            return _spot(hh.y + y0, hh.x + x0, hh.z, hh.p, p_exist=p_exist)
-        return _spot(y, x, z, float('nan'), p_exist=p_exist)
+            fy, fx, fz = hh.y + y0, hh.x + x0, hh.z
+            return _spot(fy, fx, fz, hh.p, p_exist=p_exist,
+                         amplitude=_peak_above(st, fy, fx, fz, bg))
+        return _spot(y, x, z, float('nan'), p_exist=p_exist,
+                     amplitude=_peak_above(st, y, x, z, bg))

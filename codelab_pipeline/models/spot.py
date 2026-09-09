@@ -101,6 +101,12 @@ class ASpot():
         self.linked_at = None
         self.mixture_centroids = ()
         self.z_status = Z_NOT_FIT
+        # NaN = no engine here answered 'is a spot really here'. Only
+        # the learned engine (v3-psfmatcher) produces this; v1, v2 and
+        # psf-match report a per-engine QUALITY score under a
+        # different name and must not be read as a probability. See
+        # localization/engine.py's LocalizedSpot docstring.
+        self.p_exist = float('nan')
 
     def set_metadata(self, **kwargs):
         if 'uid' in kwargs: self.uid = int(kwargs['uid'])
@@ -121,6 +127,15 @@ class ASpot():
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
         if 'mixture_centroids' in kwargs: self.mixture_centroids = tuple(kwargs['mixture_centroids'])
+        if 'p_exist' in kwargs:
+            try:
+                v = kwargs['p_exist']
+                self.p_exist = float('nan') if v is None else float(v)
+            except (TypeError, ValueError):
+                # Crosses a store boundary, so anything unreadable is
+                # 'nobody answered' rather than a crash -- the same
+                # rule z_status follows two lines below.
+                self.p_exist = float('nan')
         if 'z_status' in kwargs:
             v = str(kwargs['z_status'])
             # An unrecognised value is 'nobody has fitted it', never a
@@ -156,4 +171,12 @@ class ASpot():
                 'linked': bool(self.linked),
                 'linked_at': self.linked_at,
                 'mixture_centroids': tuple(tuple(r2(v) for v in c) for c in self.mixture_centroids),
+                # SIX DECIMALS, NOT TWO. Every other float here is a
+                # pixel coordinate where a hundredth is already past
+                # the detector's precision; this one spans 1e-12 to
+                # 1-1e-12 and its mass sits at the BOTTOM -- rounding
+                # to 2dp would collapse every spot under 0.005 onto
+                # exactly 0.0 and erase the tail the p-gate histogram
+                # is drawn from.
+                'p_exist': round(float(self.p_exist), 6),
                 'z_status': z_status_of(self)}
