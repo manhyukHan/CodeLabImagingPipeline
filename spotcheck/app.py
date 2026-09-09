@@ -442,6 +442,18 @@ class SpotCheck(QtWidgets.QMainWindow):
         self.help = QtWidgets.QLabel(self.mode.help_text)
         self.help.setStyleSheet('color:#555; padding: 2px;')
         lay.addWidget(self.help)
+        # WRAP THE WORDS, OR THEY SET THE WINDOW'S WIDTH. A QLabel with no
+        # wrap reports its whole single line as its minimum width, and the
+        # layout obeys: MEASURED, this window opened 3303 px wide in
+        # pass/fail and 3490 in multispot, both wider than the 1750 asked
+        # for and wider than the monitors people review on -- so the
+        # keystroke list, which is the one thing a new reviewer reads, was
+        # off the right-hand edge. The status line does the same on a page
+        # carrying two of its banners at once.
+        for lab in (self.status, self.help):
+            lab.setWordWrap(True)
+            lab.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                              QtWidgets.QSizePolicy.Minimum)
 
         self.canvas.mpl_connect('button_press_event', self._on_click)
         self.canvas.mpl_connect('draw_event', self._on_draw)

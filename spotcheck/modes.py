@@ -200,13 +200,21 @@ class Multispot:
     name = 'multispot'
     label = 'Multispot — how many spots are in this pillar?'
     log_kind = V.MULTISPOT_KIND
-    help_text = ('1-9 keep/drop a match   Space commit+next   '
-                 'Backspace back   A add one psf-match missed (then click '
-                 'the MIP)   U undo add   S skip unlabelled   Q quit\n'
-                 'The pillar is 15 × 15 × the whole stack, centred on a '
-                 'spot everybody already confirmed — so at least one of '
-                 'these is real. Brightness is σ above the crop '
-                 'background; the bar reads the same on every card.')
+    # EXPLICIT LINE BREAKS, not wrapping. A QLabel reports the height of
+    # the text it was GIVEN, so a line the widget wraps for itself is a
+    # line the layout never reserved room for -- MEASURED, the last line
+    # of this was cut off mid-sentence at 1750 px, and it is the line that
+    # says what the reviewer is looking at.
+    help_text = (
+        '1-9 keep/drop a match   Space commit+next   Backspace back   '
+        'A add one psf-match missed (then click the MIP)   U undo add   '
+        'S skip unlabelled   Q quit\n'
+        'DEFAULT IS DROP — press a number only for a match that is a REAL, '
+        'SEPARATE emitter. The pillar is 15 × 15 × the whole stack, centred '
+        'on a spot everybody already confirmed,\n'
+        'so at least one of these is real. Brightness is σ above the crop '
+        'background and the bar reads the same on every card, so two cards '
+        'that look alike can still be an order of magnitude apart.')
 
     def __init__(self, bank=None, bundle_dir=None, threshold=None,
                  k_sigma=REVIEW_K_SIGMA):
