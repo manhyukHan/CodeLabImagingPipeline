@@ -7890,6 +7890,209 @@ class MainWindow(QtWidgets.QMainWindow):
             # was reported ("still didn't appear"). Surface it for real.
             QtWidgets.QMessageBox.critical(self, 'Run Auto-Detect error', f'{type(e).__name__}: {e}')
 
+    def _v3_one_cell(self, engine, cell, sp, storage_path, fov, hybe,
+                     modality, channel, pad, append):
+        """Localize one cell with the learned engine. Returns n spots made.
+
+        HANDS THE ENGINE THE MASK, NOT A MASKED STACK. regions() takes the
+        background from the cell's OWN pixels while _boxes cuts from the
+        unmasked array -- the same split cell_crop already makes for the
+        Gaussian fit and for the same reason: a spot on the boundary has
+        its wings across the mask, and masking them pulls the fitted
+        centre inward (MEASURED 0.197 px, test_fit_sees_past_the_mask).
+        """
+        import numpy as _np
+        fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
+        crop = localization.cell_crop(
+            cell, hybe, channel, storage_path, fov, pad, modality=modality,
+            fov_matrices=fov_matrices,
+            resolver=self._frame_resolver(cell, fov))
+        if crop is None:
+            return None
+        stack = crop.get('stacks_unmasked')
+        if stack is None or _np.asarray(stack).size == 0:
+            return None
+        # 1 inside the cell, 0 outside -- cell_crop's masked copy is NaN
+        # beyond the mask, so this recovers the mask without re-reading it.
+        labels = _np.isfinite(_np.asarray(crop['img'], float)).astype(int)
+        spots = engine.localize(_np.asarray(stack, float), labels=labels,
+                                n_max=None)
+        rxmin, rymin = crop['rxmin'], crop['rymin']
+        H = self._matrix_to_shared(hybe, modality, cell, fov)
+        Hz = crop.get('Hz') or 0.0
+        new_spots = [self._v3_spot(s, rymin, rxmin, H, Hz, fov, hybe, channel,
+                                   modality, storage_path, cell_id=cell.id)
+                     for s in spots]
+        self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
+        return new_spots
+
+    def _v3_spot(self, s, rymin, rxmin, H, Hz, fov, hybe, channel, modality,
+                 storage_path, cell_id=-1):
+        """One LocalizedSpot -> one ASpot, in both frames."""
+        import numpy as _np
+        raw_y, raw_x = float(s.y) + rymin, float(s.x) + rxmin
+        if H is not None:
+            cy, cx, _ = H @ _np.array([raw_y, raw_x, 1.0])
+        else:
+            cy, cx = raw_y, raw_x
+        spot = ASpot()
+        spot.modality = modality or analysis_store.modality_of(storage_path)
+        spot.set_metadata(
+            fov=fov, hybe=hybe, channel=channel, cell=cell_id,
+            adj_coordinate=(float(cy), float(cx), float(s.z) + float(Hz)),
+            raw_coordinate=(raw_y, raw_x, float(s.z)),
+            size=0.0,
+            brightness=(float(s.amplitude) if _np.isfinite(s.amplitude)
+                        else 0.0),
+            # THE ENGINE LOCALIZES IN 3D, so its spots arrive with a Z that
+            # was fitted -- 'accepted', not 'not_fit'. There is no separate
+            # refinement step to wait for, and 'not_fit' would make the 3D
+            # viewer report an unasked question about an answer already
+            # given. It is also what makes the unified gate's first cut a
+            # no-op for these, as intended.
+            z_status=SPOT_Z_ACCEPTED,
+            p_exist=float(s.p_exist))
+        return spot
+
+    def _v3_fov_scope(self, sp):
+        """In FOV view, ask HOW. Returns 'cells', 'fov' or None.
+
+        TWO HONEST OPTIONS, not a refusal. Per cell is the default because
+        the background this engine reads is a per-region statistic: one
+        background for a whole field is one cell's background imposed on
+        every other, and MEASURED on a synthetic two-cell field the SAME
+        emitter's features differ by 1,616 between the two views -- under
+        the field background a bright cell's spot reads as a HOT PIXEL
+        (surround 180 sigma up, contrast down 25x, bright in every plane).
+
+        The field option exists anyway, because a field with no
+        segmentation has no cells to loop over and one background is the
+        only thing there is.
+        """
+        from PyQt5 import QtWidgets as W
+        box = W.QMessageBox(self)
+        box.setWindowTitle('Run Automatic Spot Localization -- FOV view')
+        box.setText('Run the learned engine over the whole FOV how?')
+        box.setInformativeText(
+            'PER CELL (recommended): each segmented cell gets its own '
+            'background,\n'
+            'candidates and boxes -- which is what this engine expects. '
+            'Spots keep\n'
+            'their owning cell.\n\n'
+            'WHOLE FOV: one background for the field, every spot '
+            'unassigned. Reads\n'
+            'the full Z-stack and searches all of it, so expect it to be '
+            'SLOW, and\n'
+            'expect a dim cell\'s spots to fall under a threshold a bright '
+            'cell set.\n'
+            'Use it when there is no segmentation to loop over.')
+        per_cell = box.addButton('Per cell (recommended)',
+                                 W.QMessageBox.AcceptRole)
+        whole = box.addButton('Whole FOV (slow)', W.QMessageBox.DestructiveRole)
+        box.addButton(W.QMessageBox.Cancel)
+        box.setDefaultButton(per_cell)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is per_cell:
+            return 'cells'
+        if clicked is whole:
+            return 'fov'
+        return None
+
+    def _v3_run_all_cells(self, engine, sp, storage_path, fov, hybe, modality,
+                          channel, pad, append):
+        """Option 1: every segmented cell in this FOV, one at a time."""
+        cells = (list(self.cell_container.get_cells(fov))
+                 if self.cell_container is not None else [])
+        if not cells:
+            QtWidgets.QMessageBox.warning(
+                self, 'Run Automatic Spot Localization',
+                'No segmented cells in this FOV.\n\nSegment first, or pick '
+                '"Whole FOV" -- which uses ONE background for the field and '
+                'is what that option is for.')
+            return
+        fp = self._begin_spot_edit(fov)
+        made = skipped = 0
+        for i, cell in enumerate(cells, 1):
+            try:
+                got = self._v3_one_cell(engine, cell, sp, storage_path, fov,
+                                        hybe, modality, channel, pad, append)
+            except Exception as exc:                        # noqa: BLE001
+                # ONE CELL THAT CANNOT BE READ IS ONE CELL, never the run.
+                self.log(f'   cell {cell.id}: {type(exc).__name__}: {exc}')
+                got = None
+            if got is None:
+                skipped += 1
+            else:
+                made += len(got)
+            if i % 10 == 0 or i == len(cells):
+                self.log(f'   {i}/{len(cells)} cells, {made} spot(s) so far')
+                QtWidgets.QApplication.processEvents()
+        self._commit_spot_edit(fov, fp)
+        self.log(f'FOV{fov:03d} {hybe} ch{channel}: {made} spot(s) over '
+                 f'{len(cells) - skipped} cell(s)'
+                 + (f', {skipped} with no crop' if skipped else '')
+                 + f'{", appended" if append else ""}. NOTHING is gated yet; '
+                 f'"Gate Spots..." is where you cut.')
+        self._load_spot_crop_for_display()
+        self._refresh_spot_cell_list()
+
+    def _v3_run_whole_fov(self, engine, sp, storage_path, fov, hybe, modality,
+                          channel, append):
+        """Option 2: one background for the field, every spot unassigned.
+
+        Reads the WHOLE Z-stack. The size is shown before it starts,
+        because it is the part a person is choosing to pay.
+        """
+        import h5py
+        import numpy as _np
+        from codelab_pipeline.io import paths
+        path = paths.stack_path(storage_path, fov, hybe)
+        try:
+            with h5py.File(path, 'r') as f:
+                ds = f[f'/stack/ch{int(channel)}']
+                shape, dtype = ds.shape, ds.dtype
+                mb = int(_np.prod(shape)) * int(dtype.itemsize) / 1e6
+                if QtWidgets.QMessageBox.question(
+                        self, 'Whole-FOV run',
+                        f'{hybe} ch{channel} FOV{fov:03d} is {shape[0]} x '
+                        f'{shape[1]} x {shape[2]} ({mb:.0f} MB as '
+                        f'{dtype}).\n\nIt is read whole and searched whole. '
+                        f'Continue?',
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+                        ) != QtWidgets.QMessageBox.Yes:
+                    return
+                stack = _np.asarray(ds[...], float)
+        except Exception as exc:                            # noqa: BLE001
+            QtWidgets.QMessageBox.critical(
+                self, 'Run Automatic Spot Localization',
+                f'Could not read the Z-stack for {hybe} ch{channel} '
+                f'FOV{fov:03d}:\n\n{type(exc).__name__}: {exc}')
+            return
+        self.log(f'   read {stack.shape} -- searching the whole field with '
+                 f'ONE background')
+        QtWidgets.QApplication.processEvents()
+        # labels=None: regions() then takes the field as one region, which
+        # IS the 'fov' view -- the engine's own view setting only decides
+        # this, and passing no labels says it directly.
+        spots = engine.localize(stack, labels=None, n_max=None)
+        H = self._matrix_to_shared(hybe, modality, None, fov)
+        new_spots = [self._v3_spot(s, 0, 0, H, 0.0, fov, hybe, channel,
+                                   modality, storage_path, cell_id=-1)
+                     for s in spots]
+        fp = self._begin_spot_edit(fov)
+        self._replace_fov_unassigned_spots(
+            storage_path, fov, hybe, channel, new_spots, append=append)
+        self._commit_spot_edit(fov, fp)
+        self.log(f'FOV{fov:03d} {hybe} ch{channel}: {len(new_spots)} '
+                 f'unassigned spot(s) from one field background'
+                 f'{", appended" if append else ""}. Cell ownership is '
+                 f'decided at save. NOTHING is gated yet.')
+        self._load_fov_spot_crop_for_display() \
+            if hasattr(self, '_load_fov_spot_crop_for_display') \
+            else self._load_spot_crop_for_display()
+        self._refresh_spot_cell_list()
+
     def _v3_engine(self):
         """The learned engine for the model the panel names, or None.
 
@@ -7935,97 +8138,44 @@ class MainWindow(QtWidgets.QMainWindow):
         histogram a person picks a threshold from is the histogram of
         exactly what a self-filtering run would have thrown away before
         they could look at it.
-
-        CELL VIEW HANDS THE ENGINE THE MASK, not a masked stack. Its
-        regions() takes the background from the cell's OWN pixels while
-        _boxes cuts from the unmasked array, which is the same split
-        cell_crop already makes for the Gaussian fit and for the same
-        reason: a spot on the boundary has its wings across the mask, and
-        masking them pulls the fitted centre inward (MEASURED 0.197 px,
-        tests/test_fit_sees_past_the_mask.py).
         """
-        import numpy as _np
         engine = self._v3_engine()
         if engine is None:
             return
         append = sp.AppendModeCheckBox.isChecked()
 
-        if sp.current_view() != 'cell':
-            QtWidgets.QMessageBox.warning(
-                self, 'Run Automatic Spot Localization',
-                'The learned engine needs a Z-STACK, and FOV view reads the '
-                'MIP.\n\nPick a cell (Cell view) and run it there. A '
-                'FOV-wide run would also take one background for cells that '
-                'differ in stain uptake and focus, which is the thing this '
-                "engine's cell view exists to avoid.")
+        if sp.current_view() == 'cell':
+            cell = self._selected_spot_cell()
+            if cell is None:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Run Automatic Spot Localization',
+                    'Select a cell first (Cell view).')
+                return
+            fp = self._begin_spot_edit(cell.fov)
+            got = self._v3_one_cell(engine, cell, sp, storage_path, fov, hybe,
+                                    modality, channel, pad, append)
+            self._commit_spot_edit(cell.fov, fp)
+            if got is None:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Run Automatic Spot Localization',
+                    f'Cell {cell.id}: no Z-stack crop for {hybe}.')
+                return
+            self.log(f'Cell {cell.id}, {hybe} ch{channel}: {len(got)} spot(s) '
+                     f'from {os.path.basename(sp.selected_model_dir() or "?")}'
+                     f'{", appended" if append else ""}. NOTHING is gated '
+                     f'yet; "Gate Spots..." is where you cut.')
+            self._load_spot_crop_for_display()
+            self._refresh_spot_cell_list()
             return
-        cell = self._selected_spot_cell()
-        if cell is None:
-            QtWidgets.QMessageBox.warning(
-                self, 'Run Automatic Spot Localization',
-                'Select a cell first (Cell view).')
-            return
-        fov_matrices = self._fov_matrices_for_cell_modality(modality, cell, fov)
-        crop = localization.cell_crop(
-            cell, hybe, channel, storage_path, fov, pad, modality=modality,
-            fov_matrices=fov_matrices,
-            resolver=self._frame_resolver(cell, fov))
-        if crop is None:
-            QtWidgets.QMessageBox.warning(
-                self, 'Run Automatic Spot Localization',
-                f'Cell {cell.id}: no crop for {hybe}.')
-            return
-        stack = crop.get('stacks_unmasked')
-        if stack is None or _np.asarray(stack).size == 0:
-            self.log(f'{hybe} ch{channel}: no Z-stack for this crop.')
-            return
-        # 1 inside the cell, 0 outside -- cell_crop's masked copy is NaN
-        # beyond the mask, so this recovers the mask without re-reading it.
-        labels = _np.isfinite(_np.asarray(crop['img'], float)).astype(int)
 
-        spots = engine.localize(_np.asarray(stack, float), labels=labels,
-                                n_max=None)
-        rxmin, rymin = crop['rxmin'], crop['rymin']
-        H = self._matrix_to_shared(hybe, modality, cell, fov)
-        Hz = crop.get('Hz') or 0.0
-        new_spots = []
-        for s in spots:
-            raw_y, raw_x = float(s.y) + rymin, float(s.x) + rxmin
-            if H is not None:
-                cy, cx, _ = H @ _np.array([raw_y, raw_x, 1.0])
-            else:
-                cy, cx = raw_y, raw_x
-            spot = ASpot()
-            spot.modality = modality or analysis_store.modality_of(storage_path)
-            spot.set_metadata(
-                fov=fov, hybe=hybe, channel=channel, cell=cell.id,
-                adj_coordinate=(float(cy), float(cx), float(s.z) + float(Hz)),
-                raw_coordinate=(raw_y, raw_x, float(s.z)),
-                size=0.0,
-                brightness=(float(s.amplitude)
-                            if _np.isfinite(s.amplitude) else 0.0),
-                # THE ENGINE LOCALIZES IN 3D, so its spots arrive with a Z
-                # that was fitted -- 'accepted', not 'not_fit'. A learned
-                # spot has no separate 3D-refinement step to wait for, and
-                # leaving it 'not_fit' would make the 3D viewer report an
-                # unasked question about an answer already given.
-                z_status=SPOT_Z_ACCEPTED,
-                p_exist=float(s.p_exist))
-            new_spots.append(spot)
-
-        fp = self._begin_spot_edit(cell.fov)
-        self._replace_cell_spots(cell, hybe, channel, new_spots, append=append)
-        self._commit_spot_edit(cell.fov, fp)
-        pe = _np.asarray([s.p_exist for s in spots], float)
-        n_conf = int((pe >= 0.5).sum()) if pe.size else 0
-        self.log(f'Cell {cell.id}, {hybe} ch{channel}: '
-                 f'{len(new_spots)} spot(s) from '
-                 f'{os.path.basename(sp.selected_model_dir() or "?")}'
-                 f'{", appended" if append else ""}. '
-                 f'{n_conf} at p >= 0.5 -- NOTHING is gated yet; '
-                 f'"Gate Spots..." is where you cut.')
-        self._load_spot_crop_for_display()
-        self._refresh_spot_cell_list()
+        # FOV VIEW OFFERS BOTH, rather than refusing. See _v3_fov_scope.
+        scope = self._v3_fov_scope(sp)
+        if scope == 'cells':
+            self._v3_run_all_cells(engine, sp, storage_path, fov, hybe,
+                                   modality, channel, pad, append)
+        elif scope == 'fov':
+            self._v3_run_whole_fov(engine, sp, storage_path, fov, hybe,
+                                   modality, channel, append)
 
     def _run_spot_auto_detect_body(self, sp, storage_path, fov, hybe, modality, channel, min_distance, pad):
         append = sp.AppendModeCheckBox.isChecked()
