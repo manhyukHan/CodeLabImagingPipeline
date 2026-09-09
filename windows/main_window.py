@@ -1854,6 +1854,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.RemoveTransientSpotsPushButton.clicked.connect(self._remove_transient_spots)
         sp.ClearHybeChannelPushButton.clicked.connect(self._clear_current_hybe_channel)
         sp.RemoveZRejectedPushButton.clicked.connect(self._remove_z_rejected_spots)
+        sp.EngineComboBox.currentIndexChanged.connect(
+            lambda _i: self._on_spot_engine_changed())
+        sp.PreviewPGatePushButton.clicked.connect(self._preview_p_gate)
+        sp.MakeModelPushButton.clicked.connect(self._make_new_model)
         sp.UndoPushButton.clicked.connect(self._undo_spot_action)
         sp.RedoPushButton.clicked.connect(self._redo_spot_action)
         sp.SaveCurrentSpotsPushButton.clicked.connect(self._save_current_spots)
@@ -6931,24 +6935,40 @@ class MainWindow(QtWidgets.QMainWindow):
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()
 
-    def _remove_z_rejected_spots(self):
-        """
-        Drop the spots whose 3D fit was REJECTED, and only those.
+    # -- the learned mode -----------------------------------------------
 
-        Scoped to the current (hybe, channel, modality) like every other
-        removal on this panel, in memory, persisted by Save -- so the
-        removal scope and the save scope stay identical, which is the
-        rule that stops a control here from destroying a hybe the user
-        never opened.
+    def _refresh_model_list(self):
+        """Fill the model combo from <repo>/models, keeping the choice."""
+        from codelab_pipeline.training import model_store as MS
+        sp = self.ui.SpotLocalizationPanel
+        want = sp.selected_model_dir()
+        runs = MS.available()
+        sp.populate_models(runs, select=want or MS.default_model())
+        return runs
 
-        `not_fit` spots are deliberately untouched. That distinction is
-        the whole reason ASpot.z_status has three states rather than two:
-        a rejected spot is a measured negative and sweeping it is a
-        cleanup, while an unfitted one is simply unexamined and sweeping
-        it would delete data on the strength of a question nobody asked.
-        Before z_status was persisted this button could not have existed
-        at all -- reopening the app erased the verdict.
+    def _on_spot_engine_changed(self):
+        """Mode changed: swap the page, and load models the first time."""
+        sp = self.ui.SpotLocalizationPanel
+        learned = sp.apply_mode_visibility()
+        if learned and sp.ModelComboBox.count() == 0:
+            runs = self._refresh_model_list()
+            if not runs:
+                self.log('No trained models under <repo>/models yet. '
+                         '"Make new model..." builds a review bundle, opens '
+                         'Spot Check on it, and trains one from your own '
+                         'verdicts.')
+        return learned
+
+    def _preview_p_gate(self):
+        """LOOK at the distribution without cutting anything.
+
+        Deliberately separate from "Gate Spots...", which removes: a
+        button named Preview that quietly deleted a third of the view
+        would be the worst kind of surprise. This is the same picture,
+        with no Apply.
         """
+        from codelab_pipeline.localization import p_gate as PG
+        from ui.p_gate_dialog import PGateDialog
         sp = self.ui.SpotLocalizationPanel
         fov = self._current_spot_fov()
         hybe = sp.current_hybe_folder()
@@ -6960,20 +6980,258 @@ class MainWindow(QtWidgets.QMainWindow):
         in_slice = [s for s in self.spot_container.all(fov)
                     if s.hybe == hybe and int(s.channel) == channel
                     and (s.modality or modality) == modality]
-        doomed = [s.uid for s in in_slice
-                  if spot_z_status_of(s) == SPOT_Z_REJECTED]
-        if not doomed:
+        if not in_slice:
+            self.log('Nothing in view to preview.')
+            return
+        if not PG.available(in_slice):
+            self.log('These spots carry no p at all -- nothing to threshold. '
+                     'Run a localization first.')
+            return
+        dlg = PGateDialog(
+            in_slice,
+            crop_of=self._spot_crop_for_gate(fov, hybe, modality, channel),
+            threshold=PG.DEFAULT_THRESHOLD, parent=self)
+        dlg.setWindowTitle('Spot probability gate -- preview only')
+        dlg.exec_()
+        self.log(f'Previewed p over {len(in_slice)} spot(s). '
+                 f'"Gate Spots..." is what removes them.')
+
+    def _make_new_model(self):
+        """Build a review bundle, open Spot Check on it, then train.
+
+        THE THREE STEPS WERE THREE SHELL COMMANDS a person had to be told.
+        Nothing here is new machinery -- tools/build_bundle.py and
+        spotcheck already do the work -- but a model a user can only make
+        by being handed a command line is a model most users will not
+        make, and "train it on your own experiment" was the whole promise.
+
+        The bundle path is handed to Spot Check as its default. The
+        REVIEWER NAME AND THE MODE ARE NOT: the reviewer names their own
+        verdict file, and typing it is what keeps one person's labels from
+        landing in another's on a shared folder.
+        """
+        from PyQt5 import QtWidgets as W
+        sp = self.ui.SpotLocalizationPanel
+        if not getattr(self, 'storage_path', None):
+            self.log('Open a store first -- a bundle is cut from one.')
+            return
+        channel_text = sp.ChannelComboBox.currentText().strip()
+        if not channel_text:
+            self.log('Pick a channel first: a bundle is one channel wide.')
+            return
+        store_name = os.path.basename(
+            os.path.normpath(str(self.storage_path))) or 'store'
+        default_out = os.path.join(
+            os.path.dirname(os.path.abspath(self.storage_path)),
+            'review_bundles', store_name + '_ch' + channel_text)
+        out, ok = W.QInputDialog.getText(
+            self, 'Make new model -- 1 of 3: build a review bundle',
+            'A bundle is a read-only copy of cell crops for reviewing.\n'
+            'It is a CACHE: verdicts carry their own coordinates, so the\n'
+            'bundle can be deleted once its labels are collected.\n\n'
+            'Where to build it:', text=default_out)
+        if not ok or not str(out).strip():
+            return
+        out = str(out).strip()
+        n_fov, ok = W.QInputDialog.getInt(
+            self, 'Make new model -- 1 of 3',
+            'How many FOVs to draw (at random, seeded)?\n\n'
+            'Fewer FOVs and more hybes is the better trade: a model needs\n'
+            'the experiment\'s RANGE, and cells within one FOV share a\n'
+            'background, a segmentation and a focus position.',
+            4, 1, 1000)
+        if not ok:
+            return
+        self.log(f'Building a review bundle into {out} ...')
+        self._start_bundle_build(out, int(channel_text), n_fov)
+
+    def _start_bundle_build(self, out, channel, n_fovs):
+        """Run tools/build_bundle.py in a worker, then offer Spot Check."""
+        import subprocess
+        import sys as _sys
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cmd = [_sys.executable, os.path.join(here, 'tools', 'build_bundle.py'),
+               str(self.storage_path), '--out', out,
+               '--channel', str(int(channel)),
+               '--n-fovs', str(int(n_fovs))]
+        self.log('  ' + ' '.join(cmd))
+        try:
+            # BLOCKING ON PURPOSE for now: the app has a worker pattern
+            # and this should join it, but a bundle build that silently
+            # runs behind a closed dialog is worse than one that says it
+            # is working. The log carries the command, so a person can
+            # also run it themselves.
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  cwd=here)
+        except Exception as exc:                            # noqa: BLE001
+            self.log(f'  bundle build failed to start: '
+                     f'{type(exc).__name__}: {exc}')
+            return
+        for line in (proc.stdout or '').splitlines()[-12:]:
+            self.log('  ' + line)
+        if proc.returncode != 0:
+            for line in (proc.stderr or '').splitlines()[-8:]:
+                self.log('  ! ' + line)
+            self.log('  bundle build failed.')
+            return
+        self.log(f'  bundle ready: {out}')
+        self._offer_spotcheck(out)
+
+    def _offer_spotcheck(self, bundle_dir):
+        """Open Spot Check on a bundle, with the path filled in."""
+        from PyQt5 import QtWidgets as W
+        import subprocess
+        import sys as _sys
+        if W.QMessageBox.question(
+                self, 'Make new model -- 2 of 3: review it',
+                f'The bundle is built:\n{bundle_dir}\n\n'
+                'Spot Check opens on it. You type your OWN name and pick '
+                'the review:\n'
+                '  pass/fail   is each candidate a real spot\n'
+                '  multispot   how many are in the pillar around a '
+                'confirmed one\n\n'
+                'Your name goes on your verdict file, so several people '
+                'can share\none bundle folder, and on the model you train '
+                'from it.\n\nOpen Spot Check now?',
+                W.QMessageBox.Yes | W.QMessageBox.No) != W.QMessageBox.Yes:
+            self.log(f'  review it later with:  python -m spotcheck.app '
+                     f'"{bundle_dir}"')
+            return
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # The bundle path is the default; the reviewer name and the mode
+        # are deliberately NOT passed, so the startup dialog asks for both.
+        cmd = [_sys.executable, '-m', 'spotcheck.app', str(bundle_dir)]
+        try:
+            subprocess.Popen(cmd, cwd=here)
+        except Exception as exc:                            # noqa: BLE001
+            self.log(f'  could not launch Spot Check: '
+                     f'{type(exc).__name__}: {exc}')
+            return
+        self.log('  Spot Check opened. When you have reviewed enough, train '
+                 'with:')
+        self.log(f'    python tools/train_spotmodel.py "{bundle_dir}" '
+                 f'--reviewer <your name> --storage-path '
+                 f'"{self.storage_path}"')
+        self.log('  then press "Make new model..." again -- the model list '
+                 'refreshes from <repo>/models.')
+
+    def _spot_crop_for_gate(self, fov, hybe, modality, channel, pad=7):
+        """A crop_of(spot) the p-gate dialog can draw examples with.
+
+        Returns a callable, or None when the pixels cannot be reached --
+        the dialog still draws the distribution then, and says why there
+        are no pictures rather than showing empty boxes.
+        """
+        from codelab_pipeline.alignment import spot_mapper
+        sp = self.storage_path if hasattr(self, 'storage_path') else None
+        if not sp:
+            return None
+
+        def crop_of(spot):
+            try:
+                raw = getattr(spot, 'raw_coordinate', None) or (0.0, 0.0, 0.0)
+                cube, _origin = spot_mapper.crop_for_localization(
+                    sp, int(fov), hybe, int(channel),
+                    (float(raw[0]), float(raw[1])), pad=pad, use_stack=True)
+                return cube
+            except Exception:                               # noqa: BLE001
+                # A crop that cannot be read is one missing picture, never
+                # a dialog that fails to open.
+                return None
+        return crop_of
+
+    def _remove_z_rejected_spots(self):
+        """
+        Gate this view: the measured-and-refused first, then a threshold.
+
+        ONE BUTTON FOR EVERY LOCALIZER, and one undo step for both cuts.
+        This was 'Remove Z-rejected' and only v1/v2 ever produce a
+        rejected Z, so it read as a control belonging to them. The two
+        cuts are the same act -- keep what survives a POSTERIOR test,
+        applied after localization, on the transient view, with Save
+        persisting whatever is left. Not pressing it is choosing not to
+        gate, which is why nothing here happens automatically.
+
+        Scoped to the current (hybe, channel, modality) like every other
+        removal on this panel, so the removal scope and the save scope
+        stay identical -- the rule that stops a control here from
+        destroying a hybe the user never opened.
+
+        `not_fit` spots are deliberately untouched by the first cut. That
+        distinction is the whole reason ASpot.z_status has three states
+        rather than two: a rejected spot is a measured negative and
+        sweeping it is a cleanup, while an unfitted one is simply
+        unexamined and sweeping it would delete data on the strength of a
+        question nobody asked. A learned engine's spots are z-accepted by
+        construction, so for those this cut finds nothing and the
+        threshold does the work.
+        """
+        from codelab_pipeline.localization import p_gate as PG
+        sp = self.ui.SpotLocalizationPanel
+        fov = self._current_spot_fov()
+        hybe = sp.current_hybe_folder()
+        modality = sp.current_hybe_modality()
+        channel_text = sp.ChannelComboBox.currentText().strip()
+        if fov is None or not hybe or not modality or not channel_text:
+            return
+        channel = int(channel_text)
+        in_slice = [s for s in self.spot_container.all(fov)
+                    if s.hybe == hybe and int(s.channel) == channel
+                    and (s.modality or modality) == modality]
+        if not in_slice:
+            self.log(f'FOV{fov:03d} {hybe} ch{channel}: nothing in view to '
+                     f'gate.')
+            return
+
+        z_doomed = [s for s in in_slice
+                    if spot_z_status_of(s) == SPOT_Z_REJECTED]
+        survivors = [s for s in in_slice if s not in z_doomed]
+
+        # THE THRESHOLD IS CHOSEN ON WHAT SURVIVES THE FIRST CUT, not on
+        # everything: a histogram that still contains spots already known
+        # to be going is a histogram of a set nobody will keep.
+        threshold, quantity = None, PG.quantity(survivors)
+        if quantity is not None:
+            from ui.p_gate_dialog import PGateDialog
+            dlg = PGateDialog(
+                survivors,
+                crop_of=self._spot_crop_for_gate(fov, hybe, modality, channel),
+                threshold=PG.DEFAULT_THRESHOLD, parent=self)
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                self.log('Gate cancelled -- nothing removed.')
+                return
+            threshold = dlg.threshold()
+        elif not z_doomed:
             n_unfit = sum(1 for s in in_slice
                           if spot_z_status_of(s) == SPOT_Z_NOT_FIT)
-            self.log(f'FOV{fov:03d} {hybe} ch{channel}: no Z-rejected spots '
-                     f'({len(in_slice)} here, {n_unfit} never 3D-localized).')
+            self.log(f'FOV{fov:03d} {hybe} ch{channel}: nothing to gate -- '
+                     f'no Z-rejected spots ({n_unfit} never 3D-localized) '
+                     f'and no p to threshold on.')
             return
+
+        p_doomed = ([s for s in survivors
+                     if PG.deny(s, threshold, which=quantity)]
+                    if threshold is not None else [])
+        doomed = [s.uid for s in (z_doomed + p_doomed)]
+        if not doomed:
+            self.log(f'FOV{fov:03d} {hybe} ch{channel}: gate removed nothing '
+                     f'({len(in_slice)} in view).')
+            return
+
+        # BOTH CUTS INSIDE ONE EDIT, so one Undo restores the whole gate
+        # rather than half of it.
         fp = self._begin_spot_edit(fov)
         n = len(self.spot_container.remove(fov, doomed))
         self._commit_spot_edit(fov, fp)
-        kept = len(in_slice) - n
-        self.log(f'FOV{fov:03d} {hybe} ch{channel}: {n} Z-rejected spot(s) '
-                 f'removed, {kept} kept (in memory -- Save persists it).')
+        bits = []
+        if z_doomed:
+            bits.append(f'{len(z_doomed)} Z-rejected')
+        if p_doomed:
+            bits.append(f'{len(p_doomed)} below {quantity} '
+                        f'{threshold:.3f}')
+        self.log(f'FOV{fov:03d} {hybe} ch{channel}: gate removed {n} '
+                 f'({", ".join(bits)}), {len(in_slice) - n} kept '
+                 f'(in memory -- Save persists it, Undo restores it).')
         self._refresh_spot_cell_list()
         if sp.ShowDisplayerPushButton.isChecked():
             self._show_spot_displayer()

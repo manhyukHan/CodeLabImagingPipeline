@@ -324,11 +324,22 @@ class SpotLocalizationPanelUI(object):
         # and "nobody asked" are different facts, and only the first is a
         # measured negative safe to sweep. Same (hybe, channel) scope as
         # every other removal here, in memory, persisted by Save.
-        self.RemoveZRejectedPushButton = QtWidgets.QPushButton('Remove Z-rejected')
+        # ONE GATE FOR EVERY LOCALIZER. This was 'Remove Z-rejected', and
+        # only v1/v2 ever produce a rejected Z, so it read as a v1/v2
+        # control. Both cuts are the same act -- keep what survives a
+        # posterior test -- and doing them in one press means ONE undo
+        # step restores the whole thing, on every engine.
+        self.RemoveZRejectedPushButton = QtWidgets.QPushButton('Gate Spots...')
         self.RemoveZRejectedPushButton.setToolTip(
-            'Remove spots whose 3D fit was rejected, for this hybe/channel.\n'
-            'Spots that have never been 3D-localized are left untouched.\n'
-            'In memory -- Save Current Spots persists it.')
+            'Cut what this view should not keep, for this hybe/channel:\n'
+            '  1. Z-REJECTED -- a 3D fit that was measured and refused.\n'
+            '     Spots never 3D-localized are left alone: an unasked\n'
+            '     question is not a negative answer. A learned engine\n'
+            '     reports no rejected Z, so this step simply finds none.\n'
+            '  2. A THRESHOLD on p, chosen from a histogram of the spots\n'
+            '     in view, with examples from either side of the line.\n'
+            'In memory, and ONE undo step. Save Current Spots persists\n'
+            'what is left -- not pressing this is choosing not to gate.')
         removeRowLayout.addWidget(self.RemoveZRejectedPushButton)
         layout.addWidget(removeRow)
 
