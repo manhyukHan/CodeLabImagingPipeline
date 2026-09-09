@@ -67,6 +67,27 @@ DEDUP_PX = 2.0
 VIEWS = ('cell', 'fov')
 
 
+def is_refined(spot):
+    """Whether model 3 placed this spot, or only model 1 believes in it.
+
+    A spot model 3 could not place keeps its ANCHOR's integer position
+    and NaN in `p`. It is not deleted -- MEASURED on 613 human-labelled
+    spots, the case is rare (4, 0.7%) and 3 of those 4 were REAL by human
+    judgement, against 94% for spots both models agree on. Model 3 scores
+    SHAPE, and its silence is weak evidence at best: on the same set it
+    found a peak on 172 spots that both the classifier and the reviewer
+    called nothing.
+
+    But an integer position is not a measurement. A pixel here is 208 nm
+    against a localization precision of ~30 nm, so a caller that needs a
+    POSITION -- a chromatin trace does -- must be able to tell these
+    apart rather than silently write a coordinate an order of magnitude
+    worse than the rest. That is what this is for, and it is why NaN is
+    left in `p` rather than filled with something plausible.
+    """
+    return bool(np.isfinite(getattr(spot, 'p', float('nan'))))
+
+
 def _peak_above(stack, y, x, z, background):
     """The image value at a found position, above this region's background.
 

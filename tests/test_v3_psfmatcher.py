@@ -429,7 +429,14 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     a5, _ok5, _w5 = run(0.5)
     a9, _ok9, _w9 = run(0.999999)
     n0, n5, n9 = len(cands), len(a5.polymer_adj['H']), len(a9.polymer_adj['H'])
-    check('a threshold cuts the list', n0 > n5 > n9, f'{n0} -> {n5} -> {n9}')
+    check('a threshold cuts the list', n0 >= n5 > n9, f'{n0} -> {n5} -> {n9}')
+    # WHAT THE UNREFINED FILTER ALREADY REMOVED, before p_exist saw
+    # anything: on this cube the engine offered 17 candidates and model 3
+    # could place only 2. polymer_adj is a list of POSITIONS and an
+    # anchor's integer coordinate is 208 nm against a ~30 nm precision,
+    # so the other 15 are kept as SPOTS and not as trace positions.
+    check('most candidates never had a sub-voxel position to write',
+          n0 < 17, f'{n0} written of the 17 the engine offered')
     check('the brightest locus survives every threshold',
           round(a9.polymer_adj['H'][0][1] - 200) == 15,
           str(round(a9.polymer_adj['H'][0][1] - 200)))

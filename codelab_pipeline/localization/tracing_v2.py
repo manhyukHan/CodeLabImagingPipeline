@@ -642,12 +642,31 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         return False, 'readout found nothing'
 
     from . import p_gate as PG
+    from . import psfmatcher as PSFM
     t = p.min_p_exist
     kept = cands if t is None else PG.apply(cands, t, which=PG.CALIBRATED)
+    # AND ONLY CANDIDATES MODEL 3 ACTUALLY PLACED. polymer_adj is a list
+    # of POSITIONS, and a candidate the matched filter could not place
+    # keeps its anchor's INTEGER coordinate -- 208 nm here against a
+    # localization precision near 30 nm. Writing that into a trace would
+    # be an order-of-magnitude worse position wearing the same shape as
+    # every other one, and nothing downstream could tell.
+    #
+    # THE SPOT IS NOT DELETED, it is only not TRACED. Detection keeps it
+    # (psfmatcher.is_refined says why: MEASURED, 3 of the 4 such spots in
+    # 613 labels were real), and it stays an ASpot with its p_exist. What
+    # it does not get is a position it does not have.
+    n_pre = len(kept)
+    kept = [c for c in kept if PSFM.is_refined(c)]
+    if debug is not None:
+        debug[hybe]['readout_n_unrefined'] = n_pre - len(kept)
     if debug is not None:
         debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
         debug[hybe]['readout_n_before_p_gate'] = len(cands)
     if not kept:
+        if n_pre:
+            return False, ('readout: no candidate could be placed to '
+                           'sub-voxel precision')
         return False, (f'readout: every candidate below p_exist {t:g}'
                        if t is not None else 'readout found nothing')
 
