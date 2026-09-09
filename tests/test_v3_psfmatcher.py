@@ -427,9 +427,16 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     # THE GATE IS POSTERIOR AND CUTS BEFORE THE WRITE -- the same shape as
     # max_uncert, on a different number, and p_exist is never stored.
     a5, _ok5, _w5 = run(0.5)
-    a9, _ok9, _w9 = run(0.999999)
-    n0, n5, n9 = len(cands), len(a5.polymer_adj['H']), len(a9.polymer_adj['H'])
-    check('a threshold cuts the list', n0 >= n5 > n9, f'{n0} -> {n5} -> {n9}')
+    a9, _ok9, _w9 = run(0.9)
+    n0, n5, n9 = (len(cands), len(a5.polymer_adj.get('H', [])),
+                  len(a9.polymer_adj.get('H', [])))
+    # 0.9, NOT 0.999999: p_exist is now p1 * cal(p3), and the two real
+    # loci land at 0.9999979 -- a threshold of six nines is above
+    # EVERYTHING, so it stopped testing 'stricter cuts more' and started
+    # testing 'the hybe can be emptied', which the 1.0 case below already
+    # does. The cut that matters is 3 -> 2.
+    check('a threshold cuts the list', n0 > n5 >= n9 >= 1,
+          f'{n0} -> {n5} -> {n9}')
     # WHAT THE UNREFINED FILTER ALREADY REMOVED, before p_exist saw
     # anything: on this cube the engine offered 17 candidates and model 3
     # could place only 2. polymer_adj is a list of POSITIONS and an
@@ -437,9 +444,15 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     # so the other 15 are kept as SPOTS and not as trace positions.
     check('most candidates never had a sub-voxel position to write',
           n0 < 17, f'{n0} written of the 17 the engine offered')
+    # SURVIVES, not 'is first'. The list has no primary entry: localize
+    # returns it sorted by p_exist, polymer.collapse_polymer picks the
+    # BRIGHTEST by amplitude, and export pairs adj with raw by index.
+    # Once p_exist became per-hit the two loci stopped tying, so the
+    # order changed -- and the old check read that as the bright locus
+    # being cut, which it was not.
     check('the brightest locus survives every threshold',
-          round(a9.polymer_adj['H'][0][1] - 200) == 15,
-          str(round(a9.polymer_adj['H'][0][1] - 200)))
+          15 in {round(c[1] - 200) for c in a9.polymer_adj['H']},
+          str(sorted(round(c[1] - 200) for c in a9.polymer_adj['H'])))
     check('p_exist is NOT in the stored tuple',
           all(len(c) == 4 for c in a5.polymer_adj['H']))
     _aa, ok_all, why_all = run(1.0)
@@ -508,6 +521,79 @@ def test_a_learned_spot_is_recognisable_without_a_new_field():
           'learned', not from_learned_engine(mk(0.93, Z_REJECTED)))
 
 
+def test_each_hit_carries_its_own_p_exist():
+    """The second and third emitter in a pillar are gateable.
+
+    THE DEFECT THIS CLOSES, MEASURED. Every hit from one candidate box
+    used to inherit that box's p1, so within a pillar the p-gate was
+    inert: on the 661 human-judged matches of the shipped model's own
+    verdict set, sweeping the threshold from 0.05 to 0.90 kept all 661
+    or none of them -- precision stuck at 0.728, F1 0.842, and no
+    threshold anywhere could separate a real second locus from a
+    spurious one.
+
+    With p_exist = p1 * cal(p3) the same sweep is a real curve:
+    precision 0.926 at 0.20, 0.966 at 0.50, 0.988 at 0.80; best F1
+    0.967 at 0.40 (precision 0.963, recall 0.971) assuming a pillar p1
+    of 0.95, and 0.966 at 0.33 assuming 0.80. The DEFAULT 0.5 needs no
+    change: it sits at F1 0.961 / 0.956 across that range of p1.
+    """
+    from codelab_pipeline.localization import psfmatcher as PM
+
+    class Cal(object):
+        def __init__(self, f):
+            self.f = f
+
+        def score(self, p3):
+            return self.f(float(p3))
+
+    half = Cal(lambda p: 0.5)
+    check('the product is the chain rule, no rescaling',
+          abs(PM._joint(0.9, 0.8, half) - 0.45) < 1e-12)
+    check('both factors in (0,1) keep the product in (0,1)',
+          0.0 < PM._joint(0.999, 0.999, Cal(lambda p: 0.999)) < 1.0)
+
+    # NO CALIBRATION SHIPPED -> the pillar number, never a raw NCC
+    # dressed up as a probability.
+    check('no calibration leaves p1 alone', PM._joint(0.9, 0.8, None) == 0.9)
+    check('a NaN p3 leaves p1 alone',
+          PM._joint(0.9, float('nan'), half) == 0.9)
+
+    # The shipped calibration crosses 0.5 where the measured raw
+    # threshold sits, which is what makes 0.5 a usable default.
+    import glob
+    import os as _os
+    from codelab_pipeline.training import classify as C
+    repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    md = sorted(glob.glob(_os.path.join(repo, 'models', '*')))
+    md = [d for d in md if _os.path.isdir(d)]
+    if md:
+        path = _os.path.join(md[0], C.MULTISPOT_NAME)
+        if _os.path.exists(path):
+            cal = C.MultispotCalibration.load(path)
+            lo, hi = float(cal.score(0.60)), float(cal.score(0.85))
+            check('the shipped Platt is below 0.5 at a weak match',
+                  lo < 0.5, f'cal(0.60)={lo:.4f}')
+            check('and above 0.5 at a strong one', hi > 0.5,
+                  f'cal(0.85)={hi:.4f}')
+            check('so a weak match in a believed pillar falls under 0.5',
+                  PM._joint(0.95, 0.60, cal) < 0.5)
+            check('and a strong one clears it',
+                  PM._joint(0.95, 0.85, cal) > 0.5)
+            # TWO HITS IN ONE PILLAR NOW DIFFER, which is the whole point.
+            check('two hits from one pillar get different p_exist',
+                  PM._joint(0.95, 0.60, cal) != PM._joint(0.95, 0.85, cal))
+
+    # And the engine wires it: _refine multiplies, the unrefined
+    # fallback does not.
+    import inspect
+    src = inspect.getsource(PM.PsfMatcherV3Engine._refine)
+    check('_refine multiplies per hit', '_joint(p1, hh.p, cal)' in src)
+    check('an unrefined anchor keeps the pillar number',
+          src.rstrip().endswith('amplitude=_peak_above(st, y, x, z, bg))]')
+          and 'p_exist=p1,' in src.split('cal = self.multispot_cal')[1])
+
+
 def main():
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     for t in (test_p_exist_is_its_own_field,
@@ -517,7 +603,8 @@ def main():
               test_nothing_is_dropped_on_p_exist,
               test_load_best_takes_the_report_s_winner,
               test_the_readout_writes_a_list_and_the_gate_cuts_it,
-              test_a_learned_spot_is_recognisable_without_a_new_field):
+              test_a_learned_spot_is_recognisable_without_a_new_field,
+              test_each_hit_carries_its_own_p_exist):
         t()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     for f in FAIL:

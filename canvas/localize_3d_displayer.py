@@ -421,11 +421,18 @@ class Localize3DGridDisplayer(QtWidgets.QMainWindow):
         # is generous; inner spacing (within one spot's own YX/XZ pair)
         # stays tight so the pair still reads as one connected crop.
         col_px, pair_px = 190, 300
-        # top=0.90 (not 0.97) -- the top row's own titles sit just above
-        # ax_yx, inside that same top margin; 0.97 left too little room and
-        # clipped them off the very top of the canvas (confirmed real bug).
-        outer = fig.add_gridspec(nrows_pairs, ncols, hspace=0.55, wspace=0.4,
-                                 left=0.03, right=0.98, top=0.90, bottom=0.03)
+        # A TWO-LINE TITLE NEEDS THE ROOM A TWO-LINE TITLE TAKES. Titles
+        # sit inside the outer spacing, so a second line (p_exist) has to
+        # buy both the top margin and the between-pair gap or it lands on
+        # the image above it -- the same clipping that made top=0.97
+        # wrong for one line.
+        tall = any(chr(10) in str(row[2]) for row in results if len(row) > 2)
+        if tall:
+            pair_px += 26
+        outer = fig.add_gridspec(nrows_pairs, ncols,
+                                 hspace=0.72 if tall else 0.55, wspace=0.4,
+                                 left=0.03, right=0.98,
+                                 top=0.87 if tall else 0.90, bottom=0.03)
         for i, row in enumerate(results):
             # 3-tuple (cubic, centroid, title) or 4-tuple with a
             # gate-REJECTED fit position appended -- drawn blue, the

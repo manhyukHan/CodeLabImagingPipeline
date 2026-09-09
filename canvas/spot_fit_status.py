@@ -5,7 +5,7 @@ from codelab_pipeline.io import preprocess
 
 def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, title='',
                          marker_size=130, z_display_pad=15, title_fontsize=9,
-                         rejected=None):
+                         rejected=None, scale_half=2, scale_half_z=5):
     """
     Renders one spot's fit-status: a YX max-projection (over Z) and an XZ
     max-projection (over Y -- X horizontal, Z vertical, same display
@@ -54,6 +54,25 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     renders as a squashed ellipse once aspect='auto' makes x/z pixels
     non-square; an unfilled scatter marker stays visually circular
     regardless of the axes' own data aspect.
+    scale_half / scale_half_z: the grey scale's white point is taken
+    from a box around THE MARKED SPOT -- +/-scale_half pixels laterally,
+    +/-scale_half_z planes axially -- not from the whole crop. The box is
+    ANISOTROPIC because the PSF is: this project measures sigma_xy 0.66
+    px against sigma_z 2.35 planes, so a box that is square in pixels
+    would be 3 sigma wide and under 1 sigma deep, and would keep letting
+    a lateral neighbour's tail in while cutting off the spot's own
+    z-wings.
+    DISPLAY-ONLY, and the reason is that a 15x15 crop's ub=0.9999
+    quantile is its own maximum for all practical purposes (225 pixels),
+    so ONE bright neighbour inside the crop sets white and crushes the
+    circled spot to near-black -- confirmed on a real grid, where the
+    marked spot was invisible in several tiles while an off-centre blob
+    was saturated. Scaling to the marked spot lets neighbours clip to
+    white instead, which says "there is something brighter nearby"
+    rather than "there is nothing here". The black point stays the
+    crop's own lb quantile, so the noise floor still reads as noise.
+    Falls back to whole-crop quantiles when there is no marker, or when
+    the marked box is not brighter than that floor.
     z_display_pad: the XZ panel only shows +/-z_display_pad z-planes
     around the centroid (or the cubic's own brightest voxel if no
     centroid) -- DISPLAY-ONLY, never affects what fit_gaussian_3d actually
@@ -61,8 +80,6 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     11px wide x 177 z-planes for a real DNA hybe) renders as a near-1D
     sliver, unreadable even though the fit itself lands correctly.
     """
-    yx = preprocess.normalize_to_uint8(cubic.max(axis=2), lb, ub)
-
     centroids = None
     if centroid is not None:
         centroids = list(centroid) if isinstance(centroid, list) else [centroid]
@@ -86,7 +103,31 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         z_center = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
     zmin = max(0, int(round(z_center)) - z_display_pad)
     zmax = min(depth, int(round(z_center)) + z_display_pad + 1)
-    xz = preprocess.normalize_to_uint8(cubic[:, :, zmin:zmax].max(axis=0).T, lb, ub)  # (z window, width)
+
+    # THE SCALE FOLLOWS THE MARKED SPOT. Which spot the picture is about
+    # is known here -- it is the one that gets the yellow circle -- so
+    # the white point comes from its own neighbourhood and a brighter
+    # neighbour saturates instead of deciding the whole tile's exposure.
+    if centroids:
+        mark = centroids[0]
+    elif rejected_list:
+        mark = rejected_list[0]
+    else:
+        my, mx, mz = np.unravel_index(np.nanargmax(cubic), cubic.shape)
+        mark = (float(mx), float(my), float(mz))
+    yx_img = _project(cubic, 2)
+    xz_img = _project(cubic[:, :, zmin:zmax], 0).T         # (z window, width)
+    # EACH PANEL'S OWN BLACK POINT. The two are different pictures: a
+    # max over 120 planes and a max over 15 rows do not share a noise
+    # floor, and taking one quantile of the raw cube for both left the
+    # YX panel's background sitting a sixth of the way up the grey
+    # scale (MEASURED median 43/255 against 12/255 per-panel).
+    yx = _scaled(yx_img, _floor(yx_img, lb),
+                 _peak(yx_img, mark[1], mark[0], scale_half, scale_half),
+                 lb, ub)
+    xz = _scaled(xz_img, _floor(xz_img, lb),
+                 _peak(xz_img, mark[2] - zmin, mark[0],
+                       scale_half_z, scale_half), lb, ub)
 
     ax_yx.imshow(yx, cmap='gray', aspect='auto')
     ax_xz.imshow(xz, cmap='gray', aspect='auto')
@@ -109,3 +150,66 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
                                  edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
             ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+
+
+def _project(cube, axis):
+    """A max projection that ignores a cell mask's NaN holes.
+
+    Plain max propagates NaN, so a single masked row blanks an entire
+    column of the projection -- and then there is no scale to take and
+    nothing to look at.
+    """
+    a = np.asarray(cube, float)
+    if a.dtype.kind == 'f' and np.isnan(a).any():
+        return np.nanmax(a, axis=axis)
+    return a.max(axis=axis)
+
+
+def _floor(a, lb):
+    """The crop's own black point: its lb quantile, NaN-tolerant."""
+    a = np.asarray(a, float)
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return None
+    return float(np.quantile(finite, lb)) if lb < 1 else float(lb)
+
+
+def _peak(img, row, col, half_row, half_col):
+    """The brightest value in the box around (row, col), or None.
+
+    None when the box lands entirely off the image or holds nothing
+    finite -- the caller then falls back to whole-image quantiles rather
+    than inventing a scale.
+
+    A neighbour close enough to put its own tail inside this box DOES
+    raise the white point, and that is not a defect: at 4 px the two
+    PSFs overlap, and a scale that pretended otherwise would be drawing
+    a spot the crop does not contain.
+    """
+    a = np.asarray(img, float)
+    try:
+        r, c = int(round(float(row))), int(round(float(col)))
+    except (TypeError, ValueError):
+        return None
+    r0, r1 = max(0, r - half_row), min(a.shape[0], r + half_row + 1)
+    c0, c1 = max(0, c - half_col), min(a.shape[1], c + half_col + 1)
+    if r1 <= r0 or c1 <= c0:
+        return None
+    box = a[r0:r1, c0:c1]
+    box = box[np.isfinite(box)]
+    return float(box.max()) if box.size else None
+
+
+def _scaled(img, lo, hi, lb, ub):
+    """img as uint8 on [lo, hi], or on its own quantiles if that fails.
+
+    Values above hi CLIP to white on purpose: a neighbour brighter than
+    the marked spot should read as present and saturated, not set the
+    exposure for the tile.
+    """
+    if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi) \
+            or hi <= lo:
+        return preprocess.normalize_to_uint8(img, lb, ub)
+    a = np.clip(np.asarray(img, float), lo, hi)
+    a = np.where(np.isfinite(a), a, lo)
+    return ((a - lo) / (hi - lo) * 255).astype(np.uint8)

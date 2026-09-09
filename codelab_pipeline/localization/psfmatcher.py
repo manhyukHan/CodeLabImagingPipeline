@@ -113,6 +113,37 @@ def is_refined(spot):
     return bool(np.isfinite(getattr(spot, 'p', float('nan'))))
 
 
+def _joint(p1, p3, cal):
+    """P(a real emitter is HERE) = p1 * P(this match is real | pillar real).
+
+    THIS IS THE CHAIN RULE, NOT AN INDEPENDENCE ASSUMPTION, and that is
+    what makes the product a probability rather than a score:
+
+      p1        the classifier's calibrated answer to "does this pillar
+                hold a real spot at all", trained on pass/fail verdicts
+                over crop-pillars.
+      cal(p3)   the multispot Platt's answer to "is THIS match a real
+                emitter", trained on verdicts inside pillars that
+                already contain one spot everyone agreed on (see
+                verdicts.multispot_labels: 'every pillar in this file
+                already contains one spot everybody agreed on -- the
+                seed'). It is therefore conditional on p1's event.
+
+    P(A and B) = P(A) * P(B | A) exactly. No rescaling is needed or
+    wanted: both factors are already in (0, 1), so the product is, and
+    renormalising a chain rule would destroy the calibration it has.
+
+    NO CALIBRATION SHIPPED -> p1 UNCHANGED. Multiplying by a raw NCC
+    would look like a probability and not be one; a model directory
+    without psf_multispot.json simply keeps the pillar-level answer.
+    """
+    import numpy as _np
+    p1 = float(p1)
+    if cal is None or not _np.isfinite(p3):
+        return p1
+    return p1 * float(cal.score(float(p3)))
+
+
 def _peak_above(stack, y, x, z, background):
     """The image value at a found position, above this region's background.
 
@@ -404,7 +435,11 @@ class PsfMatcherV3Engine(LocalizeEngine):
             out.sort(key=lambda s: -s.p_exist)
         return out if n_max is None else out[:int(n_max)]
 
-    def _refine(self, stack, y, x, z, p_exist, bg, sigma):
+    def _joint_p(self, p1, p3):
+        """Public spelling of the joint probability, for callers and tests."""
+        return _joint(p1, p3, self.multispot_cal)
+
+    def _refine(self, stack, y, x, z, p1, bg, sigma):
         """The matched filter on one candidate. Returns a LIST.
 
         The template is searched in a window around the candidate, and a
@@ -412,9 +447,16 @@ class PsfMatcherV3Engine(LocalizeEngine):
         position -- a spot the classifier believes in does not stop
         existing because the matched filter had no peak over threshold,
         it just has no sub-voxel refinement.
+
+        EVERY HIT FROM ONE CANDIDATE USED TO SHARE ONE p_exist, which
+        made the second and third emitter in a pillar ungateable: they
+        carried the pillar's number, not their own, so no threshold could
+        separate a real second locus from a spurious one. Each hit now
+        gets p1 * P(this match is real | the pillar is real) -- see
+        _joint below for why that is a chain rule and not an assumption.
         """
         if not self.refines:
-            return [_spot(y, x, z, float('nan'), p_exist=p_exist,
+            return [_spot(y, x, z, float('nan'), p_exist=p1,
                           amplitude=_peak_above(stack, y, x, z, bg))]
         st = np.asarray(stack, float)
         h, w, d = st.shape
@@ -440,12 +482,19 @@ class PsfMatcherV3Engine(LocalizeEngine):
             # one real spot -- so one-per-candidate discards the answer to
             # the question this engine exists to ask.
             hits = self.matcher.localize(win, seed_yxz=None, n_max=None)
+        cal = self.multispot_cal
         out = []
         for hh in hits:
             fy, fx, fz = hh.y + y0, hh.x + x0, hh.z
-            out.append(_spot(fy, fx, fz, hh.p, p_exist=p_exist,
+            out.append(_spot(fy, fx, fz, hh.p,
+                             p_exist=_joint(p1, hh.p, cal),
                              amplitude=_peak_above(st, fy, fx, fz, bg)))
         if out:
             return out
-        return [_spot(y, x, z, float('nan'), p_exist=p_exist,
+        # NO MATCH: p3 does not exist, so neither does the product. The
+        # anchor keeps the PILLAR's number and `p` stays NaN, which is
+        # what is_refined() reads. Pushing these to ~0 instead would be
+        # inventing a measurement, and would contradict one: MEASURED,
+        # 3 of the 4 unrefined spots in 613 labels were real.
+        return [_spot(y, x, z, float('nan'), p_exist=p1,
                       amplitude=_peak_above(st, y, x, z, bg))]

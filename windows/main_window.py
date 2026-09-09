@@ -1848,8 +1848,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sp.CellListWidget.itemClicked.connect(self._on_spot_cell_selected)
         self._install_spot_view_shortcuts()
         sp.FovListWidget.itemClicked.connect(self._on_fov_list_item_clicked)
-        sp.HybeComboBox.currentIndexChanged.connect(self._show_spot_displayer)
-        sp.ChannelComboBox.currentIndexChanged.connect(self._show_spot_displayer)
+        # BOTH, not just the displayer: the cell list's per-cell counts
+        # are now this hybe and channel's, so a slice change that
+        # redrew the crop but left the counts alone would show one
+        # hybe's picture over another hybe's numbers.
+        sp.HybeComboBox.currentIndexChanged.connect(self._on_spot_slice_changed)
+        sp.ChannelComboBox.currentIndexChanged.connect(
+            self._on_spot_slice_changed)
         sp.AutoDetectPushButton.clicked.connect(self._run_spot_auto_detect)
         sp.ShowDisplayerPushButton.toggled.connect(self._toggle_spot_crop_displayer)
         sp.Show3DLocalizationPushButton.toggled.connect(self._toggle_localize_3d_displayer)
@@ -5584,10 +5589,26 @@ class MainWindow(QtWidgets.QMainWindow):
             sp.populate_cell_choices([])
         else:
             cells = self.cell_container.get_cells(fov)
+            # SCOPED TO THE HYBE AND CHANNEL ON SCREEN -- the same slice
+            # the spot list below it, every removal and every save on
+            # this panel already use. A lifetime total per cell cannot
+            # be acted on here: it does not say whether THIS hybe has
+            # been localized in that cell, which is the question the
+            # list is read to answer.
+            hybe = sp.current_hybe_folder()
+            modality = sp.current_hybe_modality()
+            channel_text = sp.ChannelComboBox.currentText().strip()
+            scoped = bool(hybe and channel_text)
+            channel = int(channel_text) if scoped else None
             n_by_cell = {}
             for spot in self.spot_container.all(fov):
-                if int(spot.cell) != -1:
-                    n_by_cell[int(spot.cell)] = n_by_cell.get(int(spot.cell), 0) + 1
+                if int(spot.cell) == -1:
+                    continue
+                if scoped and not (spot.hybe == hybe
+                                   and int(spot.channel) == channel
+                                   and (spot.modality or modality) == modality):
+                    continue
+                n_by_cell[int(spot.cell)] = n_by_cell.get(int(spot.cell), 0) + 1
             sp.populate_cell_choices(cells, n_by_cell)
             self.log(f'Cell list refreshed: {len(cells)} cell(s) for FOV{fov:03d}.')
         self._refresh_spot_fov_summary()
@@ -6149,6 +6170,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_view_spot_refs = [(s, None) for s in unassigned_spots] + cell_owned_refs
         self._refresh_localize_3d_spot_choices(preserve_selected_ids=preserve_ids)
 
+    def _on_spot_slice_changed(self, *_args):
+        """The hybe or channel moved: recount the cells, then redraw."""
+        self._refresh_spot_cell_list()
+        self._show_spot_displayer()
+
     def _show_spot_displayer(self, *_args):
         """
         Populates the pop-up crop displayer from whatever's currently set
@@ -6350,10 +6376,43 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return storage_path, fov, hybe, modality, channel, targets
 
-    def _spot_grid_title(self, storage_path, fov, hybe, channel, spot, cell):
+    def _spot_grid_title(self, storage_path, fov, hybe, channel, spot, cell,
+                         show_p=False):
         gidx = self._global_spot_index_map(storage_path, fov, hybe, channel).get(id(spot), '?')
         tag = 'unassigned' if cell is None else cell.id
-        return f'Spot {gidx} | Cell {tag}'
+        line = f'Spot {gidx} | Cell {tag}'
+        if not show_p:
+            return line
+        p = getattr(spot, 'p_exist', float('nan'))
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            p = float('nan')
+        # '--', not 'nan': the spot has no calibrated probability because
+        # a Gaussian engine made it, which is a different statement from
+        # a model having judged it unlikely.
+        return line + chr(10) + (f'p_exist: {p:.2f}' if p == p
+                                 else 'p_exist: --')
+
+    def _spot_grid_titles(self, storage_path, fov, hybe, channel, targets):
+        """Titles for one grid, with p_exist shown only if any spot has it.
+
+        ALL PANELS OR NONE, decided per batch. A second title line on
+        some panels and not others staggers the images down the grid,
+        and a grid of v1/v2 spots -- none of which carries a p_exist by
+        contract -- would otherwise repeat 'p_exist: --' forty times to
+        say nothing.
+        """
+        def has_p(spot):
+            p = getattr(spot, 'p_exist', float('nan'))
+            try:
+                return float(p) == float(p)
+            except (TypeError, ValueError):
+                return False
+        show = any(has_p(spot) for spot, _cell in targets)
+        return [self._spot_grid_title(storage_path, fov, hybe, channel,
+                                      spot, cell, show_p=show)
+                for spot, cell in targets]
 
     def _run_3d_localize(self):
         """
@@ -6546,8 +6605,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                     # preview and run report the same z
         # grid titles read session containers -- GUI-thread work, done
         # before the worker starts
-        titles = [self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
-                  for spot, cell in targets]
+        titles = self._spot_grid_titles(storage_path, fov, hybe, channel,
+                                        targets)
 
         # Background PROCESS, same shape as _run_3d_localize: the NAS
         # stack-crop reads leave this process entirely (h5py's one lock
@@ -6687,8 +6746,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
 
         grid_results = []
-        for spot, cell in targets:
-            title = self._spot_grid_title(storage_path, fov, hybe, channel, spot, cell)
+        titles = self._spot_grid_titles(storage_path, fov, hybe, channel,
+                                        targets)
+        for (spot, cell), title in zip(targets, titles):
             raw_y, raw_x = float(spot.raw_coordinate[0]), float(spot.raw_coordinate[1])
             try:
                 cubic, (ymin, xmin) = spot_mapper.crop_for_localization(storage_path, fov, hybe, channel,
@@ -7063,17 +7123,26 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         from PyQt5 import QtWidgets as W
         sp = self.ui.SpotLocalizationPanel
-        if not getattr(self, 'storage_path', None):
-            self.log('Open a store first -- a bundle is cut from one.')
+        # THE STORE IS THE SELECTED HYBE'S OWN, not a window-wide one.
+        # This window HAS no storage_path attribute: each modality carries
+        # its own, and this panel's hybe combo can name a hybe from any of
+        # them. Asking the modality is the only way to reach the store a
+        # bundle would actually be cut from -- reading self.storage_path
+        # here silently answered None and made this button always refuse.
+        modality = sp.current_hybe_modality()
+        storage_path = self._storage_path_for_modality(modality)
+        if not storage_path:
+            self.log('Pick a hybe whose modality has a storage path first '
+                     '-- a bundle is cut from one store.')
             return
         channel_text = sp.ChannelComboBox.currentText().strip()
         if not channel_text:
             self.log('Pick a channel first: a bundle is one channel wide.')
             return
         store_name = os.path.basename(
-            os.path.normpath(str(self.storage_path))) or 'store'
+            os.path.normpath(str(storage_path))) or 'store'
         default_out = os.path.join(
-            os.path.dirname(os.path.abspath(self.storage_path)),
+            os.path.dirname(os.path.abspath(storage_path)),
             'review_bundles', store_name + '_ch' + channel_text)
         out, ok = W.QInputDialog.getText(
             self, 'Make new model -- 1 of 3: build a review bundle',
@@ -7094,15 +7163,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok:
             return
         self.log(f'Building a review bundle into {out} ...')
-        self._start_bundle_build(out, int(channel_text), n_fov)
+        self._start_bundle_build(storage_path, out, int(channel_text),
+                                 n_fov)
 
-    def _start_bundle_build(self, out, channel, n_fovs):
+    def _start_bundle_build(self, storage_path, out, channel, n_fovs):
         """Run tools/build_bundle.py in a worker, then offer Spot Check."""
         import subprocess
         import sys as _sys
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         cmd = [_sys.executable, os.path.join(here, 'tools', 'build_bundle.py'),
-               str(self.storage_path), '--out', out,
+               str(storage_path), '--out', out,
                '--channel', str(int(channel)),
                '--n-fovs', str(int(n_fovs))]
         self.log('  ' + ' '.join(cmd))
@@ -7126,9 +7196,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log('  bundle build failed.')
             return
         self.log(f'  bundle ready: {out}')
-        self._offer_spotcheck(out)
+        self._offer_spotcheck(storage_path, out)
 
-    def _offer_spotcheck(self, bundle_dir):
+    def _offer_spotcheck(self, storage_path, bundle_dir):
         """Open Spot Check on a bundle, with the path filled in."""
         from PyQt5 import QtWidgets as W
         import subprocess
@@ -7162,7 +7232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                  'with:')
         self.log(f'    python tools/train_spotmodel.py "{bundle_dir}" '
                  f'--reviewer <your name> --storage-path '
-                 f'"{self.storage_path}"')
+                 f'"{storage_path}"')
         self.log('  then press "Make new model..." again -- the model list '
                  'refreshes from <repo>/models.')
 
@@ -7172,23 +7242,58 @@ class MainWindow(QtWidgets.QMainWindow):
         Returns a callable, or None when the pixels cannot be reached --
         the dialog still draws the distribution then, and says why there
         are no pictures rather than showing empty boxes.
+
+        READS THE STORED MIP, NOT THE Z-STACK. The dialog projects the
+        cube it is handed (nanmax over z) to draw a YX thumbnail, so a
+        full-depth read would fetch 120 planes to make a picture the
+        store already holds -- and on NAS that is a ~278 MB stack file
+        opened once per thumbnail, eight times per refresh. The window
+        of the stored MIP IS that projection.
+
+        The MIP is read ONCE and kept in the closure: every example, and
+        every press of Refresh, is then a slice of one array in memory.
         """
-        from codelab_pipeline.alignment import spot_mapper
-        sp = self.storage_path if hasattr(self, 'storage_path') else None
-        if not sp:
+        from codelab_pipeline.io import analysis_store as AS
+        # THE STORE IS THE SELECTED HYBE'S OWN. This window has no
+        # storage_path attribute -- each modality carries one -- and
+        # reading a missing attribute here is what left this dialog with
+        # no way to read pixels at all.
+        storage_path = self._storage_path_for_modality(modality)
+        if not storage_path:
             return None
+        cache = {}
+
+        def mip():
+            if 'a' not in cache:
+                try:
+                    cache['a'] = AS.read_hybe_mip(storage_path, int(fov),
+                                                  hybe, int(channel))
+                except Exception:                           # noqa: BLE001
+                    cache['a'] = None
+            return cache['a']
 
         def crop_of(spot):
-            try:
-                raw = getattr(spot, 'raw_coordinate', None) or (0.0, 0.0, 0.0)
-                cube, _origin = spot_mapper.crop_for_localization(
-                    sp, int(fov), hybe, int(channel),
-                    (float(raw[0]), float(raw[1])), pad=pad, use_stack=True)
-                return cube
-            except Exception:                               # noqa: BLE001
-                # A crop that cannot be read is one missing picture, never
-                # a dialog that fails to open.
+            a = mip()
+            if a is None:
                 return None
+            raw = getattr(spot, 'raw_coordinate', None)
+            if raw is None and isinstance(spot, dict):
+                raw = spot.get('raw_coordinate')
+            try:
+                y, x = float(raw[0]), float(raw[1])
+            except Exception:                               # noqa: BLE001
+                # NO COORDINATE IS NOT THE ORIGIN. Defaulting to (0, 0)
+                # would draw the image's top-left corner and label it a
+                # spot, which is worse than an empty box.
+                return None
+            import numpy as _np
+            arr = _np.asarray(a)
+            h, w = arr.shape[0], arr.shape[1]
+            y0, y1 = max(0, int(round(y)) - pad), min(h, int(round(y)) + pad + 1)
+            x0, x1 = max(0, int(round(x)) - pad), min(w, int(round(x)) + pad + 1)
+            if y1 <= y0 or x1 <= x0:
+                return None
+            return arr[y0:y1, x0:x1]
         return crop_of
 
     def _remove_z_rejected_spots(self):

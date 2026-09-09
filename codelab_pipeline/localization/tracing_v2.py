@@ -671,9 +671,13 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     # (psfmatcher.is_refined says why: MEASURED, 3 of the 4 such spots in
     # 613 labels were real), and it stays an ASpot with its p_exist. What
     # it does not get is a position it does not have.
-    # The matcher's own gate, on its calibrated score where the model
-    # ships one. No calibration -> no gate here, and the matcher's sigma
-    # threshold is the only cut, which is what it was before this existed.
+    # AN EXTRA FLOOR ON THE MATCH ALONE, and off by default. p_exist
+    # already carries cal(p3): psfmatcher._joint multiplies the pillar's
+    # p1 by it per hit, so min_p_exist above is the joint cut and this
+    # one exists only to say 'and the match itself must be at least this
+    # good regardless of how much the classifier believed the pillar'.
+    # Setting both means cutting one factor twice; that is a choice, not
+    # a mistake, which is why neither has a default.
     cal = getattr(p.readout_engine, 'multispot_cal', None)
     if p.min_p3 is not None and cal is not None:
         before = len(kept)

@@ -253,6 +253,17 @@ class PGateDialog(QtWidgets.QDialog):
                 'No example images: this dialog was given no way to read '
                 'pixels, so it can show the distribution but not the spots. '
                 'The threshold is still applied.')
+        elif not shown and any(pool for _l, pool, _c in rows):
+            # THERE WERE SPOTS TO DRAW AND NONE COULD BE READ. Falling
+            # through to 'drawn at RANDOM' here would describe a picture
+            # that is not on screen, and the reader would blame the
+            # threshold for an unreadable store.
+            self.note.setText(
+                'There are spots on both sides of the line, but NONE of '
+                'their pixels could be read -- the MIP for this hybe and '
+                'channel is missing, or the spots carry no raw coordinate '
+                'to centre a crop on. The distribution and the threshold '
+                'are unaffected.')
         elif gap and band is not None:
             self.note.setText(
                 'Nothing is drawn for: ' + ', '.join(gap)

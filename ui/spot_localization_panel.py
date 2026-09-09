@@ -286,7 +286,12 @@ class SpotLocalizationPanelUI(object):
         listsLayout.addLayout(fovListCol)
 
         cellListCol = QtWidgets.QVBoxLayout()
-        cellListCol.addWidget(QtWidgets.QLabel('View (FOV pool / Cell, this FOV):'))
+        # THE COUNT IS SCOPED, so the header says so. Per-cell
+        # totals across every hybe answered a question nobody asks
+        # here: this panel localizes, saves and gates ONE
+        # (hybe, channel) at a time, and how many spots a cell has
+        # in THAT slice is what decides where to look next.
+        cellListCol.addWidget(QtWidgets.QLabel('View (FOV pool / Cell, this hybe+channel):'))
         self.CellListWidget = QtWidgets.QListWidget()
         self.CellListWidget.setMaximumHeight(120)
         cellListCol.addWidget(self.CellListWidget)
@@ -550,6 +555,13 @@ class SpotLocalizationPanelUI(object):
         pool view); rows 1+ are real cells. n_spots_by_cell: {cell.id: n}
         supplied by the caller from the session's SpotContainer -- cells
         hold no spot lists of their own.
+
+        THE COUNT IS THE CURRENT (hybe, channel, modality) SLICE, not the
+        cell's lifetime total: the caller scopes it (see
+        MainWindow._refresh_spot_cell_list), and this panel acts on one
+        slice at a time, so a cell showing 0 here has nothing in the
+        hybe on screen and may still hold hundreds in others.
+
         Selection preserved by cell id where possible, defaulting to the
         FOV row when nothing else was previously selected (matches the
         old Scope combobox's own default of Whole FOV).
