@@ -1434,15 +1434,51 @@ def apply_allele_result(allele, result):
     return allele
 
 
-def is_v2(engine):
-    """True for the v2 engine name, whatever decoration the combo carries.
+# THE ONE VOCABULARY. Two selectors used to offer the same idea in
+# incompatible words -- the tracing panel said 'v1'/'v2' and the
+# 3D-localization popup said 'gaussian'/'v2' -- so a value copied from
+# one to the other did not route, and 'gaussian' collided by name with a
+# real make_engine key while meaning something else entirely. It was
+# never a third engine: the popup's own combo reads
+# addItem('v1 gaussian', 'gaussian'), so the LABEL already said v1 and
+# only the stored value disagreed.
+ROUTE_V1 = 'v1'
+ROUTE_V2 = 'v2-anchor-fit'
+ROUTE_V3 = 'v3-psfmatcher'
+ROUTES = (ROUTE_V1, ROUTE_V2, ROUTE_V3)
 
-    Matched on a PREFIX rather than on equality so the panel's label can
-    gain explanation ('v2 (calibrated PSF)') without silently switching
-    every run back to v1 -- a failure that would show up only as slightly
-    worse numbers.
+
+def route(engine):
+    """Which fit path a stored or typed engine value names.
+
+    PREFIX MATCHED, not equality, so a label may gain explanation
+    ('v2-anchor-fit (calibrated PSF)') without silently switching every
+    run back to v1 -- a failure that would show up only as slightly
+    worse numbers. Equality is what the popup's consumer used, and it is
+    why a decorated v2 label would have routed correctly in tracing and
+    fallen back to v1 there.
+
+    EVERY OLD SPELLING STILL LANDS: 'v2' is the value in five checked-in
+    configs and prefixes ROUTE_V2; 'gaussian' was the popup's not-v2
+    sentinel and is the v1 route. Data on disk outlives a rename, the
+    same rule ASpot.coordinate -> adj_coordinate follows.
     """
-    return str(engine or '').strip().lower().startswith('v2')
+    s = str(engine or '').strip().lower()
+    if s.startswith('v3'):
+        return ROUTE_V3
+    if s.startswith('v2'):
+        return ROUTE_V2
+    return ROUTE_V1
+
+
+def is_v2(engine):
+    """True for the v2 anchor-fit route, whatever spelling reached it."""
+    return route(engine) == ROUTE_V2
+
+
+def is_v3(engine):
+    """True for the learned route."""
+    return route(engine) == ROUTE_V3
 
 
 def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,

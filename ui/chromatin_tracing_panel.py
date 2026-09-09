@@ -34,8 +34,12 @@ from PyQt5 import QtWidgets, QtCore
 # The two engines. v1 stays the reference implementation -- it is a direct
 # port of ChrTracer3's FitPsf3D and must remain runnable so any v2 claim
 # can be checked against it rather than asserted.
+# THE DISPLAY LABELS. The stored value is the itemData beside each --
+# tracing_v2.ROUTE_* -- and never this text, so a label may be reworded
+# without moving what any config says.
 ENGINE_V1 = 'v1 (ChrTracer3 port)'
-ENGINE_V2 = 'v2'
+ENGINE_V2 = 'v2-anchor-fit (PSF fit + quality gates)'
+ENGINE_V3 = 'v3-psfmatcher (learned: classifier + matched PSF)'
 
 # Voxel size, in micrometres. An INPUT with a default, not a constant:
 # v2 reasons in physical length, and a lateral pixel (0.208 um) and an
@@ -66,7 +70,7 @@ DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
                   # allele-level parallelism, 2.7-3.5x FASTER than v1 too.
                   # v1 stays selectable and unchanged -- it is the reference
                   # implementation and every v2 claim is measured against it.
-                  'engine': ENGINE_V2,
+                  'engine': 'v2-anchor-fit',
                   'readout_psf': DEFAULT_READOUT_PSF,
                   'fiducial': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2},
                   'readout': {**SHARED_FIT_DEFAULTS, 'min_hb_ratio': 1.2, **READOUT_ONLY_FIT_DEFAULTS}}
@@ -314,8 +318,14 @@ class ChromatinTracingPanelUI(object):
         # itemData, not display text. The config round-trips on this, so
         # renaming a label ("v2" -> "v2 (calibrated PSF)") must not turn
         # every saved v2 config into a v1 run silently carrying v2 numbers.
-        self.EngineComboBox.addItem(ENGINE_V1, 'v1')
-        self.EngineComboBox.addItem(ENGINE_V2, 'v2')
+        # ONE VOCABULARY WITH THE 3D-LOCALIZATION POPUP. That combo used
+        # to store 'gaussian' for this same v1 route while its own label
+        # already read 'v1 gaussian', so a value copied between the two
+        # panels did not route. Both now store tracing_v2.ROUTE_*.
+        from codelab_pipeline.localization import tracing_v2 as _R
+        self.EngineComboBox.addItem(ENGINE_V1, _R.ROUTE_V1)
+        self.EngineComboBox.addItem(ENGINE_V2, _R.ROUTE_V2)
+        self.EngineComboBox.addItem(ENGINE_V3, _R.ROUTE_V3)
         self.EngineComboBox.setProperty('config_uses_item_data', True)
         self.EngineComboBox.setCurrentText(DEFAULT_PARAMS['engine'])
         self.EngineComboBox.setToolTip(
@@ -988,11 +998,23 @@ class ChromatinTracingPanelUI(object):
         self.FitParamsStackedWidget.setCurrentIndex(1 if v2 else 0)
         return v2
 
-    def selected_engine_is_v2(self):
-        """Match tracing_v2.is_v2 -- prefix, and on itemData when present."""
+    def selected_engine(self):
+        """The route this combo names -- itemData when it has one."""
+        from codelab_pipeline.localization import tracing_v2 as R
         data = self.EngineComboBox.currentData()
-        name = data if data else self.EngineComboBox.currentText()
-        return str(name or '').strip().lower().startswith('v2')
+        return R.route(data if data else self.EngineComboBox.currentText())
+
+    def selected_engine_is_v2(self):
+        """CALLS tracing_v2.is_v2, rather than mirroring it.
+
+        This re-implemented the prefix rule inline, which made three
+        copies of one routing decision across the tree -- and the third
+        one had already drifted (localization.refine_spots_batch matched
+        on equality). One of them gaining a route the others do not know
+        about is exactly how a v3 selection routes to v1 with no error.
+        """
+        from codelab_pipeline.localization import tracing_v2 as R
+        return R.is_v2(self.selected_engine())
 
     def refresh_psf_entries(self, select=None):
         """Repopulate the PSF combo from the library on disk.

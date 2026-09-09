@@ -1504,7 +1504,12 @@ def refine_spots_batch(targets, storage_path, fov, channel, hybe, modality,
     starves the GUI's own image loads (measured 16.5 ms -> 2043 ms).
     """
     engine = params.get('engine', 'v2')
-    if engine == 'v2':
+    # THE SAME MATCHER AS TRACING, not a second rule. This read
+    # `engine == 'v2'` while tracing_v2 matched a prefix, so a decorated
+    # label routed one way in tracing and the other way here -- and the
+    # only symptom would have been slightly worse numbers.
+    from codelab_pipeline.localization import tracing_v2 as _V2ROUTE
+    if _V2ROUTE.is_v2(engine):
         # ONE TraceParams for the whole batch: the PSF (the store's
         # installed calibration, when plausible -- else free-sigma
         # fallback) is loaded once, and the popup's gate values merge

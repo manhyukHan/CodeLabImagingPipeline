@@ -17,7 +17,7 @@ DEFAULT_PARAMS = {'spad': 5, 'peak_bound': 2.0, 'max_sigma': 2.5,
                   # tracing-v2 PSF-aware fit + quality gates, adapted for
                   # standalone spots (no consensus z-depth leg; z at-bound
                   # fatal again). 0 on an uncertainty gate = gate off.
-                  'engine': 'v2', 'v2_min_occupancy': 0.40,
+                  'engine': 'v2-anchor-fit', 'v2_min_occupancy': 0.40,
                   'v2_max_uncert_xy_nm': 0, 'v2_max_uncert_z_nm': 150}
 
 
@@ -130,8 +130,16 @@ class Localize3DDisplayer(QtWidgets.QMainWindow):
         # own comment) -- ResetDefaultsPushButton below restores the same
         # dict, so the two can never silently drift apart.
         self.EngineComboBox = QtWidgets.QComboBox()
-        self.EngineComboBox.addItem('v2 (PSF fit + quality gates)', 'v2')
-        self.EngineComboBox.addItem('v1 gaussian', 'gaussian')
+        # THE SAME WORDS THE TRACING PANEL USES. This stored 'gaussian'
+        # for the v1 route while the label beside it already said 'v1
+        # gaussian' -- so the value disagreed with its own label, did not
+        # match the other panel, and collided by name with a real
+        # make_engine key that means the bare Gaussian ENGINE rather than
+        # this route. Old stored values still route (tracing_v2.route).
+        from codelab_pipeline.localization import tracing_v2 as _R
+        self.EngineComboBox.addItem('v2-anchor-fit (PSF fit + quality gates)',
+                                    _R.ROUTE_V2)
+        self.EngineComboBox.addItem('v1 (bounded gaussian)', _R.ROUTE_V1)
         self.EngineComboBox.setToolTip(
             'v2 (default): the chromatin-tracing fit -- PSF-shaped when '
             'the store carries a calibrated PSF, free-sigma otherwise -- '

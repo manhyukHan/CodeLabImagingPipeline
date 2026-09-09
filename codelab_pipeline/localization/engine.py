@@ -641,6 +641,17 @@ ENGINES = {
     AnchorFitV2Engine.name: AnchorFitV2Engine,
     PsfMatchEngine.name: PsfMatchEngine,
     'v3-psfmatcher': _v3,
+    # THE TWO NAMESPACES MEET HERE. What a person picks is a ROUTE
+    # (tracing_v2.ROUTE_*, one vocabulary across both panels and the
+    # config); what this factory builds is an ENGINE. They were entirely
+    # unconnected -- no config key, GUI widget or CLI flag ever supplied
+    # this factory's `name`, and every in-app callsite passed the literal
+    # 'gaussian' -- so make_engine's own promise that "a config/UI names
+    # an engine through" it was wired to nothing. These aliases let a
+    # stored route name an engine directly, with no translation table to
+    # drift.
+    'v1': GaussianLocalizeEngine,
+    'v2-anchor-fit': AnchorFitV2Engine,
 }
 
 

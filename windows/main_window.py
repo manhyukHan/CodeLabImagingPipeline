@@ -13182,6 +13182,11 @@ One PNG PER MODALITY: each modality has its own reference and its
             'min_distance': ('SpotLocalizationPanel', 'MinDistanceSpinBox'),
             'pad': ('SpotLocalizationPanel', 'PadSpinBox'),
             'append_mode': ('SpotLocalizationPanel', 'AppendModeCheckBox'),
+            # THE 3D-LOCALIZATION ENGINE WAS NEVER PERSISTED. It lived
+            # only in the popup's own combo, so the choice was lost on
+            # every app restart and never appeared in a config file --
+            # a run could not say which engine produced its spots.
+            'engine': ('Localize3DDisplayer', 'EngineComboBox'),
         },
         'celltype': {
             'barcode_hybe': ('CelltypeDeterminationPanel', 'BarcodeHybeComboBox'),
