@@ -446,3 +446,125 @@ def load_best(model_dir, report=REPORT_NAME, prefer=None):
            'refused': dict(refused),
            'report': rp, 'bundle': rep.get('bundle')}
     return SpotClassifier.load(path), why
+
+
+MULTISPOT_NAME = 'psf_multispot.json'
+
+
+class MultispotCalibration(object):
+    """Platt on the matcher's own score. TWO PARAMETERS, SHIPPED.
+
+    THE PROBLEM THIS SOLVES IS A SHIPPING PROBLEM, not an accuracy one.
+    A model directory carries a classifier (weights + Platt) and a PSF
+    template, and both work on a new experiment with ZERO new labels.
+    The matcher's operating point did not: it was a number measured from
+    multispot verdicts, so using it meant assuming every experiment comes
+    with its own multispot review, and hard-coding it meant shipping one
+    experiment's answer as a universal constant. Neither is acceptable.
+
+    A Platt pair fixes it by being the same KIND of artefact as the
+    classifier: fitted once against people, written into the model
+    directory, applied with no labels, retrained by anyone who has their
+    own. And the threshold stops being a magic number -- a calibrated
+    probability is thresholded at 0.5.
+
+    IT ALSO REMOVES A TEMPLATE DEPENDENCY. The raw score is an affine
+    remap of an NCC, and psf_bank.K_SIGMA's header explains why a raw NCC
+    means something different at another template size. The calibration
+    is fitted with a template recorded beside it and refuses one it was
+    not measured on, so that dependency is checked instead of forgotten.
+
+    MEASURED on 661 human-judged matches from 260 pillars of MP58/RNA:
+    the raw score already separates keep from drop at PR-AUC 0.993, and
+    the best raw threshold (0.732) is stable across the experiment's own
+    hybes (per-hybe optima 0.680-0.739, and the global one holds every
+    hybe at precision >= 0.90, recall >= 0.96). So this layer is not
+    buying discrimination -- the ranking is p3's and stays p3's. It is
+    buying a number that can be SHIPPED.
+    """
+
+    def __init__(self, platt, template=None, meta=None):
+        self.platt = (float(platt[0]), float(platt[1]))
+        self.template = tuple(template) if template else None
+        self.meta = dict(meta or {})
+
+    def score(self, p3):
+        """Raw matcher score -> calibrated probability, strictly in (0, 1).
+
+        float64 and clipped for the reason SpotClassifier.score gives at
+        length: a p of exactly 0 or 1 claims certainty no finite label
+        set supports and is an infinity to anything taking its log.
+        """
+        p = np.clip(np.asarray(p3, dtype=np.float64), 1e-9, 1.0 - 1e-9)
+        logit = np.log(p / (1.0 - p))
+        a, b = self.platt
+        z = np.clip(logit * a + b, -30.0, 30.0)
+        return np.clip(1.0 / (1.0 + np.exp(-z)), 1e-12, 1.0 - 1e-12)
+
+    def check(self, template):
+        """Refuse a template this was not measured on."""
+        if self.template and template is not None \
+                and tuple(template) != tuple(self.template):
+            raise ValueError(
+                f'this multispot calibration was fitted with a '
+                f'{tuple(self.template)} template and the engine is using '
+                f'{tuple(template)}. The score it calibrates is an affine '
+                f'remap of a raw NCC, which means something different at '
+                f'another template size -- see psf_bank.K_SIGMA.')
+        return True
+
+    def save(self, path):
+        doc = {'platt': list(self.platt),
+               'template': list(self.template) if self.template else None,
+               'meta': self.meta}
+        tmp = str(path) + '.part'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, indent=1)
+        os.replace(tmp, str(path))
+        return str(path)
+
+    @staticmethod
+    def load(path):
+        with open(str(path), encoding='utf-8') as f:
+            doc = json.load(f)
+        return MultispotCalibration(doc['platt'], doc.get('template'),
+                                    doc.get('meta'))
+
+
+def fit_multispot(bundle_dir, template=None):
+    """(MultispotCalibration, report) from a bundle's multispot verdicts.
+
+    Returns (None, report) when there is nothing to fit -- no verdicts, or
+    every match judged the same way. A calibration invented from one class
+    is a number with no evidence under it.
+    """
+    from . import verdicts as V
+    recs, _agree = V.merge(str(bundle_dir), kind=V.MULTISPOT_KIND)
+    shown = [e for r in recs for e in (r.get('shown') or [])
+             if e.get('p') is not None]
+    rep = {'pillars': len(recs), 'n': len(shown),
+           'template': list(template) if template else None}
+    if not shown:
+        rep['skipped'] = 'no multispot verdicts in this bundle'
+        return None, rep
+    y = np.asarray([1 if int(e.get('keep', 0)) == 1 else 0 for e in shown],
+                   float)
+    p = np.clip(np.asarray([float(e['p']) for e in shown], float),
+                1e-9, 1.0 - 1e-9)
+    rep['n_kept'] = int(y.sum())
+    if not y.any() or y.all():
+        rep['skipped'] = 'every judged match fell in one class'
+        return None, rep
+    logit = np.log(p / (1.0 - p))
+    a, b = _platt(logit, y)
+    cal = MultispotCalibration((a, b), template,
+                              {k: rep[k] for k in ('pillars', 'n', 'n_kept')})
+    q = cal.score(p)
+    rep.update(platt=[float(a), float(b)],
+               raw_pr_auc=float(pr_auc(y, p)),
+               cal_pr_auc=float(pr_auc(y, q)),
+               kept_at_half=int((q >= 0.5).sum()),
+               precision_at_half=float(y[q >= 0.5].mean()) if (q >= 0.5).any()
+               else float('nan'),
+               recall_at_half=float((q[y == 1] >= 0.5).mean()))
+    return cal, rep

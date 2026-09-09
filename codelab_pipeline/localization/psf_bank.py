@@ -397,6 +397,77 @@ def centre_crop(patch, r=DEFAULT_R, rz=DEFAULT_RZ):
 
 # -- matching -------------------------------------------------------------
 
+# TWO MATCHES CLOSER THAN THE OPTICS CAN RESOLVE ARE ONE MATCH.
+#
+# A matched filter will happily place two peaks a pixel apart and there
+# is no evidence in the image that they are two things. 2 px laterally
+# is the floor -- MEASURED from the MP58 store's own calibration,
+# sigma_xy is 0.66 px, so 2 px is 3.0 sigma_xy.
+#
+# AND THE SAME COUNT OF SIGMA AXIALLY, WHICH IS NOT THE SAME COUNT OF
+# VOXELS. A lateral-only bound looks right and is not: MEASURED over
+# 2,639 match pairs from 300 pillars, 135 sit within 2 px laterally and
+# 130 OF THOSE ARE MORE THAN 5 PLANES APART -- median 17.3, which is
+# 7 sigma_z. Merging those would not be declining to over-resolve, it
+# would be discarding pairs the microscope separates perfectly well
+# along its coarser axis. sigma_z is 2.35 planes, so 3.0 sigma is 7.1.
+#
+# THIS LIVED IN THE REVIEW APP and does not belong there: the same bound
+# governs what a LOCALIZE ENGINE may report, and a second copy of it is
+# the divergence this codebase keeps having to hunt down.
+MERGE_LATERAL_PX = 2.0
+MERGE_AXIAL_PLANES = 7.1
+DEFAULT_SIGMA_XY_PX = 0.66
+DEFAULT_SIGMA_Z_PLANES = 2.35
+
+
+def resolution_bound(meta=None, lateral_px=MERGE_LATERAL_PX):
+    """(lateral px, axial planes) below which two matches are one.
+
+    Takes the anisotropy from the BANK'S OWN analytic reference when it
+    carries one, so a bank measured on another objective or z step
+    brings its own ratio rather than inheriting MP58's. The lateral
+    bound is the number that was chosen; the axial one is the same
+    count of sigma.
+    """
+    lat = float(lateral_px)
+    ref = (meta or {}).get('analytic_ref') or {}
+    pr = ref.get('params') or {}
+    vx = (meta or {}).get('voxel_um')
+    try:
+        sxy = float(pr['sigma_xy_um']) / float(vx[0])
+        sz = float(pr['sigma_z_um']) / float(vx[2])
+        if sxy > 0 and sz > 0:
+            return lat, lat * (sz / sxy)
+    except (KeyError, TypeError, IndexError, ZeroDivisionError, ValueError):
+        pass
+    return lat, float(MERGE_AXIAL_PLANES)
+
+
+def merge_unresolvable(hits, brightness, lateral_px=MERGE_LATERAL_PX,
+                       axial_planes=MERGE_AXIAL_PLANES):
+    """Collapse matches the optics cannot separate. BRIGHTEST SURVIVES.
+
+    `brightness` returns the image value at a hit -- not its NCC score.
+    Those rank a pair differently 42% of the time, and "which of these
+    is the real spot" is a question about the picture rather than about
+    which position the filter liked best.
+
+    Greedy from the brightest down, so a survivor is never suppressed by
+    something dimmer that it in turn suppresses.
+
+    Works on anything with .y .x .z -- a LocalizedSpot or a plain
+    namedtuple -- because the review app and the engine both need it.
+    """
+    out = []
+    for h in sorted(hits, key=lambda k: -float(brightness(k))):
+        if any(np.hypot(h.y - k.y, h.x - k.x) < lateral_px
+               and abs(h.z - k.z) < axial_planes for k in out):
+            continue
+        out.append(h)
+    return out
+
+
 def ncc(volume, template, eps=1e-9):
     """Normalised cross-correlation, same shape as `volume`.
 

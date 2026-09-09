@@ -171,6 +171,31 @@ def main(argv=None):
                     'selection': 'labels() positive bucket',
                     'provisional': provisional},
             analytic_ref=ref)
+        # THE MATCHER'S OWN OPERATING POINT, fitted here so it SHIPS.
+        # Without it the matched filter has no calibrated threshold and a
+        # caller either hard-codes one experiment's answer as a universal
+        # constant or assumes every experiment arrives with its own
+        # multispot review. Neither is acceptable; a Platt pair beside
+        # the template is the same kind of artefact as the classifier.
+        # Absent multispot verdicts this simply does not write, and the
+        # matcher falls back to its sigma threshold.
+        cal, calrep = C.fit_multispot(a.bundle_dir, template=mean.shape
+                                      if False else (2 * PB.DEFAULT_R + 1,
+                                                     2 * PB.DEFAULT_R + 1,
+                                                     2 * PB.DEFAULT_RZ + 1))
+        report['multispot'] = calrep
+        if cal is None:
+            print(f"
+multispot calibration: {calrep.get('skipped')}")
+        else:
+            cp = cal.save(os.path.join(a.out, C.MULTISPOT_NAME))
+            print(f"
+multispot calibration from {calrep['n']} judged "
+                  f"matches over {calrep['pillars']} pillars:")
+            print(f"   raw PR-AUC {calrep['raw_pr_auc']:.3f}  ->  at p 0.5: "
+                  f"precision {calrep['precision_at_half']:.3f}, "
+                  f"recall {calrep['recall_at_half']:.3f}")
+            print(f'   -> {os.path.basename(cp)}')
         d = PB.drift(pos, mean)
         print(f'   template {mean.shape}, components {comps.shape[0]}'
               + (f', explained {np.round(var * 100, 1).tolist()}%'

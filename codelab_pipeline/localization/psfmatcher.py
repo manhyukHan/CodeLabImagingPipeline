@@ -7,19 +7,44 @@ outside a test, so the one number in this repo that is a probability
 reached no engine, no gate and no z_status. This is the engine that
 reads it.
 
-THE THREE MODELS RUN IN ORDER, with no human in between:
+TWO LEARNED ARTEFACTS AND ONE ALGORITHM, not three models:
 
-    candidates   the wrapper below, NOT a model
-    model 1      SpotClassifier   -> p_exist, "is a spot here at all"
-    model 2      psf_bank.h5      -> the measured template
-    model 3      psf-match        -> sub-voxel (y, x, z) + an NCC quality
+    candidates       the wrapper below. No parameters, not a model.
+    the classifier   SpotClassifier: weights + a Platt pair, trained on
+                     human keep/drop           -> p_exist
+    the template     psf_bank.h5: the MEAN of 1,157 human-confirmed
+                     spots. Learned, but it is an array.
+    the matcher      NCC + peak_local_max over that template. ZERO
+                     learned parameters        -> p = (NCC + 1) / 2
 
-p_exist IS THE ANSWER AND THE OTHERS ARE NOT. Model 1 is trained on
-"did a person keep this", which is the question. Models 2 and 3 score
-how well a thing matches a PSF, which is a statement about quality --
-a bright blob of non-specific stain matches a PSF beautifully. So
-`p_exist` carries the classifier and `p` keeps the NCC, in two fields,
-for the reason LocalizedSpot's own docstring now gives at length.
+Calling the template and the search "model 2" and "model 3" split one
+thing -- a matched filter with a data-derived kernel -- into two, and
+this module said so for a while. There is no third model, and `p` is not
+the output of a final layer: it is an affine remap of a correlation
+coefficient, so p = 0.74 means NCC = 0.48 and nothing about probability.
+
+AND THEY ARE NOT INDEPENDENT. The classifier and the template come from
+the SAME 1,157 human positives -- train_spotmodel builds one from the
+feature vectors and the other from the voxels of those very spots. When
+they agree, that is two readings of one label set and not a second
+opinion, and any number quoting their agreement has to say so.
+
+p_exist IS THE CALIBRATED ANSWER AND p IS NOT. The classifier is trained
+on "did a person keep this", with a proper scoring rule and Platt-scaled
+on held-out cells. The NCC scores how well a thing matches a PSF, which
+is a different question -- a bright blob of non-specific stain matches a
+PSF beautifully, and MEASURED on 613 labels the matcher found a peak on
+172 spots both the classifier and the reviewer called nothing.
+
+BUT ON ITS OWN QUESTION THE NCC IS EXCELLENT, and that is worth saying
+because this module used to claim otherwise. Asked "is this EXTRA match,
+beside a spot already confirmed, a real emitter?", MEASURED on 387
+matches from 150 human-judged pillars: PR-AUC 0.993, best F1 at p = 0.74
+(precision 0.958, recall 0.975). The caveat is the selection -- every one
+of those 387 was proposed BY the matcher, so this says its ranking is
+good among what it offers, not that it offers everything. And 0.74 is
+tied to the 7 x 7 x 11 template: psf_bank.K_SIGMA's own header explains
+why a raw NCC number moves when the template size does.
 
 THE CANDIDATE LAYER IS INSIDE THIS MODULE ON PURPOSE. It looks like
 pre-processing a caller could own, and it must not be: v4 is meant to
@@ -149,6 +174,7 @@ class PsfMatcherV3Engine(LocalizeEngine):
         self._match = None
         self._refines = None
         self._no_refine = None
+        self._cal = False              # False = not looked for yet
 
     # -- the models ------------------------------------------------------
 
@@ -211,6 +237,33 @@ class PsfMatcherV3Engine(LocalizeEngine):
     def no_refine_why(self):
         self.refines
         return self._no_refine
+
+    @property
+    def multispot_cal(self):
+        """The matcher's shipped Platt pair, or None.
+
+        Loaded from the model directory like everything else, so a new
+        experiment needs NO multispot labels to get a calibrated matcher
+        score -- and anyone with their own labels re-fits it the same way
+        they would re-fit the classifier. Absent, the matcher keeps its
+        sigma threshold and `p` stays a raw NCC remap.
+        """
+        if self._cal is False:
+            import os
+            from ..training import classify as C
+            self._cal = None
+            path = (os.path.join(self.model_dir, C.MULTISPOT_NAME)
+                    if self.model_dir else None)
+            if path and os.path.exists(path):
+                cal = C.MultispotCalibration.load(path)
+                if self.refines:
+                    # REFUSE ONE FITTED ON ANOTHER TEMPLATE. The score it
+                    # calibrates is an affine remap of a raw NCC, which
+                    # means something different at another template size.
+                    cal.check(tuple(np.asarray(
+                        self.matcher.templates[0]).shape))
+                self._cal = cal
+        return self._cal
 
     @property
     def chosen(self):
@@ -291,8 +344,8 @@ class PsfMatcherV3Engine(LocalizeEngine):
     def localize(self, stack, seed_yxz=None, n_max=1, labels=None):
         """Every emitter this engine believes is in `stack`.
 
-        Returns LocalizedSpot with `p_exist` set from model 1 and `p`
-        from model 3's NCC. NOTHING IS DROPPED ON p_exist HERE -- the
+        Returns LocalizedSpot with `p_exist` from the classifier and
+        `p` from the matcher's NCC. NOTHING IS DROPPED ON p_exist HERE -- the
         p-gate is posterior and a person chooses its threshold off a
         histogram of these very numbers, so an engine that pre-filtered
         would be choosing it for them and hiding the evidence.
@@ -309,11 +362,24 @@ class PsfMatcherV3Engine(LocalizeEngine):
             feats, cores = self._boxes(st, seeds, bg, sigma)
             p_exist = self.classifier.score(X=feats, boxes=cores)
             for (y, x, z), pe in zip(seeds, p_exist):
-                out.append(self._refine(st, y, x, z, float(pe), bg, sigma))
-        # Lateral dedup on the FINAL positions: two regions can propose
-        # the same emitter on a boundary, and model 3 can walk two seeds
-        # onto one peak.
-        out = dedupe(out, min_sep=self.dedup_px)
+                out.extend(self._refine(st, y, x, z, float(pe), bg, sigma))
+        # THE RESOLUTION BOUND, NOT A LATERAL DEDUP. engine.dedupe merges
+        # anything within 2 px laterally whatever its z, and says so:
+        # "two emitters genuinely stacked in z ... cannot be told apart by
+        # this fit anyway". That is true of a Gaussian anchor fit and
+        # FALSE of a matched filter -- MEASURED over 2,639 pairs, 130 of
+        # the 135 within 2 px laterally are more than 5 planes apart,
+        # median 17.3, which is 7 sigma_z and comfortably resolved. So the
+        # bound is the PSF's own anisotropy (psf_bank.resolution_bound),
+        # and what survives a collision is the BRIGHTER one rather than
+        # the better-correlated one.
+        from . import psf_bank as PB
+        lat, ax = PB.resolution_bound(getattr(self.matcher, 'meta', None)
+                                      if self.refines else None,
+                                      lateral_px=self.dedup_px)
+        out = PB.merge_unresolvable(
+            out, lambda h: (h.amplitude if np.isfinite(h.amplitude)
+                            else -np.inf), lat, ax)
         if seed_yxz is not None:
             sy, sx, sz = (float(v) for v in seed_yxz)
             out.sort(key=lambda s: ((s.y - sy) ** 2 + (s.x - sx) ** 2
@@ -323,7 +389,7 @@ class PsfMatcherV3Engine(LocalizeEngine):
         return out if n_max is None else out[:int(n_max)]
 
     def _refine(self, stack, y, x, z, p_exist, bg, sigma):
-        """Model 3 on one candidate: sub-voxel position and an NCC quality.
+        """The matched filter on one candidate. Returns a LIST.
 
         The template is searched in a window around the candidate, and a
         candidate model 3 finds nothing at keeps the anchor's own integer
@@ -332,7 +398,8 @@ class PsfMatcherV3Engine(LocalizeEngine):
         it just has no sub-voxel refinement.
         """
         if not self.refines:
-            return _spot(y, x, z, float('nan'), p_exist=p_exist)
+            return [_spot(y, x, z, float('nan'), p_exist=p_exist,
+                          amplitude=_peak_above(stack, y, x, z, bg))]
         st = np.asarray(stack, float)
         h, w, d = st.shape
         tpl = np.asarray(self.matcher.templates[0])
@@ -348,12 +415,21 @@ class PsfMatcherV3Engine(LocalizeEngine):
         win = (st[y0:y1, x0:x1, :] - bg) / max(sigma, 1e-9)
         hits = []
         if win.shape[0] > tpl.shape[0] and win.shape[1] > tpl.shape[1]:
-            hits = self.matcher.localize(
-                win, seed_yxz=(y - y0, x - x0, z), n_max=1)
-        if hits:
-            hh = hits[0]
+            # n_max=None, NOT 1. Returning one position per candidate is
+            # what stopped this engine from demultiplexing at all: two
+            # emitters in one candidate's neighbourhood came back as one,
+            # and the only reason two ever appeared was that the CANDIDATE
+            # layer happened to propose two seeds. MEASURED on 150 human
+            # multispot verdicts, 43% of confirmed pillars hold more than
+            # one real spot -- so one-per-candidate discards the answer to
+            # the question this engine exists to ask.
+            hits = self.matcher.localize(win, seed_yxz=None, n_max=None)
+        out = []
+        for hh in hits:
             fy, fx, fz = hh.y + y0, hh.x + x0, hh.z
-            return _spot(fy, fx, fz, hh.p, p_exist=p_exist,
-                         amplitude=_peak_above(st, fy, fx, fz, bg))
-        return _spot(y, x, z, float('nan'), p_exist=p_exist,
-                     amplitude=_peak_above(st, y, x, z, bg))
+            out.append(_spot(fy, fx, fz, hh.p, p_exist=p_exist,
+                             amplitude=_peak_above(st, fy, fx, fz, bg)))
+        if out:
+            return out
+        return [_spot(y, x, z, float('nan'), p_exist=p_exist,
+                      amplitude=_peak_above(st, y, x, z, bg))]

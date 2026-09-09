@@ -68,62 +68,14 @@ ADDED_SEED_Z = -1.0
 
 BANK_NAME = 'psf_bank.h5'
 
-# TWO MATCHES CLOSER THAN THE OPTICS CAN RESOLVE ARE ONE MATCH.
-#
-# This page exists to find merged spots, which is exactly the appetite
-# that has to be bounded: a matched filter will happily place two peaks
-# a pixel apart and there is no evidence in the image that they are two
-# things. 2 px laterally is the hard floor -- MEASURED from the store's
-# own calibration, sigma_xy is 0.66 px and sigma_z is 2.35 planes, so
-# 2 px is 3.0 sigma_xy and a comfortable margin over the limit.
-#
-# AND THE SAME NUMBER OF SIGMA AXIALLY, which is not the same number of
-# voxels. A LATERAL-ONLY bound looks right and is not: MEASURED over
-# 2,639 match pairs from 300 pillars, 135 sit within 2 px laterally and
-# 130 OF THOSE ARE MORE THAN 5 PLANES APART IN z -- median 17.3 planes,
-# which is 7 sigma_z. Merging them would not be declining to over-
-# resolve, it would be throwing away pairs the microscope resolves
-# perfectly well, just along the axis with the coarser sigma. So the
-# bound is 3.0 sigma in BOTH directions: 2.0 px and 7.1 planes.
-#
-# skimage's peak_local_max already enforces min_distance=3, but in the
-# L-infinity sense over y, x AND z alike -- so it suppresses a pair 2 px
-# apart laterally while letting through a pair at the SAME (y, x) eleven
-# planes apart. This is the bound that is shaped like the PSF.
-MERGE_LATERAL_PX = 2.0
-MERGE_AXIAL_PLANES = 7.1
-# Falls back to these when a bank carries no analytic reference to take
-# the anisotropy from; see Multispot._resolution.
-DEFAULT_SIGMA_XY_PX = 0.66
-DEFAULT_SIGMA_Z_PLANES = 2.35
+# The resolution bound moved into the LIBRARY -- psf_bank owns it now,
+# because the same rule governs what a localize engine may report and a
+# second copy of it is the divergence this codebase keeps hunting. The
+# measured argument and the numbers live in psf_bank.resolution_bound.
+from codelab_pipeline.localization.psf_bank import (      # noqa: E402
+    MERGE_LATERAL_PX, MERGE_AXIAL_PLANES, merge_unresolvable as
+    _merge_unresolvable_lib)
 
-# HOW MANY SIGMA A MATCH MUST CLEAR TO BE PUT IN FRONT OF A PERSON.
-#
-# THE SAME AS DETECTION, and it took a bug fix to get there. This was 4.0
-# -- deliberately looser than psf_bank.K_SIGMA, on the argument that a
-# proposal nobody keeps costs zero keystrokes while a proposal never made
-# costs a label. That argument was sound and the number under it was
-# wrong: it came from a search that could only report positions in the
-# central 9 x 9 of the pillar, so the recovery it was buying looseness to
-# fix was being lost to geometry, not to the threshold.
-#
-# RE-MEASURED on 200 confirmed-spot pillars with the corrected 15 x 15
-# search. "seed found" is a match within 2 px of the spot pass/fail
-# already confirmed -- a pillar blank there is a page nobody can judge:
-#
-#     k     seed found   mean cards    pages with 6+ cards
-#    4.0        99.5%       4.33              29%
-#    4.5        98.5%       3.51              16%
-#    5.0        97.5%       2.90              10%
-#    5.5        94.5%       2.52               8%
-#    6.0        91.5%       2.18               7%
-#
-# 5.0 recovers the seed MORE OFTEN than 4.0 did before the fix (97.5%
-# against 95.5%) on a page carrying three cards instead of four and a
-# third. Staying at 4.0 would spend a card and a half per page on the
-# 46% of matches that sit 6+ px from the seed at p 0.675 and 3.2 sigma --
-# and a page that takes ten seconds to read is not a better review, it is
-# a slower one.
 REVIEW_K_SIGMA = 5.0
 
 
@@ -295,19 +247,8 @@ class Multispot:
         lateral bound stays MERGE_LATERAL_PX -- it is the number that was
         chosen -- and the axial bound is the same count of sigma.
         """
-        lat = float(MERGE_LATERAL_PX)
-        ref = (self.engine.meta or {}).get('analytic_ref') or {}
-        pr = ref.get('params') or {}
-        vx = (self.engine.meta or {}).get('voxel_um')
-        try:
-            sxy = float(pr['sigma_xy_um']) / float(vx[0])
-            sz = float(pr['sigma_z_um']) / float(vx[2])
-            if sxy > 0 and sz > 0:
-                return lat, lat * (sz / sxy)
-        except (KeyError, TypeError, IndexError, ZeroDivisionError,
-                ValueError):
-            pass
-        return lat, float(MERGE_AXIAL_PLANES)
+        from codelab_pipeline.localization import psf_bank as PB
+        return PB.resolution_bound(self.engine.meta)
 
     # -- the queue -------------------------------------------------------
 
@@ -536,23 +477,8 @@ class Multispot:
 
 def _merge_unresolvable(hits, brightness, lateral_px=MERGE_LATERAL_PX,
                         axial_planes=MERGE_AXIAL_PLANES):
-    """Collapse matches the optics cannot separate. BRIGHTEST SURVIVES.
-
-    `brightness` returns the image value at a hit -- not its NCC score.
-    Those two rank a pair differently 42% of the time, and "which of
-    these is the real spot" is a question about the picture, not about
-    which position the filter liked best.
-
-    Greedy from the brightest down, so a survivor is never suppressed by
-    something dimmer that it in turn suppresses.
-    """
-    out = []
-    for h in sorted(hits, key=lambda k: -float(brightness(k))):
-        if any(np.hypot(h.y - k.y, h.x - k.x) < lateral_px
-               and abs(h.z - k.z) < axial_planes for k in out):
-            continue
-        out.append(h)
-    return out
+    """psf_bank.merge_unresolvable, kept as a name this module reads by."""
+    return _merge_unresolvable_lib(hits, brightness, lateral_px, axial_planes)
 
 
 def _shift(hit, dy, dx):

@@ -679,3 +679,64 @@ def multispot_labels(bundle_dir):
         pts = adds.get((key, sk), [])
         pillar['added'] = [p for p, _n in _cluster_added(pts)] if pts else []
     return out
+
+
+def multispot_operating_point(bundle_dir, grid=None):
+    """The p a matched filter should keep its own proposals above.
+
+    WHY THIS IS A PER-MODEL NUMBER AND NOT A PER-RUN HUMAN STEP. The
+    multispot review judges matches the matcher PROPOSED, so its product
+    is not a set of spots to keep -- it is a THRESHOLD on the matcher's
+    own score, measured once against people, exactly the way the
+    classifier's weights are fitted once against people. Nobody reviews
+    at inference time; a model directory carries the number the way it
+    carries the template.
+
+    It must NOT be used to rebuild the template. Those matches were
+    selected BY the template, so averaging them would pull the kernel
+    toward whatever it already matches and blind psf_bank.drift -- the
+    one instrument that says the optics moved. The pass/fail positives
+    the bank IS built from were chosen by an anchor+Gaussian fit
+    (training/extract.py) with no say from the matcher, which is what
+    keeps that direction honest.
+
+    Returns None when there are no multispot verdicts, and a dict of
+    {p, precision, recall, f1, n, n_kept, template} otherwise. `p` is the
+    best-F1 operating point.
+
+    THE NUMBER IS TIED TO THE TEMPLATE IT WAS MEASURED WITH. p here is an
+    affine remap of a raw NCC, and psf_bank.K_SIGMA's header explains why
+    a raw NCC means something different at another template size -- so a
+    caller records `grid` (the template shape) beside it and refuses a
+    threshold measured on a different one.
+    """
+    import numpy as np
+    recs, _agree = merge(bundle_dir, kind=MULTISPOT_KIND)
+    shown = [e for r in recs for e in (r.get('shown') or [])]
+    shown = [e for e in shown if e.get('p') is not None
+             and int(e.get('keep', 0)) >= 0]
+    if not shown:
+        return None
+    y = np.asarray([1 if int(e.get('keep', 0)) == 1 else 0 for e in shown])
+    p = np.asarray([float(e['p']) for e in shown])
+    if not y.any() or y.all():
+        # One class only: no operating point exists, and inventing one
+        # from a set nobody disagreed about would be a number with no
+        # evidence under it.
+        return None
+    best = None
+    for t in np.unique(np.round(p, 4)):
+        pred = p >= t
+        tp = int((pred & (y == 1)).sum())
+        fp = int((pred & (y == 0)).sum())
+        fn = int((~pred & (y == 1)).sum())
+        pr = tp / max(tp + fp, 1)
+        rc = tp / max(tp + fn, 1)
+        f1 = 2 * pr * rc / max(pr + rc, 1e-9)
+        if best is None or f1 > best['f1']:
+            best = dict(p=float(t), precision=float(pr), recall=float(rc),
+                        f1=float(f1))
+    best.update(n=int(y.size), n_kept=int(y.sum()),
+                pillars=len(recs),
+                template=(list(grid) if grid is not None else None))
+    return best
