@@ -5,6 +5,7 @@ import os
 import re
 import time
 import multiprocessing
+import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from copy import deepcopy
@@ -373,6 +374,76 @@ class ProcWorker(QtCore.QThread):
             self.finished_ok.emit(results)
         except Exception as e:
             self.failed.emit(f'{type(e).__name__}: {e}')
+
+
+class StreamingProcWorker(QtCore.QThread):
+    """
+    Run ONE external command and stream its stdout back, line by line.
+
+    The third worker shape here, and the one the other two cannot cover:
+    FnWorker runs a callable in this process, ProcWorker runs picklable
+    jobs in a pool, and neither can host a command-line tool that
+    reports its own progress on stdout. Bundle building is exactly that
+    -- tools/build_bundle.py already prints `[done/total]` lines, and it
+    is a SEPARATE PROGRAM whose whole point is that it does not share
+    this process's h5py lock.
+
+    WHY NOT subprocess.run. This started as a blocking `run()` on the GUI
+    thread with a comment admitting it. On a real six-FOV MP58 bundle
+    that freezes the entire application for the length of the build --
+    every panel, every viewer, the log itself -- for work that has
+    nothing to do with the rest of the app and holds none of its state.
+
+    `-u` is added to the interpreter by the caller: without it Python
+    block-buffers a pipe and the progress lines arrive in 8 KB clumps at
+    the end, which is a progress bar that jumps from 0 to done.
+
+    Cancellation is deliberately NOT offered. The child writes a bundle
+    directory and its own manifest; killing it midway would leave a
+    half-written cache that looks finished. It is cheap to rebuild and
+    harmless to leave running.
+    """
+    line = QtCore.pyqtSignal(str)                # one stdout line
+    progress = QtCore.pyqtSignal(int, int)       # (done, total)
+    finished_ok = QtCore.pyqtSignal(int)         # exit code
+    failed = QtCore.pyqtSignal(str)
+
+    # '  [  12/ 666] fov007 Hyb_101 ...' -- build_bundle's own format
+    _PROGRESS = re.compile(r'^\s*\[\s*(\d+)\s*/\s*(\d+)\s*\]')
+
+    def __init__(self, cmd, cwd=None):
+        super().__init__()
+        self.cmd = list(cmd)
+        self.cwd = cwd
+
+    def run(self):
+        try:
+            proc = subprocess.Popen(
+                self.cmd, cwd=self.cwd, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                encoding='utf-8', errors='replace')
+        except Exception as e:                              # noqa: BLE001
+            self.failed.emit(f'{type(e).__name__}: {e}')
+            return
+        try:
+            for raw in proc.stdout:
+                text = raw.rstrip()
+                m = self._PROGRESS.match(text)
+                if m:
+                    self.progress.emit(int(m.group(1)), int(m.group(2)))
+                if text:
+                    self.line.emit(text)
+            proc.wait()
+        except Exception as e:                              # noqa: BLE001
+            self.failed.emit(f'{type(e).__name__}: {e}')
+            return
+        finally:
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception:                               # noqa: BLE001
+                pass
+        self.finished_ok.emit(int(proc.returncode or 0))
 
 
 class ClassicalSegmentWorker(QtCore.QThread):
@@ -1299,6 +1370,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spot_loaded_fovs = set()   # {fov}: disk spots staged once per session
         self._active_ingestions = []     # live IngestionWorkers, any modality -- see _wire_ingestion_ui_guard
         self._ingestion_progress = {}    # {worker: (done, total)} -- the one ProgressBar shows the aggregate
+        # The background bundle build, or None. One at a time: two
+        # would race for the same NAS reads and for one progress bar.
+        self._bundle_worker = None
         # {(modality, fov): set(hybe folders)} -- PER-FOV ingestion
         # readiness, the FOV-level view active_hybe_list deliberately is
         # not (that list is modality-level, any-FOV grain). Fed live by
@@ -7104,6 +7178,10 @@ class MainWindow(QtWidgets.QMainWindow):
             threshold=PG.DEFAULT_THRESHOLD, parent=self)
         dlg.setWindowTitle('Spot probability gate -- preview only')
         dlg.exec_()
+        # A PARENTED DIALOG OUTLIVES exec_(). Qt keeps it as a child of
+        # this window until the window itself dies, so every press left
+        # one behind holding its spot list and two matplotlib figures.
+        dlg.deleteLater()
         self.log(f'Previewed p over {len(in_slice)} spot(s). '
                  f'"Gate Spots..." is what removes them.')
 
@@ -7167,33 +7245,64 @@ class MainWindow(QtWidgets.QMainWindow):
                                  n_fov)
 
     def _start_bundle_build(self, storage_path, out, channel, n_fovs):
-        """Run tools/build_bundle.py in a worker, then offer Spot Check."""
-        import subprocess
+        """Build a bundle in the BACKGROUND, on this panel's progress bar.
+
+        Nothing here touches the session: the child reads the store and
+        writes a new directory, and the app keeps its own store, cells,
+        spots and viewers untouched for the whole build. So the only
+        thing the GUI has to do is show how far along it is.
+        """
         import sys as _sys
+        if getattr(self, '_bundle_worker', None) is not None:
+            self.log('A bundle build is already running -- one at a time, '
+                     'so the two do not fight over the same NAS reads.')
+            return
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cmd = [_sys.executable, os.path.join(here, 'tools', 'build_bundle.py'),
+        # -u: unbuffered, or the child's progress lines sit in an 8 KB
+        # pipe buffer and the bar jumps straight from empty to done.
+        cmd = [_sys.executable, '-u',
+               os.path.join(here, 'tools', 'build_bundle.py'),
                str(storage_path), '--out', out,
                '--channel', str(int(channel)),
                '--n-fovs', str(int(n_fovs))]
         self.log('  ' + ' '.join(cmd))
-        try:
-            # BLOCKING ON PURPOSE for now: the app has a worker pattern
-            # and this should join it, but a bundle build that silently
-            # runs behind a closed dialog is worse than one that says it
-            # is working. The log carries the command, so a person can
-            # also run it themselves.
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  cwd=here)
-        except Exception as exc:                            # noqa: BLE001
-            self.log(f'  bundle build failed to start: '
-                     f'{type(exc).__name__}: {exc}')
+        sp = self.ui.SpotLocalizationPanel
+        sp.ProgressBar.setMaximum(0)         # busy until the first count
+        sp.ProgressBar.setValue(0)
+        sp.MakeModelPushButton.setEnabled(False)
+
+        w = StreamingProcWorker(cmd, cwd=here)
+        self._bundle_worker = w
+        w.line.connect(lambda t: self.log('  ' + t))
+        w.progress.connect(self._on_bundle_progress)
+        w.finished_ok.connect(
+            lambda code: self._on_bundle_done(code, storage_path, out))
+        w.failed.connect(lambda why: self._on_bundle_done(-1, storage_path,
+                                                          out, why))
+        w.start()
+        self.log('Building in the background -- the app stays usable. '
+                 'Progress is on the Spot Localization bar.')
+
+    def _on_bundle_progress(self, done, total):
+        sp = self.ui.SpotLocalizationPanel
+        sp.ProgressBar.setMaximum(max(int(total), 1))
+        sp.ProgressBar.setValue(int(done))
+
+    def _on_bundle_done(self, code, storage_path, out, why=''):
+        sp = self.ui.SpotLocalizationPanel
+        sp.MakeModelPushButton.setEnabled(True)
+        sp.ProgressBar.setMaximum(1)
+        sp.ProgressBar.setValue(0)
+        w = getattr(self, '_bundle_worker', None)
+        self._bundle_worker = None
+        if w is not None:
+            w.deleteLater()
+        if why:
+            self.log('  bundle build failed to start: ' + why)
             return
-        for line in (proc.stdout or '').splitlines()[-12:]:
-            self.log('  ' + line)
-        if proc.returncode != 0:
-            for line in (proc.stderr or '').splitlines()[-8:]:
-                self.log('  ! ' + line)
-            self.log('  bundle build failed.')
+        if int(code) != 0:
+            self.log(f'  bundle build failed (exit {code}). The lines above '
+                     f'are the build\'s own output.')
             return
         self.log(f'  bundle ready: {out}')
         self._offer_spotcheck(storage_path, out)
@@ -7236,45 +7345,102 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log('  then press "Make new model..." again -- the model list '
                  'refreshes from <repo>/models.')
 
-    def _spot_crop_for_gate(self, fov, hybe, modality, channel, pad=7):
+    def _spot_crop_for_gate(self, fov, hybe, modality, channel, pad=None):
         """A crop_of(spot) the p-gate dialog can draw examples with.
 
         Returns a callable, or None when the pixels cannot be reached --
         the dialog still draws the distribution then, and says why there
         are no pictures rather than showing empty boxes.
 
-        READS THE STORED MIP, NOT THE Z-STACK. The dialog projects the
-        cube it is handed (nanmax over z) to draw a YX thumbnail, so a
-        full-depth read would fetch 120 planes to make a picture the
-        store already holds -- and on NAS that is a ~278 MB stack file
-        opened once per thumbnail, eight times per refresh. The window
-        of the stored MIP IS that projection.
+        HANDS BACK A CUBE AND THE SPOT'S PLACE IN IT (a GateCrop), not
+        just pixels. The dialog draws a ZX projection beside the YX one
+        and rings the spot in both, and neither is possible from a plain
+        window: a ZX view needs the z axis, and a ring needs to know
+        where in the crop the spot actually is -- which is NOT the centre
+        for any spot near a frame edge, where the window is clipped.
 
-        The MIP is read ONCE and kept in the closure: every example, and
-        every press of Refresh, is then a slice of one array in memory.
+        READS THE Z-STACK DIRECTLY, NOT stack_cache. That cache holds
+        FULL-FRAME slabs, and its own enabled() docstring says callers
+        whose natural read is smaller than a slab must branch and read
+        directly. Here the natural read is 15x15xdepth: on the real
+        store's (32, 32, 64) gzip chunks that touches at most 8 chunks,
+        about 1 MiB inflated, where one slab is ~126 MB. segment.py has
+        the same branch for the same reason, measured at 4x.
+
+        MEASURED, real store G:/Seonghyeok/2025-11-30-MP58/RNA, FOV007
+        ch635, 15x15x105 crops, a different hybe per variant so none of
+        them warms the next:
+
+            eight crops, stored MIP window (no ZX)      84 ms cold
+            eight crops, cubes, ONE open           296-327 ms cold
+            eight crops, cubes, EIGHT opens            359 ms cold
+            eight crops, cubes, ONE open                24 ms warm
+
+        and end to end, the dialog opening on a batch of SIXTEEN (eight
+        either side of the line), including every draw: 1.19 s cold,
+        0.43 s warm.
+
+        The file handle is opened lazily and closed by crop_of.close(),
+        which the dialog calls at the end of each batch -- one open per
+        Refresh, and no handle left alive behind a dialog somebody
+        forgot to close.
         """
-        from codelab_pipeline.io import analysis_store as AS
+        import h5py
+        from codelab_pipeline.io import paths
+        from codelab_pipeline.models import spot as SPOT
+        from ui.p_gate_dialog import GateCrop, THUMB_R
+        # ONE PLACE DECIDES THE HALF-WIDTH, and it is the dialog's, since
+        # the dialog is what has to draw the result.
+        pad = THUMB_R if pad is None else int(pad)
         # THE STORE IS THE SELECTED HYBE'S OWN. This window has no
         # storage_path attribute -- each modality carries one -- and
-        # reading a missing attribute here is what left this dialog with
-        # no way to read pixels at all.
+        # reading a missing attribute here is what once left this dialog
+        # with no way to read pixels at all.
         storage_path = self._storage_path_for_modality(modality)
         if not storage_path:
             return None
-        cache = {}
+        try:
+            path = paths.stack_path(storage_path, int(fov), hybe)
+        except Exception:                                   # noqa: BLE001
+            # A STORE THIS CANNOT ADDRESS IS 'NO PIXELS', NOT A CRASH.
+            # stack_path runs paths._require_fov3, which RAISES on a
+            # store still holding 'fov07'-style directories. Eagerly,
+            # that raise escaped both callers and replaced the whole gate
+            # with an 'Unexpected error' box -- where the old MIP reader
+            # hit the same check inside its own try and simply drew the
+            # histogram with no pictures, which is what this function's
+            # docstring promises.
+            return None
+        dsname = f'/stack/ch{int(channel)}'
+        state = {}
 
-        def mip():
-            if 'a' not in cache:
+        def dataset():
+            if 'ds' not in state:
                 try:
-                    cache['a'] = AS.read_hybe_mip(storage_path, int(fov),
-                                                  hybe, int(channel))
+                    # The same enlarged chunk cache chain.py opens its ZX
+                    # windows with: eight small windows out of one gzip
+                    # dataset re-touch chunks, and the default 1 MB cache
+                    # cannot hold even one (32, 32, 64) chunk's worth of
+                    # neighbours.
+                    f = h5py.File(path, 'r', rdcc_nbytes=64 << 20,
+                                  rdcc_nslots=50021)
+                    state['f'], state['ds'] = f, f[dsname]
                 except Exception:                           # noqa: BLE001
-                    cache['a'] = None
-            return cache['a']
+                    state['f'], state['ds'] = None, None
+            return state['ds']
+
+        def close():
+            f = state.pop('f', None)
+            state.pop('ds', None)
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:                           # noqa: BLE001
+                    pass
 
         def crop_of(spot):
-            a = mip()
-            if a is None:
+            ds = dataset()
+            if ds is None:
                 return None
             raw = getattr(spot, 'raw_coordinate', None)
             if raw is None and isinstance(spot, dict):
@@ -7283,17 +7449,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 y, x = float(raw[0]), float(raw[1])
             except Exception:                               # noqa: BLE001
                 # NO COORDINATE IS NOT THE ORIGIN. Defaulting to (0, 0)
-                # would draw the image's top-left corner and label it a
+                # would draw the frame's top-left corner and label it a
                 # spot, which is worse than an empty box.
                 return None
-            import numpy as _np
-            arr = _np.asarray(a)
-            h, w = arr.shape[0], arr.shape[1]
+            h, w = ds.shape[0], ds.shape[1]
             y0, y1 = max(0, int(round(y)) - pad), min(h, int(round(y)) + pad + 1)
             x0, x1 = max(0, int(round(x)) - pad), min(w, int(round(x)) + pad + 1)
             if y1 <= y0 or x1 <= x0:
                 return None
-            return arr[y0:y1, x0:x1]
+            try:
+                cube = ds[y0:y1, x0:x1, :]
+            except Exception:                               # noqa: BLE001
+                return None
+            # A FITTED Z OR NONE, never a placeholder. spot.py is
+            # explicit that inferring 'unfitted' from z == 0.0 is unsafe
+            # -- a real emitter on plane 0 and a never-fitted spot write
+            # the same number -- so z_status is what decides, and an
+            # unfitted spot hands back z=None so the dialog rings it
+            # laterally and claims nothing about depth.
+            # SPOT.z_status_of is an ASpot accessor (it uses getattr, and
+            # every other caller hands it an ASpot), so a spot that
+            # arrived as a store dict is read the same tolerant way this
+            # function already reads its coordinate.
+            zs = (spot.get('z_status') if isinstance(spot, dict)
+                  else SPOT.z_status_of(spot))
+            zs = zs if zs in SPOT.Z_STATUSES else SPOT.Z_NOT_FIT
+            z = None
+            if zs in (SPOT.Z_ACCEPTED, SPOT.Z_REJECTED):
+                try:
+                    zv = float(raw[2])
+                    # FINITE, not merely non-NaN: `zv == zv` lets inf
+                    # through, and int(round(inf)) raises OverflowError
+                    # downstream where there is no plane to round to.
+                    if np.isfinite(zv):
+                        z = zv
+                except Exception:                           # noqa: BLE001
+                    z = None
+            return GateCrop(cube, x - x0, y - y0, z, zs == SPOT.Z_REJECTED)
+        crop_of.close = close
         return crop_of
 
     def _remove_z_rejected_spots(self):
@@ -7353,10 +7546,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 survivors,
                 crop_of=self._spot_crop_for_gate(fov, hybe, modality, channel),
                 threshold=PG.DEFAULT_THRESHOLD, parent=self)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            accepted = dlg.exec_() == QtWidgets.QDialog.Accepted
+            threshold = dlg.threshold() if accepted else None
+            dlg.deleteLater()          # see _preview_p_gate
+            if not accepted:
                 self.log('Gate cancelled -- nothing removed.')
                 return
-            threshold = dlg.threshold()
         elif not z_doomed:
             n_unfit = sum(1 for s in in_slice
                           if spot_z_status_of(s) == SPOT_Z_NOT_FIT)

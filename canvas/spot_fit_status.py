@@ -5,7 +5,8 @@ from codelab_pipeline.io import preprocess
 
 def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, title='',
                          marker_size=130, z_display_pad=15, title_fontsize=9,
-                         rejected=None, scale_half=2, scale_half_z=5):
+                         rejected=None, scale_half=2, scale_half_z=5,
+                         lateral=None):
     """
     Renders one spot's fit-status: a YX max-projection (over Z) and an XZ
     max-projection (over Y -- X horizontal, Z vertical, same display
@@ -40,7 +41,11 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     spot's own fit was rejected -- drawn as circles when given, omitted
     entirely when not (never a red X or other "failed" marker), matching
     ChrTracer3's own "circled = good, plain = missing" convention so a
-    grid of these reads the same way by eye. The FIRST entry is always
+    grid of these reads the same way by eye. FOUR STATES NOW, not
+    three: `lateral` below added a WHITE DASHED ring for a spot whose z
+    was never fitted, so "no circle" means no marker was ASKED FOR
+    rather than "no fit" -- fitted against unfitted is carried by the
+    ring's colour and dash, and a SOLID ring still means a fit. The FIRST entry is always
     this spot's own representative position -- the BRIGHTEST accepted
     component when the crop's fit found more than one real blob (yellow);
     any FURTHER entries are the other accepted components detected in the
@@ -73,6 +78,16 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     crop's own lb quantile, so the noise floor still reads as noise.
     Falls back to whole-crop quantiles when there is no marker, or when
     the marked box is not brighter than that floor.
+    lateral: (x, y) crop-local, or a list of them, for a spot whose Z
+    was NEVER FITTED. Drawn WHITE and DASHED, and only on the YX panel,
+    because "circled = fitted" is a convention the rest of this grid
+    depends on -- the docstring for `centroid` above says no circle
+    means no fit, and a yellow ring on an unfitted spot would quietly
+    claim a measurement nobody made. Its y and x ARE measured, so the
+    YX panel can say which blob is under discussion; its z is not, so
+    the XZ panel gets no ring at all and is merely CENTRED on the
+    brightest plane of that spot's own column -- which is an
+    observation about the pixels, not a fit.
     z_display_pad: the XZ panel only shows +/-z_display_pad z-planes
     around the centroid (or the cubic's own brightest voxel if no
     centroid) -- DISPLAY-ONLY, never affects what fit_gaussian_3d actually
@@ -85,11 +100,16 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         centroids = list(centroid) if isinstance(centroid, list) else [centroid]
     # rejected: fits that EXIST but were gate-rejected, drawn blue -- the
     # same colour as mixture-context components, and the same meaning: a
-    # fit that is not a traced position. Three states per tile: yellow =
-    # traced, blue = fitted but gated, no circle = no fit at all.
+    # fit that is not a traced position. FOUR states per tile: yellow
+    # solid = traced, blue solid = fitted but gated, white dashed (see
+    # `lateral`) = a real spot whose z was never fitted, and no ring at
+    # all = the caller named no position.
     rejected_list = None
     if rejected is not None:
         rejected_list = list(rejected) if isinstance(rejected, list) else [rejected]
+    lateral_list = None
+    if lateral is not None:
+        lateral_list = list(lateral) if isinstance(lateral, list) else [lateral]
 
     depth = cubic.shape[2]
     if centroids:
@@ -99,10 +119,31 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         # shows a slab picked by the brightest voxel and the blue circle
         # can fall outside its own display window
         z_center = rejected_list[0][2]
+    elif lateral_list:
+        # THE SPOT'S OWN COLUMN, not the crop's. A spot with no fitted z
+        # still has a measured y and x, and the brightest plane at THAT
+        # (y, x) is where its own signal is -- centring on the crop's
+        # global maximum would frame a neighbour instead and leave the
+        # spot outside the window entirely.
+        z_center = _column_peak_z(cubic, lateral_list[0][1],
+                                  lateral_list[0][0])
     else:
         z_center = float(np.unravel_index(np.nanargmax(cubic), cubic.shape)[2])
+    # CLAMPED INTO THE CROP, because z_center is not always inside it.
+    # A stored z outlives a re-ingestion that produced FEWER planes, so
+    # a spot fitted at plane 100 of a 120-plane stack lands past the end
+    # of a 60-plane one. Unclamped that gives zmin >= zmax, an EMPTY
+    # slab, and projecting an empty axis raises -- out of a dialog's
+    # __init__, where it takes the whole dialog with it instead of
+    # drawing a worse picture. A non-finite z has no plane to refer to
+    # at all, so it goes to the middle.
+    if not np.isfinite(z_center):
+        z_center = (depth - 1) / 2.0
+    z_center = min(max(float(z_center), 0.0), float(max(depth - 1, 0)))
     zmin = max(0, int(round(z_center)) - z_display_pad)
     zmax = min(depth, int(round(z_center)) + z_display_pad + 1)
+    if zmax <= zmin:                       # a zero-depth cube, nothing else
+        zmin, zmax = 0, depth
 
     # THE SCALE FOLLOWS THE MARKED SPOT. Which spot the picture is about
     # is known here -- it is the one that gets the yellow circle -- so
@@ -112,6 +153,8 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         mark = centroids[0]
     elif rejected_list:
         mark = rejected_list[0]
+    elif lateral_list:
+        mark = (lateral_list[0][0], lateral_list[0][1], z_center)
     else:
         my, mx, mz = np.unravel_index(np.nanargmax(cubic), cubic.shape)
         mark = (float(mx), float(my), float(mz))
@@ -150,6 +193,34 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
                                  edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
             ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+    if lateral_list:
+        # YX ONLY, dashed. See the `lateral` paragraph above: this marks
+        # WHICH blob is under discussion without claiming a z nobody
+        # fitted, so the XZ panel deliberately gets no ring.
+        for cx, cy in lateral_list:
+            ax_yx.scatter([cx], [cy], s=marker_size, marker='o',
+                          facecolors='none', edgecolors='white',
+                          linewidths=1.2, linestyle='--')
+
+
+def _column_peak_z(cube, y, x):
+    """The brightest plane in one (y, x) column, or the crop's own peak.
+
+    Falls back to the whole-crop argmax when the column is off the crop
+    or holds nothing finite -- there is then no column to speak of.
+    """
+    a = np.asarray(cube, float)
+    try:
+        fy, fx = float(y), float(x)
+        r, c = ((int(round(fy)), int(round(fx)))
+                if np.isfinite(fy) and np.isfinite(fx) else (-1, -1))
+    except (TypeError, ValueError):
+        r = c = -1
+    if 0 <= r < a.shape[0] and 0 <= c < a.shape[1]:
+        col = a[r, c, :]
+        if np.isfinite(col).any():
+            return float(np.nanargmax(col))
+    return float(np.unravel_index(np.nanargmax(a), a.shape)[2])
 
 
 def _project(cube, axis):
@@ -188,9 +259,16 @@ def _peak(img, row, col, half_row, half_col):
     """
     a = np.asarray(img, float)
     try:
-        r, c = int(round(float(row))), int(round(float(col)))
+        fr, fc = float(row), float(col)
     except (TypeError, ValueError):
         return None
+    # FINITE FIRST. int(round(inf)) raises OverflowError, which this
+    # caught neither as TypeError nor ValueError -- and an infinite
+    # coordinate reaches here from a stored z the display clamps but
+    # the MARKER keeps, so the guard has to live on both paths.
+    if not (np.isfinite(fr) and np.isfinite(fc)):
+        return None
+    r, c = int(round(fr)), int(round(fc))
     r0, r1 = max(0, r - half_row), min(a.shape[0], r + half_row + 1)
     c0, c1 = max(0, c - half_col), min(a.shape[1], c + half_col + 1)
     if r1 <= r0 or c1 <= c0:

@@ -185,12 +185,76 @@ def test_helpers():
           F._scaled(np.array([[0.0, 1.0]]), 5.0, 5.0, 0.3, 0.9999) is not None)
 
 
+def test_markers_land_where_they_are_told():
+    """(x, y, z) -- x FIRST -- and ASYMMETRICALLY, so a swap shows.
+
+    THE ORDER HERE IS THE OPPOSITE of every other coordinate in this
+    project: spot.raw_coordinate, adj_coordinate and mixture_centroids
+    are all (y, x, z), and this function's centroid is (x, y, z). The
+    repo records that transposing them has already shipped once. A test
+    on a spot at (7, 7) cannot catch it, so every position below is
+    asymmetric AND the transposed position is planted with a DIFFERENT
+    z, so a swap moves the ring in both panels.
+    """
+    import matplotlib.pyplot as plt
+    cube = np.random.RandomState(0).normal(300, 3, (15, 15, 41))
+    cube[3, 11, 30] = 3000.0      # the spot:      y=3,  x=11, z=30
+    # BRIGHTER THAN THE SPOT, on purpose: the crop's own maximum is the
+    # NEIGHBOUR, so a z window that ignored `lateral` and fell back to
+    # the global argmax would centre 22 planes away and frame the wrong
+    # blob. With both blobs equal the two agree and the test proves
+    # nothing -- which is exactly what an earlier draft of it did.
+    cube[11, 3, 8] = 5000.0       # transposed:    y=11, x=3,  z=8
+
+    check('_column_peak_z takes (cube, y, x)',
+          F._column_peak_z(cube, 3, 11) == 30.0
+          and F._column_peak_z(cube, 11, 3) == 8.0)
+
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=(11.0, 3.0, 30.0))
+    check('an accepted ring lands at (x, y) in YX',
+          tuple(ax_yx.collections[0].get_offsets()[0]) == (11.0, 3.0))
+    check('and at (x, z - zmin) in ZX',
+          tuple(ax_xz.collections[0].get_offsets()[0]) == (11.0, 15.0))
+    plt.close(fig)
+
+    # UNFITTED: ringed laterally only, and the ZX window follows the
+    # SPOT'S OWN column rather than the crop's brightest voxel -- here
+    # those are 22 planes apart, so centring on the wrong one would put
+    # the spot outside the window entirely.
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, lateral=(11.0, 3.0))
+    check('an unfitted spot is ringed in YX only',
+          len(ax_yx.collections) == 1 and len(ax_xz.collections) == 0)
+    check('its ring is white and dashed, never the fitted yellow',
+          tuple(np.round(ax_yx.collections[0].get_edgecolor()[0], 2))
+          == (1.0, 1.0, 1.0, 1.0)
+          and ax_xz is not None
+          and ax_yx.collections[0].get_linestyle()[0][1] is not None)
+    # z=30 with pad 15 over a depth of 41 -> planes 15..40, 26 rows.
+    check('and its ZX window is centred on its own column peak',
+          np.asarray(ax_xz.images[-1].get_array()).shape[0] == 26,
+          str(np.asarray(ax_xz.images[-1].get_array()).shape))
+    plt.close(fig)
+
+    # The crop's brightest voxel is the OTHER blob, so a fallback that
+    # ignored `lateral` would give a different window.
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=None)
+    # z=8 with pad 15 -> planes 0..23, 24 rows; against the spot's 26.
+    check('with no marker at all it falls back to the crop peak',
+          np.asarray(ax_xz.images[-1].get_array()).shape[0] == 24,
+          str(np.asarray(ax_xz.images[-1].get_array()).shape))
+    plt.close(fig)
+
+
 def main():
     test_marked_spot_is_visible()
     test_no_marker_falls_back()
     test_rejected_marker_is_used()
     test_degenerate_inputs()
     test_helpers()
+    test_markers_land_where_they_are_told()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1
