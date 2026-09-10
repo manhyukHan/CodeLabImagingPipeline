@@ -335,10 +335,18 @@ def full_frame(rec, entry):
 def recut(rec, storage_path=None):
     """The exact voxels this verdict was made against, from the store.
 
-    This is what lets a bundle be deleted once its labels are collected:
-    a crop is a pure window read -- no anchoring, no engine, no fit -- so
+    A crop is a pure window read -- no anchoring, no engine, no fit -- so
     given the same store this returns the same array the reviewer saw,
-    element for element.
+    element for element. That is what lets the LABELS outlive the
+    bundle: a verdict carries its own frame and crop window.
+
+    IT DOES NOT YET LET TRAINING OUTLIVE THE BUNDLE. dataset.rows() drops
+    a verdict whose shard is absent ("labelled against a shard we lack")
+    and dataset.boxes(storage_path=...) raises NotImplementedError, so a
+    retrain still reads pixels from the shards -- for the classifier's
+    features and for the PSF bank alike; only the multispot calibration
+    is fitted from verdicts alone. Until boxes() re-cuts through this
+    function, delete a bundle only when you will not train from it.
     """
     import h5py
     from ..io import paths

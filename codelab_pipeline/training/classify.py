@@ -274,6 +274,14 @@ def train(X, boxes, y, groups, head='linear', epochs=400, lr=0.02,
                          'too few labelled cells to hold any out')
 
     std = F.Standardiser().fit(np.asarray(X)[tr]) if head != 'conv' else None
+    # THE WEIGHTS ARE SEEDED TOO, or two trainings of the same verdicts
+    # are two different models. `seed` already fixed the split and the
+    # augmentation; make_head draws its initial weights from torch's own
+    # generator, which nothing set. MEASURED: identical inputs, linear
+    # PR-AUC 0.9595 vs 0.9604 and different `state` in both heads, while
+    # the PSF bank came out numerically identical. A person retraining
+    # under the same run name expects the same M1 back.
+    _torch().manual_seed(int(seed))
     model = make_head(head, np.asarray(X).shape[1],
                       None if head != 'conv' else np.asarray(boxes).shape[1:])
 

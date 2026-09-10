@@ -214,6 +214,26 @@ def test_calibrate_into_leaves_m1_alone():
         shutil.rmtree(run, ignore_errors=True)
 
 
+def test_training_is_seeded_all_the_way_down():
+    """MEASURED before this: two trainings of the same verdicts gave
+    different `state` and `platt` in both heads (linear PR-AUC 0.9595 vs
+    0.9604) while the PSF bank came out numerically identical. The split
+    and augmentation were seeded; torch's initial weights were not."""
+    print('the same verdicts give the same M1')
+    import inspect
+    from codelab_pipeline.training import classify as C
+    src = inspect.getsource(C.train)
+    check('torch is seeded from the same seed as the split, INSIDE train()',
+          '_torch().manual_seed(int(seed))' in src)
+    check('and before the head is built',
+          src.index('manual_seed(int(seed))') < src.index('make_head('))
+    # The first attempt put this line in the lazy-import helper _torch(),
+    # where `seed` does not exist: every torch call then raised NameError
+    # and calibrate-into died at its first fit. Pinned so it cannot move.
+    check('and NOT in the import helper',
+          'manual_seed' not in inspect.getsource(C._torch))
+
+
 def main():
     test_shard_names_carry_the_channel()
     test_the_real_two_channel_bundle()
@@ -221,6 +241,7 @@ def main():
     test_eta_and_workers()
     test_a_build_appends()
     test_calibrate_into_leaves_m1_alone()
+    test_training_is_seeded_all_the_way_down()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1
