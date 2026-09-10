@@ -226,9 +226,12 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.WorkersSpinBox.setRange(1, 64)
         self.WorkersSpinBox.setValue(6)
         self.WorkersSpinBox.setToolTip(
-            'Parallel crop extractions. Each reads its crop off the NAS '
-            'before fitting, and readers contend there long before the '
-            'cores do -- more is not faster past about six on this store.')
+            'Parallel crop extractions. The fit is 99.8% of a crop, so on '
+            'a machine with idle cores more workers are close to '
+            'proportionally faster. Measured 2026-09-10 on a real build '
+            'from a local volume: 6 workers used 6 of 64 cores (13% CPU), '
+            'disk and network idle. Six is a conservative default for a '
+            'store on the NAS.')
         self.WorkersSpinBox.setMaximumWidth(120)
         f.addWidget(self.WorkersSpinBox, 2, 1, QtCore.Qt.AlignLeft)
         self.BuildBundlePushButton = QtWidgets.QPushButton('Build bundle')

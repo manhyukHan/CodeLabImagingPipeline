@@ -552,13 +552,17 @@ DEFAULT_WORKERS = 6
 def default_workers():
     """6, or fewer on a small machine. --workers overrides.
 
-    NOT the core count. The fit is 99.8% of a crop's CPU, but every crop
-    is first READ off the NAS, and readers contend there long before the
-    cores do: ingestion measured 117.6 MB/s at 12 workers against 66 MB/s
-    at 36. A cap of 32 was set here from the fit measurement alone and
-    made a real build slower, not faster. Six is the operator's chosen
-    default for this store; it is a setting on the Build model window,
-    not a constant to tune here.
+    SIX IS THE OPERATOR'S CHOICE, NOT A MEASUREMENT. It was set on the
+    expectation that readers would contend on the NAS as they do in
+    ingestion (117.6 MB/s at 12 workers against 66 at 36). MEASURED on
+    2026-09-10 during a real 10,000-crop build of MP58/DNA ch555 from a
+    LOCAL volume: 64 logical cores, total CPU 13%, the six workers each
+    pinned at 85-100% of one core, network idle. This workload is the
+    fit (99.8% of a crop), so there the worker count is what bounds the
+    build, and more workers should be close to proportionally faster
+    until the disk or the cores saturate -- that part is not measured
+    yet. It is a setting on the Build model window, not a constant to
+    tune here.
     """
     import multiprocessing
     return max(1, min(DEFAULT_WORKERS, (multiprocessing.cpu_count() or 4) - 2))
