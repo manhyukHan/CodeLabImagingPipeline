@@ -205,6 +205,69 @@ def test_build_commands():
     check('no path -> no commands', d.build_commands() == [])
 
 
+def test_train_during_build():
+    """A bundle is usable while it is being built -- every shard on disk
+    is complete and .h5.part is never listed -- so training and the
+    build are independent children with independent gates, and
+    training never touches the build's progress bar."""
+    print('train during a build')
+    d = make()
+
+    class Fake:
+        def deleteLater(self):
+            pass
+
+    d._build_worker = Fake()
+    d._set_build_busy(True)
+    check('a running build leaves Train enabled',
+          not d.BuildBundlePushButton.isEnabled()
+          and d.TrainPushButton.isEnabled())
+    check('and only a second BUILD is refused',
+          d._build_busy() and not d._train_busy())
+    d._on_progress(7, 1380)
+    d._set_train_busy(True)
+    check("training shows its own indicator and leaves the build's bar alone",
+          not d.TrainProgressBar.isHidden() and d.TrainProgressBar.maximum() == 0
+          and d.ProgressBar.maximum() == 1380 and d.ProgressBar.value() == 7
+          and not d.TrainPushButton.isEnabled()
+          and not d.BuildBundlePushButton.isEnabled())
+    d._train_worker = Fake()
+    check('a second training run is refused while the build still is',
+          d._train_busy() and d._build_busy())
+    d._set_train_busy(False)
+    d._release_train_worker()
+    check("training's end frees Train only, and the build's bar is untouched",
+          d.TrainPushButton.isEnabled() and not d.BuildBundlePushButton.isEnabled()
+          and d.ProgressBar.value() == 7 and d.ProgressBar.maximum() == 1380
+          and d.TrainProgressBar.isHidden() and d._train_worker is None)
+    d._set_build_busy(False)
+    d._release_build_worker()
+    check("the build's end frees Build and resets its bar",
+          d.BuildBundlePushButton.isEnabled() and d.ProgressBar.maximum() == 1
+          and d._build_worker is None)
+    d._build_worker = Fake()
+    d.close()
+    check('closing while a build runs says so and hides',
+          d.isHidden() and any('build continue' in d.LogListWidget.item(i).text()
+                               for i in range(d.LogListWidget.count())))
+    d._build_worker = None
+
+    import inspect
+    src = inspect.getsource(ModelBuildDialog)
+    check('no single shared slot is left',
+          'self._worker' not in src and '_set_busy(' not in src
+          and '_release_worker(' not in src)
+    check('_train gates on the train slot, _build_bundle on the build slot',
+          'if self._train_busy():' in inspect.getsource(ModelBuildDialog._train)
+          and 'if self._build_busy():'
+          in inspect.getsource(ModelBuildDialog._build_bundle))
+    import tools.build_bundle as BB
+    check('the build manifest is rewritten atomically, so a mid-build '
+          'reader never sees half of it',
+          inspect.getsource(BB.main).count('_write_json_atomic(mpath') == 2
+          and 'os.replace(tmp, path)' in inspect.getsource(BB._write_json_atomic))
+
+
 def test_review_status():
     print('4  review status on the real two-channel bundle')
     if not os.path.isdir(TWOCH):
@@ -525,6 +588,7 @@ def main():
     test_sources()
     test_fovs()
     test_build_commands()
+    test_train_during_build()
     test_review_status()
     test_train_command()
     test_render_report()

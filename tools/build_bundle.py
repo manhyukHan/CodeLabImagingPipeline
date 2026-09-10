@@ -118,6 +118,17 @@ def fovs_with_cells(storage_path, candidates):
             for f, ids in cells_in(storage_path, candidates).items()]
 
 
+def _write_json_atomic(path, obj):
+    """.part then os.replace. A bundle is used WHILE it is built --
+    training and the window's review status read the manifest -- and a
+    reader that opens it mid-rewrite must see the old one or the new
+    one, never half of either."""
+    tmp = str(path) + '.part'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('storage_path')
@@ -306,8 +317,7 @@ def main(argv=None):
     manifest['channels'] = sorted({int(r['channel']) for r in manifest['runs']})
     # Written BEFORE the run, so an interrupted bundle still says what it
     # was trying to be. Completion is stamped on at the end.
-    with open(mpath, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
+    _write_json_atomic(mpath, manifest)
 
     t0 = time.time()
     state = {'crops': 0, 'cands': 0}
@@ -362,8 +372,7 @@ def main(argv=None):
     manifest.update(finished=time.strftime('%Y-%m-%dT%H:%M:%S'),
                     wall_seconds=round(wall, 1), summary=summary,
                     complete=True)
-    with open(mpath, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
+    _write_json_atomic(mpath, manifest)
 
     print(f'\ndone in {wall / 60:.1f} min')
     print(f"   {summary['crops']:,} crops   {summary['candidates']:,} candidates"

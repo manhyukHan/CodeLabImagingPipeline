@@ -113,7 +113,8 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._fov_pool = [int(f) for f in fov_pool]
         self._storage_for = storage_for
         self._repo = str(repo_root)
-        self._worker = None          # the running build/train child
+        self._build_worker = None    # the running build child (ours)
+        self._train_worker = None    # the running training child
         self._scan = None            # the running mask scan
         self._queue = []             # commands still to run, this build
         self._have = {}              # storage_path -> [(fov, n_cells)]
@@ -306,6 +307,17 @@ class ModelBuildDialog(QtWidgets.QDialog):
             'Runs tools/train_spotmodel.py in the background. The result '
             'lands below and in the model list.')
         f.addWidget(self.TrainPushButton, 3, 0, 1, 3)
+        # TRAINING HAS ITS OWN INDICATOR. The bar at the bottom is the
+        # build's, and a build may still be cutting shards while a
+        # person trains on the ones already down -- so training neither
+        # borrows that bar nor resets it when it finishes.
+        self.TrainProgressBar = QtWidgets.QProgressBar()
+        self.TrainProgressBar.setRange(0, 1)
+        self.TrainProgressBar.setValue(0)
+        self.TrainProgressBar.setTextVisible(False)
+        self.TrainProgressBar.setMaximumHeight(8)
+        self.TrainProgressBar.hide()
+        f.addWidget(self.TrainProgressBar, 4, 0, 1, 3)
         self.ResultTextEdit = QtWidgets.QPlainTextEdit()
         self.ResultTextEdit.setReadOnly(True)
         self.ResultTextEdit.setMinimumHeight(170)
@@ -313,7 +325,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.ResultTextEdit.setPlaceholderText(
             'Training result appears here: labels, each head\'s '
             'validation numbers, the multispot calibration and the PSF.')
-        f.addWidget(self.ResultTextEdit, 4, 0, 1, 3)
+        f.addWidget(self.ResultTextEdit, 5, 0, 1, 3)
         f.setColumnStretch(1, 1)
         lay.addWidget(g)
 
@@ -668,7 +680,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
 
     def _reattach_if_building(self):
         """A build this app did not start is followed, not re-run."""
-        if self._worker is not None or self._tail is not None:
+        if self._build_worker is not None or self._tail is not None:
             return
         state = self.bundle_state()
         if state != 'building':
@@ -749,7 +761,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         return cmds
 
     def _build_bundle(self):
-        if self._busy():
+        if self._build_busy():
             return
         cmds = self.build_commands()
         if not cmds:
@@ -770,7 +782,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._log(f'building {len(cmds)} channel(s) into {self.bundle_dir()} '
                   f'-- in the background, one channel after another. '
                   f'Closing the app does not stop it.')
-        self._set_busy(True)
+        self._set_build_busy(True)
         # Show the status line NOW, not only when the build ends: a
         # suggested path is set programmatically, which fires no
         # editingFinished, so until this the line sat empty for the
@@ -780,7 +792,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
 
     def _next_build(self):
         if not self._queue:
-            self._set_busy(False)
+            self._set_build_busy(False)
             self._log('bundle ready: ' + self.bundle_dir())
             self._refresh_review()
             return
@@ -795,7 +807,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         w = StreamingProcWorker(
             cmd, cwd=self._repo,
             log_path=os.path.join(self.bundle_dir(), BUILD_LOG))
-        self._worker = w
+        self._build_worker = w
         w.line.connect(lambda t: self._log('  ' + t))
         w.progress.connect(self._on_progress)
         w.finished_ok.connect(self._on_build_step_done)
@@ -803,12 +815,12 @@ class ModelBuildDialog(QtWidgets.QDialog):
         w.start()
 
     def _on_build_step_done(self, code, why=''):
-        self._release_worker()
+        self._release_build_worker()
         if why:
             self._log('  could not start: ' + why)
         if int(code) != 0 or why:
             self._queue = []
-            self._set_busy(False)
+            self._set_build_busy(False)
             self._log(f'bundle build stopped (exit {code}); the lines above '
                       f'are the build\'s own output.')
             self._refresh_review()
@@ -1087,31 +1099,30 @@ class ModelBuildDialog(QtWidgets.QDialog):
         return cmd
 
     def _train(self):
-        if self._busy():
+        if self._train_busy():
             return
         cmd = self.train_command()
         if not cmd:
             return
         self._log('training in the background:   ' + ' '.join(cmd[2:]))
-        self._set_busy(True)
-        self.ProgressBar.setRange(0, 0)
+        self._set_train_busy(True)
         self._last_run_dir = None
         w = StreamingProcWorker(cmd, cwd=self._repo)
-        self._worker = w
+        self._train_worker = w
         w.line.connect(self._on_train_line)
         w.finished_ok.connect(self._on_train_done)
         w.failed.connect(lambda why: self._on_train_done(-1, why))
         w.start()
 
     def _on_train_line(self, text):
-        self._log('  ' + text)
+        self._log('[train] ' + text)
         marker = 'writing the run to '
         if text.strip().startswith(marker):
             self._last_run_dir = text.strip()[len(marker):].strip()
 
     def _on_train_done(self, code, why=''):
-        self._release_worker()
-        self._set_busy(False)
+        self._release_train_worker()
+        self._set_train_busy(False)
         if why:
             self._log('  could not start: ' + why)
             return
@@ -1227,35 +1238,69 @@ class ModelBuildDialog(QtWidgets.QDialog):
 
     # -- busy state -----------------------------------------------------
 
-    def _busy(self):
-        if self._worker is not None:
-            self._log('something is already running here -- one at a time.')
+    # -- busy state: a build and a training run are INDEPENDENT ---------
+    #
+    # A bundle is usable while it is still being built: every shard on
+    # disk is complete, a .h5.part is never listed, and training reads
+    # only the shards and the verdicts. So a person reviews the first
+    # shards, trains on them and opens the multispot review while the
+    # build is still cutting the rest. One slot per child, one gate per
+    # button, and training never touches the build's progress bar. (The
+    # window used to hold ONE slot and disable both buttons for either
+    # child, which made a three-hour build a three-hour wait.)
+
+    def _build_busy(self):
+        if self._build_worker is not None:
+            self._log('a build is already running here -- one build at a '
+                      'time.')
             return True
         return False
 
-    def _set_busy(self, busy):
-        for w in (self.BuildBundlePushButton, self.TrainPushButton):
-            w.setEnabled(not busy)
+    def _train_busy(self):
+        if self._train_worker is not None:
+            self._log('a training run is already going -- one at a time.')
+            return True
+        return False
+
+    def _set_build_busy(self, busy):
+        self.BuildBundlePushButton.setEnabled(not busy)
         if not busy:
             self.ProgressBar.setRange(0, 1)
             self.ProgressBar.setValue(0)
+
+    def _set_train_busy(self, busy):
+        self.TrainPushButton.setEnabled(not busy)
+        self.TrainProgressBar.setVisible(bool(busy))
+        self.TrainProgressBar.setRange(0, 0 if busy else 1)
+        if not busy:
+            self.TrainProgressBar.setValue(0)
 
     def _on_progress(self, done, total):
         self.ProgressBar.setRange(0, max(int(total), 1))
         self.ProgressBar.setValue(int(done))
 
-    def _release_worker(self):
-        w = self._worker
-        self._worker = None
+    def _release_build_worker(self):
+        w = self._build_worker
+        self._build_worker = None
+        if w is not None:
+            w.deleteLater()
+
+    def _release_train_worker(self):
+        w = self._train_worker
+        self._train_worker = None
         if w is not None:
             w.deleteLater()
 
     def closeEvent(self, event):
-        """Closing HIDES; a running build keeps running and keeps
-        reporting here. The main window caches this dialog, so Build
-        model... brings it back with its log intact."""
-        if self._worker is not None:
-            self._log('closed while running -- the build continues in the '
-                      'background; reopen Build model... to watch it.')
+        """Closing HIDES; a running build or training run keeps running
+        and keeps reporting here. The main window caches this dialog, so
+        Build model... brings it back with its log intact."""
+        running = [name for name, w in (('build', self._build_worker),
+                                        ('training', self._train_worker))
+                   if w is not None]
+        if running:
+            self._log('closed while running -- the ' + ' and '.join(running)
+                      + ' continue in the background; reopen Build '
+                        'model... to watch.')
         event.ignore()
         self.hide()
