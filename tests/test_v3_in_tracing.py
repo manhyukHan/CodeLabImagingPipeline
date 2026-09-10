@@ -126,6 +126,18 @@ def test_params():
     check('from_panel reads the v3 block under a v3 engine',
           p.readout_model_dir == MODEL and p.min_p_exist == 0.6
           and p.is_learned)
+    check('unset, the three reach settings are the measured values: 5 px, '
+          '17 planes, and the readout threshold for the fiducial',
+          p.lateral_reach() == 5 and p.fiducial_window() == 17
+          and p.fiducial_min_p() == 0.6)
+    r = T2.V2Params.from_panel(
+        {'engine': T2.ROUTE_V3,
+         'v3': {'model_dir': MODEL, 'min_p_exist': 0.6,
+                'min_p_exist_fiducial': 0.9, 'lateral_reach_px': 8,
+                'fiducial_z_window': 11}, 'v2': {}}, None)
+    check('and set, they are what the panel said',
+          r.lateral_reach() == 8 and r.fiducial_window() == 11
+          and r.fiducial_min_p() == 0.9 and r.min_p_exist == 0.6)
     check('describe() names it', p.describe().startswith('v3,')
           and '0.6' in p.describe())
     q = T2.V2Params.from_panel(
@@ -133,7 +145,8 @@ def test_params():
          'v2': {}}, None)
     check('but not under a v2 engine -- the v3 block is ignored',
           q.readout_model_dir is None and q.min_p_exist is None
-          and not q.is_learned and q.readout_engine is None)
+          and not q.is_learned and q.readout_engine is None
+          and q.lateral_reach_px is None and q.fiducial_z_window is None)
 
     # PICKLING: the engine never crosses; the directory does.
     p.readout_engine = FakeEngine([])
@@ -318,6 +331,54 @@ def test_rejected_labels_say_why():
           str(debug['H']['readout_rejected_labels']))
 
 
+def test_reach_settings_are_honoured():
+    """The three settings the panel gained change what the engines do."""
+    print('the reach settings are honoured')
+    from codelab_pipeline.models.allele import AnAllele
+
+    def shared(h, y, x, z, ymin, xmin):
+        return (y + ymin, x + xmin, z)
+
+    def readout(p, spots, cube):
+        a = AnAllele()
+        a.polymer_adj, a.polymer_raw = {}, {}
+        p.readout_engine = FakeEngine(spots)
+        dbg = {'H': {}}
+        ok, why = T2._readout_multi(a, 'H', cube, 20.0, p, 0.0, 0.0, 0.0, 0, 0,
+                                    shared, debug=dbg, seed_yx=(8.0, 8.0),
+                                    display_shape=(17, 17))
+        return a, ok, why, dbg['H']
+
+    cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
+    z0 = _slab_z0(20.0, T2._seed_z_half(T2.READOUT_FIT_RADIUS_UM,
+                                        T2.DEFAULT_VOXEL_UM))
+    far = [spot(8, 15, 20.0 - z0, 0.99)]                # 7 px from the seed
+    a1, ok1, _w, d1 = readout(T2.V2Params(min_p_exist=0.5, z_boundary_trim=0),
+                              far, cube)
+    check('at the measured 5 px a candidate 7 px out is cut, tagged xy',
+          not ok1 and d1['readout_rejected_labels'] == ['0.99 xy'])
+    a2, ok2, _w, d2 = readout(T2.V2Params(min_p_exist=0.5, z_boundary_trim=0,
+                                          lateral_reach_px=8), far, cube)
+    check('at 8 px from the panel it is kept',
+          ok2 and len(a2.polymer_adj['H']) == 1
+          and d2['readout_search']['lateral_px'] == 8)
+
+    p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0, fiducial_z_window=8)
+    zs = _slab_z0(20.0, 8)
+    p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 + 12 - zs, 0.9)])
+    f, _w, _a, how = T2._fiducial_learned(cube, 20.0, p)
+    check('a fiducial window of 8 planes makes a candidate 12 off "beyond '
+          'window"', f is not None and how == 'v3 beyond window', str(how))
+    p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0,
+                    min_p_exist_fiducial=0.95)
+    z17 = _slab_z0(20.0, 17)
+    p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z17, 0.9)])
+    f2, why2, _a, _h = T2._fiducial_learned(cube, 20.0, p)
+    check("the fiducial's own threshold gates the fiducial, not the "
+          "readout's", f2 is None and 'p_exist >= 0.95' in why2, why2)
+    check('and the readout threshold is untouched', p.min_p_exist == 0.5)
+
+
 def test_display_box_is_a_hard_boundary():
     """A candidate whose localized position lies outside the display crop
     is removed silently -- never counted, never listed, never drawn."""
@@ -482,9 +543,10 @@ def test_panel():
                        select='/m/r1')
     ui.V3MinPExistSpinBox.setValue(0.65)
     pr = ui.params()
-    check("params() carries the v3 block",
+    check("params() carries the v3 block, reach settings included",
           pr['v3'] == {'model_dir': '/m/r1', 'fiducial_model_dir': None,
-                       'min_p_exist': 0.65}
+                       'min_p_exist': 0.65, 'min_p_exist_fiducial': 0.5,
+                       'lateral_reach_px': 5, 'fiducial_z_window': 17}
           and T2.route(pr['engine']) == T2.ROUTE_V3)
     ui.populate_models([{'name': 'r1', 'path': '/m/r1', 'is_default': True,
                          'has_multispot': True, 'problems': []}],
@@ -497,6 +559,11 @@ def test_panel():
     ui.V3FiducialModelComboBox.setCurrentIndex(0)
     check('back to v2 Gaussian -> None',
           ui.params()['v3']['fiducial_model_dir'] is None)
+    check('the three reach settings are on the v3 page with the measured '
+          'defaults',
+          ui.V3LateralReachSpinBox.value() == 5
+          and ui.V3FiducialZWindowSpinBox.value() == 17
+          and ui.V3FiducialMinPExistSpinBox.value() == 0.5)
     check('the v3 page shows no Gaussian-fit gate',
           not any(k in dir(ui) for k in ('V3PeakBoundSpinBox',
                                           'V3MaxSigmaSpinBox')))
@@ -576,6 +643,12 @@ def test_main_window_wiring():
           'chp.populate_models(' in inspect.getsource(MW._refresh_model_list))
     check('the fiducial tile shows best-of-one with its p_exist',
           "d.get('fiducial_engine') == 'v3'" in src and 'best of' in src)
+    check('the v3 page is config-shaped state: every one of its six '
+          'controls is in the map',
+          all(k in MW._CONFIG_PARAM_MAP['chromatin_tracing'] for k in
+              ('v3_readout_model', 'v3_fiducial_model', 'v3_min_p_exist',
+               'v3_min_p_exist_fiducial', 'v3_lateral_reach_px',
+               'v3_fiducial_z_window')))
     check("a fiducial reason on a readout tile follows the readout title's "
           "own convention, so its threshold survives the 34-character cut",
           "('occupancy', 'occ')" in src and "('; refit ', ', ')" in src
@@ -595,6 +668,7 @@ def main():
     test_routing()
     test_params()
     test_readout_multi_gates()
+    test_reach_settings_are_honoured()
     test_rejected_labels_say_why()
     test_display_box_is_a_hard_boundary()
     test_learned_fiducial_best_of_one()

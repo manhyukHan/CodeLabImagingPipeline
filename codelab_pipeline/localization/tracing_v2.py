@@ -349,8 +349,22 @@ class V2Params(object):
                  readout_engine=None, min_p_exist=None, min_p3=None,
                  readout_model_dir=None, engine_label='',
                  z_window=None, z_boundary_trim=10,
-                 fiducial_model_dir=None):
+                 fiducial_model_dir=None, lateral_reach_px=None,
+                 fiducial_z_window=None, min_p_exist_fiducial=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # THREE SETTINGS THE CODE HAD AND THE PANEL DID NOT. Each is None
+        # for the measured value the code used before it was a setting:
+        # the readout's lateral reach (5 px, the 1 um v2's readout fit
+        # may move), the learned fiducial's depth window (17 planes, the
+        # Gaussian's seed window), and the fiducial's own p_exist
+        # threshold (the readout's, when unset -- one number gated both
+        # models, and they are different models).
+        self.lateral_reach_px = (None if lateral_reach_px is None
+                                 else int(lateral_reach_px))
+        self.fiducial_z_window = (None if fiducial_z_window is None
+                                  else int(fiducial_z_window))
+        self.min_p_exist_fiducial = (None if min_p_exist_fiducial is None
+                                     else float(min_p_exist_fiducial))
         # A SECOND MODEL FOR THE FIDUCIAL, optional. Trained on the
         # fiducial channel, it calls fiducial spots the way the readout
         # model calls readouts -- but the fiducial phase takes BEST OF
@@ -431,6 +445,24 @@ class V2Params(object):
         """Readout axial reach in planes: the panel's, else the measured."""
         return (self.z_window if self.z_window is not None
                 else _seed_z_half(READOUT_FIT_RADIUS_UM, self.voxel_um))
+
+    def lateral_reach(self):
+        """Readout lateral reach in px from the fiducial: the panel's,
+        else the measured 1 um (5 px at 0.208 um)."""
+        return (self.lateral_reach_px if self.lateral_reach_px is not None
+                else _lateral_reach_px(READOUT_FIT_RADIUS_UM, self.voxel_um))
+
+    def fiducial_window(self):
+        """The learned fiducial's depth window in planes: the panel's,
+        else the Gaussian's own seed window (17 at 0.2 um)."""
+        return (self.fiducial_z_window if self.fiducial_z_window is not None
+                else fiducial_window_planes(self.voxel_um))
+
+    def fiducial_min_p(self):
+        """The learned fiducial's p_exist threshold: its own, else the
+        readout's."""
+        return (self.min_p_exist_fiducial
+                if self.min_p_exist_fiducial is not None else self.min_p_exist)
 
     @property
     def readout_engine(self):
@@ -526,6 +558,12 @@ class V2Params(object):
                    fiducial_model_dir=(v3.get('fiducial_model_dir')
                                        if learned else None),
                    min_p_exist=(v3.get('min_p_exist') if learned else None),
+                   min_p_exist_fiducial=(v3.get('min_p_exist_fiducial')
+                                         if learned else None),
+                   lateral_reach_px=(v3.get('lateral_reach_px')
+                                     if learned else None),
+                   fiducial_z_window=(v3.get('fiducial_z_window')
+                                      if learned else None),
                    engine_label=str(params.get('engine_label') or
                                     params.get('engine') or ''))
 
@@ -543,8 +581,11 @@ class V2Params(object):
         if self.is_learned:
             t = ('none' if self.min_p_exist is None
                  else f'{self.min_p_exist:g}')
+            fp = self.fiducial_min_p()
             fid = (f'fiducial best-of-one from '
-                   f'{os.path.basename(str(self.fiducial_model_dir))}'
+                   f'{os.path.basename(str(self.fiducial_model_dir))} '
+                   f'(p_exist >= {"none" if fp is None else f"{fp:g}"}, '
+                   f'window {self.fiducial_window()} planes)'
                    if self.fiducial_model_dir else 'fiducial by v2 Gaussian')
             return (f'v3, readout by the learned engine from '
                     f'{os.path.basename(str(self.readout_model_dir or "?"))} '
@@ -844,7 +885,7 @@ def _fiducial_learned(cube, z0, p):
     human judgement. Dropping the hybe over a missing sub-voxel step
     when a Gaussian fit can supply it was the wrong trade.
     """
-    window = fiducial_window_planes(p.voxel_um)
+    window = p.fiducial_window()
     slab, s0, s1, reach, z_off = _learned_slab(cube, z0, p, reach=window)
     if slab is None:
         return None, 'no planes left between the trimmed ends', [], None
@@ -859,7 +900,7 @@ def _fiducial_learned(cube, z0, p):
     if not cands:
         return None, 'engine found nothing', [], None
     from . import psfmatcher as PSFM
-    t = p.min_p_exist
+    t = p.fiducial_min_p()
     inside, beyond, unrefined, alts = [], [], [], []
     for c in cands:
         dzr = (abs(float(c.z) - float(z0))
@@ -1003,7 +1044,7 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     # would have looked is a spot with a different z-drift from the
     # fiducial's, which is exactly the spot this trace must not carry.
     # Lateral reach needs no gate: the crop's own edges are it.
-    r_lat = _lateral_reach_px(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    r_lat = p.lateral_reach()
     if seed_yx is None:
         h, w = np.asarray(cube).shape[:2]
         seed_yx = ((h - 1) / 2.0, (w - 1) / 2.0)
@@ -1462,8 +1503,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # are the same 17 planes). A candidate tagged 'z' is outside
             # these lines, and a person can now see that.
             debug[hybe]['fiducial_zexp'] = float(z0)
-            debug[hybe]['fiducial_z_window'] = int(
-                fiducial_window_planes(p.voxel_um))
+            debug[hybe]['fiducial_z_window'] = int(p.fiducial_window())
         if p.fiducial_engine is not None:
             # THE LEARNED FIDUCIAL, best of one. No Gaussian gate applies
             # -- a matched filter has no occupancy or CI -- the p_exist
@@ -1804,6 +1844,9 @@ def allele_task(payload):
         'readout_model_dir': (params.readout_model_dir if params else None),
         'fiducial_model_dir': (params.fiducial_model_dir if params else None),
         'min_p_exist': (params.min_p_exist if params else None),
+        'min_p_exist_fiducial': (params.min_p_exist_fiducial if params else None),
+        'lateral_reach_px': (params.lateral_reach_px if params else None),
+        'fiducial_z_window': (params.fiducial_z_window if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
@@ -1915,6 +1958,9 @@ def allele_task_with_debug(payload):
         'readout_model_dir': (params.readout_model_dir if params else None),
         'fiducial_model_dir': (params.fiducial_model_dir if params else None),
         'min_p_exist': (params.min_p_exist if params else None),
+        'min_p_exist_fiducial': (params.min_p_exist_fiducial if params else None),
+        'lateral_reach_px': (params.lateral_reach_px if params else None),
+        'fiducial_z_window': (params.fiducial_z_window if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
@@ -2074,7 +2120,10 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
             if v2_params.is_learned:
                 stamp.update({'readout_model_dir': v2_params.readout_model_dir,
                               'fiducial_model_dir': v2_params.fiducial_model_dir,
-                              'min_p_exist': v2_params.min_p_exist})
+                              'min_p_exist': v2_params.min_p_exist,
+                              'min_p_exist_fiducial': v2_params.min_p_exist_fiducial,
+                              'lateral_reach_px': v2_params.lateral_reach_px,
+                              'fiducial_z_window': v2_params.fiducial_z_window})
         allele.provenance = stamp
     if not uses_v2_tracer(engine):
         from codelab_pipeline.localization import localization as L

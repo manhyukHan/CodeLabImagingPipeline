@@ -14100,6 +14100,18 @@ One PNG PER MODALITY: each modality has its own reference and its
             'v2_fiducial_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2FiducialMaxUncertZSpinBox'),
             'v2_readout_max_uncert_z_nm': ('ChromatinTracingPanel', 'V2ReadoutMaxUncertZSpinBox'),
             'v2_qc_shift': ('ChromatinTracingPanel', 'V2QcShiftCheckBox'),
+            # THE v3 PAGE. It was not in the map at all, so Save Config
+            # dropped the readout model, the fiducial model and the
+            # threshold -- a run that could not be reproduced from its
+            # own config. The model combos round-trip their item data
+            # (the run directory), and are filled when the engine entry
+            # above lands on v3, before these are applied.
+            'v3_readout_model': ('ChromatinTracingPanel', 'V3ModelComboBox'),
+            'v3_fiducial_model': ('ChromatinTracingPanel', 'V3FiducialModelComboBox'),
+            'v3_min_p_exist': ('ChromatinTracingPanel', 'V3MinPExistSpinBox'),
+            'v3_min_p_exist_fiducial': ('ChromatinTracingPanel', 'V3FiducialMinPExistSpinBox'),
+            'v3_lateral_reach_px': ('ChromatinTracingPanel', 'V3LateralReachSpinBox'),
+            'v3_fiducial_z_window': ('ChromatinTracingPanel', 'V3FiducialZWindowSpinBox'),
             'readout_psf': ('ChromatinTracingPanel', 'ReadoutPsfComboBox'),
             'spad': ('ChromatinTracingPanel', 'SpadSpinBox'),
             'z_window': ('ChromatinTracingPanel', 'ZWindowSpinBox'),
@@ -14172,6 +14184,13 @@ One PNG PER MODALITY: each modality has its own reference and its
                 # very object stored -- the bug that broke the hybe combo.
                 for i in range(w.count()):
                     if w.itemData(i) == value:
+                        w.setCurrentIndex(i)
+                        return True
+                # AN ENTRY WITH NO DATA saves its text (the fiducial
+                # combo's 'v2 Gaussian fit'), so the text is the second
+                # key -- otherwise that choice could never be applied.
+                for i in range(w.count()):
+                    if w.itemData(i) is None and w.itemText(i) == value:
                         w.setCurrentIndex(i)
                         return True
                 return False

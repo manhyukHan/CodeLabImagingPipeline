@@ -66,7 +66,8 @@ READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 # v3: the p_exist cut. 0.5 is where a calibrated probability is
 # thresholded; MEASURED on the shipped model's own 661 judged matches it
 # sits within 0.006 F1 of the optimum across a range of pillar p1.
-V3_DEFAULTS = {'min_p_exist': 0.5}
+V3_DEFAULTS = {'min_p_exist': 0.5, 'min_p_exist_fiducial': 0.5,
+               'lateral_reach_px': 5, 'fiducial_z_window': 17}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
                   # v2 by default, per explicit request. Measured through the
                   # app on four experiments: 43-68% better same-locus repeat
@@ -889,15 +890,59 @@ class ChromatinTracingPanelUI(object):
             'readout grid with its p_exist so this number can be chosen '
             'from what one allele actually looks like.')
         form.addRow('p_exist threshold (readout):', self.V3MinPExistSpinBox)
+        # THREE SETTINGS THE CODE HAD AND THE PANEL DID NOT. A person
+        # reading a tile tagged 'xy' asked where the 5 px came from, and
+        # the answer was a constant. Each default is the measured value
+        # the code used before it was a setting.
+        self.V3LateralReachSpinBox = QtWidgets.QSpinBox()
+        self.V3LateralReachSpinBox.setRange(1, 32)
+        self.V3LateralReachSpinBox.setSuffix(' px')
+        self.V3LateralReachSpinBox.setValue(V3_DEFAULTS['lateral_reach_px'])
+        self.V3LateralReachSpinBox.setToolTip(
+            'Readout candidates are kept only within this many px of the '
+            'fiducial\'s xy (tag "xy" in the grid). 5 px is the 1 um v2\'s '
+            'readout fit may move from its seed. Raise it toward the crop '
+            'half-width to keep a second locus of the same cell further '
+            'away -- which also keeps a neighbour\'s spot the crop happened '
+            'to include.')
+        form.addRow('Lateral reach (px from the fiducial):',
+                    self.V3LateralReachSpinBox)
+        self.V3FiducialZWindowSpinBox = QtWidgets.QSpinBox()
+        self.V3FiducialZWindowSpinBox.setRange(1, 60)
+        self.V3FiducialZWindowSpinBox.setSuffix(' planes')
+        self.V3FiducialZWindowSpinBox.setValue(V3_DEFAULTS['fiducial_z_window'])
+        self.V3FiducialZWindowSpinBox.setToolTip(
+            'How far from the consensus depth the learned fiducial is '
+            'looked for -- the dashed lines on the fiducial tile\'s XZ '
+            'panel. 17 planes is v2\'s own seed window. Past it the best '
+            'candidate in the slab is still handed on, and the z-drift '
+            'gate above decides.')
+        form.addRow('Fiducial Z window (+/- planes from consensus):',
+                    self.V3FiducialZWindowSpinBox)
+        self.V3FiducialMinPExistSpinBox = QtWidgets.QDoubleSpinBox()
+        self.V3FiducialMinPExistSpinBox.setRange(0.0, 1.0)
+        self.V3FiducialMinPExistSpinBox.setDecimals(2)
+        self.V3FiducialMinPExistSpinBox.setSingleStep(0.05)
+        self.V3FiducialMinPExistSpinBox.setValue(
+            V3_DEFAULTS['min_p_exist_fiducial'])
+        self.V3FiducialMinPExistSpinBox.setToolTip(
+            'Keep a fiducial candidate when p_exist >= this, then best of '
+            'one among those. Separate from the readout\'s threshold '
+            'because the fiducial model is a different model; it applies '
+            'only when a fiducial model is chosen.')
+        form.addRow('p_exist threshold (fiducial):',
+                    self.V3FiducialMinPExistSpinBox)
         outer.addLayout(form)
         note = QtWidgets.QLabel(
-            'The fiducial is still fitted by v2 (one Gaussian, the major '
-            'spot -- never a multispot search) inside the same crop, and '
-            'the drift / z-drift gates above still apply. Readout '
-            'candidates are kept only within the fiducial\'s own axial '
-            'reach, so a spot with a different z-drift from the fiducial is '
-            'not carried. v2\'s fiducial gates (occupancy, CI) are on the '
-            'v2 page and still in force.')
+            'Fiducial: v2\'s Gaussian fit unless a fiducial model is chosen; '
+            'then that model calls it, best of one, inside the Z window '
+            'above, and a candidate it believes but cannot place to '
+            'sub-voxel precision is refined by the Gaussian fit. The drift '
+            '/ z-drift gates above apply either way. Readout candidates are '
+            'kept within the fiducial\'s reach in z (Z search window) and '
+            'xy (lateral reach); every candidate, kept or cut, is drawn in '
+            'the grid with its p_exist and why it was cut. v2\'s fiducial '
+            'gates (occupancy, CI) are on the v2 page and still in force.')
         note.setWordWrap(True)
         note.setStyleSheet('color: #555;')
         outer.addWidget(note)
@@ -951,7 +996,11 @@ class ChromatinTracingPanelUI(object):
     def v3_params(self):
         return {'model_dir': self.selected_model_dir(),
                 'fiducial_model_dir': self.selected_fiducial_model_dir(),
-                'min_p_exist': float(self.V3MinPExistSpinBox.value())}
+                'min_p_exist': float(self.V3MinPExistSpinBox.value()),
+                'min_p_exist_fiducial': float(
+                    self.V3FiducialMinPExistSpinBox.value()),
+                'lateral_reach_px': int(self.V3LateralReachSpinBox.value()),
+                'fiducial_z_window': int(self.V3FiducialZWindowSpinBox.value())}
 
     def _build_v2_page(self, double_spin):
         """v2's own parameters, in v2's own units.
@@ -1225,6 +1274,10 @@ class ChromatinTracingPanelUI(object):
                 w.setValue(0.0 if v is None else float(v))
         self.V2QcShiftCheckBox.setChecked(bool(V2.V2Params().qc_shift))
         self.V3MinPExistSpinBox.setValue(V3_DEFAULTS['min_p_exist'])
+        self.V3FiducialMinPExistSpinBox.setValue(
+            V3_DEFAULTS['min_p_exist_fiducial'])
+        self.V3LateralReachSpinBox.setValue(V3_DEFAULTS['lateral_reach_px'])
+        self.V3FiducialZWindowSpinBox.setValue(V3_DEFAULTS['fiducial_z_window'])
         self.apply_engine_visibility()
         self.refresh_psf_entries(select=DEFAULT_READOUT_PSF)
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])
