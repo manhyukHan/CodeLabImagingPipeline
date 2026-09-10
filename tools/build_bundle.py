@@ -128,6 +128,11 @@ def main(argv=None):
                     help='the draw is recorded with this; default is a '
                          'timestamp, which is still written down')
     ap.add_argument('--workers', type=int, default=None)
+    ap.add_argument('--rebuild', action='store_true',
+                    help='rebuild shards that are already on disk. The '
+                         'default APPENDS: a shard on disk is complete '
+                         '(written .part then os.replace), so only the '
+                         'missing ones are built.')
     ap.add_argument('--chunk', type=int, default=X.DEFAULT_CHUNK)
     ap.add_argument('--pad', type=int, default=X.DEFAULT_PAD)
     ap.add_argument('--dry-run', action='store_true',
@@ -275,9 +280,17 @@ def main(argv=None):
               flush=True)
 
     print()
+    def on_plan(n_todo, n_skipped):
+        if a.rebuild:
+            print(f'shards  {n_todo} to build (--rebuild)', flush=True)
+        elif n_skipped:
+            print(f'shards  {n_todo} to build, {n_skipped} already on disk '
+                  f'-- appending', flush=True)
+
     X.extract(store, fovs, hybes, int(a.channel), str(a.out),
               workers=workers, chunk=int(a.chunk), pad=int(a.pad),
-              on_task=on_task)
+              on_task=on_task, skip_existing=not a.rebuild,
+              on_plan=on_plan)
     wall = time.time() - t0
 
     summary = X.summarize(str(a.out))

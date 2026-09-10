@@ -1,5 +1,5 @@
 <settings
-  project_root="G:\JP\2026-01-26-cross_modal"
+  project_root="G:\JP\2026-01-26-JP-chr19_downstream"
   fov_list="7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40"
   celltype_names="">
   <modality
@@ -8,9 +8,9 @@
     name="RNA" />
   <acquisition
     voxel_xy_um="0.208"
-    voxel_z_um="0.2" />
+    voxel_z_um="0.202" />
   <cell_segmentation
-    reference_hybe="Hyb_002 (DNA)"
+    reference_hybe="Hyb_500 (RNA)"
     channel="635"
     method="Cellpose"
     diameter="40"
@@ -22,7 +22,7 @@
     classical_min_size="500"
     classical_max_size="10000"
     append_mode="0"
-    projection="MIP (stored)"
+    projection="single plane"
     z_plane="0"
     z_start="0"
     z_end="0" />
@@ -36,17 +36,17 @@
     channel_type="635"
     border_trim="0"
     max_shift="0"
-    reference_hybe_DNA="Hyb_002"
-    reference_hybe_RNA="Hyb_101" />
+    reference_hybe_DNA="DAPI"
+    reference_hybe_RNA="Hyb_131" />
   <cell_alignment
     channel_type="555"
     pad="10"
-    max_z_shift="15"
+    max_z_shift="55"
     overlay_autosave_threshold_px="0"
     reference_hybe_DNA="Hyb_002"
     reference_hybe_RNA="Hyb_101" />
   <spot_localization
-    hybe="Hyb_002 (DNA)"
+    hybe="Hyb_005 (DNA)"
     channel="635"
     threshold_percent="50"
     threshold_absolute=""
@@ -66,7 +66,7 @@
     upper_bound_value="0.999"
     include_transient="1" />
   <chromatin_tracing
-    reference_hybe="Hyb_002 (DNA)"
+    reference_hybe="Hyb_005 (DNA)"
     engine="v2"
     v2_fiducial_min_occupancy="0.25"
     v2_readout_min_occupancy="0.4"

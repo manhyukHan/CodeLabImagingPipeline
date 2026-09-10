@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -78,6 +79,71 @@ def analytic_reference(mean, voxel_um, storage_path=None):
             'cosine_to_measured': float(a @ PB.normalise(mean).ravel())}
 
 
+def calibrate_into(a):
+    """Fit ONLY the multispot calibration, into an existing run.
+
+    THE CALIBRATION BELONGS TO THE BANK THAT SCORED THE VERDICTS. Each
+    judged match carries the p the reviewer saw, and that p was the NCC
+    against whichever psf_bank.h5 Spot Check was matching with. A fresh
+    retrain rebuilds a bank from the same positives and usually gets the
+    same template -- but 'usually' is not a binding, and a retrain also
+    re-fits the classifier, which is the M1 a person may have chosen and
+    wants kept. So: the run stays, the calibration is added, the
+    manifest is rebound over the new file set.
+    """
+    run = os.path.abspath(a.calibrate_into)
+    if not os.path.isdir(run):
+        print(f'no such run directory: {run}')
+        return 1
+    from codelab_pipeline.training import classify as C
+    rp = os.path.join(run, 'report.json')
+    try:
+        with open(rp, encoding='utf-8') as f:
+            report = json.load(f)
+    except Exception as exc:                                 # noqa: BLE001
+        print(f'{run} has no readable report.json ({exc}); a run to '
+              f'calibrate into must be one train_spotmodel wrote.')
+        return 1
+    r = int(report.get('template_r', a.template_r))
+    rz = int(report.get('template_rz', a.template_rz))
+    tpl_shape = (2 * r + 1, 2 * r + 1, 2 * rz + 1)
+    man = MS.read_manifest(run) or {}
+    print(f'run     {run}')
+    print(f"model   {man.get('model_id', '?')}  template {tpl_shape}")
+    cal, calrep = C.fit_multispot(a.bundle_dir, template=tpl_shape)
+    report['multispot'] = calrep
+    if cal is None:
+        print(f"multispot calibration: {calrep.get('skipped')}")
+        print('nothing written')
+        return 1
+    calrep['bank_model_id'] = man.get('model_id')
+    cp = cal.save(os.path.join(run, C.MULTISPOT_NAME))
+    print(f"multispot calibration from {calrep['n']} judged matches over "
+          f"{calrep['pillars']} pillars:")
+    print(f"   raw PR-AUC {calrep['raw_pr_auc']:.3f}  ->  at p 0.5: "
+          f"precision {calrep['precision_at_half']:.3f}, "
+          f"recall {calrep['recall_at_half']:.3f}")
+    print(f'   -> {os.path.basename(cp)}')
+    with open(rp, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=1)
+    # REBOUND, with the run's own provenance kept: write_manifest hashes
+    # every file afresh (so the new calibration is bound) but knows
+    # nothing of reviewer or bundle unless told.
+    extra = {'bundle': man.get('bundle') or a.bundle_dir,
+             'reviewer': man.get('reviewer') or a.reviewer,
+             'calibrated_from': a.bundle_dir,
+             'calibrated_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    new = MS.write_manifest(run, extra=extra)
+    print(f"   manifest {man.get('model_id', '?')} -> {new['model_id']} "
+          f"over {len(new['files'])} files  (the classifier and the bank "
+          f"are untouched; the id changed because the file set did)")
+    if a.set_default:
+        print(f'   pinned as the default model: {MS.set_default(run)}')
+    print(f'writing the run to {run}')
+    print(f'\nreport  {rp}')
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('bundle_dir')
@@ -122,11 +188,23 @@ def main(argv=None):
                          'a run at a different size gets its own.')
     ap.add_argument('--template-rz', type=int, default=PB.DEFAULT_RZ,
                     help='SEARCH template half-depth. See --template-r.')
+    ap.add_argument('--calibrate-into', default=None, metavar='RUN_DIR',
+                    help='ADD the multispot calibration to an EXISTING run '
+                         'and touch nothing else in it. The classifier and '
+                         'the PSF bank stay as they are; psf_multispot.json '
+                         'is fitted from this bundle\'s multispot verdicts '
+                         'against that run\'s template, report.json gains '
+                         'its multispot block, and the manifest is rebound. '
+                         'This is how a second-stage review lands on the '
+                         'model whose PSF it was judged with, instead of a '
+                         'retrain whose bank merely happens to match.')
     ap.add_argument('--storage-path', default=None,
                     help='to compare the measured PSF against the analytic '
                          'calibration in that store')
     a = ap.parse_args(argv)
     voxel = tuple(float(v) for v in a.voxel_um.split(','))
+    if a.calibrate_into:
+        return calibrate_into(a)
 
     rows = D.rows(a.bundle_dir)
     s = D.summary(rows)

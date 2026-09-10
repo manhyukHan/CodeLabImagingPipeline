@@ -67,6 +67,30 @@ MAX_HITS = 9
 ADDED_SEED_Z = -1.0
 
 BANK_NAME = 'psf_bank.h5'
+_BANK_SHA = {}
+
+
+def _bank_sha(path, chunk=1 << 20):
+    """Short content hash of the bank file, or None. Cached per path."""
+    if not path:
+        return None
+    try:
+        key = (str(path), os.path.getmtime(path))
+    except OSError:
+        return None
+    if key in _BANK_SHA:
+        return _BANK_SHA[key]
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for b in iter(lambda: f.read(chunk), b''):
+                h.update(b)
+        out = h.hexdigest()[:12]
+    except OSError:
+        out = None
+    _BANK_SHA[key] = out
+    return out
 
 # The resolution bound moved into the LIBRARY -- psf_bank owns it now,
 # because the same rule governs what a localize engine may report and a
@@ -459,6 +483,13 @@ class Multispot:
                'n_found': int(s['n_total']),
                'bank': os.path.basename(self.bank_path or ''),
                'shown': shown,
+               # WHICH BANK SCORED THESE p. `bank` above is the basename,
+               # kept short because a re-run should read the same; these
+               # two say WHERE it was and WHAT it hashed to, so a
+               # calibration fitted on these p can be written into the
+               # run that owns that bank instead of trusting the caller.
+               'bank_path': self.bank_path,
+               'bank_sha': _bank_sha(self.bank_path),
                'added': [{'y': round(float(a) + y0, 3),
                           'x': round(float(b) + x0, 3)}
                          for (a, b) in s['added']],

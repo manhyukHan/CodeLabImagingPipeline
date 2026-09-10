@@ -260,6 +260,15 @@ def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
 DEFAULT_CHUNK = 8
 
 
+def shard_path(out_dir, fov, hybe, channel, tag):
+    """Where one (fov, hybe, channel, cell-chunk) shard lives. ONE place,
+    because two callers need it: the writer, and the planner that skips
+    a shard already there."""
+    return os.path.join(str(out_dir),
+                        f'fov{int(fov):03d}__{hybe}__ch{int(channel)}'
+                        f'__{tag}.h5')
+
+
 def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
                   pad=DEFAULT_PAD, max_fits=DEFAULT_MAX_FITS,
                   keep_top=DEFAULT_KEEP_TOP, anchor=None,
@@ -303,9 +312,7 @@ def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
     # overwrote the first channel's shard entirely. Not a mix-up of
     # pixels -- the earlier channel simply vanished, and the bundle
     # still looked complete.
-    path = os.path.join(str(out_dir),
-                        f'fov{int(fov):03d}__{hybe}__ch{int(channel)}'
-                        f'__{tag}.h5')
+    path = shard_path(out_dir, fov, hybe, channel, tag)
     info = dict(meta or {})
     info.update(fov=int(fov), hybe=str(hybe), channel=int(channel),
                 pad=int(pad),
@@ -437,12 +444,22 @@ def default_workers():
 
 
 def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
-            chunk=DEFAULT_CHUNK, on_task=None, **kw):
+            chunk=DEFAULT_CHUNK, on_task=None, skip_existing=True,
+            on_plan=None, **kw):
     """Build a whole bundle. (fov, hybe, cell-chunk) through ONE pool.
 
     on_task(done, total, fov, hybe, path, n_crops, n_candidates) fires as
     each chunk lands, so progress is visible without waiting on the
     slowest anything.
+
+    AN INCOMPLETE BUNDLE IS APPENDED TO, NOT REDONE. Every shard on disk
+    is complete -- BundleWriter writes .part and os.replace's it -- so a
+    build interrupted anywhere (the app quit, the machine slept, a
+    channel was added later) leaves a folder whose shards are all
+    usable and whose gaps are exactly the tasks still to run. With
+    skip_existing the planner drops the tasks whose shard exists and
+    on_plan(n_todo, n_skipped) says so; a .part left behind is not a
+    shard and is rebuilt. skip_existing=False rebuilds everything.
 
     `workers` defaults to default_workers(). This workload is CPU
     bound -- 99.8% of a crop is the fit -- so unlike the alignment path,
@@ -453,6 +470,13 @@ def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
     import multiprocessing
     os.makedirs(str(out_dir), exist_ok=True)
     tasks = plan(storage_path, fovs, hybes, channel, chunk=chunk)
+    n_all = len(tasks)
+    if skip_existing:
+        tasks = [t for t in tasks
+                 if not os.path.exists(shard_path(out_dir, t[0], t[1],
+                                                  channel, t[3]))]
+    if on_plan:
+        on_plan(len(tasks), n_all - len(tasks))
     if workers is None:
         workers = default_workers()
     workers = int(workers)

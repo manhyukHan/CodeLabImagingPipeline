@@ -31,7 +31,12 @@ import time
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from ui.proc_stream import StreamingProcWorker
+from ui.proc_stream import LogTailWorker, StreamingProcWorker
+
+# A build's own log, inside its bundle: what a relaunched app reads.
+BUILD_LOG = 'build.log'
+# How long a build log may go quiet before it is called stalled.
+STALE_SECONDS = 180
 
 
 class MaskScanWorker(QtCore.QThread):
@@ -113,8 +118,11 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._queue = []             # commands still to run, this build
         self._have = {}              # storage_path -> [(fov, n_cells)]
         self._last_run_dir = None
+        self._tail = None            # following a build we did not start
         self._build()
         self._populate_sources()
+        self._recall_bundle_path()
+        self._refresh_runs()
         self._refresh_review()
 
     # -- layout --------------------------------------------------------
@@ -212,6 +220,10 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.RefreshReviewPushButton = QtWidgets.QPushButton(
             'Refresh review status')
         f.addWidget(self.RefreshReviewPushButton, 0, 1)
+        self.BundleStateLabel = QtWidgets.QLabel('')
+        self.BundleStateLabel.setWordWrap(True)
+        self.BundleStateLabel.setStyleSheet('color:#7a5200;')
+        f.addWidget(self.BundleStateLabel, 2, 0, 1, 2)
         self.ReviewStatusLabel = QtWidgets.QLabel('')
         self.ReviewStatusLabel.setWordWrap(True)
         self.ReviewStatusLabel.setTextInteractionFlags(
@@ -229,11 +241,23 @@ class ModelBuildDialog(QtWidgets.QDialog):
         f.addWidget(self.ReviewerLineEdit, 0, 1)
         self.SetDefaultCheckBox = QtWidgets.QCheckBox('pin as default model')
         f.addWidget(self.SetDefaultCheckBox, 0, 2)
+        f.addWidget(QtWidgets.QLabel('into:'), 1, 0)
+        self.TargetRunComboBox = QtWidgets.QComboBox()
+        self.TargetRunComboBox.setToolTip(
+            'NEW RUN trains everything from the pass/fail verdicts: the '
+            'classifier (M1), the PSF bank, and -- if multispot verdicts '
+            'exist -- the calibration.\n\n'
+            'AN EXISTING RUN adds ONLY the multispot calibration to it and '
+            'touches nothing else. Pick the run whose PSF the multispot '
+            'review matched with: its verdicts carry the p that bank '
+            'scored, so the calibration belongs to that bank, and a fresh '
+            'retrain would also re-fit the M1 you may want kept.')
+        f.addWidget(self.TargetRunComboBox, 1, 1, 1, 2)
         self.TrainPushButton = QtWidgets.QPushButton('Train')
         self.TrainPushButton.setToolTip(
-            'Runs tools/train_spotmodel.py on this bundle in the '
-            'background. The result lands below and in the model list.')
-        f.addWidget(self.TrainPushButton, 1, 0, 1, 3)
+            'Runs tools/train_spotmodel.py in the background. The result '
+            'lands below and in the model list.')
+        f.addWidget(self.TrainPushButton, 2, 0, 1, 3)
         self.ResultTextEdit = QtWidgets.QPlainTextEdit()
         self.ResultTextEdit.setReadOnly(True)
         self.ResultTextEdit.setMinimumHeight(170)
@@ -241,7 +265,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.ResultTextEdit.setPlaceholderText(
             'Training result appears here: labels, each head\'s '
             'validation numbers, the multispot calibration and the PSF.')
-        f.addWidget(self.ResultTextEdit, 2, 0, 1, 3)
+        f.addWidget(self.ResultTextEdit, 3, 0, 1, 3)
         f.setColumnStretch(1, 1)
         lay.addWidget(g)
 
@@ -273,7 +297,9 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.BuildBundlePushButton.clicked.connect(self._build_bundle)
         self.OpenSpotCheckPushButton.clicked.connect(self._open_spotcheck)
         self.RefreshReviewPushButton.clicked.connect(self._refresh_review)
-        self.BundlePathLineEdit.editingFinished.connect(self._refresh_review)
+        self.BundlePathLineEdit.editingFinished.connect(self._on_path_edited)
+        self.TargetRunComboBox.currentIndexChanged.connect(
+            lambda _i: self._explain_target())
         self.TrainPushButton.clicked.connect(self._train)
         self.ClosePushButton.clicked.connect(self.close)
 
@@ -472,7 +498,117 @@ class ModelBuildDialog(QtWidgets.QDialog):
             self, 'Bundle directory', start)
         if d:
             self.BundlePathLineEdit.setText(d)
-            self._refresh_review()
+            self._on_path_edited()
+
+    def _on_path_edited(self):
+        self._remember_bundle_path()
+        self._refresh_review()
+        self._reattach_if_building()
+
+    # -- memory across relaunch ----------------------------------------
+
+    def _memory_path(self):
+        # Beside Spot Check's own last_session.json, same idea, same
+        # lifetime: a small file in the repo that says where we were.
+        return os.path.join(self._repo, 'spotcheck', 'build_model_last.json')
+
+    def _remember_bundle_path(self):
+        b = self.bundle_dir()
+        if not b:
+            return
+        try:
+            with open(self._memory_path(), 'w', encoding='utf-8') as f:
+                json.dump({'bundle': b}, f)
+        except OSError:
+            pass
+
+    def _recall_bundle_path(self):
+        """Prefill the bundle path from the last session -- ours, else
+        Spot Check's. A relaunch mid-workflow lands on the same bundle
+        instead of asking a person to find it again."""
+        if self.BundlePathLineEdit.text().strip():
+            return
+        for path in (self._memory_path(),
+                     os.path.join(self._repo, 'spotcheck', 'last_session.json')):
+            try:
+                with open(path, encoding='utf-8') as f:
+                    b = (json.load(f) or {}).get('bundle')
+            except Exception:                               # noqa: BLE001
+                continue
+            if b and os.path.isdir(str(b)):
+                self.BundlePathLineEdit.setText(str(b))
+                self._log('bundle path recalled from the last session: ' + str(b))
+                return
+
+    # -- what state a bundle directory is in ------------------------------
+
+    def bundle_state(self):
+        """'none' | 'building' | 'incomplete' | 'complete', from disk.
+
+        The manifest is written before a build and stamped complete=True
+        after it, and the build appends to build.log as it goes. So: no
+        manifest -> none; complete -> complete; otherwise the log's
+        mtime says whether something is still writing (recent) or the
+        build was interrupted (quiet longer than STALE_SECONDS)."""
+        b = self.bundle_dir()
+        if not b or not os.path.isdir(b):
+            return 'none'
+        mp = os.path.join(b, 'bundle_manifest.json')
+        if not os.path.exists(mp):
+            return 'none'
+        try:
+            with open(mp, encoding='utf-8') as f:
+                if (json.load(f) or {}).get('complete'):
+                    return 'complete'
+        except Exception:                                   # noqa: BLE001
+            return 'incomplete'
+        lp = os.path.join(b, BUILD_LOG)
+        try:
+            if time.time() - os.path.getmtime(lp) < STALE_SECONDS:
+                return 'building'
+        except OSError:
+            pass
+        return 'incomplete'
+
+    def _manifest_complete(self):
+        return self.bundle_state() == 'complete'
+
+    def _reattach_if_building(self):
+        """A build this app did not start is followed, not re-run."""
+        if self._worker is not None or self._tail is not None:
+            return
+        state = self.bundle_state()
+        if state != 'building':
+            return
+        self._log('a build is writing to this bundle right now (its log '
+                  'changed within the last %d s) -- following it. Build '
+                  'is disabled until it finishes.' % STALE_SECONDS)
+        self.BuildBundlePushButton.setEnabled(False)
+        self.ProgressBar.setRange(0, 0)
+        t = LogTailWorker(os.path.join(self.bundle_dir(), BUILD_LOG),
+                          self._manifest_complete, stale_seconds=STALE_SECONDS)
+        self._tail = t
+        t.line.connect(lambda x: self._log('  ' + x))
+        t.progress.connect(self._on_progress)
+        t.finished_ok.connect(self._on_tail_done)
+        t.start()
+
+    def _on_tail_done(self, done):
+        t = self._tail
+        self._tail = None
+        if t is not None:
+            t.deleteLater()
+        self.BuildBundlePushButton.setEnabled(True)
+        self.ProgressBar.setRange(0, 1)
+        self.ProgressBar.setValue(0)
+        if done:
+            self._log('the build we were following finished.')
+        else:
+            self._log('the build we were following went quiet for %d s -- '
+                      'treating it as interrupted. Its shards are all '
+                      'usable; Build appends the missing ones.'
+                      % STALE_SECONDS)
+        self._refresh_review()
 
     def bundle_dir(self):
         return self.BundlePathLineEdit.text().strip()
@@ -516,9 +652,22 @@ class ModelBuildDialog(QtWidgets.QDialog):
         cmds = self.build_commands()
         if not cmds:
             return
+        if self._tail is not None:
+            self._log('a build is already writing to this bundle -- wait '
+                      'for it, or pick another path.')
+            return
+        state = self.bundle_state()
+        if state == 'incomplete':
+            self._log('this bundle is incomplete -- the build APPENDS: '
+                      'shards already on disk are kept, only the missing '
+                      'ones are built.')
+        elif state == 'complete':
+            self._log('this bundle is complete -- a build here adds '
+                      'channels or FOVs not yet in it and skips the rest.')
         self._queue = list(cmds)
         self._log(f'building {len(cmds)} channel(s) into {self.bundle_dir()} '
-                  f'-- in the background, one channel after another')
+                  f'-- in the background, one channel after another. '
+                  f'Closing the app does not stop it.')
         self._set_busy(True)
         # Show the status line NOW, not only when the build ends: a
         # suggested path is set programmatically, which fires no
@@ -537,7 +686,13 @@ class ModelBuildDialog(QtWidgets.QDialog):
         ch = cmd[cmd.index('--channel') + 1]
         self._log(f'--- channel {ch} ---   ' + ' '.join(cmd[2:]))
         self.ProgressBar.setRange(0, 0)
-        w = StreamingProcWorker(cmd, cwd=self._repo)
+        # FILE-BACKED AND DETACHED, so the build outlives this app. Its
+        # output goes to <bundle>/build.log, which a relaunched app
+        # follows (see _reattach_if_building). MEASURED: a child on a
+        # pipe died with its parent; one on a file finished.
+        w = StreamingProcWorker(
+            cmd, cwd=self._repo,
+            log_path=os.path.join(self.bundle_dir(), BUILD_LOG))
         self._worker = w
         w.line.connect(lambda t: self._log('  ' + t))
         w.progress.connect(self._on_progress)
@@ -651,6 +806,15 @@ class ModelBuildDialog(QtWidgets.QDialog):
         return st
 
     def _refresh_review(self):
+        state = self.bundle_state()
+        self.BundleStateLabel.setText({
+            'none': '',
+            'building': 'a build is writing to this bundle now',
+            'incomplete': 'INCOMPLETE build -- every shard on disk is '
+                          'complete and usable; Build appends the missing '
+                          'ones. Review and training work on what is there.',
+            'complete': '',
+        }[state])
         st = self.review_status()
         if st is None:
             self.ReviewStatusLabel.setText(
@@ -673,8 +837,72 @@ class ModelBuildDialog(QtWidgets.QDialog):
             names = pf['reviewers'] or ms['reviewers']
             if len(names) == 1:
                 self.ReviewerLineEdit.setText(names[0])
+        if ms['records'] and self.target_run() is None:
+            self.suggest_target()
 
     # -- 5  train -------------------------------------------------------
+
+    def _refresh_runs(self, select=None):
+        """Fill the target combo: new run, then every run on disk."""
+        from codelab_pipeline.training import model_store as MS
+        cb = self.TargetRunComboBox
+        want = select or cb.currentData()
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem('new run  (<reviewer>_<timestamp>)', None)
+        try:
+            runs = MS.available()
+        except Exception:                                   # noqa: BLE001
+            runs = []
+        for r in runs:
+            tag = ('  [default]' if r.get('is_default') else '') + (
+                '  +multispot' if r.get('has_multispot') else '')
+            cb.addItem(f"{r['name']}{tag}", r['path'])
+        idx = cb.findData(want) if want else -1
+        cb.setCurrentIndex(idx if idx >= 0 else 0)
+        cb.blockSignals(False)
+        self._explain_target()
+
+    def target_run(self):
+        """The existing run to calibrate into, or None for a new run."""
+        return self.TargetRunComboBox.currentData()
+
+    def _explain_target(self):
+        run = self.target_run()
+        self.TrainPushButton.setText(
+            'Train  (new run: M1 + PSF + calibration if reviewed)'
+            if not run else
+            f'Add multispot calibration to {os.path.basename(run)}  '
+            f'(M1 and PSF untouched)')
+
+    def bank_that_scored_the_verdicts(self):
+        """The run whose PSF the multispot verdicts were matched with,
+        read from the verdicts themselves (records carry `bank_path`),
+        or None for verdicts older than that field."""
+        b = self.bundle_dir()
+        if not b or not os.path.isdir(b):
+            return None
+        from codelab_pipeline.training import verdicts as V
+        try:
+            recs, _a = V.merge(b, kind=V.MULTISPOT_KIND)
+        except Exception:                                   # noqa: BLE001
+            return None
+        banks = {str(r.get('bank_path')) for r in recs if r.get('bank_path')}
+        if len(banks) == 1:
+            run = os.path.dirname(next(iter(banks)))
+            return run if os.path.isdir(run) else None
+        return None
+
+    def suggest_target(self):
+        """Preselect the run the multispot verdicts belong to."""
+        run = self.bank_that_scored_the_verdicts()
+        if run is None:
+            st = self.review_status() or {}
+            if (st.get('multispot') or {}).get('records'):
+                bank = self.psf_bank_for_review()
+                run = os.path.dirname(bank) if bank else None
+        if run:
+            self._refresh_runs(select=run)
 
     def train_command(self):
         """The train_spotmodel command, or None with a logged reason."""
@@ -682,6 +910,17 @@ class ModelBuildDialog(QtWidgets.QDialog):
         if not b or not os.path.isdir(b):
             self._log('No bundle to train from.')
             return None
+        run = self.target_run()
+        if run:
+            # CALIBRATE INTO: the classifier and the bank in that run
+            # stay; only psf_multispot.json is added and the manifest
+            # rebound. No reviewer needed -- the run already has one.
+            cmd = [sys.executable, '-u',
+                   os.path.join(self._repo, 'tools', 'train_spotmodel.py'),
+                   b, '--calibrate-into', str(run)]
+            if self.SetDefaultCheckBox.isChecked():
+                cmd.append('--set-default')
+            return cmd
         who = self.ReviewerLineEdit.text().strip()
         if not who:
             self._log('Name the reviewer (5): the run folder is '
@@ -757,6 +996,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
             return
         self.ResultTextEdit.setPlainText(self.render_report(run))
         self._log('model ready: ' + run)
+        self._refresh_runs(select=run)
         self.model_trained.emit(run)
 
     @staticmethod
@@ -846,6 +1086,10 @@ class ModelBuildDialog(QtWidgets.QDialog):
                    if ref else ''))
         for w in r.get('warnings') or []:
             lines.append('WARNING    ' + str(w))
+        if man.get('calibrated_at'):
+            lines.append(f"calibrated {man['calibrated_at']} from "
+                         f"{man.get('calibrated_from', '?')}  -- M1 and PSF "
+                         f"are the original run's")
         return '\n'.join(lines)
 
     # -- busy state -----------------------------------------------------

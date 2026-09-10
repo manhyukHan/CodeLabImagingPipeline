@@ -203,6 +203,11 @@ def test_train_command():
     print('5  train command')
     d = make()
     d.BundlePathLineEdit.setText(TWOCH if os.path.isdir(TWOCH) else REPO)
+    # The dialog recalls the last session's bundle at startup and, when
+    # that bundle has exactly one reviewer, prefills the name -- so 'no
+    # reviewer' has to be made true rather than assumed.
+    d.ReviewerLineEdit.setText('')
+    d.TargetRunComboBox.setCurrentIndex(0)
     check('no reviewer -> no command, with the reason',
           d.train_command() is None
           and any('Name the reviewer' in d.LogListWidget.item(i).text()
@@ -316,6 +321,113 @@ def test_multispot_gets_the_trained_bank():
           'only the pass/fail review' in src)
 
 
+def test_bundle_state_and_relaunch():
+    """What a relaunched app sees on disk, and what it does about it."""
+    print('bundle state across a relaunch')
+    import json
+    import shutil
+    import tempfile
+    import time
+    d = make()
+    root = tempfile.mkdtemp(prefix='state_')
+    try:
+        d.BundlePathLineEdit.setText(os.path.join(root, 'nope'))
+        check("no directory -> 'none'", d.bundle_state() == 'none')
+        b = os.path.join(root, 'b')
+        os.makedirs(b)
+        d.BundlePathLineEdit.setText(b)
+        check("a directory without a manifest -> 'none'",
+              d.bundle_state() == 'none')
+        mp = os.path.join(b, 'bundle_manifest.json')
+        json.dump({'channel': 635}, open(mp, 'w'))
+        check("a manifest without complete and no log -> 'incomplete'",
+              d.bundle_state() == 'incomplete')
+        lp = os.path.join(b, 'build.log')
+        open(lp, 'w').write('  [  1/ 10] fov001 H 1 crops 1 cand\n')
+        check("...and a log written just now -> 'building'",
+              d.bundle_state() == 'building')
+        old = time.time() - 3600
+        os.utime(lp, (old, old))
+        check("...and a log an hour quiet -> 'incomplete' (interrupted)",
+              d.bundle_state() == 'incomplete')
+        d._refresh_review()
+        check('the state line says the shards are usable and Build appends',
+              'INCOMPLETE' in d.BundleStateLabel.text()
+              and 'appends' in d.BundleStateLabel.text())
+        json.dump({'channel': 635, 'complete': True}, open(mp, 'w'))
+        check("complete=True -> 'complete'", d.bundle_state() == 'complete')
+
+        # A build in progress is FOLLOWED, not re-run.
+        json.dump({'channel': 635}, open(mp, 'w'))
+        now = time.time()
+        os.utime(lp, (now, now))
+        d._reattach_if_building()
+        check('a running build gets a tail and Build is disabled',
+              d._tail is not None
+              and not d.BuildBundlePushButton.isEnabled())
+        d._tail.stop()
+        d._tail.wait(2000)
+        d._on_tail_done(0)
+        check('when it goes quiet, Build comes back and says why',
+              d.BuildBundlePushButton.isEnabled()
+              and any('interrupted' in d.LogListWidget.item(i).text()
+                      for i in range(d.LogListWidget.count())))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_memory_and_target():
+    print('memory across relaunch, and where training lands')
+    import json
+    import shutil
+    import tempfile
+    root = tempfile.mkdtemp(prefix='mem_')
+    try:
+        mem = os.path.join(root, 'build_model_last.json')
+        b = os.path.join(root, 'bundle')
+        os.makedirs(b)
+        d = make()
+        d._memory_path = lambda: mem
+        d.BundlePathLineEdit.setText(b)
+        d._on_path_edited()
+        check('the bundle path is remembered', json.load(open(mem))['bundle'] == b)
+        d2 = make()
+        d2._memory_path = lambda: mem
+        d2.BundlePathLineEdit.setText('')
+        d2._recall_bundle_path()
+        check('and recalled on the next open', d2.BundlePathLineEdit.text() == b)
+
+        # A run to calibrate into, chosen from the verdicts themselves.
+        run = os.path.join(root, 'tester_20260910-100000')
+        os.makedirs(run)
+        open(os.path.join(run, 'psf_bank.h5'), 'wb').close()
+        rec = {'kind': 'multispot', 'reviewer': 'tester', 'key': 'k1',
+               'page': 0, 'shown': [{'i': 0, 'y': 1, 'x': 1, 'z': 1,
+                                     'p': 0.9, 'keep': 1}],
+               'bank': 'psf_bank.h5',
+               'bank_path': os.path.join(run, 'psf_bank.h5'),
+               'bank_sha': 'abc'}
+        with open(os.path.join(b, 'multispot_tester__s1.jsonl'), 'w') as f:
+            f.write(json.dumps(rec) + '\n')
+        check('the verdicts name the run whose bank scored them',
+              d2.bank_that_scored_the_verdicts() == run)
+        d2.TargetRunComboBox.addItem('tester_20260910-100000', run)
+        d2.TargetRunComboBox.setCurrentIndex(d2.TargetRunComboBox.count() - 1)
+        check('an existing target -> calibrate into it, no reviewer needed',
+              d2.target_run() == run
+              and '--calibrate-into' in d2.train_command()
+              and '--reviewer' not in d2.train_command())
+        check('and the button says what will and will not change',
+              'Add multispot calibration' in d2.TrainPushButton.text()
+              and 'untouched' in d2.TrainPushButton.text())
+        d2.TargetRunComboBox.setCurrentIndex(0)
+        check("'new run' -> the full training command",
+              d2.target_run() is None
+              and 'Train' in d2.TrainPushButton.text())
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_sources()
     test_fovs()
@@ -326,6 +438,8 @@ def main():
     test_close_hides()
     test_log_collapses_repeats()
     test_multispot_gets_the_trained_bank()
+    test_bundle_state_and_relaunch()
+    test_memory_and_target()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1

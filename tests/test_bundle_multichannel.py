@@ -115,11 +115,112 @@ def test_eta_and_workers():
           isinstance(w, int) and 1 <= w <= 32, str(w))
 
 
+ETACHECK = 'D:/claude-tmp/etacheck'
+MODEL = 'D:/models/mp58_rna'
+MP58_BUNDLE = 'D:/bundles/MP58_RNA_all_4fov'
+STORE = 'G:/Seonghyeok/2025-11-30-MP58/RNA'
+
+
+def test_a_build_appends():
+    """An interrupted bundle is appended to, not redone: every shard on
+    disk is complete (.part then os.replace), so only the missing tasks
+    run. Verified against the real store: a finished 1-FOV bundle
+    rebuilt in 0.0 min with '0 to build, 15 already on disk'."""
+    print('appendable builds')
+    import inspect
+    import subprocess
+    from codelab_pipeline.training import extract as X
+    import tools.build_bundle as BB
+    check('one shard_path, used by the writer',
+          'path = shard_path(out_dir, fov, hybe, channel, tag)'
+          in inspect.getsource(X.extract_chunk))
+    src = inspect.getsource(X.extract)
+    check('extract() skips shards already on disk by default',
+          'skip_existing=True' in src and 'on_plan' in src
+          and 'os.path.exists(shard_path(' in src)
+    check('--rebuild is the way to redo them',
+          "'--rebuild'" in inspect.getsource(BB.main))
+    if not (os.path.isdir(ETACHECK) and os.path.isdir(STORE)):
+        check('the finished 1-FOV bundle and the store are present', False,
+              'skipped')
+        return
+    n_before = len([n for n in os.listdir(ETACHECK) if n.endswith('.h5')])
+    out = subprocess.run(
+        [sys.executable, '-u', 'tools/build_bundle.py', STORE,
+         '--out', ETACHECK, '--channel', '635', '--fovs', '7',
+         '--fov-pool', '7', '--hybes', 'Hyb_101', '--pad', '14'],
+        capture_output=True, text=True, timeout=300).stdout
+    check('rebuilding a finished bundle builds nothing',
+          f'shards  0 to build, {n_before} already on disk -- appending' in out,
+          str([t for t in out.splitlines() if t.startswith('shards')][:1]))
+    check('and finishes at once', 'done in 0.0 min' in out)
+    n_after = len([n for n in os.listdir(ETACHECK) if n.endswith('.h5')])
+    check('no shard was touched', n_after == n_before)
+
+
+def test_calibrate_into_leaves_m1_alone():
+    """The multispot calibration is fitted on the p each match was
+    SHOWN with, i.e. against one specific bank. --calibrate-into writes
+    it into that run and touches nothing else; a retrain would re-fit
+    the classifier too, and bind the calibration to a bank that merely
+    happens to match."""
+    print('calibrate into an existing run')
+    import hashlib
+    import shutil
+    import subprocess
+    import tempfile
+    import inspect
+    import tools.train_spotmodel as T
+    check('--calibrate-into exists and short-circuits main',
+          'if a.calibrate_into:' in inspect.getsource(T.main)
+          and 'return calibrate_into(a)' in inspect.getsource(T.main))
+    if not (os.path.isdir(MODEL) and os.path.isdir(MP58_BUNDLE)):
+        check('the shipped run and its bundle are present', False, 'skipped')
+        return
+    from codelab_pipeline.training import model_store as MS
+
+    def sha(path):
+        return hashlib.sha256(open(path, 'rb').read()).hexdigest()
+
+    run = tempfile.mkdtemp(prefix='calinto_')
+    shutil.rmtree(run)
+    shutil.copytree(MODEL, run)
+    try:
+        before = {n: sha(os.path.join(run, n)) for n in
+                  ('spot_classifier_linear.json', 'spot_classifier_mlp.json',
+                   'psf_bank.h5')}
+        out = subprocess.run(
+            [sys.executable, '-u', 'tools/train_spotmodel.py', MP58_BUNDLE,
+             '--calibrate-into', run],
+            capture_output=True, text=True, timeout=300)
+        check('it ran', out.returncode == 0, out.stdout[-300:])
+        check('the calibration was fitted on the recorded matches',
+              'from 661 judged matches over 260 pillars' in out.stdout)
+        after = {n: sha(os.path.join(run, n)) for n in before}
+        check('the classifier and the bank are byte-identical',
+              before == after)
+        check('the manifest binds the new file set and verifies clean',
+              MS.verify(run) == [], str(MS.verify(run)))
+        man = MS.read_manifest(run) or {}
+        check('and records where the calibration came from',
+              man.get('calibrated_from') == MP58_BUNDLE
+              and bool(man.get('calibrated_at')))
+        rep = json.load(open(os.path.join(run, 'report.json')))
+        check("report.json gained the multispot block",
+              (rep.get('multispot') or {}).get('n') == 661)
+        check("and the dialog's 'writing the run to' marker was printed",
+              'writing the run to' in out.stdout)
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+
+
 def main():
     test_shard_names_carry_the_channel()
     test_the_real_two_channel_bundle()
     test_a_rebuilt_channel_replaces_its_own_entry()
     test_eta_and_workers()
+    test_a_build_appends()
+    test_calibrate_into_leaves_m1_alone()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1
