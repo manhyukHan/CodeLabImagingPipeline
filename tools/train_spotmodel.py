@@ -217,6 +217,10 @@ def main(argv=None):
                          'a run at a different size gets its own.')
     ap.add_argument('--template-rz', type=int, default=PB.DEFAULT_RZ,
                     help='SEARCH template half-depth. See --template-r.')
+    ap.add_argument('--bank-from', default=None, metavar='RUN_DIR',
+                    help='when no confirmed spot has pixels (the verdicts '
+                         'carry vectors and the shards are gone), reuse '
+                         'this run\'s psf_bank.h5 instead of failing.')
     ap.add_argument('--calibrate-into', default=None, metavar='RUN_DIR',
                     help='ADD the multispot calibration to an EXISTING run '
                          'and touch nothing else in it. The classifier and '
@@ -252,12 +256,25 @@ def main(argv=None):
         print('  ** not as a measure of how well it works.')
 
     train_rows = [r for r in rows if r['label'] in (0, 1)]
-    kept, cores, cols = D.boxes(train_rows)
-    print(f'\nboxes   {len(kept)} of {len(train_rows)} (the rest ran too far '
-          f'off their crop), core {cores.shape[1:]}, column {cols.shape[1]}')
-    X = F.many(cores, cols, kept)
+    kept, X, cores = D.features_for_rows(train_rows)
+    n_cut = sum(1 for c in cores if c is not None)
+    print(f'\nrows    {len(kept)} of {len(train_rows)} (the rest ran too far '
+          f'off their crop): {n_cut} cut from shards, {len(kept) - n_cut} '
+          f'from vectors stored in the verdicts')
+    if s.get('inconsistent'):
+        print(f"   ** {s['inconsistent']} candidate(s) EXCLUDED: reviewers' "
+              f"stored vectors disagree, so they were judged against "
+              f"different pixels")
+    if not len(kept):
+        print('nothing to train on')
+        return 1
     y = np.array([r['label'] for r in kept])
     groups = [tuple(r['group']) for r in kept]
+    if any(c is None for c in cores) and 'conv' in a.heads:
+        print('   conv head skipped: it reads pixels, and some rows here '
+              'have only their stored vector')
+        a.heads = ','.join(h for h in a.heads.split(',')
+                           if h.strip() != 'conv')
     if not a.out:
         if not a.reviewer:
             ap.error('--reviewer is required (or pass --out). A model is '
@@ -284,7 +301,8 @@ def main(argv=None):
     print('\nclassifier (split by cell):')
     for head in [h.strip() for h in a.heads.split(',') if h.strip()]:
         try:
-            clf, rep = C.train(X, cores, y, groups, head=head,
+            clf, rep = C.train(X, (np.asarray(cores) if head == 'conv'
+                                   else cores), y, groups, head=head,
                                epochs=a.epochs, seed=a.seed,
                                val_frac=a.val_frac)
         except Exception as exc:                             # noqa: BLE001
@@ -292,7 +310,7 @@ def main(argv=None):
             report['heads'][head] = {'error': str(exc)}
             continue
         p = clf.score(X if head != 'conv' else None,
-                      cores if head == 'conv' else None)
+                      np.asarray(cores) if head == 'conv' else None)
         rep['degenerate'] = bool(float(p.max() - p.min()) < 1e-3)
         rep['all_fail'] = bool((p >= clf.threshold).sum() == 0)
         rep['all_pass'] = bool((p < clf.threshold).sum() == 0)
@@ -304,10 +322,23 @@ def main(argv=None):
                 '  ALL-PASS' if rep['all_pass'] else '')
         print(f'          -> {os.path.basename(path)}{flag}')
 
-    pos = [c for c, r in zip(cores, kept) if r['label'] == 1]
-    print(f'\nPSF bank from {len(pos)} confirmed spots:')
-    if not pos:
-        print('   no positives -- nothing to measure a PSF from')
+    pos = [c for c, r in zip(cores, kept)
+           if r['label'] == 1 and c is not None]
+    n_pos_all = sum(1 for r in kept if r['label'] == 1)
+    print(f'\nPSF bank from {len(pos)} confirmed spots'
+          + (f' ({n_pos_all - len(pos)} more have only their vector; a bank '
+             f'is averaged PIXELS and cannot use those)'
+             if n_pos_all > len(pos) else '') + ':')
+    if not pos and a.bank_from:
+        import shutil
+        shutil.copyfile(os.path.join(a.bank_from, 'psf_bank.h5'),
+                        os.path.join(a.out, 'psf_bank.h5'))
+        print(f'   no pixels to build one from -- REUSED the bank of '
+              f'{a.bank_from}')
+        report['psf'] = {'reused_from': a.bank_from}
+    elif not pos:
+        print('   no positives with pixels -- nothing to measure a PSF '
+              'from. Pass --bank-from RUN to reuse an earlier run\'s bank.')
     else:
         mean, comps, var = PB.build(pos, voxel, n_components=a.psf_components)
         ref = analytic_reference(mean, voxel, a.storage_path)

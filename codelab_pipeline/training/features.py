@@ -149,6 +149,14 @@ NAMES = (
 # The box and the full z column through it are the whole input.
 
 
+def names_sha():
+    """Short hash of NAMES in order -- stamped on every stored vector, so
+    a verdict featurised under one feature set is never fed to a model
+    trained on another."""
+    import hashlib
+    return hashlib.sha256(','.join(NAMES).encode()).hexdigest()[:8]
+
+
 def _bright_stretches(v):
     """(count, longest) of the maximal stretches where v is True.
 

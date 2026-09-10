@@ -58,6 +58,8 @@ A line:
 """
 import json
 import os
+
+import numpy as np
 import time
 
 FILENAME_FMT = 'verdicts_{reviewer}.jsonl'
@@ -100,6 +102,24 @@ def _session_tag():
 # a bundle regenerated after a library upgrade still aggregates with the
 # labels made against the old one.
 SAME_SPOT_PX = 0.5
+
+
+def _feat_fields(f):
+    """The stored form of one featurize_crop entry: 5 decimals, which
+    is far inside what the classifier can tell apart and keeps a 16-wide
+    vector under 200 bytes."""
+    return {'feat': [round(float(v), 5) for v in f['feat']],
+            'z_used': round(float(f['z']), 3),
+            'border_frac': round(float(f['border_frac']), 4),
+            'planes_from_stack_end': round(
+                float(f['planes_from_stack_end']), 2)}
+
+
+# How far two reviewers' vectors for the same candidate may differ
+# before they are called different pixels. In sigma units and on
+# log/ratio features, agreement is exact to rounding; 1e-3 is a hundred
+# times the stored precision.
+FEAT_AGREE = 1e-3
 
 
 def path_for(bundle_dir, reviewer):
@@ -208,7 +228,8 @@ class VerdictLog:
                           for a in (found.get('added') or [])]}
 
     def commit(self, row, page, page_ix, cands, accepted, added=(),
-               unsure=(), seconds=None, bundle=None, store=None):
+               unsure=(), seconds=None, bundle=None, store=None,
+               features=None, added_features=None, feat_meta=None):
         """Record one judged page.
 
         row       the bundle index row for this crop (key, fov, hybe,
@@ -223,6 +244,20 @@ class VerdictLog:
         Everything needed to re-cut the pixels and to identify each label
         goes into the line. Nothing refers to the bundle except as
         provenance.
+
+        features       {i: {feat, z, border_frac, planes_from_stack_end}}
+                       for shown candidates, from dataset.featurize_crop
+                       on the pixels the reviewer was looking at
+        added_features [same dict, ...] aligned with `added`
+        feat_meta      {names_sha, r, rz, bg, sigma, depth} -- what the
+                       vectors mean and the crop they were taken from
+        THE VECTOR IN THE VERDICT is what lets the classifier retrain
+        without the bundle: its input is these 16 numbers, not pixels.
+        It is also what lets two reviewers' records be checked against
+        each other -- the same candidate judged against the same pixels
+        gives the same vector, and a different one means somebody was
+        looking at something else (labels() files that as
+        'inconsistent' and trains on neither).
 
         KEEP HAS THREE VALUES, NOT TWO. 1 kept, 0 shown-and-not-kept, -1
         abstained. The default is drop, which is what keeps 100k
@@ -253,11 +288,15 @@ class VerdictLog:
             if i >= len(cands):
                 continue
             y, x, z, p, fit_ok, gate = cands[i][:6]
-            shown.append({'i': i,
-                          'y': round(float(y), 3), 'x': round(float(x), 3),
-                          'z': round(float(z), 3), 'p': round(float(p), 4),
-                          'fit_ok': int(fit_ok), 'gate': int(gate),
-                          'keep': 1 if i in keep else -1 if i in skip else 0})
+            e = {'i': i,
+                 'y': round(float(y), 3), 'x': round(float(x), 3),
+                 'z': round(float(z), 3), 'p': round(float(p), 4),
+                 'fit_ok': int(fit_ok), 'gate': int(gate),
+                 'keep': 1 if i in keep else -1 if i in skip else 0}
+            f = (features or {}).get(i)
+            if f is not None:
+                e.update(_feat_fields(f))
+            shown.append(e)
         rec = {'key': str(row['key']),
                'fov': int(row['fov']), 'hybe': str(row['hybe']),
                'channel': int(row['channel']), 'cell': int(row['cell']),
@@ -266,12 +305,20 @@ class VerdictLog:
                         'depth': int(row['depth'])},
                'page': int(page),
                'shown': shown,
-               'added': [{'y': round(float(a), 3), 'x': round(float(b), 3)}
-                         for (a, b) in added],
+               'added': [dict({'y': round(float(a), 3),
+                               'x': round(float(b), 3)},
+                              **(_feat_fields(added_features[k])
+                                 if added_features and k < len(added_features)
+                                 and added_features[k] is not None else {}))
+                         for k, (a, b) in enumerate(added)],
                'reviewer': self.reviewer,
                'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
         if store:
             rec['store'] = str(store)
+        if feat_meta:
+            rec['feat_meta'] = {k: (round(float(v), 4)
+                                    if isinstance(v, float) else v)
+                                for k, v in dict(feat_meta).items()}
         if seconds is not None:
             rec['seconds'] = round(float(seconds), 2)
         if bundle:
@@ -523,6 +570,8 @@ def labels(bundle_dir):
     recs, _agree = merge(bundle_dir)
     tally, coord, meta, who = {}, {}, {}, {}
     add_who = {}                 # key -> [(y, x, reviewer), ...]
+    feats = {}                   # key -> sk -> [(reviewer, entry), ...]
+    fmeta = {}                   # key -> feat_meta of the first record
     for rec in recs:
         key = rec.get('key')
         if key is None:
@@ -530,11 +579,16 @@ def labels(bundle_dir):
         meta.setdefault(key, {k: rec.get(k) for k in
                               ('crop', 'fov', 'hybe', 'channel', 'cell',
                                'store')})
+        if rec.get('feat_meta') and key not in fmeta:
+            fmeta[key] = dict(rec['feat_meta'])
         t = tally.setdefault(key, {})
         c = coord.setdefault(key, {})
         for e in rec.get('shown') or []:
             sk = _spot_key(e['y'], e['x'], e['z'])
             c[sk] = (float(e['y']), float(e['x']), float(e['z']))
+            if e.get('feat') is not None:
+                feats.setdefault(key, {}).setdefault(sk, []).append(
+                    (rec.get('reviewer'), e))
             v = int(e.get('keep', 0))
             kept, seen = t.get(sk, (0, 0))
             if v < 0:
@@ -581,12 +635,37 @@ def labels(bundle_dir):
         clusters = _cluster_added(add_who.get(key, []))
         nrev = len(who.get(key, ()))
         e.update(positive=[], negative=[], contested=[], undetermined=[],
+                 inconsistent=[],
                  added=sorted(c for c, _w in clusters),
                  added_votes={c: (len(w), nrev) for c, w in clusters},
-                 reviewers=nrev, votes={})
+                 reviewers=nrev, votes={}, feat={},
+                 feat_meta=fmeta.get(key))
         for sk, (kept, seen) in t.items():
             xyz = coord[key][sk]
             e['votes'][xyz] = (kept, seen)
+            # THE VECTORS ARE THE CORRUPTION GATE. Every reviewer who
+            # judged this candidate against the same pixels stored the
+            # same 16 numbers. Two that differ mean two different crops
+            # wore the same key -- a rebuilt bundle, another pad, a
+            # channel mix-up -- and a label made against pixels the
+            # other reviewer never saw. Such a candidate trains nobody.
+            fl = feats.get(key, {}).get(sk) or []
+            if fl:
+                vecs = [np.asarray(f['feat'], float) for _r, f in fl]
+                spread = (max(float(np.max(np.abs(v - vecs[0])))
+                              for v in vecs) if len(vecs) > 1 else 0.0)
+                if spread > FEAT_AGREE:
+                    e['inconsistent'].append(xyz)
+                    continue
+                f0 = fl[0][1]
+                fm = fmeta.get(key) or {}
+                e['feat'][xyz] = {
+                    'feat': [float(v) for v in f0['feat']],
+                    'border_frac': float(f0.get('border_frac', 0.0)),
+                    'planes_from_stack_end':
+                        float(f0.get('planes_from_stack_end', 0.0)),
+                    'z_used': float(f0.get('z_used', xyz[2])),
+                    'bg': fm.get('bg'), 'sigma': fm.get('sigma')}
             if seen == 0:
                 # Everyone who saw it abstained. Not a negative: nobody
                 # said no. Not contested either: nobody disagreed.

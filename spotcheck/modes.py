@@ -190,11 +190,38 @@ class PassFail:
         return None
 
     def commit(self, log, s, seconds):
+        # THE VECTORS GO INTO THE VERDICT, computed from the very pixels
+        # on screen (dataset.featurize_crop is what training uses too).
+        # From then on the classifier can retrain without this shard.
+        feats, added_feats, meta = None, None, None
+        try:
+            from codelab_pipeline.training import dataset as D
+            from codelab_pipeline.training import features as F
+            st = s.get('stack')
+            if st is not None:
+                shown_ix = [int(i) for i in s['ix']
+                            if int(i) < len(s['cands'])]
+                pts = [(float(s['cands'][i][0]), float(s['cands'][i][1]),
+                        float(s['cands'][i][2])) for i in shown_ix]
+                pts += [(float(a), float(b), None) for (a, b) in s['added']]
+                per, b0, sg = D.featurize_crop(st, pts, with_cores=False)
+                feats = {i: per[k] for k, i in enumerate(shown_ix)}
+                added_feats = per[len(shown_ix):]
+                meta = {'names_sha': F.names_sha(), 'r': D.DEFAULT_R,
+                        'rz': D.DEFAULT_RZ, 'bg': b0, 'sigma': sg,
+                        'depth': int(np.asarray(st).shape[2])}
+        except Exception:                                   # noqa: BLE001
+            # A verdict without its vectors is still a verdict; the
+            # shard can featurise it later. Never lose a judgement to
+            # a bookkeeping failure.
+            feats, added_feats, meta = None, None, None
         return log.commit(s['row'], s['page'], s['ix'], s['cands'],
                           s['accepted'], added=s['added'],
                           unsure=s.get('unsure') or (), seconds=seconds,
                           bundle=os.path.basename(s['shard']),
-                          store=s['store'])
+                          store=s['store'],
+                          features=feats, added_features=added_feats,
+                          feat_meta=meta)
 
 
 class Multispot:

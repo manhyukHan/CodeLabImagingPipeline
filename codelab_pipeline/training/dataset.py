@@ -92,17 +92,30 @@ def rows(bundle_dir, include_contested=True, include_added=True):
 
     out = []
     for key, e in sorted(lab.items()):
-        if key not in index:
+        feats = e.get('feat') or {}
+        if key in index:
+            shard, irow = index[key]
+            base = dict(key=key, shard=shard,
+                        fov=int(irow['fov']),
+                        hybe=(irow['hybe'].decode()
+                              if isinstance(irow['hybe'], bytes)
+                              else str(irow['hybe'])),
+                        channel=int(irow['channel']), cell=int(irow['cell']),
+                        group=(int(irow['fov']), int(irow['cell'])),
+                        store=e.get('store'))
+        elif feats:
+            # NO SHARD, BUT THE VERDICT STORED ITS VECTORS. The crop's
+            # identity comes from the record itself -- a verdict names
+            # its fov, hybe, channel and cell -- and the classifier's
+            # input is the vector, so this row trains the same. It has
+            # no pixels: features_for_rows leaves its core None.
+            base = dict(key=key, shard=None,
+                        fov=int(e.get('fov')), hybe=str(e.get('hybe')),
+                        channel=int(e.get('channel')), cell=int(e.get('cell')),
+                        group=(int(e.get('fov')), int(e.get('cell'))),
+                        store=e.get('store'))
+        else:
             continue                      # labelled against a shard we lack
-        shard, irow = index[key]
-        base = dict(key=key, shard=shard,
-                    fov=int(irow['fov']),
-                    hybe=(irow['hybe'].decode()
-                          if isinstance(irow['hybe'], bytes)
-                          else str(irow['hybe'])),
-                    channel=int(irow['channel']), cell=int(irow['cell']),
-                    group=(int(irow['fov']), int(irow['cell'])),
-                    store=e.get('store'))
         # UNDETERMINED IS NOT A NEGATIVE. It is a spot every reviewer who
         # saw it ABSTAINED on (Shift+N in the app), and it rides here on
         # label -1 with contested for the same reason: -1 is what every
@@ -112,12 +125,21 @@ def rows(bundle_dir, include_contested=True, include_added=True):
         # people disagreeing and people declining to answer are different
         # facts, and only the first is a ceiling on accuracy.
         for bucket, label in (('positive', 1), ('negative', 0),
-                              ('contested', -1), ('undetermined', -1)):
+                              ('contested', -1), ('undetermined', -1),
+                              ('inconsistent', -1)):
             if label == -1 and not include_contested:
                 continue
             for (y, x, z) in e.get(bucket) or []:
+                stored = feats.get((y, x, z))
                 out.append(dict(base, y=float(y), x=float(x), z=float(z),
-                                label=label, origin=bucket))
+                                label=label, origin=bucket,
+                                **({'feat': stored['feat'],
+                                    'border_frac': stored['border_frac'],
+                                    'planes_from_stack_end':
+                                        stored['planes_from_stack_end'],
+                                    'bg': stored.get('bg'),
+                                    'sigma': stored.get('sigma')}
+                                   if stored else {})))
         if include_added:
             votes = e.get('added_votes') or {}
             for (y, x) in e.get('added') or []:
@@ -126,6 +148,52 @@ def rows(bundle_dir, include_contested=True, include_added=True):
                                 label=1, origin='added',
                                 added_votes=seen))
     return out
+
+
+def featurize_crop(stack, points, r=DEFAULT_R, rz=DEFAULT_RZ,
+                   with_cores=True):
+    """The feature vector for every point of ONE crop -- the same
+    computation boxes() makes at training time, callable at review time.
+
+    points: [(y, x, z), ...] crop-local; z None for a spot a reviewer
+    added on a MIP (it gets _z_for_added, the anchor stage's own rule).
+
+    Returns (per_point, bg, sigma) with per_point[i] =
+        {feat, z, border_frac, planes_from_stack_end, core, col}
+    where core/col are None unless with_cores. Nothing is gated here:
+    border_frac rides along, and the caller decides (boxes() drops a box
+    with more than MAX_BORDER_FRAC of itself off the crop).
+
+    WHY ONE FUNCTION. The classifier's input is this vector, not the
+    pixels. Spot Check has the pixels in hand when a verdict is made, so
+    it can store the vector IN the verdict -- and then a retrain of the
+    classifier needs no shard at all. That only holds if review time and
+    train time compute the same thing, which is why boxes() below is
+    written in terms of this and not beside it.
+    """
+    from . import features as F
+    st = np.asarray(stack, float)
+    b0, sg = background_mode(st)
+    h, w, d = st.shape
+    out = []
+    for (y, x, z) in points:
+        if z is None:
+            z = _z_for_added(st, y, x)
+        iy, ix, iz = int(round(y)), int(round(x)), int(round(z))
+        core, border = _pad_window(st, iy, ix, iz, r, rz, b0)
+        col = np.asarray(st[int(np.clip(iy, 0, h - 1)),
+                            int(np.clip(ix, 0, w - 1)), :], float)
+        core_s = (core - b0) / max(sg, 1e-9)
+        col_s = (col - b0) / max(sg, 1e-9)
+        feat = F.one(core_s, col_s, frac_padded=float(border))
+        out.append(dict(
+            feat=np.asarray(feat, float),
+            z=float(z), border_frac=float(border),
+            planes_from_stack_end=float(min(max(z, 0.0),
+                                            max(d - 1 - z, 0.0))),
+            core=core_s if with_cores else None,
+            col=col_s if with_cores else None))
+    return out, float(b0), float(sg)
 
 
 def _pad_window(stack, iy, ix, iz, r, rz, fill):
@@ -155,49 +223,72 @@ def boxes(label_rows, r=DEFAULT_R, rz=DEFAULT_RZ,
     bundle is ~50x faster and the store is what remains once a bundle is
     deleted.
     """
-    order = sorted(range(len(label_rows)),
-                   key=lambda i: (label_rows[i]['shard'],
-                                  label_rows[i]['key']))
+    if storage_path:
+        raise NotImplementedError(
+            'recut path needs the verdict record; use bundle boxes '
+            'for now and see verdicts.recut for the store path')
+    with_shard = [i for i, rr in enumerate(label_rows) if rr.get('shard')]
+    order = sorted(with_shard, key=lambda i: (label_rows[i]['shard'],
+                                              label_rows[i]['key']))
     kept, cores, cols = [], [], []
-    cur_key, st, b0, sg = None, None, 0.0, 1.0
-    for i in order:
-        rrow = label_rows[i]
-        if rrow['key'] != cur_key:
-            if storage_path:
-                rec = dict(rrow, crop=None)
-                raise NotImplementedError(
-                    'recut path needs the verdict record; use bundle boxes '
-                    'for now and see verdicts.recut for the store path')
-            stack, _mask, _c, _w = B.read_crop(rrow['shard'], rrow['key'])
-            st = np.asarray(stack, float)
-            b0, sg = background_mode(st)
-            cur_key = rrow['key']
-            if on_crop:
-                on_crop(cur_key, st.shape)
-        z = rrow['z']
-        if z is None:
-            z = _z_for_added(st, rrow['y'], rrow['x'])
-        iy = int(round(rrow['y']))
-        ix = int(round(rrow['x']))
-        iz = int(round(z))
-        core, border = _pad_window(st, iy, ix, iz, r, rz, b0)
-        if border > max_border_frac:
-            continue
-        h, w, d = st.shape
-        col = np.asarray(
-            st[int(np.clip(iy, 0, h - 1)), int(np.clip(ix, 0, w - 1)), :],
-            float)
-        # planes_from_stack_end rides along as METADATA, never as a
-        # feature -- see localization/edge_gate.py for why the distance
-        # to the end of a stack gates a finished answer instead of
-        # informing the model that produces it.
-        kept.append(dict(rrow, z=float(z), border_frac=float(border),
-                         bg=float(b0), sigma=float(sg),
-                         planes_from_stack_end=float(
-                             min(max(z, 0.0), max(st.shape[2] - 1 - z, 0.0)))))
-        cores.append((core - b0) / max(sg, 1e-9))
-        cols.append((col - b0) / max(sg, 1e-9))
+    # one crop read, one featurize, for every row on that crop
+    i0 = 0
+    while i0 < len(order):
+        key = label_rows[order[i0]]['key']
+        i1 = i0
+        while i1 < len(order) and label_rows[order[i1]]['key'] == key:
+            i1 += 1
+        group = [label_rows[i] for i in order[i0:i1]]
+        stack, _mask, _c, _w = B.read_crop(group[0]['shard'], key)
+        st = np.asarray(stack, float)
+        if on_crop:
+            on_crop(key, st.shape)
+        per, b0, sg = featurize_crop(
+            st, [(rr['y'], rr['x'], rr['z']) for rr in group], r=r, rz=rz)
+        for rr, f in zip(group, per):
+            if f['border_frac'] > max_border_frac:
+                continue
+            # planes_from_stack_end rides along as METADATA, never as a
+            # feature -- see localization/edge_gate.py for why the
+            # distance to the end of a stack gates a finished answer
+            # instead of informing the model that produces it.
+            kept.append(dict(rr, z=f['z'], border_frac=f['border_frac'],
+                             bg=b0, sigma=sg,
+                             planes_from_stack_end=f['planes_from_stack_end']))
+            cores.append(f['core'])
+            cols.append(f['col'])
+        i0 = i1
     return kept, np.asarray(cores), np.asarray(cols)
+
+
+def features_for_rows(label_rows, r=DEFAULT_R, rz=DEFAULT_RZ,
+                      max_border_frac=MAX_BORDER_FRAC, on_crop=None):
+    """(kept_rows, X, cores) for training -- from stored vectors where a
+    row carries one, from pixels where it does not.
+
+    A row from rows() has a `shard` when its crop is on disk and a
+    `feat` when its verdict stored the vector; either is enough for the
+    classifier. cores[i] is the 15x15x25 sigma-unit box for a row that
+    was cut from pixels and None for one that came from its verdict --
+    the PSF bank and the conv head need pixels and can only use the
+    former. Both kinds pass through the same border gate.
+    """
+    from . import features as F
+    cut_rows = [rr for rr in label_rows if rr.get('shard')]
+    kept, cores, cols = boxes(cut_rows, r=r, rz=rz,
+                              max_border_frac=max_border_frac,
+                              on_crop=on_crop)
+    X = list(F.many(cores, cols, kept)) if len(kept) else []
+    cores = list(cores)
+    for rr in label_rows:
+        if rr.get('shard') or rr.get('feat') is None:
+            continue
+        if float(rr.get('border_frac', 0.0)) > max_border_frac:
+            continue
+        kept.append(dict(rr))
+        X.append(np.asarray(rr['feat'], float))
+        cores.append(None)
+    return kept, (np.asarray(X) if X else np.zeros((0, len(F.NAMES)))), cores
 
 
 def split_by_group(label_rows, frac=0.25, seed=0):
@@ -225,9 +316,12 @@ def summary(label_rows):
     con = sum(1 for r in label_rows if r.get('origin') == 'contested')
     und = sum(1 for r in label_rows if r.get('origin') == 'undetermined')
     add = sum(1 for r in label_rows if r.get('origin') == 'added')
+    inc = sum(1 for r in label_rows if r.get('origin') == 'inconsistent')
+    from_feat = sum(1 for r in label_rows
+                    if not r.get('shard') and r.get('feat') is not None)
     return dict(
         n=n, positive=pos, negative=neg, contested=con, undetermined=und,
-        added=add,
+        added=add, inconsistent=inc, feature_only=from_feat,
         groups=len({tuple(r['group']) for r in label_rows}),
         crops=len({r['key'] for r in label_rows}),
         hybes=sorted({r['hybe'] for r in label_rows}),
