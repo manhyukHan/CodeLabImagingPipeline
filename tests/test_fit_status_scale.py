@@ -248,6 +248,22 @@ def test_markers_land_where_they_are_told():
           len(ax_yx.collections) == 2 and len(ax_xz.collections) == 1)
     plt.close(fig)
 
+    # A MARKER OFF THE DISPLAYED BOX IS NOT DRAWN, and cannot move the
+    # picture: a learned engine's wider search crop hands the grid
+    # candidates past the image edge, which scatter() drew in the margin
+    # while autoscaling the image into a white frame.
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube,
+                           centroid=[(11.0, 3.0, 30.0), (22.0, 3.0, 30.0)],
+                           rejected=[(-4.0, 3.0, 30.0), (3.0, 11.0, 30.0)])
+    check('markers outside the image are skipped on YX',
+          len(ax_yx.collections) == 2)
+    check('and the axes stay pinned to the image',
+          ax_yx.get_xlim() == (-0.5, 14.5) and ax_yx.get_ylim() == (14.5, -0.5)
+          and ax_xz.get_xlim() == (-0.5, 14.5),
+          f'{ax_yx.get_xlim()} {ax_yx.get_ylim()}')
+    plt.close(fig)
+
     # The crop's brightest voxel is the OTHER blob, so a fallback that
     # ignored `lateral` would give a different window.
     fig, ax_yx, ax_xz = axes()

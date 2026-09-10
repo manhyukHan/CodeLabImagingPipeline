@@ -13999,7 +13999,7 @@ One PNG PER MODALITY: each modality has its own reference and its
             # only in the popup's own combo, so the choice was lost on
             # every app restart and never appeared in a config file --
             # a run could not say which engine produced its spots.
-            'engine': ('Localize3DDisplayer', 'EngineComboBox'),
+            'engine': ('localize_3d_displayer', 'EngineComboBox'),
         },
         'celltype': {
             'barcode_hybe': ('CelltypeDeterminationPanel', 'BarcodeHybeComboBox'),
@@ -14126,6 +14126,22 @@ One PNG PER MODALITY: each modality has its own reference and its
         w.setValue(int(float(value)))
         return True
 
+    def _config_widget(self, panel, widget):
+        """The widget a _CONFIG_PARAM_MAP entry names.
+
+        ONE RESOLVER FOR BOTH SIDES. Capture and apply each did
+        getattr(getattr(self.ui, panel), widget) inline, and the map's
+        3D-localization entry named a pop-up that lives on the WINDOW
+        (self.localize_3d_displayer), not on self.ui -- so Save Config
+        raised AttributeError on every press, from the write side, with
+        the read side one edit away from the same. A panel name is looked
+        up on self.ui first, then on the window itself.
+        """
+        owner = getattr(self.ui, panel, None)
+        if owner is None:
+            owner = getattr(self, panel)
+        return getattr(owner, widget)
+
     def _capture_config_params(self):
         """
         Every analysis parameter the app is currently running with, as
@@ -14137,7 +14153,7 @@ One PNG PER MODALITY: each modality has its own reference and its
         """
         out = {}
         for section, entries in self._CONFIG_PARAM_MAP.items():
-            out[section] = {param: self._widget_value(getattr(getattr(self.ui, panel), widget))
+            out[section] = {param: self._widget_value(self._config_widget(panel, widget))
                             for param, (panel, widget) in entries.items()}
         for name, hybe in self.ui.AlignmentPanel.same_modality_references().items():
             out['fov_alignment'][f'reference_hybe_{name}'] = hybe
@@ -14265,7 +14281,7 @@ One PNG PER MODALITY: each modality has its own reference and its
                 target = entries.get(param)
                 if target is None:
                     continue
-                w = getattr(getattr(self.ui, target[0]), target[1])
+                w = self._config_widget(target[0], target[1])
                 if not self._apply_widget_value(w, value):
                     pending.append((w, value))
         for w, value in pending:

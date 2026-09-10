@@ -187,8 +187,22 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     if title:
         ax_yx.set_title(title, fontsize=title_fontsize)
 
+    # NOTHING IS DRAWN OUTSIDE THE DISPLAYED BOX. A learned engine searches
+    # a crop wider than the one shown, and its dropped candidates arrive
+    # with coordinates past the image's edge; scatter() would draw them
+    # in the margin AND autoscale the axes to include them, shrinking the
+    # image inside a white frame (seen on a real grid). A marker that is
+    # not on the picture is not drawn, and the axes are pinned to the
+    # image below so no marker can move the picture.
+    h_img, w_img = yx_img.shape[0], yx_img.shape[1]
+
+    def _on_yx(cx, cy):
+        return -0.5 <= cx < w_img - 0.5 and -0.5 <= cy < h_img - 0.5
+
     if centroids:
         for i, (cx, cy, cz) in enumerate(centroids):
+            if not _on_yx(cx, cy):
+                continue
             color = 'yellow' if (i == 0 or all_primary) else 'blue'
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none', edgecolors=color, linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
@@ -202,6 +216,8 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
                 _label(ax_yx, cx, cy, str(labels[i]), color)
     if rejected_list:
         for i, (cx, cy, cz) in enumerate(rejected_list):
+            if not _on_yx(cx, cy):
+                continue
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none',
                                  edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
@@ -214,9 +230,17 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
         # WHICH blob is under discussion without claiming a z nobody
         # fitted, so the XZ panel deliberately gets no ring.
         for cx, cy in lateral_list:
+            if not _on_yx(cx, cy):
+                continue
             ax_yx.scatter([cx], [cy], s=marker_size, marker='o',
                           facecolors='none', edgecolors='white',
                           linewidths=1.2, linestyle='--')
+    # PINNED. imshow's own extent, restated after every scatter and
+    # annotation so nothing drawn can enlarge the axes.
+    ax_yx.set_xlim(-0.5, w_img - 0.5)
+    ax_yx.set_ylim(h_img - 0.5, -0.5)
+    ax_xz.set_xlim(-0.5, w_img - 0.5)
+    ax_xz.set_ylim(xz_img.shape[0] - 0.5, -0.5)
 
 
 def _label(ax, x, y, text, color):

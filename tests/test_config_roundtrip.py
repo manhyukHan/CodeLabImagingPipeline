@@ -70,7 +70,7 @@ def main():
         n_tweaked = 0
         for section, entries in a._CONFIG_PARAM_MAP.items():
             for param, (panel, widget) in entries.items():
-                _tweak(getattr(getattr(a.ui, panel), widget))
+                _tweak(a._config_widget(panel, widget))
                 n_tweaked += 1
         # the two dynamic parameters
         chp = a.ui.ChromatinTracingPanel
