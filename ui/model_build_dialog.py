@@ -520,6 +520,11 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._log(f'building {len(cmds)} channel(s) into {self.bundle_dir()} '
                   f'-- in the background, one channel after another')
         self._set_busy(True)
+        # Show the status line NOW, not only when the build ends: a
+        # suggested path is set programmatically, which fires no
+        # editingFinished, so until this the line sat empty for the
+        # whole build and read as if the button did nothing.
+        self._refresh_review()
         self._next_build()
 
     def _next_build(self):
@@ -611,7 +616,9 @@ class ModelBuildDialog(QtWidgets.QDialog):
         st = self.review_status()
         if st is None:
             self.ReviewStatusLabel.setText(
-                'no bundle at that path yet' if self.bundle_dir() else '')
+                'no bundle at that path yet -- Build bundle (3) writes one'
+                if self.bundle_dir() else
+                'give the bundle a path (3) to see its review status here')
             return
         pf, ms = st['passfail'], st['multispot']
         chans = ', '.join(f'ch{c}' for c in sorted(st['channels'])) or '--'
