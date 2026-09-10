@@ -102,8 +102,13 @@ def test_eta_and_workers():
     from codelab_pipeline.training import extract as X
     src = inspect.getsource(BB.main)
     check('the worker count is printed', "print(f'workers {workers}'" in src)
-    check('no ETA before a full wave has landed', 'if done >= workers:' in src)
-    check('and the log says so instead', "ETA after {workers} tasks" in src)
+    check('no ETA before a full wave has landed',
+          'wave = min(workers, total)' in src and 'if done >= wave:' in src)
+    check('and the log says so instead', "ETA after {wave} tasks" in src)
+    # MEASURED: a 15-task build on 32 workers gated on `workers` alone
+    # never printed an ETA. Fewer tasks than workers is its own state.
+    check('fewer tasks than workers is named, not waited for',
+          'elif total <= workers:' in src and 'tasks in flight' in src)
     check('the resolved count is what extract() gets', 'workers=workers,' in src)
     w = X.default_workers()
     check('default_workers() is an int in [1, 32]',

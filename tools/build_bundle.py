@@ -255,11 +255,20 @@ def main(argv=None):
         # the remaining time by about `workers` times -- a real run read
         # '~1083 min left' for a build that took two hours. Rate means
         # something once a full wave has landed.
-        if done >= workers:
+        wave = min(workers, total)
+        if done >= wave:
             rate = done / max(el, 1e-9)
             tail = f'~{(total - done) / rate / 60:5.1f} min left'
+        elif total <= workers:
+            # FEWER TASKS THAN WORKERS: everything is already in flight,
+            # so there is no wave to wait for and no rate to extrapolate
+            # from -- the run ends when its slowest chunk does. Gating on
+            # `workers` here never printed an ETA at all (MEASURED: a
+            # 15-task build on 32 workers said 'ETA after 32 tasks' to
+            # the last line).
+            tail = f'all {total} tasks in flight'
         else:
-            tail = f'ETA after {workers} tasks'
+            tail = f'ETA after {wave} tasks'
         print(f'  [{done:4d}/{total}] fov{fov:03d} {hybe:9s} '
               f'{n_crops:3d} crops {n_cands:6d} cand   '
               f'{el / 60:5.1f} min elapsed, {tail}',
