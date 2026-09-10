@@ -219,6 +219,11 @@ class PsfMatcherV3Engine(LocalizeEngine):
         self._clf = classifier
         self._why = None
         self._match = None
+        # CONTEXT FOR THE CLASSIFIER: experiment-level facts a head may
+        # have been trained on (features.CONTEXT_NAMES), set by whoever
+        # runs the engine -- the tracer, from the Ingestion tab's field.
+        # A head that needs one refuses to score without it.
+        self.context = {}
         self._refines = None
         self._no_refine = None
         self._cal = False              # False = not looked for yet
@@ -407,7 +412,9 @@ class PsfMatcherV3Engine(LocalizeEngine):
             if not seeds:
                 continue
             feats, cores = self._boxes(st, seeds, bg, sigma)
-            p_exist = self.classifier.score(X=feats, boxes=cores)
+            p_exist = self.classifier.score(
+                X=self.classifier.with_context(feats, self.context),
+                boxes=cores)
             for (y, x, z), pe in zip(seeds, p_exist):
                 out.extend(self._refine(st, y, x, z, float(pe), bg, sigma))
         # THE RESOLUTION BOUND, NOT A LATERAL DEDUP. engine.dedupe merges

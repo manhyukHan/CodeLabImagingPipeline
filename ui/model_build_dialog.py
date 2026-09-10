@@ -103,8 +103,11 @@ class ModelBuildDialog(QtWidgets.QDialog):
     model_trained = QtCore.pyqtSignal(str)   # a new run directory exists
 
     def __init__(self, sources, fov_pool, storage_for, repo_root,
-                 parent=None):
+                 parent=None, genomic_resolution_kb=None):
         super().__init__(parent)
+        # A callable (the Ingestion tab's current value, read at build
+        # time) or a number; None = unknown, and the manifest says so.
+        self._genomic_resolution_kb = genomic_resolution_kb
         self.setWindowTitle('Build model')
         self.setWindowFlags(self.windowFlags()
                             & ~QtCore.Qt.WindowContextHelpButtonHint)
@@ -819,6 +822,8 @@ class ModelBuildDialog(QtWidgets.QDialog):
             by_ch.setdefault(int(ch), [])
             if folder not in by_ch[ch]:
                 by_ch[ch].append(folder)
+        res = self._genomic_resolution_kb
+        res = res() if callable(res) else res
         # THE BUNDLE'S BUDGET, SHARED OUT BY SOURCE. build_bundle runs
         # once per channel and splits its --n-crops over its hybes, so a
         # channel with more hybes gets a proportionally larger share:
@@ -839,7 +844,9 @@ class ModelBuildDialog(QtWidgets.QDialog):
                          '--fov-pool', ','.join(str(f) for f in
                                                 (self._fov_pool or fovs)),
                          '--workers', str(int(self.WorkersSpinBox.value())),
-                         '--n-crops', str(int(budget))])
+                         '--n-crops', str(int(budget))]
+                        + (['--genomic-resolution-kb', f'{float(res):g}']
+                           if res else []))
         return cmds
 
     def _build_bundle(self):

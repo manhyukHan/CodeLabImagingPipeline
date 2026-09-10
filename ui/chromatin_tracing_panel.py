@@ -318,6 +318,9 @@ class ChromatinTracingPanelUI(object):
         self._voxel_um = (VOXEL_DEFAULTS['voxel_xy_um'],
                           VOXEL_DEFAULTS['voxel_xy_um'],
                           VOXEL_DEFAULTS['voxel_z_um'])
+        # Injected by MainWindow from the Ingestion panel, like the voxel
+        # size; None = unknown.
+        self._genomic_resolution_kb = None
 
         self.EngineComboBox = QtWidgets.QComboBox()
         # itemData, not display text. The config round-trips on this, so
@@ -832,6 +835,7 @@ class ChromatinTracingPanelUI(object):
                 # and lives on the Ingestion panel. MainWindow injects it,
                 # so there is exactly one widget pair for it in the app.
                 'voxel_um': self._voxel_um,
+                'genomic_resolution_kb': self._genomic_resolution_kb,
                 'readout_psf': self.ReadoutPsfComboBox.currentData()
                                or self.ReadoutPsfComboBox.currentText(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),

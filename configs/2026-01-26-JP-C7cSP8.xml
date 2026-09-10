@@ -6,6 +6,8 @@
     name="DNA" />
   <modality
     name="RNA" />
+  <acquisition
+    genomic_resolution_kb="200" />
   <cell_segmentation
     reference_hybe="Hyb_003 (DNA)"
     channel="635"

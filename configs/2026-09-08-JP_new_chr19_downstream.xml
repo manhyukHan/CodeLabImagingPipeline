@@ -8,7 +8,8 @@
     name="RNA" />
   <acquisition
     voxel_xy_um="0.208"
-    voxel_z_um="0.202" />
+    voxel_z_um="0.202"
+    genomic_resolution_kb="200" />
   <cell_segmentation
     reference_hybe="Hyb_500 (RNA)"
     channel="635"

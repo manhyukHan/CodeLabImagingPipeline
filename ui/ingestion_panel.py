@@ -187,6 +187,36 @@ class IngestionPanelUI(object):
         voxelLayout.addWidget(self.VoxelStatusLabel, 1)
         form.addRow('Voxel size:', voxelRow)
 
+        # GENOMIC RESOLUTION, kb per readout step. Experiment-level like
+        # the voxel size, and for the same reason it lives here: one
+        # widget, every consumer reads it. The fiducial is the whole
+        # genomic region the readouts trace, so its apparent size is
+        # physical and tracks how much DNA a step spans; the target span
+        # in Mb is the physical quantity but is rarely a clean number
+        # (sparse coverage, gaps), while the step in kb is, and scales
+        # with it. It rides into bundle manifests and, when it varies
+        # across pooled bundles, into the fiducial model as a feature.
+        # Empty means unknown, which is allowed and is recorded as such.
+        resRow = QtWidgets.QWidget()
+        resLayout = QtWidgets.QHBoxLayout(resRow)
+        resLayout.setContentsMargins(0, 0, 0, 0)
+        self.GenomicResolutionLineEdit = QtWidgets.QLineEdit('')
+        rv = QtGui.QDoubleValidator(0.01, 1000000.0, 3)
+        rv.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        self.GenomicResolutionLineEdit.setValidator(rv)
+        self.GenomicResolutionLineEdit.setMaximumWidth(90)
+        self.GenomicResolutionLineEdit.setPlaceholderText('unknown')
+        self.GenomicResolutionLineEdit.setToolTip(
+            'Genomic resolution of the design: kb of DNA per readout step '
+            '(MP58 50, chr19 downstream 200, HoxA 5). Saved with the '
+            'config, written into every bundle built from this experiment, '
+            'and used as a feature of the fiducial model once bundles of '
+            'different resolutions are pooled. Leave empty if unknown.')
+        resLayout.addWidget(self.GenomicResolutionLineEdit)
+        resLayout.addWidget(QtWidgets.QLabel('kb per readout step'))
+        resLayout.addStretch(1)
+        form.addRow('Genomic resolution:', resRow)
+
         # What is actually IN FORCE, as opposed to what is typed. Committed
         # only by apply_voxel(); every reader asks for this.
         self._voxel_committed = (VOXEL_DEFAULTS['voxel_xy_um'],
@@ -583,6 +613,18 @@ class IngestionPanelUI(object):
         for item in self.JobQueueListWidget.selectedItems():
             self.JobQueueListWidget.takeItem(self.JobQueueListWidget.row(item))
 
+
+    def genomic_resolution_kb(self):
+        """kb per readout step, or None when the field is empty or not a
+        number -- unknown is a legitimate state and is never a guess."""
+        text = self.GenomicResolutionLineEdit.text().strip().replace(',', '.')
+        if not text:
+            return None
+        try:
+            v = float(text)
+        except ValueError:
+            return None
+        return v if v > 0 else None
 
     def voxel_um(self):
         """(dy, dx, dz) currently IN FORCE -- never the raw edit text."""

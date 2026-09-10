@@ -200,14 +200,19 @@ def _short_bundle(b):
     return f'{exp}/{os.path.basename(b)}' if exp else os.path.basename(b)
 
 
-def _manifest_store(bundle_dir):
-    """The store a bundle was cut from, from its own manifest."""
+def _manifest_value(bundle_dir, key):
+    """One value from a bundle's own manifest, or None."""
     try:
         with open(os.path.join(bundle_dir, 'bundle_manifest.json'),
                   encoding='utf-8') as f:
-            return json.load(f).get('storage_path')
+            return json.load(f).get(key)
     except Exception:                                        # noqa: BLE001
         return None
+
+
+def _manifest_store(bundle_dir):
+    """The store a bundle was cut from, from its own manifest."""
+    return _manifest_value(bundle_dir, 'storage_path')
 
 
 def _per_bundle_val(clf, head, X, cores, y, groups, kept, bundles, a):
@@ -262,7 +267,10 @@ def _transfer(X, cores, y, groups, kept, bundles, heads, a):
                                                           'one class only'}
                 continue
             try:
-                clf, rp = C.train(X[src], [cores[i] for i in src], ys,
+                # ONE BUNDLE: any context column is constant here, so the
+                # transfer heads read the box features only.
+                nb = len(F.NAMES)
+                clf, rp = C.train(X[src][:, :nb], [cores[i] for i in src], ys,
                                   [groups[i] for i in src], head=head,
                                   epochs=a.epochs, seed=a.seed,
                                   val_frac=a.val_frac, verbose=False)
@@ -280,7 +288,7 @@ def _transfer(X, cores, y, groups, kept, bundles, heads, a):
                 if not len(dst) or yd.sum() == 0 or yd.sum() == len(dst):
                     e['to'][_short_bundle(b2)] = {'skipped': 'one class only'}
                     continue
-                pd = clf.score(X[dst], None)
+                pd = clf.score(X[dst][:, :nb], None)
                 e['to'][_short_bundle(b2)] = {
                     'n': len(dst), 'positive_frac': float(yd.mean()),
                     'pr_auc': float(C.pr_auc(yd, pd)),
@@ -364,6 +372,14 @@ def main(argv=None):
                          'This is how a second-stage review lands on the '
                          'model whose PSF it was judged with, instead of a '
                          'retrain whose bank merely happens to match.')
+    ap.add_argument('--genomic-resolution-kb', action='append', default=None,
+                    type=float,
+                    help='kb per readout step, ONE PER BUNDLE in order, '
+                         'overriding what each bundle\'s manifest records. '
+                         'When the pooled bundles carry different values '
+                         'it becomes a feature of the model '
+                         '(features.CONTEXT_NAMES); one value across all '
+                         'rows is metadata, recorded but not learned on.')
     ap.add_argument('--storage-path', action='append', default=None,
                     help='to compare the measured PSF against the analytic '
                          'calibration in that store. Default: the store '
@@ -422,6 +438,47 @@ def main(argv=None):
         return 1
     y = np.array([r['label'] for r in kept])
     groups = [tuple(r['group']) for r in kept]
+
+    # THE CONTEXT FEATURE, when it varies. Each bundle's genomic
+    # resolution (the manifest's, or --genomic-resolution-kb per bundle)
+    # is one value for every row of that bundle. With two or more
+    # distinct values across the pooled rows it is appended as
+    # log10_genomic_resolution_kb and the model learns on it; with one
+    # value it is a constant column -- unidentifiable here and wild on
+    # the next experiment after standardising -- so it is recorded and
+    # not trained on, and the run says which.
+    res_by_bundle = {}
+    for bi, b in enumerate(bundles):
+        given = (a.genomic_resolution_kb or [])
+        v = given[bi] if bi < len(given) else None
+        if v is None:
+            v = _manifest_value(b, 'genomic_resolution_kb')
+        res_by_bundle[bi] = float(v) if v else None
+        per_bundle[bi]['genomic_resolution_kb'] = res_by_bundle[bi]
+    feature_names = list(F.NAMES)
+    context_used = False
+    distinct = {v for v in res_by_bundle.values() if v}
+    if any(v is None for v in res_by_bundle.values()):
+        missing = [_short_bundle(bundles[bi]) for bi, v in res_by_bundle.items()
+                   if v is None]
+        print(f'\ncontext genomic resolution unknown for {missing} -- the '
+              f'model has no resolution feature (set it on the Ingestion '
+              f'tab before building, or pass --genomic-resolution-kb)')
+    elif len(distinct) < 2:
+        print(f'\ncontext genomic resolution {sorted(distinct)} kb, one value '
+              f'for every row: recorded, not a feature (nothing to learn '
+              f'from a constant)')
+    else:
+        col = np.array([[np.log10(res_by_bundle[r['bundle']])] for r in kept])
+        X = np.hstack([np.asarray(X, float), col])
+        feature_names = list(F.NAMES) + list(F.CONTEXT_NAMES)
+        context_used = True
+        print(f'\ncontext genomic resolution per bundle '
+              f'{ {_short_bundle(bundles[bi]): v for bi, v in res_by_bundle.items()} } '
+              f'kb -> log10_genomic_resolution_kb is the 17th feature')
+    report_context = {'genomic_resolution_kb': {
+        _short_bundle(bundles[bi]): v for bi, v in res_by_bundle.items()},
+        'as_feature': context_used}
     if any(c is None for c in cores) and 'conv' in a.heads:
         print('   conv head skipped: it reads pixels, and some rows here '
               'have only their stored vector')
@@ -448,6 +505,7 @@ def main(argv=None):
     bundle_label = (a.bundle_dir[0] if len(bundles) == 1
                     else ' + '.join(_short_bundle(b) for b in bundles))
     report = {'bundle': bundle_label, 'bundles': per_bundle, 'labels': s,
+              'context': report_context, 'features': feature_names,
               'provisional': provisional,
               'n_boxes': len(kept), 'heads': {}, 'voxel_um': list(voxel),
               'template_r': a.template_r, 'template_rz': a.template_rz}
@@ -459,7 +517,8 @@ def main(argv=None):
             clf, rep = C.train(X, (np.asarray(cores) if head == 'conv'
                                    else cores), y, groups, head=head,
                                epochs=a.epochs, seed=a.seed,
-                               val_frac=a.val_frac)
+                               val_frac=a.val_frac,
+                               feature_names=feature_names)
         except Exception as exc:                             # noqa: BLE001
             print(f'   {head:6s} FAILED {type(exc).__name__}: {exc}')
             report['heads'][head] = {'error': str(exc)}

@@ -160,6 +160,12 @@ def main(argv=None):
                          'permutation per hybe and FOV. Default '
                          f'{X.DEFAULT_N_CROPS}; 0 = every cell of every '
                          'hybe, in store order.')
+    ap.add_argument('--genomic-resolution-kb', type=float, default=None,
+                    help='kb of DNA per readout step in this experiment\'s '
+                         'design (the Ingestion tab\'s field). Recorded in '
+                         'the manifest; train_spotmodel uses it as a '
+                         'feature once bundles of different resolutions '
+                         'are pooled. Unknown is allowed.')
     ap.add_argument('--draw-seed', type=int, default=0,
                     help='seed of the crop draw; recorded. Default 0, so '
                          'the same store, FOVs, hybes and count give the '
@@ -267,6 +273,8 @@ def main(argv=None):
         fovs=fovs, fov_seed=seed, fov_pool=str(a.fov_pool),
         cells_per_fov={str(f): ncell[f] for f in fovs},
         n_crops=n_crops, draw_seed=draw_seed,
+        genomic_resolution_kb=(float(a.genomic_resolution_kb)
+                               if a.genomic_resolution_kb else None),
         crops_planned=crops, crops_possible=possible,
         crops_per_hybe=per_hybe,
         crops_per_fov={str(f): per_fov[f] for f in fovs},

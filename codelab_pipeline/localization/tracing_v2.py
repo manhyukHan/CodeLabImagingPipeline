@@ -350,8 +350,13 @@ class V2Params(object):
                  readout_model_dir=None, engine_label='',
                  z_window=None, z_boundary_trim=10,
                  fiducial_model_dir=None, lateral_reach_px=None,
-                 fiducial_z_window=None, min_p_exist_fiducial=None):
+                 fiducial_z_window=None, min_p_exist_fiducial=None,
+                 genomic_resolution_kb=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # kb per readout step, from the Ingestion tab; a learned head
+        # trained with it as a feature needs it to score. None = unknown.
+        self.genomic_resolution_kb = (float(genomic_resolution_kb)
+                                      if genomic_resolution_kb else None)
         # THREE SETTINGS THE CODE HAD AND THE PANEL DID NOT. Each is None
         # for the measured value the code used before it was a setting:
         # the readout's lateral reach (5 px, the 1 um v2's readout fit
@@ -471,7 +476,17 @@ class V2Params(object):
             from .engine import make_engine
             self._readout_engine = make_engine(ROUTE_V3,
                                                model_dir=self.readout_model_dir)
+            self._give_context(self._readout_engine)
         return self._readout_engine
+
+    def context(self):
+        """Experiment-level facts a learned head may score with."""
+        return {'genomic_resolution_kb': self.genomic_resolution_kb}
+
+    def _give_context(self, engine):
+        if engine is not None and hasattr(engine, 'context'):
+            engine.context = dict(getattr(engine, 'context', None) or {},
+                                  **self.context())
 
     @readout_engine.setter
     def readout_engine(self, value):
@@ -488,6 +503,7 @@ class V2Params(object):
             from .engine import make_engine
             self._fiducial_engine = make_engine(
                 ROUTE_V3, model_dir=self.fiducial_model_dir)
+            self._give_context(self._fiducial_engine)
         return self._fiducial_engine
 
     @fiducial_engine.setter
@@ -564,6 +580,7 @@ class V2Params(object):
                                      if learned else None),
                    fiducial_z_window=(v3.get('fiducial_z_window')
                                       if learned else None),
+                   genomic_resolution_kb=params.get('genomic_resolution_kb'),
                    engine_label=str(params.get('engine_label') or
                                     params.get('engine') or ''))
 
@@ -1847,6 +1864,8 @@ def allele_task(payload):
         'min_p_exist_fiducial': (params.min_p_exist_fiducial if params else None),
         'lateral_reach_px': (params.lateral_reach_px if params else None),
         'fiducial_z_window': (params.fiducial_z_window if params else None),
+        'genomic_resolution_kb': (params.genomic_resolution_kb
+                                  if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
@@ -1961,6 +1980,8 @@ def allele_task_with_debug(payload):
         'min_p_exist_fiducial': (params.min_p_exist_fiducial if params else None),
         'lateral_reach_px': (params.lateral_reach_px if params else None),
         'fiducial_z_window': (params.fiducial_z_window if params else None),
+        'genomic_resolution_kb': (params.genomic_resolution_kb
+                                  if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,

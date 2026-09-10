@@ -156,6 +156,30 @@ class SpotClassifier:
                     X if self.std is None else self.std(X), np.float32))
             return self.model(t).flatten().numpy()
 
+    @property
+    def feature_names(self):
+        """What this head was trained on: features.NAMES, plus any context
+        names after them."""
+        return tuple((self.meta or {}).get('features') or F.NAMES)
+
+    @property
+    def context_names(self):
+        """The context features this head needs at scoring time."""
+        return tuple(self.feature_names[len(F.NAMES):])
+
+    def with_context(self, X, context=None):
+        """Append the context columns this head was trained with to a
+        (n, len(NAMES)) matrix. A head without context returns X as is;
+        one with it raises when the context is missing."""
+        names = self.context_names
+        X = np.asarray(X, float)
+        if not names or X.ndim != 2:
+            return X
+        if X.shape[1] == len(self.feature_names):
+            return X                      # already complete
+        v = F.context_vector(context, names)
+        return np.hstack([X, np.tile(v, (X.shape[0], 1))])
+
     def score(self, X=None, boxes=None):
         """Calibrated p, STRICTLY inside (0, 1).
 
@@ -208,7 +232,8 @@ class SpotClassifier:
         std = (F.Standardiser.from_dict(doc['standardiser'])
                if doc.get('standardiser') else None)
         shape = doc.get('meta', {}).get('box_shape')
-        model = make_head(doc['head'], len(F.NAMES), shape)
+        names = (doc.get('meta') or {}).get('features') or F.NAMES
+        model = make_head(doc['head'], len(names), shape)
         model.load_state_dict({k: torch.as_tensor(np.asarray(v, np.float32))
                                for k, v in doc['state'].items()})
         return SpotClassifier(doc['head'], std, model, doc['platt'],
@@ -258,12 +283,19 @@ def _platt(logit, y):
 
 
 def train(X, boxes, y, groups, head='linear', epochs=400, lr=0.02,
-          weight_decay=1e-3, seed=0, val_frac=0.25, verbose=True):
+          weight_decay=1e-3, seed=0, val_frac=0.25, verbose=True,
+          feature_names=None):
     """Fit one head. Returns (SpotClassifier, report dict).
 
     `groups` splits by CELL. `y` must be 0/1 -- contested rows belong
-    nowhere in here.
+    nowhere in here. `feature_names` records what the columns of X are
+    (features.NAMES, plus context names after them); the head is sized
+    from X and refuses to score anything else.
     """
+    names = list(feature_names or F.NAMES)
+    if head != 'conv' and np.asarray(X).shape[1] != len(names):
+        raise ValueError(f'X has {np.asarray(X).shape[1]} columns but '
+                         f'{len(names)} feature names were given')
     torch = _torch()
     rows = [{'group': g} for g in groups]
     from . import dataset as D
@@ -332,7 +364,7 @@ def train(X, boxes, y, groups, head='linear', epochs=400, lr=0.02,
     clf = SpotClassifier(head, std, model, platt, 0.5,
                          meta={'box_shape': (list(np.asarray(boxes).shape[1:])
                                              if head == 'conv' else None),
-                               'features': list(F.NAMES),
+                               'features': names,
                                'n_train': len(tr), 'n_val': len(va),
                                'seed': seed})
     p = clf.score(np.asarray(X)[va] if head != 'conv' else None,
@@ -421,9 +453,12 @@ def load_best(model_dir, report=REPORT_NAME, prefer=None):
         except (OSError, ValueError):
             refused.append((name, 'unreadable'))
             continue
-        if feats is not None and tuple(feats) != tuple(F.NAMES):
+        # OURS: features.NAMES first, then only context names we know.
+        if feats is not None and not (
+                tuple(feats[:len(F.NAMES)]) == tuple(F.NAMES)
+                and all(f in F.CONTEXT_NAMES for f in feats[len(F.NAMES):])):
             refused.append((name, f'{len(feats)} features, not our '
-                                  f'{len(F.NAMES)}'))
+                                  f'{len(F.NAMES)} (+ known context)'))
             continue
         auc = h.get('val_pr_auc')
         if auc is None:

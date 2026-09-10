@@ -7157,7 +7157,8 @@ class MainWindow(QtWidgets.QMainWindow):
             dlg = ModelBuildDialog(
                 self._model_build_sources(),
                 self._parse_fov_list(ip.FovListLineEdit.text()),
-                self._storage_path_for_modality, here, parent=self)
+                self._storage_path_for_modality, here, parent=self,
+                genomic_resolution_kb=self._genomic_resolution_kb)
             dlg.logged.connect(self.log)
             dlg.model_trained.connect(self._on_model_trained)
             self._model_build_dialog = dlg
@@ -9181,6 +9182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fov_matrices = self._composed_fov_matrices_for_cell_alignment(storage_path, fov)
 
         chp._voxel_um = self._voxel_um()
+        chp._genomic_resolution_kb = self._genomic_resolution_kb()
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
         resolver = self._frame_resolver(None, fov)
@@ -9474,6 +9476,10 @@ class MainWindow(QtWidgets.QMainWindow):
         produces.
         """
         return self.ui.IngestionPanel.voxel_um()
+
+    def _genomic_resolution_kb(self):
+        """kb per readout step from the Ingestion tab, or None."""
+        return self.ui.IngestionPanel.genomic_resolution_kb()
 
     def _chromatin_v2_params(self, full_params, storage_path, install=True):
         """V2Params for this run, or None when v1 is selected.
@@ -10022,6 +10028,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         chp._voxel_um = self._voxel_um()
+        chp._genomic_resolution_kb = self._genomic_resolution_kb()
         full_params = chp.params()
         fiducial_params, readout_params = self._chromatin_channel_params(full_params)
 
@@ -14003,6 +14010,10 @@ One PNG PER MODALITY: each modality has its own reference and its
         'acquisition': {
             'voxel_xy_um': ('IngestionPanel', 'VoxelXYLineEdit'),
             'voxel_z_um': ('IngestionPanel', 'VoxelZLineEdit'),
+            # kb per readout step: the design's genomic resolution,
+            # experiment-level for the same reason the voxel size is.
+            'genomic_resolution_kb': ('IngestionPanel',
+                                      'GenomicResolutionLineEdit'),
         },
         'cell_segmentation': {
             'reference_hybe': ('CellSegmentPanel', 'ReferenceHybeComboBox'),

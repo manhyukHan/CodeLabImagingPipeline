@@ -115,6 +115,41 @@ NAMES = (
     'box_frac_padded',
 )
 
+# CONTEXT FEATURES: facts about the EXPERIMENT, not about the box.
+# Appended after NAMES when a model was trained with them; never stored
+# in a verdict (they are per bundle, and the manifest carries them);
+# supplied at inference by whoever runs the model, from the same field
+# the manifest was written from. A model trained with a context feature
+# refuses to score without it -- see classify.SpotClassifier.
+#
+#   log10_genomic_resolution_kb   kb of DNA per readout step, log10. The
+#       fiducial is the whole genomic region the readouts trace, so its
+#       apparent size tracks the design, not the optics: the two DNA
+#       ch555 bundles pooled first (MP58 at 50 kb, chr19 downstream)
+#       had fiducial templates of sigma_z 760 and 1072 nm, and an MLP
+#       trained on one alone fell to PR-AUC 0.65 on the other.
+CONTEXT_NAMES = ('log10_genomic_resolution_kb',)
+
+
+def context_vector(context, names=CONTEXT_NAMES):
+    """The context feature values, in `names` order. Raises when one is
+    missing: a model that learned on it has nothing to say without it."""
+    ctx = dict(context or {})
+    out = []
+    for n in names:
+        if n == 'log10_genomic_resolution_kb':
+            v = ctx.get('genomic_resolution_kb')
+            if v is None or not float(v) > 0:
+                raise ValueError(
+                    'this model uses the genomic resolution (kb per readout '
+                    'step) as a feature, and none is set -- type it on the '
+                    "Ingestion tab's 'Genomic resolution' field")
+            out.append(float(np.log10(float(v))))
+        else:
+            raise ValueError(f'unknown context feature {n!r}')
+    return np.asarray(out, float)
+
+
 # NOT A FEATURE: how close the brightest plane sits to the end of the
 # stack. localization/edge_gate.py computes it, and computes it AFTER
 # everything -- after pass/fail, after the matched filter has placed the
