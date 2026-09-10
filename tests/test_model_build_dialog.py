@@ -171,6 +171,22 @@ def test_build_commands():
     d.WorkersSpinBox.setValue(4)
     check('and it is what the command carries',
           all(c[c.index('--workers') + 1] == '4' for c in d.build_commands()))
+    # A COUNT OF CELLS, NOT EVERY CELL. Four RNA sources are checked
+    # here (two hybes x two channels): four crops a cell.
+    nc = {c[c.index('--n-cells') + 1] for c in cmds}
+    check('the cell count is a setting, default 10,000, on every channel',
+          nc == {'10000'} and d.CellsSpinBox.value() == 10000, str(nc))
+    note = d.CellsNote.text()
+    check('and the note says what it comes to: cells x sources = crops',
+          '10,000 cells' in note and '4 source(s) = 40,000 crops' in note,
+          note)
+    d.CellsSpinBox.setValue(0)
+    check('0 reads "all", the command carries it, the note says every cell',
+          d.CellsSpinBox.text() == 'all'
+          and all(c[c.index('--n-cells') + 1] == '0'
+                  for c in d.build_commands())
+          and 'every cell' in d.CellsNote.text(), d.CellsNote.text())
+    d.CellsSpinBox.setValue(10000)
 
     d.FovListLineEdit.setText('')
     check('no FOVs -> no commands, with a reason', d.build_commands() == [])

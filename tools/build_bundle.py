@@ -13,6 +13,12 @@ gives an unbiased draw that anyone can reproduce exactly -- including
 "extend it to eight FOVs" without re-drawing the four already reviewed,
 since the same seed prefixes the same sequence.
 
+NOT EVERY CELL. A build cuts a COUNT of cells (--n-cells, default
+10,000), spread evenly over the FOVs by a seeded draw that every
+channel of the bundle shares, and every hybe and channel is cut for
+each drawn cell -- so the crops to review are cells x sources. 0 is
+every cell, in store order. The draw is recorded in the manifest.
+
 FEWER FOVs, MORE HYBES is usually the right shape. A detector learns
 from the variety of SIGNAL, and a hybe is a different probe on the same
 cells while a FOV is the same probes on different cells; 4 FOVs x 12
@@ -85,22 +91,29 @@ def hybes_in(storage_path, fov, datatypes=None):
             if hybe_datatype(storage_path, fov, h).upper() in want]
 
 
-def fovs_with_cells(storage_path, candidates):
-    """(fov, n_cells) for the FOVs that carry a segmentation.
+def cells_in(storage_path, candidates):
+    """{fov: [cell ids]} for the FOVs that carry a segmentation.
 
     A FOV with no masks is not an error and not a gap in the data -- it
     is one nobody has segmented yet -- but drawing it into the sample
-    would silently shrink the sample.
+    would silently shrink the sample. Read ONCE: the cell draw takes
+    these ids rather than opening the masks a second time.
     """
-    out = []
+    out = {}
     for fov in candidates:
         try:
             ids = [c[0] for c in X.cell_masks(storage_path, fov)]
         except Exception:                                    # noqa: BLE001
             continue
         if ids:
-            out.append((int(fov), len(ids)))
+            out[int(fov)] = ids
     return out
+
+
+def fovs_with_cells(storage_path, candidates):
+    """(fov, n_cells) for the FOVs that carry a segmentation."""
+    return [(f, len(ids))
+            for f, ids in cells_in(storage_path, candidates).items()]
 
 
 def main(argv=None):
@@ -127,6 +140,18 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=None,
                     help='the draw is recorded with this; default is a '
                          'timestamp, which is still written down')
+    ap.add_argument('--n-cells', type=int, default=X.DEFAULT_N_CELLS,
+                    help='how many CELLS to cut, spread evenly over the '
+                         'FOVs by a seeded draw -- the same cells for '
+                         'every channel built into this bundle. Every '
+                         'hybe and channel is cut for each drawn cell, so '
+                         'the crops are cells x sources. Default '
+                         f'{X.DEFAULT_N_CELLS}; 0 = every cell, in store '
+                         'order.')
+    ap.add_argument('--cell-seed', type=int, default=0,
+                    help='seed of the cell draw; recorded. Default 0, so '
+                         'the same store, FOVs and count give the same '
+                         'cells on any machine.')
     ap.add_argument('--workers', type=int, default=None)
     ap.add_argument('--rebuild', action='store_true',
                     help='rebuild shards that are already on disk. The '
@@ -156,7 +181,8 @@ def main(argv=None):
     print(f'store   {store}')
     print('scanning for cell masks ...', flush=True)
     t = time.time()
-    have = fovs_with_cells(store, pool)
+    ids_by_fov = cells_in(store, pool)
+    have = [(f, len(ids)) for f, ids in ids_by_fov.items()]
     print(f'   {len(have)} of {len(pool)} FOVs carry masks, '
           f'{sum(n for _, n in have)} cells   ({time.time() - t:.1f}s)')
     if not have:
@@ -191,11 +217,20 @@ def main(argv=None):
             print(f'   fov{f:03d} is missing {gone} -- dropping them')
             hybes = [h for h in hybes if h in here]
 
-    cells = sum(ncell[f] for f in fovs)
+    n_cells = int(a.n_cells) if int(a.n_cells or 0) > 0 else None
+    cell_seed = int(a.cell_seed)
+    drawn, avail = X.draw_cells(store, fovs, n_cells=n_cells, seed=cell_seed,
+                                ids_by_fov=ids_by_fov)
+    cells = sum(len(drawn[f]) for f in fovs)
+    cells_all = sum(avail[f] for f in fovs)
     print(f'\nFOVs    {fovs}' + (f'   (random, seed {seed})' if seed else
                                  '   (given)'))
-    print(f'        cells per FOV: '
-          + ', '.join(f'{f}:{ncell[f]}' for f in fovs) + f'   total {cells}')
+    print(f'cells   {cells:,} of {cells_all:,}'
+          + (f'   (--n-cells {n_cells}, seed {cell_seed}: an equal share '
+             f"per FOV off each FOV's seeded permutation)"
+             if n_cells is not None else '   (every cell, store order)'))
+    print('        per FOV drawn/have: '
+          + ', '.join(f'{f}:{len(drawn[f])}/{avail[f]}' for f in fovs))
     print(f'hybes   {len(hybes)}  (datatypes {a.datatypes or "all"})')
     for h in hybes:
         print(f'          {h:10s} {dts.get(h, "?")}')
@@ -213,6 +248,9 @@ def main(argv=None):
         hybes=hybes, hybe_datatypes=dts, datatypes=str(a.datatypes),
         fovs=fovs, fov_seed=seed, fov_pool=str(a.fov_pool),
         cells_per_fov={str(f): ncell[f] for f in fovs},
+        n_cells=n_cells, cell_seed=cell_seed,
+        cells_drawn=cells, cells_available=cells_all,
+        cells_drawn_per_fov={str(f): len(drawn[f]) for f in fovs},
         pad=int(a.pad), chunk=int(a.chunk), workers=a.workers,
         engine='anchor-v2', anchor=dict(E.GENEROUS_ANCHOR),
         started=time.strftime('%Y-%m-%dT%H:%M:%S'))
@@ -234,6 +272,23 @@ def main(argv=None):
             prior = [{k: v for k, v in was.items() if k != 'runs'}]
     except Exception:                                        # noqa: BLE001
         prior = []
+    # A DIFFERENT DRAW AGAINST SHARDS ON DISK is the one append that is
+    # not exact: a shard is skipped by NAME, so a chunk this draw shares
+    # a name with keeps the earlier run's cells. Said here, from the
+    # manifest, rather than discovered in the review.
+    def _draw_of(r):
+        n = r.get('n_cells')
+        return (int(n) if n else None, int(r.get('cell_seed') or 0))
+    differ = sorted({_draw_of(r) for r in prior
+                     if _draw_of(r) != (n_cells, cell_seed)}, key=str)
+    if differ:
+        print(f'\nWARNING the run(s) already in this bundle drew their '
+              f'cells differently -- (n_cells, seed) {differ} against '
+              f'({n_cells}, {cell_seed}) now. A shard already on disk is '
+              f'kept as it is, so where this draw shares a chunk name '
+              f'with one of theirs the earlier cells stay and these are '
+              f'not cut. Pass the same --n-cells and --cell-seed to extend '
+              f'the bundle exactly, or --rebuild.', flush=True)
     # Same channel built again REPLACES its own entry rather than
     # stacking duplicates: the shards were just overwritten too.
     prior = [r for r in prior if int(r.get('channel', -1)) != int(a.channel)]
@@ -290,7 +345,7 @@ def main(argv=None):
     X.extract(store, fovs, hybes, int(a.channel), str(a.out),
               workers=workers, chunk=int(a.chunk), pad=int(a.pad),
               on_task=on_task, skip_existing=not a.rebuild,
-              on_plan=on_plan)
+              on_plan=on_plan, cells=drawn)
     wall = time.time() - t0
 
     summary = X.summarize(str(a.out))

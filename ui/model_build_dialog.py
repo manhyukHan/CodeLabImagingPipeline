@@ -199,6 +199,27 @@ class ModelBuildDialog(QtWidgets.QDialog):
         f.addWidget(self.BundlePathLineEdit, 0, 1)
         self.BrowsePushButton = QtWidgets.QPushButton('Browse...')
         f.addWidget(self.BrowsePushButton, 0, 2)
+        f.addWidget(QtWidgets.QLabel('cells:'), 1, 0)
+        self.CellsSpinBox = QtWidgets.QSpinBox()
+        self.CellsSpinBox.setRange(0, 1000000)
+        self.CellsSpinBox.setSingleStep(500)
+        self.CellsSpinBox.setSpecialValueText('all')
+        self.CellsSpinBox.setValue(10000)
+        self.CellsSpinBox.setToolTip(
+            'How many CELLS the bundle cuts, spread evenly over the listed '
+            'FOVs by a seeded draw -- the same cells for every checked '
+            'channel. Every checked hybe and channel is cut for each drawn '
+            'cell, so the crops to review are cells x sources: four '
+            'sources, four crops a cell. "all" (0) is every cell of every '
+            'listed FOV, in store order.')
+        self.CellsSpinBox.setMaximumWidth(120)
+        self.CellsNote = QtWidgets.QLabel('')
+        self.CellsNote.setWordWrap(True)
+        self.CellsNote.setStyleSheet('color:#555;')
+        h = QtWidgets.QHBoxLayout()
+        h.addWidget(self.CellsSpinBox)
+        h.addWidget(self.CellsNote, 1)
+        f.addLayout(h, 1, 1, 1, 2)
         f.addWidget(QtWidgets.QLabel('workers:'), 2, 0)
         self.WorkersSpinBox = QtWidgets.QSpinBox()
         self.WorkersSpinBox.setRange(1, 64)
@@ -316,6 +337,12 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.SourceListWidget.itemChanged.connect(
             lambda _i: self._suggest_bundle_path())
         self.RandomCountLineEdit.returnPressed.connect(self._draw_fovs)
+        self.CellsSpinBox.valueChanged.connect(
+            lambda _v: self._explain_cells())
+        self.SourceListWidget.itemChanged.connect(
+            lambda _i: self._explain_cells())
+        self.FovListLineEdit.textChanged.connect(
+            lambda _t: self._explain_cells())
         self.BrowsePushButton.clicked.connect(self._browse)
         self.BuildBundlePushButton.clicked.connect(self._build_bundle)
         self.OpenSpotCheckPushButton.clicked.connect(self._open_spotcheck)
@@ -329,6 +356,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
             lambda _t: self._explain_target())
         self.TrainPushButton.clicked.connect(self._train)
         self.ClosePushButton.clicked.connect(self.close)
+        self._explain_cells()
 
     # -- log ----------------------------------------------------------
 
@@ -490,6 +518,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._log(f'{len(have)} of {len(self._fov_pool)} declared FOV(s) '
                   f'carry cell masks')
         self._fill_fovs(n, have)
+        self._explain_cells()
 
     def _on_scan_failed(self, why):
         self.ProgressBar.setRange(0, 1)
@@ -516,6 +545,35 @@ class ModelBuildDialog(QtWidgets.QDialog):
             return _parse_fovs(self.FovListLineEdit.text())
         except ValueError:
             return []
+
+    def _explain_cells(self):
+        """What the cells setting comes to in crops. Pure: no NAS read
+        -- the listed FOVs' cell counts are used only once a draw has
+        scanned them."""
+        n = int(self.CellsSpinBox.value())
+        srcs = len(self.checked_sources())
+        avail = None
+        sp = self._store(quiet=True)
+        fovs = self.fovs()
+        if sp and sp in self._have and fovs:
+            counts = dict(self._have[sp])
+            avail = sum(counts.get(int(f), 0) for f in fovs)
+        if n <= 0:
+            cells, head = avail, 'every cell of the listed FOVs'
+        elif avail is not None and n >= avail:
+            cells = avail
+            head = f'{n:,} asked, {avail:,} in the listed FOVs: every cell'
+        else:
+            cells = n
+            head = (f'{n:,} cells, an equal share per FOV, seeded'
+                    + (f' (of {avail:,})' if avail is not None else ''))
+        if srcs and cells is not None:
+            tail = f'  x {srcs} source(s) = {cells * srcs:,} crops to review'
+        elif srcs:
+            tail = f'  x {srcs} source(s)'
+        else:
+            tail = '  x (no source checked yet)'
+        self.CellsNote.setText(head + tail)
 
     # -- 3  bundle ------------------------------------------------------
 
@@ -671,7 +729,8 @@ class ModelBuildDialog(QtWidgets.QDialog):
                          # the old chain made at FOV 41.
                          '--fov-pool', ','.join(str(f) for f in
                                                 (self._fov_pool or fovs)),
-                         '--workers', str(int(self.WorkersSpinBox.value()))])
+                         '--workers', str(int(self.WorkersSpinBox.value())),
+                         '--n-cells', str(int(self.CellsSpinBox.value()))])
         return cmds
 
     def _build_bundle(self):

@@ -259,6 +259,93 @@ def candidates_for(stack, engine, max_fits, anchor, keep_top=None):
 
 DEFAULT_CHUNK = 8
 
+# WHICH CELLS. Not every cell of every FOV. A review is a person's week,
+# and a detector learns from VARIETY -- cells spread across FOVs, and
+# every hybe and channel of each -- not from the 300th cell of one
+# field. So a build takes a count of CELLS, spreads it as evenly as the
+# FOVs allow, and cuts every source (hybe, channel) for each drawn
+# cell: the crops a reviewer meets are n_cells x sources -- four
+# sources, four crops a cell. 10,000 is the operator's default. None
+# (the CLI's --n-cells 0) is every cell in store order, exactly the
+# earlier behaviour, which is what a bundle built before the draw
+# existed has.
+#
+# THE DRAW IS A SEEDED PERMUTATION PER FOV, and the chunks are cut from
+# its prefix. That is what makes the sample shared and extendable:
+# every channel's build draws the same cells (the permutation depends
+# on the seed and the FOV alone -- not on the channel, the hybes, or
+# which other FOVs are in the run); an interrupted build resumes on
+# the same plan; asking for more cells later extends each FOV's prefix,
+# so only the last, partial chunk of each FOV changes. A DIFFERENT count
+# or seed against shards already on disk is the one case that is not
+# exact, and build_bundle says so from the manifest.
+DEFAULT_N_CELLS = 10000
+
+
+def allocate(avail, n, seed=0):
+    """{fov: k} -- n cells spread as evenly as the FOVs allow.
+
+    Equal shares, water-filled: a FOV with fewer cells than its share
+    gives all of them and the shortfall goes round the others. What is
+    left when the shares reach zero goes one each to FOVs in a seeded
+    order, so the split is the same on every machine.
+    """
+    avail = {int(f): max(0, int(c)) for f, c in avail.items()}
+    total = sum(avail.values())
+    if n is None or int(n) >= total:
+        return dict(avail)
+    left = max(0, int(n))
+    take = {f: 0 for f in avail}
+    room = [f for f in avail if avail[f] > 0]
+    while left > 0 and room:
+        share = left // len(room)
+        if share == 0:
+            break
+        for f in list(room):
+            add = min(share, avail[f] - take[f])
+            take[f] += add
+            left -= add
+            if take[f] >= avail[f]:
+                room.remove(f)
+    if left > 0 and room:
+        import random
+        order = sorted(room)
+        random.Random(int(seed)).shuffle(order)
+        for f in order[:left]:
+            take[f] += 1
+    return take
+
+
+def permuted_ids(ids, fov, seed=0):
+    """This FOV's cells in a fixed random order -- a function of (seed,
+    fov) alone, never of the run's other settings."""
+    ids = sorted(int(i) for i in ids)
+    rng = np.random.RandomState((int(seed) * 1000003 + int(fov)) % (2 ** 32))
+    return [ids[i] for i in rng.permutation(len(ids))]
+
+
+def draw_cells(storage_path, fovs, n_cells=None, seed=0, ids_by_fov=None):
+    """({fov: [cell ids]}, {fov: n_available}) -- the cells a build cuts.
+
+    n_cells None: every cell, in store order (see above). Otherwise the
+    per-FOV share from allocate(), taken off the front of that FOV's
+    permutation. ids_by_fov lets a caller that already read the masks
+    (build_bundle's scan) pass them in rather than read them again.
+    """
+    fovs = [int(f) for f in fovs]
+    if ids_by_fov is None:
+        # ids only -- the frame does not change which cells exist
+        ids_by_fov = {f: [c[0] for c in cell_masks(storage_path, f)]
+                      for f in fovs}
+    ids_by_fov = {int(f): [int(i) for i in (v or [])]
+                  for f, v in ids_by_fov.items()}
+    avail = {f: len(ids_by_fov.get(f) or []) for f in fovs}
+    if n_cells is None:
+        return {f: list(ids_by_fov.get(f) or []) for f in fovs}, avail
+    take = allocate(avail, int(n_cells), seed=seed)
+    return ({f: permuted_ids(ids_by_fov.get(f) or [], f, seed)[:take[f]]
+             for f in fovs}, avail)
+
 
 def shard_path(out_dir, fov, hybe, channel, tag):
     """Where one (fov, hybe, channel, cell-chunk) shard lives. ONE place,
@@ -343,18 +430,27 @@ def extract_chunk(storage_path, fov, hybe, channel, cell_ids, out_dir, tag,
     return path, n_crop, n_cand
 
 
-def plan(storage_path, fovs, hybes, channel, chunk=DEFAULT_CHUNK):
+def plan(storage_path, fovs, hybes, channel, chunk=DEFAULT_CHUNK,
+         n_cells=None, seed=0, cells=None):
     """[(fov, hybe, cell_ids, tag), ...] -- every task, FOV-major.
 
     FOV-major ordering, one shared pool: the same rule ingestion follows.
     Ordering matters even with balanced chunks, because a run stopped
     half way then has whole FOVs finished rather than a scatter of
     fragments across all of them.
+
+    `cells` is draw_cells()'s {fov: ids} when the caller drew already
+    (build_bundle does, to print and record the draw); otherwise the
+    draw is made here from n_cells and seed. Chunks are cut from each
+    FOV's list in ITS order -- the permutation's, when drawn -- so a
+    chunk's membership depends on the draw alone, never on the channel.
     """
+    if cells is None:
+        cells, _avail = draw_cells(storage_path, fovs, n_cells=n_cells,
+                                   seed=seed)
     tasks = []
     for fov in [int(f) for f in fovs]:
-        # ids only -- the frame does not change which cells exist
-        ids = [c[0] for c in cell_masks(storage_path, fov)]
+        ids = [int(i) for i in (cells.get(int(fov)) or [])]
         if not ids:
             continue
         for hybe in hybes:
@@ -449,7 +545,7 @@ def default_workers():
 
 def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
             chunk=DEFAULT_CHUNK, on_task=None, skip_existing=True,
-            on_plan=None, **kw):
+            on_plan=None, n_cells=None, seed=0, cells=None, **kw):
     """Build a whole bundle. (fov, hybe, cell-chunk) through ONE pool.
 
     on_task(done, total, fov, hybe, path, n_crops, n_candidates) fires as
@@ -465,6 +561,10 @@ def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
     on_plan(n_todo, n_skipped) says so; a .part left behind is not a
     shard and is rebuilt. skip_existing=False rebuilds everything.
 
+    WHICH CELLS: `cells` ({fov: ids}, from draw_cells) when the caller
+    drew them, else drawn here from n_cells and seed -- None is every
+    cell. See DEFAULT_N_CELLS for why a build is a COUNT of cells.
+
     `workers` defaults to default_workers(). This workload is CPU
     bound -- 99.8% of a crop is the fit -- so unlike the alignment path,
     which is bandwidth bound and measured FASTER at 3 workers, here more
@@ -473,7 +573,8 @@ def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
     from concurrent.futures import ProcessPoolExecutor, as_completed
     import multiprocessing
     os.makedirs(str(out_dir), exist_ok=True)
-    tasks = plan(storage_path, fovs, hybes, channel, chunk=chunk)
+    tasks = plan(storage_path, fovs, hybes, channel, chunk=chunk,
+                 n_cells=n_cells, seed=seed, cells=cells)
     n_all = len(tasks)
     if skip_existing:
         tasks = [t for t in tasks
