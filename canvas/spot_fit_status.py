@@ -192,7 +192,12 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             color = 'yellow' if (i == 0 or all_primary) else 'blue'
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none', edgecolors=color, linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
-            ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+            # ONLY INSIDE THE WINDOW IT SHOWS. A ring whose z lies
+            # outside [zmin, zmax) was being drawn in the margin above or
+            # below the image, which read as a broken panel rather than
+            # as "further away than this view reaches".
+            if zmin <= cz < zmax:
+                ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
             if labels and i < len(labels) and labels[i]:
                 _label(ax_yx, cx, cy, str(labels[i]), color)
     if rejected_list:
@@ -200,7 +205,8 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none',
                                  edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
-            ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+            if zmin <= cz < zmax:
+                ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
             if rejected_labels and i < len(rejected_labels) and rejected_labels[i]:
                 _label(ax_yx, cx, cy, str(rejected_labels[i]), 'deepskyblue')
     if lateral_list:

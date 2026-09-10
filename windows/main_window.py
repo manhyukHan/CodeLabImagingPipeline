@@ -9256,6 +9256,20 @@ class MainWindow(QtWidgets.QMainWindow):
             fid_results, readout_results = [], []
             rejected = allele.rejected_hybes or {}
 
+            def _short_reason(why):
+                """A rejection reason that fits a 190 px tile."""
+                w = str(why)
+                if w.startswith('readout'):
+                    w = w[len('readout'):].strip(' :')
+                for long, short in (
+                        ('no candidate could be placed to sub-voxel '
+                         'precision', 'none placed sub-voxel'),
+                        ('every candidate below p_exist', 'all below p'),
+                        ('planes from the fiducial in z', 'planes from fid z'),
+                        ('every candidate more than', 'all >')):
+                    w = w.replace(long, short)
+                return w[:34]
+
             def _titled(hybe, occ, unc, channel):
                 """'Hyb_023 / occ 0.69 / at bound (z)' -- number AND verdict.
 
@@ -9330,14 +9344,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         pe = d.get('readout_p_exist') or []
                         kept_n = len(d.get('readout_centroids') or [])
                         why = str(rejected.get(hybe, '') or '')
-                        head = (f'{hybe}\np_exist ' + ', '.join(
-                            f'{v:.2f}' for v in sorted(pe, reverse=True)[:6])
-                            + (' ...' if len(pe) > 6 else '')
+                        # FOUR VALUES AND A COUNT: a 190 px tile holds
+                        # about that at 8 pt before the next tile's
+                        # title runs into it, which a real grid showed.
+                        top = sorted(pe, reverse=True)[:4]
+                        head = (f'{hybe}\np ' + ', '.join(f'{v:.2f}' for v in top)
+                            + (f' +{len(pe) - 4}' if len(pe) > 4 else '')
                             + f'\n{kept_n} kept of {len(pe)}')
-                        if why and why.startswith('readout'):
-                            head += '\n' + why[len('readout'):].strip(' :')
-                        elif why:
-                            head += '\n' + why
+                        if why:
+                            head += '\n' + _short_reason(why)
                         readout_results.append((
                             d['readout_cubic'], d.get('readout_centroids'),
                             head, d.get('readout_rejected_centroids'),

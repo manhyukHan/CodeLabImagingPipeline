@@ -85,6 +85,9 @@ def test_routing():
     src = inspect.getsource(T2.trace_allele)
     check('trace_allele dispatches on the tracer, not on is_v2',
           'if not uses_v2_tracer(engine):' in src)
+    bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
+    check("the caller hands _readout_multi the fiducial's own position",
+          'seed_yx=seed_yx' in bsrc and 'fid_local[hybe][0]' in bsrc)
     check('and stamps v3 as v3', "'v3' if is_v3(engine)" in src)
     for fn in (T2.allele_task, T2.allele_task_with_debug):
         s = inspect.getsource(fn)
@@ -123,7 +126,8 @@ def test_params():
         check('the shipped model is present', False, 'skipped')
 
 
-def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None):
+def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None,
+         seed_yx=(8.0, 8.0)):
     from codelab_pipeline.models.allele import AnAllele
     a = AnAllele()
     a.polymer_adj, a.polymer_raw = {}, {}
@@ -133,52 +137,65 @@ def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None):
         cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
     ok, why = T2._readout_multi(
         a, 'H', cube, z_r, p, 0.0, 0.0, 0.0, 100, 200,
-        lambda h, y, x, z, ymin, xmin: (y + ymin, x + xmin, z), debug)
+        lambda h, y, x, z, ymin, xmin: (y + ymin, x + xmin, z), debug,
+        seed_yx=seed_yx)
     return a, ok, why
 
 
 def test_readout_multi_gates():
     print('_readout_multi: the fiducial\'s reach, then p_exist, then refinement')
     z_half = T2._seed_z_half(T2.READOUT_FIT_RADIUS_UM, T2.DEFAULT_VOXEL_UM)
+    r_lat = T2._lateral_reach_px(T2.READOUT_FIT_RADIUS_UM, T2.DEFAULT_VOXEL_UM)
     check('the axial reach is v2\'s own readout search half-depth',
           z_half >= 1, f'{z_half} planes')
-    spots = [spot(8, 8, 20.0, 0.9),                 # kept
-             spot(8, 12, 22.0, 0.8),                # kept: a second locus
-             spot(8, 4, 20.0 + z_half + 5, 0.95),   # out of the fiducial's reach
-             spot(4, 8, 20.0, 0.3),                 # below the threshold
-             spot(12, 8, 21.0, 0.7, p=float('nan'))]  # never refined
+    check('and the lateral reach is the same radius in pixels',
+          r_lat >= 1, f'{r_lat} px')
+    # THE ENGINE SEES THE SLAB, so a fake that echoes its inputs must
+    # speak slab-local z: z0 = z_r - z_half, and a hit at slab z_half is
+    # at the fiducial's own plane.
+    z0 = 20 - z_half
+    spots = [spot(8, 8, float(z_half), 0.9),               # kept, at z_r
+             spot(8, 12, float(z_half + 2), 0.8),          # kept: a second locus
+             spot(8, 4, float(2 * z_half + 5), 0.95),      # beyond the reach in z
+             spot(8, 16, float(z_half), 0.88),             # beyond the reach laterally
+             spot(4, 8, float(z_half), 0.3),               # below the threshold
+             spot(12, 8, float(z_half + 1), 0.7, p=float('nan'))]  # never refined
     eng = FakeEngine(spots)
     debug = {'H': {}}
     a, ok, why = _run(eng, z_r=20.0, min_p_exist=0.5, debug=debug)
-    check('the engine saw the fiducial-anchored crop as given',
-          eng.seen == (17, 17, 105))
+    check("the engine saw the fiducial's SLAB, not the whole column",
+          eng.seen == (17, 17, 2 * z_half + 1), str(eng.seen))
     check('it wrote', ok, why)
     adj = a.polymer_adj['H']
     check('TWO loci written as a list -- the multispot the panel never got',
           len(adj) == 2 and all(len(t) == 4 for t in adj))
+    check('their z is back in the CROP\'s planes, not the slab\'s',
+          sorted(round(t[2]) for t in adj) == [20, 22],
+          str([t[2] for t in adj]))
     check('the far-in-z spot is NOT one of them, however confident',
           all(abs(t[2] - 20.0) <= z_half + 2.5 for t in adj))
     d = debug['H']
     check('every candidate reaches the grid with its p_exist',
-          d['readout_engine'] == 'v3' and len(d['readout_p_exist']) == 5)
+          d['readout_engine'] == 'v3' and len(d['readout_p_exist']) == 6)
     check('kept ones carry labels', d['readout_labels'] == ['0.90', '0.80'])
     check('dropped ones carry theirs and their reasons',
-          len(d['readout_rejected_centroids']) == 3
-          and d['readout_rejected_labels'] == ['0.95', '0.30', '0.70']
-          and any('from the fiducial' in w for w in d['readout_dropped_why'])
+          len(d['readout_rejected_centroids']) == 4
+          and d['readout_rejected_labels'] == ['0.95', '0.88', '0.30', '0.70']
+          and any('planes from the fiducial' in w for w in d['readout_dropped_why'])
+          and any('px from the fiducial' in w for w in d['readout_dropped_why'])
           and any('p_exist 0.30 < 0.5' in w for w in d['readout_dropped_why'])
           and any('sub-voxel' in w for w in d['readout_dropped_why']),
           str(d['readout_dropped_why']))
     check('and the count of out-of-reach ones is recorded',
-          d['readout_n_out_of_reach'] == 1)
+          d['readout_n_out_of_reach'] == 2)
 
-    # No threshold: p_exist is not cut at all (the axial reach still is).
+    # No threshold: p_exist is not cut at all (the reach still is).
     a2, ok2, _ = _run(FakeEngine(spots), z_r=20.0, min_p_exist=None)
     check('with no threshold, only reach and refinement cut',
           ok2 and len(a2.polymer_adj['H']) == 3)
 
     # Every candidate out of reach: the reason says so.
-    far = [spot(8, 8, 90.0, 0.9), spot(8, 12, 95.0, 0.9)]
+    far = [spot(8, 8, 2 * z_half + 20.0, 0.9), spot(8, 12, 2 * z_half + 25.0, 0.9)]
     a3, ok3, why3 = _run(FakeEngine(far), z_r=20.0)
     check('all out of reach -> rejected with the reach named',
           not ok3 and 'from the fiducial in z' in why3, why3)
@@ -271,6 +288,8 @@ def test_main_window_wiring():
     check('the readout tile for v3 lists p_exist and rings every kept hit',
           "d.get('readout_engine') == 'v3'" in src
           and "'all_primary': True" in src)
+    check('and its title is cut to fit the tile',
+          'def _short_reason(why):' in src and "[:4]" in src)
     check('the tracing panel gets the same model list as Spot Localization',
           'chp.populate_models(' in inspect.getsource(MW._refresh_model_list))
 

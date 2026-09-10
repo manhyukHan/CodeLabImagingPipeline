@@ -672,8 +672,13 @@ def fit_fiducial_from(cube, seed, p):
         background='linear', apply_gates=False)
 
 
+def _lateral_reach_px(fit_radius_um, voxel_um):
+    """Lateral reach in PIXELS, from the same radius the axial one uses."""
+    return max(1, int(round(fit_radius_um[0] / float(voxel_um[0]))))
+
+
 def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
-                   to_shared, debug=None):
+                   to_shared, debug=None, seed_yx=None):
     """Every readout candidate in one crop, via a learned engine.
 
     Returns (wrote_anything, reason). Fills polymer_adj / polymer_raw with
@@ -692,8 +697,27 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     so it has to be finite and comparable within this crop; it is not a
     quantity to compare against a v1/v2 amplitude from another run.
     """
+    # THE SEARCH IS THE FIDUCIAL'S SLAB, not the whole column. The crop
+    # carries every plane of the stack, and a learned engine handed all
+    # of it found real emitters forty planes from this locus -- other
+    # cells' spots in the same column -- which the reach gate then
+    # rejected, and the grid drew them off the ZX image because the
+    # window it shows is the reach. Cutting the slab first means such a
+    # candidate never forms, the engine does a third of the work, and
+    # everything it returns is inside the picture a person sees. Lateral
+    # extent stays the crop's: the engine's own boxes are 15 px wide and
+    # need room; reach is gated below instead.
+    z_half = _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    depth = int(np.asarray(cube).shape[2])
+    if z_r is not None and np.isfinite(z_r):
+        z0 = max(0, int(round(float(z_r))) - z_half)
+        z1 = min(depth, int(round(float(z_r))) + z_half + 1)
+    else:
+        z0, z1 = 0, depth
+    slab = np.asarray(cube)[:, :, z0:z1]
     try:
-        cands = p.readout_engine.localize(cube, seed_yxz=None, n_max=None)
+        cands = p.readout_engine.localize(slab, seed_yxz=None, n_max=None)
+        cands = [c._replace(z=float(c.z) + z0) for c in cands]
     except Exception as exc:                                # noqa: BLE001
         # A tracing run must not die on one crop. Same rule the rest of
         # this module keeps: a hybe that cannot be fitted is a rejected
@@ -714,14 +738,25 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     # would have looked is a spot with a different z-drift from the
     # fiducial's, which is exactly the spot this trace must not carry.
     # Lateral reach needs no gate: the crop's own edges are it.
-    z_half = _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    r_lat = _lateral_reach_px(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    if seed_yx is None:
+        h, w = np.asarray(cube).shape[:2]
+        seed_yx = ((h - 1) / 2.0, (w - 1) / 2.0)
     dropped = []                    # (cand, why) for the grid
     in_reach = []
     for c in cands:
-        if (z_r is not None and np.isfinite(z_r)
-                and abs(float(c.z) - float(z_r)) > z_half):
-            dropped.append((c, f'z {abs(float(c.z) - float(z_r)):.1f} planes '
-                               f'from the fiducial > {z_half}'))
+        dzr = (abs(float(c.z) - float(z_r))
+               if z_r is not None and np.isfinite(z_r) else 0.0)
+        dlat = max(abs(float(c.y) - float(seed_yx[0])),
+                   abs(float(c.x) - float(seed_yx[1])))
+        if dzr > z_half:
+            dropped.append((c, f'z {dzr:.1f} planes from the fiducial '
+                               f'> {z_half}'))
+        elif dlat > r_lat:
+            # THE FIDUCIAL'S OWN LATERAL REACH, the same +/-1 um v2's
+            # readout fit is allowed to move from its seed. A candidate
+            # further out is a neighbour the crop happened to include.
+            dropped.append((c, f'{dlat:.1f} px from the fiducial > {r_lat}'))
         else:
             in_reach.append(c)
     t = p.min_p_exist
@@ -1328,9 +1363,17 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # that rebuilt that mapping would be a second implementation
             # of the frame conversion, which is the divergence this
             # codebase keeps having to hunt down.
+            # THE SEED IS THE FIDUCIAL'S OWN FITTED POSITION in this crop
+            # -- both channels are cut by _cut around the same mapped
+            # centre with the same pad, so fid_local's (y, x) is valid
+            # here -- and that, not the crop centre, is what a readout
+            # candidate has to be near.
+            seed_yx = ((float(fid_local[hybe][0]), float(fid_local[hybe][1]))
+                       if hybe in fid_local else None)
             done, why_multi = _readout_multi(allele, hybe, cube, z_r, p,
                                              dy, dx, dz, ymin, xmin,
-                                             _to_shared, debug)
+                                             _to_shared, debug,
+                                             seed_yx=seed_yx)
             if not done:
                 allele.rejected_hybes[hybe] = why_multi
             continue

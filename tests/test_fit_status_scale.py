@@ -237,6 +237,17 @@ def test_markers_land_where_they_are_told():
           str(np.asarray(ax_xz.images[-1].get_array()).shape))
     plt.close(fig)
 
+    # A RING OUTSIDE THE SHOWN WINDOW STAYS OFF THE ZX PANEL. It used to
+    # be drawn in the margin above or below the image, which read as a
+    # broken panel rather than as 'further than this view reaches'.
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube,
+                           centroid=[(11.0, 3.0, 30.0)],
+                           rejected=[(3.0, 11.0, 8.0)])   # 22 planes off
+    check('the kept ring is on both panels',
+          len(ax_yx.collections) == 2 and len(ax_xz.collections) == 1)
+    plt.close(fig)
+
     # The crop's brightest voxel is the OTHER blob, so a fallback that
     # ignored `lateral` would give a different window.
     fig, ax_yx, ax_xz = axes()
