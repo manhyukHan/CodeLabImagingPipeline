@@ -41,21 +41,35 @@ DEFAULT_VOXEL = (0.208, 0.208, 0.2)
 
 
 def analytic_reference(mean, voxel_um, storage_path=None):
-    """How far the measured template is from the calibrated analytic one.
+    """How far the measured template is from the calibrated analytic one,
+    and which analytic family describes the template ITSELF.
 
-    A cheap and worthwhile check: if the two agree, that is confidence in
-    both; if they do not, the difference is what an analytic family
-    cannot express, which is the reason to measure a template at all.
-    Returns {} when this project has never been analytically calibrated.
+    A cheap and worthwhile check: if the installed calibration and the
+    template agree, that is confidence in both. If they do not, the
+    family fits say which kind of disagreement it is: a template that a
+    fitted gaussian describes at cosine 0.95 while the installed readout
+    gaussian_halo sits at 0.78 was measured on other emitters (the
+    fiducial channel), not on bad labels or bad optics. The installed
+    keys (family, params, cosine_to_measured) are {} when this project
+    has never been calibrated; the fits are always there.
     """
+    out = {}
+    try:
+        ff = PB.fit_families(mean, voxel_um)
+        out['fits'] = ff['fits']
+        b = ff['best']
+        out['best_fit'] = {'family': b, 'params': ff['fits'][b]['params'],
+                           'cosine': ff['fits'][b]['cosine']}
+    except Exception as exc:                                 # noqa: BLE001
+        out['fits_error'] = f'{type(exc).__name__}: {exc}'
     if not storage_path:
-        return {}
+        return out
     try:
         doc = PSF.load(storage_path)
     except Exception:                                        # noqa: BLE001
-        return {}
+        return out
     if not doc:
-        return {}
+        return out
     # THE PARAMETERS ARE A TUPLE IN THE FAMILY'S OWN ORDER, and getting
     # that from the dict is what psf_library.shape_tuple is for. Passing
     # the dict straight to evaluate() raises -- and the first version of
@@ -66,7 +80,7 @@ def analytic_reference(mean, voxel_um, storage_path=None):
     from codelab_pipeline.localization import psf_library as PL
     st = PL.shape_tuple(doc)
     if st is None:
-        return {}
+        return out
     family, shape_params = st
     ny, nx, nz = mean.shape
     yy, xx, zz = np.mgrid[0:ny, 0:nx, 0:nz].astype(float)
@@ -75,8 +89,9 @@ def analytic_reference(mean, voxel_um, storage_path=None):
     dz = (zz - nz // 2) * voxel_um[2]
     vol = PSF.evaluate(family, shape_params, dy, dx, dz)
     a = PB.normalise(np.asarray(vol, float)).ravel()
-    return {'family': family, 'params': doc.get('params'),
-            'cosine_to_measured': float(a @ PB.normalise(mean).ravel())}
+    out.update({'family': family, 'params': doc.get('params'),
+                'cosine_to_measured': float(a @ PB.normalise(mean).ravel())})
+    return out
 
 
 # What one training run writes. ONLY these are cleared on an overwrite:
@@ -388,9 +403,16 @@ def main(argv=None):
                  if len(var) else ''))
         print(f'   its own spots score median {float(np.median(d)):.3f} '
               f'(p10 {float(np.percentile(d, 10)):.3f})')
-        if ref:
-            print(f'   vs the analytic {ref.get("family")}: '
+        if ref.get('cosine_to_measured') is not None:
+            print(f'   vs the installed {ref.get("family")}: '
                   f'cosine {ref["cosine_to_measured"]:.3f}')
+        for fam, fit in (ref.get('fits') or {}).items():
+            pr = fit.get('params') or {}
+            print(f'   fitted {fam:<13} cosine {fit["cosine"]:.3f}   '
+                  + '  '.join(f'{k}={v:.4f}' for k, v in pr.items())
+                  + ('' if fit.get('plausible') else '   (implausible)')
+                  + ('   <- best' if fam == (ref.get('best_fit') or {}).get('family')
+                     else ''))
         print(f'   -> {os.path.basename(path)}')
         report['psf'] = {'path': path, 'n_spots': len(pos),
                          'explained_var': [float(v) for v in var],

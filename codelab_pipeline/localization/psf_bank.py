@@ -451,14 +451,115 @@ DEFAULT_SIGMA_Z_PLANES = 2.35
 PSF_COSINE_MIN = 0.90
 
 
+# THE FAMILY IS TESTED, NOT ASSUMED. The installed calibration is a
+# READOUT PSF -- for MP58 the universal default, gaussian_halo, a mean
+# over three experiments' readout channels -- and every bank was
+# compared against it, whatever the bank was measured on. A bank of 905
+# confirmed DNA ch555 spots (the fiducial channel) came out at cosine
+# 0.776 to it, and the warning said "check the store calibration and
+# the voxel size", which was the wrong diagnosis: neither had changed.
+# Fiducial emitters are simply not readout emitters, and a plain
+# Gaussian usually describes them better than a core-plus-halo. So each
+# family is fitted to the template ITSELF: if one of them reaches the
+# floor, the template is a clean, simple shape and the low cosine to the
+# installed reference is a difference of EMITTER, not of labels or
+# optics -- and the bank's own fit, not the readout calibration, is what
+# should set its anisotropy.
+FIT_FAMILIES = ('gaussian', 'gaussian_halo')
+
+
+def fit_families(mean, voxel_um, families=FIT_FAMILIES):
+    """Fit each analytic family's shape to a measured template.
+
+    Returns {'fits': {family: {'params', 'cosine', 'plausible',
+    'warnings'}}, 'best': family}. The objective is the cosine between
+    the normalised rendered shape and the normalised template on the
+    template's own grid -- the same number cosine_warning judges -- so
+    the best fit is, by construction, the best any shape of that family
+    can do here. Each family starts from its declared initial guess and
+    from the template's own second moments, and the better of the two
+    is kept; the best family is the best-scoring PLAUSIBLE one, as
+    psf.select_best does for a calibration.
+    """
+    from scipy.optimize import minimize
+    from . import psf as P
+    m = np.asarray(mean, float)
+    if m.ndim != 3:
+        raise ValueError('expected a (ny, nx, nz) template')
+    ny, nx, nz = m.shape
+    r, rz = ny // 2, nz // 2
+    target = normalise(m).ravel()
+    vox = tuple(float(v) for v in voxel_um)
+
+    # a moment-based second start: the template's own widths
+    w = m - float(np.percentile(m, 10))
+    w = np.clip(w, 0, None)
+    w = w / max(float(w.sum()), 1e-12)
+    yy, xx, zz = np.mgrid[0:ny, 0:nx, 0:nz].astype(float)
+    s_lat = float(np.sqrt(0.5 * ((w * (yy - r) ** 2).sum()
+                                 + (w * (xx - nx // 2) ** 2).sum()))) * vox[0]
+    s_ax = float(np.sqrt((w * (zz - rz) ** 2).sum())) * vox[2]
+
+    def cosine(family, theta):
+        try:
+            vol = render(family, tuple(float(t) for t in theta), r=r, rz=rz,
+                         voxel_um=vox)
+        except Exception:                                   # noqa: BLE001
+            return -1.0
+        v = normalise(np.asarray(vol, float)).ravel()
+        return float(v @ target)
+
+    fits = {}
+    for family in families:
+        _fn, names, init, bounds = P.FAMILIES[family]
+        starts = [list(init)]
+        alt = list(init)
+        alt[0] = float(np.clip(s_lat, bounds[0][0], bounds[0][1]))
+        alt[1] = float(np.clip(s_ax, bounds[1][0], bounds[1][1]))
+        starts.append(alt)
+        best = None
+        for x0 in starts:
+            res = minimize(lambda t: 1.0 - cosine(family, t),
+                           np.array(x0, float), method='Nelder-Mead',
+                           bounds=bounds,
+                           options={'xatol': 1e-4, 'fatol': 1e-6,
+                                    'maxiter': 400})
+            if best is None or res.fun < best.fun:
+                best = res
+        params = {k: float(v) for k, v in zip(names, best.x)}
+        ok, why = P.plausible(family, params)
+        fits[family] = {'params': params, 'cosine': float(1.0 - best.fun),
+                        'plausible': bool(ok), 'warnings': list(why or [])}
+    usable = [f for f in fits if fits[f]['plausible']] or list(fits)
+    # THE SIMPLEST FAMILY WITHIN A HAIR OF THE BEST WINS. A Gaussian is
+    # also a gaussian_halo with halo_frac 0, so on a Gaussian template
+    # the two tie to the last decimal and floating point decides -- and
+    # it decided for the four-parameter shape. The tolerance is far
+    # below any real difference (the RNA readout bank separates them by
+    # 0.05, the DNA ch555 bank by 0.03).
+    top = max(fits[f]['cosine'] for f in usable)
+    close = [f for f in usable if fits[f]['cosine'] >= top - 1e-3]
+    best = min(close, key=lambda f: (len(P.FAMILIES[f][1]),
+                                     -fits[f]['cosine']))
+    return {'fits': fits, 'best': best}
+
+
+def best_fit(analytic_ref):
+    """The bank's own best analytic fit from its reference, or {}."""
+    return (analytic_ref or {}).get('best_fit') or {}
+
+
 def cosine_warning(analytic_ref, n_spots=None, floor=PSF_COSINE_MIN):
     """A sentence when the template does not match the optics, else None.
 
-    Says WHICH of the two causes to look at, because the answer is
-    different work: more review, or a re-calibration.
+    Says WHICH of the causes to look at, because the answer is different
+    work: more review, a re-calibration, or -- when a fitted family
+    describes the template well -- nothing at all, because the bank was
+    measured on another kind of emitter than the installed calibration.
     """
     ref = analytic_ref or {}
     c = ref.get('cosine_to_measured')
+    bf = best_fit(ref)
     if c is None:
         return ('no analytic PSF to compare against -- train_spotmodel was '
                 'run without --storage-path, so nothing checked this '
@@ -468,6 +569,20 @@ def cosine_warning(analytic_ref, n_spots=None, floor=PSF_COSINE_MIN):
     if float(c) >= float(floor):
         return None
     n = int(n_spots) if n_spots else None
+    if bf.get('cosine') is not None and float(bf['cosine']) >= float(floor):
+        pr = bf.get('params') or {}
+        why = (f"but a fitted {bf.get('family')} describes the template at "
+               f"cosine {float(bf['cosine']):.3f} (sigma_xy "
+               f"{1000 * float(pr.get('sigma_xy_um', float('nan'))):.0f} nm, "
+               f"sigma_z {1000 * float(pr.get('sigma_z_um', float('nan'))):.0f}"
+               f" nm), so this is neither a label shortage nor a microscope "
+               f"problem: the emitters this bank was measured on are not the "
+               f"ones the installed {ref.get('family')} was calibrated on -- "
+               f"a fiducial-channel bank, most likely. The bank itself is the "
+               f"PSF here, and its own fit sets its anisotropy."
+               + (f' ({n} confirmed spots went into it.)' if n else ''))
+        return (f'PSF template cosine to the installed {ref.get("family")} '
+                f'is {float(c):.3f}, below {float(floor):.2f}, {why}')
     if n is not None and n < 80:
         why = (f'{n} confirmed spots went into it, and MEASURED on MP58/RNA '
                f'a template needs about 80 before this settles (at 40 the '
@@ -481,8 +596,12 @@ def cosine_warning(analytic_ref, n_spots=None, floor=PSF_COSINE_MIN):
                if n is not None else
                'check both the number of confirmed spots and the store '
                'calibration.')
+    fitted = (f" No fitted family reaches {float(floor):.2f} either (best "
+              f"{bf.get('family')} at {float(bf['cosine']):.3f}), so the "
+              f"template is not a clean simple shape."
+              if bf.get('cosine') is not None else '')
     return (f'PSF template cosine to the calibrated optics is {float(c):.3f}, '
-            f'below {float(floor):.2f}. {why}')
+            f'below {float(floor):.2f}. {why}{fitted}')
 
 
 def resolution_bound(meta=None, lateral_px=MERGE_LATERAL_PX):
@@ -493,10 +612,25 @@ def resolution_bound(meta=None, lateral_px=MERGE_LATERAL_PX):
     brings its own ratio rather than inheriting MP58's. The lateral
     bound is the number that was chosen; the axial one is the same
     count of sigma.
+
+    THE BANK'S OWN FIT WINS over the installed calibration whenever it
+    describes the template better (see fit_families): a fiducial-channel
+    bank at cosine 0.776 to the readout gaussian_halo would otherwise
+    take the readout's sigma_z/sigma_xy for emitters that are not
+    readouts.
     """
     lat = float(lateral_px)
     ref = (meta or {}).get('analytic_ref') or {}
     pr = ref.get('params') or {}
+    bf = best_fit(ref)
+    try:
+        if bf.get('params') and (
+                ref.get('cosine_to_measured') is None
+                or float(bf.get('cosine', -1.0))
+                > float(ref.get('cosine_to_measured'))):
+            pr = bf['params']
+    except (TypeError, ValueError):
+        pass
     vx = (meta or {}).get('voxel_um')
     try:
         sxy = float(pr['sigma_xy_um']) / float(vx[0])

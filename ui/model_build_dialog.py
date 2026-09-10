@@ -1307,9 +1307,21 @@ class ModelBuildDialog(QtWidgets.QDialog):
             lines.append(
                 f"psf        {psf.get('n_spots', '?')} confirmed spots   "
                 f"drift median {psf.get('drift_median', float('nan')):.3f}"
-                + (f"   vs analytic {ref.get('family')}: cosine "
+                + (f"   vs installed {ref.get('family')}: cosine "
                    f"{ref.get('cosine_to_measured', float('nan')):.3f}"
-                   if ref else ''))
+                   if ref.get('cosine_to_measured') is not None else ''))
+            bf = ref.get('best_fit') or {}
+            if bf:
+                pr = bf.get('params') or {}
+                lines.append(
+                    f"           best analytic fit {bf.get('family')}: cosine "
+                    f"{bf.get('cosine', float('nan')):.3f}   sigma_xy "
+                    f"{1000 * pr.get('sigma_xy_um', float('nan')):.0f} nm, "
+                    f"sigma_z {1000 * pr.get('sigma_z_um', float('nan')):.0f} nm"
+                    + ('' if len(ref.get('fits') or {}) < 2 else
+                       '   (' + ', '.join(
+                           f"{f} {v.get('cosine', float('nan')):.3f}"
+                           for f, v in (ref.get('fits') or {}).items()) + ')'))
         for w in r.get('warnings') or []:
             lines.append('WARNING    ' + str(w))
         if man.get('calibrated_at'):
