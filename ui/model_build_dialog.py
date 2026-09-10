@@ -199,26 +199,27 @@ class ModelBuildDialog(QtWidgets.QDialog):
         f.addWidget(self.BundlePathLineEdit, 0, 1)
         self.BrowsePushButton = QtWidgets.QPushButton('Browse...')
         f.addWidget(self.BrowsePushButton, 0, 2)
-        f.addWidget(QtWidgets.QLabel('cells:'), 1, 0)
-        self.CellsSpinBox = QtWidgets.QSpinBox()
-        self.CellsSpinBox.setRange(0, 1000000)
-        self.CellsSpinBox.setSingleStep(500)
-        self.CellsSpinBox.setSpecialValueText('all')
-        self.CellsSpinBox.setValue(10000)
-        self.CellsSpinBox.setToolTip(
-            'How many CELLS the bundle cuts, spread evenly over the listed '
-            'FOVs by a seeded draw -- the same cells for every checked '
-            'channel. Every checked hybe and channel is cut for each drawn '
-            'cell, so the crops to review are cells x sources: four '
-            'sources, four crops a cell. "all" (0) is every cell of every '
-            'listed FOV, in store order.')
-        self.CellsSpinBox.setMaximumWidth(120)
-        self.CellsNote = QtWidgets.QLabel('')
-        self.CellsNote.setWordWrap(True)
-        self.CellsNote.setStyleSheet('color:#555;')
+        f.addWidget(QtWidgets.QLabel('crops:'), 1, 0)
+        self.CropsSpinBox = QtWidgets.QSpinBox()
+        self.CropsSpinBox.setRange(0, 10000000)
+        self.CropsSpinBox.setSingleStep(500)
+        self.CropsSpinBox.setSpecialValueText('all')
+        self.CropsSpinBox.setValue(10000)
+        self.CropsSpinBox.setToolTip(
+            'How many CROPS the whole bundle cuts -- a crop is one cell in '
+            "one hybe and channel. Split equally over the checked sources "
+            "(each channel's build gets its share), then equally over the "
+            'listed FOVs; each (source, FOV) draws its own cells off a '
+            'seeded permutation, so hybes see different cells and every '
+            'cell is in about as many hybes as any other. "all" (0) is '
+            'every cell of every listed FOV in every source, store order.')
+        self.CropsSpinBox.setMaximumWidth(120)
+        self.CropsNote = QtWidgets.QLabel('')
+        self.CropsNote.setWordWrap(True)
+        self.CropsNote.setStyleSheet('color:#555;')
         h = QtWidgets.QHBoxLayout()
-        h.addWidget(self.CellsSpinBox)
-        h.addWidget(self.CellsNote, 1)
+        h.addWidget(self.CropsSpinBox)
+        h.addWidget(self.CropsNote, 1)
         f.addLayout(h, 1, 1, 1, 2)
         f.addWidget(QtWidgets.QLabel('workers:'), 2, 0)
         self.WorkersSpinBox = QtWidgets.QSpinBox()
@@ -337,12 +338,12 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.SourceListWidget.itemChanged.connect(
             lambda _i: self._suggest_bundle_path())
         self.RandomCountLineEdit.returnPressed.connect(self._draw_fovs)
-        self.CellsSpinBox.valueChanged.connect(
-            lambda _v: self._explain_cells())
+        self.CropsSpinBox.valueChanged.connect(
+            lambda _v: self._explain_crops())
         self.SourceListWidget.itemChanged.connect(
-            lambda _i: self._explain_cells())
+            lambda _i: self._explain_crops())
         self.FovListLineEdit.textChanged.connect(
-            lambda _t: self._explain_cells())
+            lambda _t: self._explain_crops())
         self.BrowsePushButton.clicked.connect(self._browse)
         self.BuildBundlePushButton.clicked.connect(self._build_bundle)
         self.OpenSpotCheckPushButton.clicked.connect(self._open_spotcheck)
@@ -356,7 +357,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
             lambda _t: self._explain_target())
         self.TrainPushButton.clicked.connect(self._train)
         self.ClosePushButton.clicked.connect(self.close)
-        self._explain_cells()
+        self._explain_crops()
 
     # -- log ----------------------------------------------------------
 
@@ -518,7 +519,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self._log(f'{len(have)} of {len(self._fov_pool)} declared FOV(s) '
                   f'carry cell masks')
         self._fill_fovs(n, have)
-        self._explain_cells()
+        self._explain_crops()
 
     def _on_scan_failed(self, why):
         self.ProgressBar.setRange(0, 1)
@@ -546,34 +547,38 @@ class ModelBuildDialog(QtWidgets.QDialog):
         except ValueError:
             return []
 
-    def _explain_cells(self):
-        """What the cells setting comes to in crops. Pure: no NAS read
-        -- the listed FOVs' cell counts are used only once a draw has
-        scanned them."""
-        n = int(self.CellsSpinBox.value())
+    def _explain_crops(self):
+        """What the crops setting comes to per source and per FOV. Pure:
+        no NAS read -- the listed FOVs' cell counts are used only once a
+        draw has scanned them."""
+        n = int(self.CropsSpinBox.value())
         srcs = len(self.checked_sources())
+        fovs = self.fovs()
         avail = None
         sp = self._store(quiet=True)
-        fovs = self.fovs()
         if sp and sp in self._have and fovs:
             counts = dict(self._have[sp])
             avail = sum(counts.get(int(f), 0) for f in fovs)
+        if not srcs:
+            self.CropsNote.setText('check sources (1) to see what this '
+                                   'comes to per source and per FOV')
+            return
         if n <= 0:
-            cells, head = avail, 'every cell of the listed FOVs'
-        elif avail is not None and n >= avail:
-            cells = avail
-            head = f'{n:,} asked, {avail:,} in the listed FOVs: every cell'
+            text = (f'every cell of every listed FOV, in all {srcs} '
+                    f'source(s)')
+            if avail is not None:
+                text += f' = {avail * srcs:,} crops'
         else:
-            cells = n
-            head = (f'{n:,} cells, an equal share per FOV, seeded'
-                    + (f' (of {avail:,})' if avail is not None else ''))
-        if srcs and cells is not None:
-            tail = f'  x {srcs} source(s) = {cells * srcs:,} crops to review'
-        elif srcs:
-            tail = f'  x {srcs} source(s)'
-        else:
-            tail = '  x (no source checked yet)'
-        self.CellsNote.setText(head + tail)
+            per = n // srcs
+            text = (f'{n:,} crops = {per:,} a source, equal over {srcs} '
+                    f'source(s)')
+            if fovs:
+                text += (f' and over {len(fovs)} FOV(s): '
+                         f'{per // len(fovs):,} cells a FOV a source')
+            if avail is not None and per >= avail:
+                text += (f' -- the listed FOVs have {avail:,} cells, so '
+                         f'every cell: {avail * srcs:,} crops')
+        self.CropsNote.setText(text)
 
     # -- 3  bundle ------------------------------------------------------
 
@@ -717,8 +722,15 @@ class ModelBuildDialog(QtWidgets.QDialog):
             by_ch.setdefault(int(ch), [])
             if folder not in by_ch[ch]:
                 by_ch[ch].append(folder)
+        # THE BUNDLE'S BUDGET, SHARED OUT BY SOURCE. build_bundle runs
+        # once per channel and splits its --n-crops over its hybes, so a
+        # channel with more hybes gets a proportionally larger share:
+        # every (hybe, channel) ends up with the same number of crops.
+        n_total = int(self.CropsSpinBox.value())
+        n_src = sum(len(v) for v in by_ch.values()) or 1
         cmds = []
         for ch in sorted(by_ch):
+            budget = (n_total * len(by_ch[ch])) // n_src if n_total > 0 else 0
             cmds.append([sys.executable, '-u',
                          os.path.join(self._repo, 'tools', 'build_bundle.py'),
                          str(sp), '--out', out, '--channel', str(ch),
@@ -730,7 +742,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
                          '--fov-pool', ','.join(str(f) for f in
                                                 (self._fov_pool or fovs)),
                          '--workers', str(int(self.WorkersSpinBox.value())),
-                         '--n-cells', str(int(self.CellsSpinBox.value()))])
+                         '--n-crops', str(int(budget))])
         return cmds
 
     def _build_bundle(self):

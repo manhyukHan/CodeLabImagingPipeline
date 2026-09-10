@@ -171,22 +171,24 @@ def test_build_commands():
     d.WorkersSpinBox.setValue(4)
     check('and it is what the command carries',
           all(c[c.index('--workers') + 1] == '4' for c in d.build_commands()))
-    # A COUNT OF CELLS, NOT EVERY CELL. Four RNA sources are checked
-    # here (two hybes x two channels): four crops a cell.
-    nc = {c[c.index('--n-cells') + 1] for c in cmds}
-    check('the cell count is a setting, default 10,000, on every channel',
-          nc == {'10000'} and d.CellsSpinBox.value() == 10000, str(nc))
-    note = d.CellsNote.text()
-    check('and the note says what it comes to: cells x sources = crops',
-          '10,000 cells' in note and '4 source(s) = 40,000 crops' in note,
-          note)
-    d.CellsSpinBox.setValue(0)
-    check('0 reads "all", the command carries it, the note says every cell',
-          d.CellsSpinBox.text() == 'all'
-          and all(c[c.index('--n-cells') + 1] == '0'
+    # A COUNT OF CROPS FOR THE WHOLE BUNDLE, shared out by source. Four
+    # RNA sources are checked here (two hybes x two channels), so each
+    # channel's run gets half of the 10,000 and splits it over its two
+    # hybes: 2,500 crops a source.
+    nc = [c[c.index('--n-crops') + 1] for c in cmds]
+    check('10,000 crops, default, shared out to each channel by its hybes',
+          nc == ['5000', '5000'] and d.CropsSpinBox.value() == 10000, str(nc))
+    note = d.CropsNote.text()
+    check('and the note says what it comes to per source and per FOV',
+          '10,000 crops' in note and '2,500 a source' in note
+          and '1,250 cells a FOV a source' in note, note)
+    d.CropsSpinBox.setValue(0)
+    check('0 reads "all", every command carries 0, the note says every cell',
+          d.CropsSpinBox.text() == 'all'
+          and all(c[c.index('--n-crops') + 1] == '0'
                   for c in d.build_commands())
-          and 'every cell' in d.CellsNote.text(), d.CellsNote.text())
-    d.CellsSpinBox.setValue(10000)
+          and 'every cell' in d.CropsNote.text(), d.CropsNote.text())
+    d.CropsSpinBox.setValue(10000)
 
     d.FovListLineEdit.setText('')
     check('no FOVs -> no commands, with a reason', d.build_commands() == [])
