@@ -576,6 +576,10 @@ def test_main_window_wiring():
           'chp.populate_models(' in inspect.getsource(MW._refresh_model_list))
     check('the fiducial tile shows best-of-one with its p_exist',
           "d.get('fiducial_engine') == 'v3'" in src and 'best of' in src)
+    check("a fiducial reason on a readout tile follows the readout title's "
+          "own convention, so its threshold survives the 34-character cut",
+          "('occupancy', 'occ')" in src and "('; refit ', ', ')" in src
+          and "w = 'fid ' + w[len('fiducial '):]" in src)
     check('every tile, both engines, carries the depth window for the XZ '
           'panel', src.count("_z_extras(d, 'fiducial')") == 2
           and src.count("_z_extras(d, 'readout')") == 2

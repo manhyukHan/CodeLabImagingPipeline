@@ -9258,8 +9258,16 @@ class MainWindow(QtWidgets.QMainWindow):
             rejected = allele.rejected_hybes or {}
 
             def _short_reason(why):
-                """A rejection reason that fits a 190 px tile."""
-                w = str(why)
+                """A rejection reason that fits a 190 px tile: 34 characters.
+
+                The readout title's own convention -- 'fid p 1.00',
+                'p<0.5' -- applied to every reason, because a fiducial
+                reason shown on a readout tile ('fiducial unrefined;
+                refit occupancy 0.17 < 0.25', 41 characters) was cut
+                exactly where the threshold stood. Display only: what
+                is stored on the allele stays spelled out.
+                """
+                w = str(why).strip(' :')
                 if w.startswith('readout'):
                     w = w[len('readout'):].strip(' :')
                 for long, short in (
@@ -9267,8 +9275,12 @@ class MainWindow(QtWidgets.QMainWindow):
                          'precision', 'none placed sub-voxel'),
                         ('every candidate below p_exist', 'all below p'),
                         ('planes from the fiducial in z', 'planes from fid z'),
-                        ('every candidate more than', 'all >')):
+                        ('every candidate more than', 'all >'),
+                        ('occupancy', 'occ'), ('; refit ', ', '),
+                        (' < ', '<'), (' > ', '>')):
                     w = w.replace(long, short)
+                if w.startswith('fiducial '):
+                    w = 'fid ' + w[len('fiducial '):]
                 return w[:34]
 
             def _z_extras(d, kind):
