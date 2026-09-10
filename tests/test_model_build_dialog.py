@@ -217,6 +217,15 @@ def test_train_command():
     check('the command names the bundle and the reviewer',
           cmd is not None and cmd[3] == d.bundle_dir()
           and cmd[cmd.index('--reviewer') + 1] == 'tester')
+    check('the run is NAMED, not timestamped: --out defaults to the reviewer',
+          cmd[cmd.index('--out') + 1] == 'tester')
+    d.RunNameLineEdit.setText('mp58_v2')
+    cmd = d.train_command()
+    check('a run name overrides it', cmd[cmd.index('--out') + 1] == 'mp58_v2')
+    check('the button says new run when the name is free',
+          'new run mp58_v2' in d.TrainPushButton.text(),
+          d.TrainPushButton.text())
+    d.RunNameLineEdit.setText('')
     if os.path.isdir(TWOCH):
         check("the store comes from the bundle's own manifest",
               '--storage-path' in cmd
@@ -428,6 +437,58 @@ def test_memory_and_target():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_overwrite_is_said_and_cleared():
+    """The same name replaces the run -- said in the log, and the run's
+    own artefacts cleared first so nothing stale is bound in."""
+    print('a named run overwrites')
+    import shutil
+    import tempfile
+    from codelab_pipeline.training import model_store as MS
+    import tools.train_spotmodel as T
+    root = tempfile.mkdtemp(prefix='named_')
+    try:
+        real = MS.models_dir
+        MS.models_dir = lambda root=None: root_dir
+        root_dir = root
+        run = os.path.join(root, 'mine')
+        os.makedirs(run)
+        for n in ('spot_classifier_linear.json', 'spot_classifier_conv.json',
+                  'psf_bank.h5', 'psf_multispot.json', 'report.json',
+                  MS.MANIFEST):
+            open(os.path.join(run, n), 'w').write('{}')
+        open(os.path.join(run, 'my_notes.txt'), 'w').write('keep me')
+        d = make()
+        d.BundlePathLineEdit.setText(REPO)
+        d.ReviewerLineEdit.setText('tester')
+        d.RunNameLineEdit.setText('mine')
+        d.TargetRunComboBox.setCurrentIndex(0)
+        check('the button warns of the overwrite',
+              'OVERWRITE run mine' in d.TrainPushButton.text(),
+              d.TrainPushButton.text())
+        cmd = d.train_command()
+        check('the command still goes out (no modal stop)',
+              cmd is not None and cmd[cmd.index('--out') + 1] == 'mine')
+        check('and the log says what will be replaced',
+              any('will be OVERWRITTEN' in d.LogListWidget.item(i).text()
+                  for i in range(d.LogListWidget.count())))
+        gone = T.clear_run(run)
+        check("clear_run removes exactly the run's artefacts",
+              sorted(gone) == sorted(['spot_classifier_linear.json',
+                                      'spot_classifier_conv.json',
+                                      'psf_bank.h5', 'psf_multispot.json',
+                                      'report.json', MS.MANIFEST]),
+              str(gone))
+        check("and leaves a person's file alone",
+              os.path.exists(os.path.join(run, 'my_notes.txt')))
+        import inspect
+        src = inspect.getsource(T.main)
+        check('main clears an existing run before writing',
+              'clear_run(a.out)' in src and 'OVERWRITING' in src)
+    finally:
+        MS.models_dir = real
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     test_sources()
     test_fovs()
@@ -440,6 +501,7 @@ def main():
     test_multispot_gets_the_trained_bank()
     test_bundle_state_and_relaunch()
     test_memory_and_target()
+    test_overwrite_is_said_and_cleared()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1

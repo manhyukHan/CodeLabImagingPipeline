@@ -237,11 +237,24 @@ class ModelBuildDialog(QtWidgets.QDialog):
         f.addWidget(QtWidgets.QLabel('reviewer:'), 0, 0)
         self.ReviewerLineEdit = QtWidgets.QLineEdit()
         self.ReviewerLineEdit.setPlaceholderText(
-            'names the run folder: <reviewer>_<timestamp>')
+            'who labelled it -- recorded in the manifest')
         f.addWidget(self.ReviewerLineEdit, 0, 1)
         self.SetDefaultCheckBox = QtWidgets.QCheckBox('pin as default model')
         f.addWidget(self.SetDefaultCheckBox, 0, 2)
-        f.addWidget(QtWidgets.QLabel('into:'), 1, 0)
+        f.addWidget(QtWidgets.QLabel('run name:'), 1, 0)
+        self.RunNameLineEdit = QtWidgets.QLineEdit()
+        self.RunNameLineEdit.setPlaceholderText(
+            'folder under models/ -- defaults to the reviewer; an existing '
+            'name is OVERWRITTEN')
+        self.RunNameLineEdit.setToolTip(
+            'THE NAME IS THE FOLDER. No timestamp: train again under the '
+            'same name and the run is replaced -- its classifier, bank, '
+            'calibration, report and manifest are removed first, so '
+            'nothing of the old run is bound into the new one. Anything '
+            'else in that folder is left alone. A different name keeps '
+            'the old run.')
+        f.addWidget(self.RunNameLineEdit, 1, 1, 1, 2)
+        f.addWidget(QtWidgets.QLabel('into:'), 2, 0)
         self.TargetRunComboBox = QtWidgets.QComboBox()
         self.TargetRunComboBox.setToolTip(
             'NEW RUN trains everything from the pass/fail verdicts: the '
@@ -252,12 +265,12 @@ class ModelBuildDialog(QtWidgets.QDialog):
             'review matched with: its verdicts carry the p that bank '
             'scored, so the calibration belongs to that bank, and a fresh '
             'retrain would also re-fit the M1 you may want kept.')
-        f.addWidget(self.TargetRunComboBox, 1, 1, 1, 2)
+        f.addWidget(self.TargetRunComboBox, 2, 1, 1, 2)
         self.TrainPushButton = QtWidgets.QPushButton('Train')
         self.TrainPushButton.setToolTip(
             'Runs tools/train_spotmodel.py in the background. The result '
             'lands below and in the model list.')
-        f.addWidget(self.TrainPushButton, 2, 0, 1, 3)
+        f.addWidget(self.TrainPushButton, 3, 0, 1, 3)
         self.ResultTextEdit = QtWidgets.QPlainTextEdit()
         self.ResultTextEdit.setReadOnly(True)
         self.ResultTextEdit.setMinimumHeight(170)
@@ -265,7 +278,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.ResultTextEdit.setPlaceholderText(
             'Training result appears here: labels, each head\'s '
             'validation numbers, the multispot calibration and the PSF.')
-        f.addWidget(self.ResultTextEdit, 3, 0, 1, 3)
+        f.addWidget(self.ResultTextEdit, 4, 0, 1, 3)
         f.setColumnStretch(1, 1)
         lay.addWidget(g)
 
@@ -300,6 +313,10 @@ class ModelBuildDialog(QtWidgets.QDialog):
         self.BundlePathLineEdit.editingFinished.connect(self._on_path_edited)
         self.TargetRunComboBox.currentIndexChanged.connect(
             lambda _i: self._explain_target())
+        self.RunNameLineEdit.textChanged.connect(
+            lambda _t: self._explain_target())
+        self.ReviewerLineEdit.textChanged.connect(
+            lambda _t: self._explain_target())
         self.TrainPushButton.clicked.connect(self._train)
         self.ClosePushButton.clicked.connect(self.close)
 
@@ -867,13 +884,35 @@ class ModelBuildDialog(QtWidgets.QDialog):
         """The existing run to calibrate into, or None for a new run."""
         return self.TargetRunComboBox.currentData()
 
+    def run_name(self):
+        """The run folder name: the run-name field, else the reviewer."""
+        name = self.RunNameLineEdit.text().strip()
+        return name or self.ReviewerLineEdit.text().strip()
+
+    def run_dir_for_name(self):
+        from codelab_pipeline.training import model_store as MS
+        name = self.run_name()
+        return os.path.join(MS.models_dir(), name) if name else None
+
     def _explain_target(self):
         run = self.target_run()
-        self.TrainPushButton.setText(
-            'Train  (new run: M1 + PSF + calibration if reviewed)'
-            if not run else
-            f'Add multispot calibration to {os.path.basename(run)}  '
-            f'(M1 and PSF untouched)')
+        if run:
+            self.TrainPushButton.setText(
+                f'Add multispot calibration to {os.path.basename(run)}  '
+                f'(M1 and PSF untouched)')
+            return
+        name = self.run_name()
+        target = self.run_dir_for_name()
+        if not name:
+            self.TrainPushButton.setText('Train  (name the run first)')
+        elif target and os.path.isdir(target) and os.listdir(target):
+            self.TrainPushButton.setText(
+                f'Train -> OVERWRITE run {name}  (M1 + PSF + calibration '
+                f'if reviewed; the old run is replaced)')
+        else:
+            self.TrainPushButton.setText(
+                f'Train -> new run {name}  (M1 + PSF + calibration if '
+                f'reviewed)')
 
     def bank_that_scored_the_verdicts(self):
         """The run whose PSF the multispot verdicts were matched with,
@@ -923,13 +962,22 @@ class ModelBuildDialog(QtWidgets.QDialog):
             return cmd
         who = self.ReviewerLineEdit.text().strip()
         if not who:
-            self._log('Name the reviewer (5): the run folder is '
-                      '<reviewer>_<timestamp>, and a model is calibrated '
-                      'to whoever labelled it.')
+            self._log('Name the reviewer (5): a model is calibrated to '
+                      'whoever labelled it, and the manifest records them.')
             return None
+        name = self.run_name()
+        target = self.run_dir_for_name()
+        if target and os.path.isdir(target) and os.listdir(target):
+            # SAID, NOT ASKED. A modal question here is a stop, and the
+            # name field's whole point is that the same name replaces
+            # the run. The log says what is about to be replaced.
+            self._log(f'run "{name}" exists -- it will be OVERWRITTEN: its '
+                      f'classifier, PSF bank, calibration, report and '
+                      f'manifest are removed first; other files in the '
+                      f'folder are left alone.')
         cmd = [sys.executable, '-u',
                os.path.join(self._repo, 'tools', 'train_spotmodel.py'),
-               b, '--reviewer', who]
+               b, '--reviewer', who, '--out', name]
         # THE STORE THE BUNDLE CAME FROM, read from its own manifest --
         # analytic_ref and resolution_bound are measured there, and
         # without it they silently fall back to another experiment's

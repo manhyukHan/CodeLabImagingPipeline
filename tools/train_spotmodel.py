@@ -79,6 +79,35 @@ def analytic_reference(mean, voxel_um, storage_path=None):
             'cosine_to_measured': float(a @ PB.normalise(mean).ravel())}
 
 
+# What one training run writes. ONLY these are cleared on an overwrite:
+# a run folder may hold notes, and a person's file is never a stale
+# artefact.
+RUN_ARTEFACTS = ('psf_bank.h5', 'psf_multispot.json', 'report.json',
+                 MS.MANIFEST)
+
+
+def clear_run(out):
+    """Remove a previous run's artefacts before writing over it.
+
+    WHY NOT JUST OVERWRITE. A retrain writes the heads it was asked for,
+    a bank, a report and a manifest -- and only writes a multispot
+    calibration when this bundle has multispot verdicts. A calibration
+    left from the previous run would then sit beside a NEW bank, pass
+    the template-size check (same 7x7x11), be bound into the new
+    manifest, and quietly calibrate p3 against a bank it was never
+    fitted on. A head file for a head no longer trained would be bound
+    the same way. So the run's own artefacts go first, named, and
+    nothing else in the folder is touched.
+    """
+    gone = []
+    for n in sorted(os.listdir(out)):
+        if n in RUN_ARTEFACTS or (n.startswith('spot_classifier_')
+                                  and n.endswith('.json')):
+            os.remove(os.path.join(out, n))
+            gone.append(n)
+    return gone
+
+
 def calibrate_into(a):
     """Fit ONLY the multispot calibration, into an existing run.
 
@@ -238,7 +267,13 @@ def main(argv=None):
         a.out = os.path.join(MS.models_dir(), MS.run_name(a.reviewer))
     elif not os.path.isabs(a.out) and os.sep not in a.out and '/' not in a.out:
         a.out = os.path.join(MS.models_dir(), a.out)
+    existed = os.path.isdir(a.out) and bool(os.listdir(a.out))
     os.makedirs(a.out, exist_ok=True)
+    if existed:
+        gone = clear_run(a.out)
+        print(f'OVERWRITING {a.out}: removed its previous '
+              f'{len(gone)} artefact(s) ({", ".join(gone)}) so nothing '
+              f'from the old run is bound into the new one')
     print(f'writing the run to {a.out}')
 
     report = {'bundle': a.bundle_dir, 'labels': s, 'provisional': provisional,
