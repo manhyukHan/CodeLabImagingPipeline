@@ -741,12 +741,13 @@ LearnedFit = namedtuple('LearnedFit',
                         ['y', 'x', 'z', 'amplitude', 'p_exist', 'at_bound'])
 
 
-def _learned_slab(cube, z_c, p):
-    """The z-slab a learned engine searches around z_c: the panel's reach
-    padded by the engine's own box, never into the trimmed ends. Returns
-    (slab, z0, z1, reach, z_off)."""
+def _learned_slab(cube, z_c, p, reach=None):
+    """The z-slab a learned engine searches around z_c: the reach (the
+    panel's, unless the caller has its own) padded by the engine's own
+    box, never into the trimmed ends. Returns (slab, z0, z1, reach,
+    z_off)."""
     from .psfmatcher import BOX_RZ
-    reach = p.z_reach()
+    reach = p.z_reach() if reach is None else int(reach)
     depth = int(np.asarray(cube).shape[2])
     z_off = _z_trim_offset(depth, p.z_boundary_trim)
     if z_c is not None and np.isfinite(z_c):
@@ -759,54 +760,129 @@ def _learned_slab(cube, z_c, p):
     return np.asarray(cube)[:, :, z0:z1], z0, z1, reach, z_off
 
 
+def fiducial_window_planes(voxel_um):
+    """How far from the expected depth a learned fiducial is looked for:
+    the SAME window v2's Gaussian fiducial seeds in (its fit radius,
+    3.6 um -> 17 planes), not the readout's reach (14).
+
+    MEASURED, MP58/DNA, 48 alleles x 73 hybes, learned fiducial from the
+    ch555 model gated at the readout reach: 656 of 994 refusals were
+    'every candidate out of z reach', the refused candidate a median 17
+    planes from the expected depth, and the Gaussian arm had found a
+    fiducial in 96% of exactly those hybes -- the same ten hybes in
+    nearly every allele. That is a per-hybe depth offset the consensus
+    placement does not carry, which the Gaussian tolerates because its
+    seed window is 17 planes and its fit may move further, with the
+    drift gate against the reference (phase 3) as the real acceptance.
+    So the learned fiducial gets the Gaussian's window, and past it the
+    drift gate decides, as it does for the Gaussian.
+    """
+    return _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, voxel_um)
+
+
 def _fiducial_learned(cube, z0, p):
     """The fiducial by the learned engine, BEST OF ONE.
 
-    Returns (fit, why, alternatives): `fit` is a LearnedFit or None, `why`
-    the reason when None, `alternatives` every other candidate in the
-    crop as (LearnedFit, why) for the grid. One answer, not a list: the
-    fiducial's job is to place this hybe's frame, and a second candidate
-    is an ambiguity rather than a second alignment. The choice is the
-    highest p_exist among those inside the fiducial's own reach of the
-    expected depth and above the threshold.
+    Returns (fit, why, alternatives, how): `fit` is a LearnedFit -- or a
+    Gaussian fit when the learned candidate was refined by one -- or
+    None, `why` the reason when None, `alternatives` every other
+    candidate in the crop as (LearnedFit, why) for the grid, and `how`
+    says which way the answer came:
+
+        'v3'               the best p_exist inside the fiducial window
+        'v3 beyond window' nothing inside it; the best in the slab, and
+                           the drift gate against the reference decides
+        'v3+gauss'         the engine believed a spot but placed no
+                           sub-voxel peak; v2's Gaussian fit, seeded
+                           there and passed through v2's own gates,
+                           gives it the position
+
+    One answer, not a list: the fiducial's job is to place this hybe's
+    frame, and a second candidate is an ambiguity rather than a second
+    alignment. Within a tier the choice is the highest p_exist above
+    the threshold.
+
+    WHY THE TWO FALLBACKS. Measured on MP58/DNA (see
+    fiducial_window_planes): with the readout reach and no refinement,
+    the learned fiducial covered 71.6% of hybes against the Gaussian's
+    96.4%, and where both existed they agreed to 0.4 px -- so the loss
+    was almost entirely hybes the Gaussian handled and this path refused
+    on its own stricter, unmeasured rules. 15% of refusals were
+    'unrefined': model 1 said spot, model 3 found no peak, and
+    psfmatcher.is_refined records that 3 of 4 such spots were real by
+    human judgement. Dropping the hybe over a missing sub-voxel step
+    when a Gaussian fit can supply it was the wrong trade.
     """
-    slab, s0, s1, reach, z_off = _learned_slab(cube, z0, p)
+    window = fiducial_window_planes(p.voxel_um)
+    slab, s0, s1, reach, z_off = _learned_slab(cube, z0, p, reach=window)
     if slab is None:
-        return None, 'no planes left between the trimmed ends', []
+        return None, 'no planes left between the trimmed ends', [], None
     try:
         cands = p.fiducial_engine.localize(slab, seed_yxz=None, n_max=None)
     except Exception as exc:                                # noqa: BLE001
-        return None, f'engine failed: {type(exc).__name__}: {exc}', []
+        return None, f'engine failed: {type(exc).__name__}: {exc}', [], None
     cands = [c._replace(z=float(c.z) + s0) for c in cands]
     h, w = np.asarray(cube).shape[:2]
     cands = [c for c in cands
              if -0.5 <= float(c.y) < h - 0.5 and -0.5 <= float(c.x) < w - 0.5]
     if not cands:
-        return None, 'engine found nothing', []
+        return None, 'engine found nothing', [], None
     from . import psfmatcher as PSFM
     t = p.min_p_exist
-    fits, alts = [], []
+    inside, beyond, unrefined, alts = [], [], [], []
     for c in cands:
         dzr = (abs(float(c.z) - float(z0))
                if z0 is not None and np.isfinite(z0) else 0.0)
         lf = LearnedFit(float(c.y), float(c.x), float(c.z),
                         float(c.amplitude) if np.isfinite(c.amplitude) else 0.0,
                         float(c.p_exist), ())
-        if dzr > reach:
-            alts.append((lf, f'z {dzr:.1f} planes from expected > {reach}'))
-        elif t is not None and not (float(c.p_exist) >= t):
+        if t is not None and not (float(c.p_exist) >= t):
             alts.append((lf, f'p_exist {float(c.p_exist):.2f} < {t:g}'))
         elif not PSFM.is_refined(c):
-            alts.append((lf, 'no sub-voxel position'))
+            unrefined.append((lf, dzr))
+        elif dzr > window:
+            beyond.append((lf, dzr))
         else:
-            fits.append(lf)
-    if not fits:
-        return None, (f'no candidate at p_exist >= {t:g} within reach'
-                      if t is not None else 'no candidate within reach'), alts
-    fits.sort(key=lambda f: -f.p_exist)
-    best = fits[0]
-    alts = [(f, 'not the best') for f in fits[1:]] + alts
-    return best, None, alts
+            inside.append(lf)
+    if inside:
+        inside.sort(key=lambda f: -f.p_exist)
+        best = inside[0]
+        rest = ([(f, 'not the best') for f in inside[1:]]
+                + [(f, f'beyond the fiducial window ({d:.1f} > {window} '
+                       f'planes from expected)') for f, d in beyond]
+                + [(f, 'no sub-voxel position') for f, _d in unrefined]
+                + alts)
+        return best, None, rest, 'v3'
+    if beyond:
+        beyond.sort(key=lambda fd: -fd[0].p_exist)
+        best, d = beyond[0]
+        rest = ([(f, f'not the best ({dd:.1f} planes from expected)')
+                 for f, dd in beyond[1:]]
+                + [(f, 'no sub-voxel position') for f, _d in unrefined]
+                + alts)
+        return best, None, rest, 'v3 beyond window'
+    if unrefined:
+        # THE ENGINE BELIEVES IT, MODEL 3 COULD NOT PLACE IT. Give the
+        # integer position to v2's Gaussian fit as its seed and hold the
+        # result to v2's own gates -- the same path the Gaussian fiducial
+        # takes, only seeded by the learned engine instead of the
+        # centroid.
+        unrefined.sort(key=lambda fd: -fd[0].p_exist)
+        cand, _d = unrefined[0]
+        g = fit_fiducial_from(cube, (cand.y, cand.x, cand.z), p)
+        ok, gwhy = gate(g, cube, p.fiducial_gates, p.voxel_um)
+        rest = ([(f, 'no sub-voxel position') for f, _dd in unrefined[1:]]
+                + alts)
+        if ok and g is not None:
+            return g, None, [(cand, 'refined by the Gaussian fit')] + rest, \
+                'v3+gauss'
+        return None, (f'the engine\'s candidate (p_exist {cand.p_exist:.2f}) '
+                      f'had no sub-voxel position and the Gaussian fit seeded '
+                      f'there failed its gate: {gwhy}'), \
+            [(cand, 'no sub-voxel position; Gaussian refinement failed')] \
+            + rest, None
+    return None, (f'no candidate at p_exist >= {t:g}'
+                  if t is not None else 'no candidate'), alts, None
 
 
 def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
@@ -1346,12 +1422,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # every other candidate reaches the grid, labelled, as what
             # was NOT chosen. The Gaussian seed fallback below is v2's
             # and does not run for it.
-            f, why, alts = _fiducial_learned(cube, z0, p)
+            f, why, alts, how = _fiducial_learned(cube, z0, p)
             ok = f is not None
             if debug is not None:
                 debug[hybe]['fiducial_engine'] = 'v3'
+                debug[hybe]['fiducial_how'] = how
                 debug[hybe]['fiducial_p_exist'] = (
-                    float(f.p_exist) if f is not None else float('nan'))
+                    float(getattr(f, 'p_exist', float('nan')))
+                    if f is not None else float('nan'))
                 debug[hybe]['fiducial_n_candidates'] = (
                     len(alts) + (1 if f is not None else 0))
                 debug[hybe]['fiducial_rejected_centroids'] = (

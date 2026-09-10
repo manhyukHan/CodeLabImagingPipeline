@@ -312,38 +312,91 @@ def test_display_box_is_a_hard_boundary():
 
 
 def test_learned_fiducial_best_of_one():
-    print('the learned fiducial: best of one')
+    print('the learned fiducial: best of one, in the Gaussian\'s own window')
     p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0)
-    reach = p.z_reach()
-    z0 = _slab_z0(20.0, reach)
+    window = T2.fiducial_window_planes(p.voxel_um)
+    check("the window is the Gaussian fiducial's seed window (17 planes at "
+          "0.2 um), not the readout reach (14)",
+          window == 17 and window > p.z_reach(), f'{window} vs {p.z_reach()}')
+    z0 = _slab_z0(20.0, window)
     cands = [spot(8, 8, 20.0 - z0, 0.7),                 # good
              spot(4, 8, 21.0 - z0, 0.95),                # BEST
              spot(12, 8, 20.0 - z0, 0.99, p=float('nan')),  # unrefined
-             spot(8, 12, 20.0 + reach + 6 - z0, 0.98),   # out of reach
+             spot(8, 12, 20.0 + window + 3 - z0, 0.98),  # beyond the window
              spot(8, 4, 20.0 - z0, 0.3),                 # below threshold
              spot(8, 30, 20.0 - z0, 0.99)]               # outside the crop
     p.fiducial_engine = FakeEngine(cands)
     cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
-    f, why, alts = T2._fiducial_learned(cube, 20.0, p)
-    check('the highest p_exist within reach and threshold wins',
-          f is not None and (f.y, f.x) == (4.0, 8.0) and f.p_exist == 0.95,
-          str(f))
+    f, why, alts, how = T2._fiducial_learned(cube, 20.0, p)
+    check('the highest p_exist inside the window and above threshold wins',
+          f is not None and (f.y, f.x) == (4.0, 8.0) and f.p_exist == 0.95
+          and how == 'v3', str((f, how)))
     check('its z is back in the crop\'s planes', abs(f.z - 21.0) < 1e-9)
     check('ONE answer -- the fit has no list', isinstance(f, T2.LearnedFit))
     whys = [w for _a, w in alts]
     check('every other candidate is an alternative with a reason',
           len(alts) == 4 and 'not the best' in whys
           and any('no sub-voxel' in w for w in whys)
-          and any('from expected' in w for w in whys)
+          and any('beyond the fiducial window' in w for w in whys)
           and any('p_exist 0.30 < 0.5' in w for w in whys), str(whys))
     check('the one outside the crop never existed', len(alts) + 1 == 5)
+    check('the slab the engine saw spans the window plus its box',
+          p.fiducial_engine.seen[2] >= 2 * window + 1)
+
+    # 16 PLANES OFF IS INSIDE THE WINDOW. At the readout reach it was
+    # refused, and on MP58/DNA that refusal cost two thirds of the
+    # learned fiducial's losses.
+    p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 + 16 - z0, 0.9)])
+    f16, _w, _a, how16 = T2._fiducial_learned(cube, 20.0, p)
+    check('a candidate 16 planes from the expected depth is taken',
+          f16 is not None and abs(f16.z - 36.0) < 1e-9 and how16 == 'v3')
+
+    # NOTHING INSIDE THE WINDOW: the best in the slab, and phase 3's
+    # drift gate against the reference decides, as it does for v2.
+    p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 + window + 3 - z0, 0.8),
+                                    spot(6, 6, 20.0 + window + 5 - z0, 0.6)])
+    fb, _w, ab, howb = T2._fiducial_learned(cube, 20.0, p)
+    check('beyond the window, the best p_exist is still handed on -- and '
+          'says so', fb is not None and fb.p_exist == 0.8
+          and howb == 'v3 beyond window' and len(ab) == 1
+          and 'not the best' in ab[0][1], str((fb, howb, ab)))
+
+    # UNREFINED, BELIEVED: the Gaussian fit takes the seed. A bright
+    # Gaussian blob is planted where the engine points.
+    yy, xx, zz = np.mgrid[0:17, 0:17, 0:105].astype(float)
+    blob = 3000.0 * np.exp(-0.5 * (((yy - 8) / 1.4) ** 2 + ((xx - 8) / 1.4) ** 2
+                                   + ((zz - 22) / 3.0) ** 2))
+    cube_b = cube + blob
+    p.fiducial_engine = FakeEngine([spot(8, 8, 22.0 - z0, 0.9, p=float('nan'))])
+    fg, wg, ag, howg = T2._fiducial_learned(cube_b, 20.0, p)
+    check('an unrefined candidate is refined by the Gaussian fit, seeded '
+          'where the engine pointed',
+          fg is not None and howg == 'v3+gauss'
+          and abs(fg.y - 8) < 0.5 and abs(fg.x - 8) < 0.5 and abs(fg.z - 22) < 1.0,
+          str((None if fg is None else (fg.y, fg.x, fg.z), howg, wg)))
+    check('and the engine\'s own candidate is listed as what was refined',
+          ag and 'refined by the Gaussian' in ag[0][1], str(ag[:1]))
+    # THE GATE IS FORCED, not hoped for: v2's fiducial gate is generous
+    # enough to pass a Gaussian fitted to flat noise (it did here), so
+    # the failure branch is exercised by making the gate say no.
+    p.fiducial_engine = FakeEngine([spot(8, 8, 22.0 - z0, 0.9, p=float('nan'))])
+    real_gate = T2.gate
+    T2.gate = lambda *a, **k: (False, 'occupancy 0.10 < 0.25')
+    try:
+        fn, wn, an, hown = T2._fiducial_learned(cube_b, 20.0, p)
+    finally:
+        T2.gate = real_gate
+    check('but a Gaussian fit that fails its gate does not rescue it',
+          fn is None and hown is None and 'Gaussian fit' in wn
+          and 'occupancy 0.10' in wn
+          and an and 'Gaussian refinement failed' in an[0][1], wn)
 
     p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z0, 0.2)])
-    f2, why2, alts2 = T2._fiducial_learned(cube, 20.0, p)
+    f2, why2, alts2, _h = T2._fiducial_learned(cube, 20.0, p)
     check('none above the threshold -> None with the reason',
           f2 is None and 'p_exist >= 0.5' in why2 and len(alts2) == 1, why2)
     p.fiducial_engine = FakeEngine([])
-    f3, why3, _ = T2._fiducial_learned(cube, 20.0, p)
+    f3, why3, _, _h = T2._fiducial_learned(cube, 20.0, p)
     check('nothing found -> None, says so', f3 is None and 'nothing' in why3)
 
     # V2Params carries the second model the same way as the first.
@@ -367,9 +420,10 @@ def test_learned_fiducial_best_of_one():
 
     import inspect
     bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
-    check('the builder branches on the fiducial engine',
+    check('the builder branches on the fiducial engine and records how',
           'if p.fiducial_engine is not None:' in bsrc
-          and '_fiducial_learned(cube, z0, p)' in bsrc)
+          and 'f, why, alts, how = _fiducial_learned(cube, z0, p)' in bsrc
+          and "debug[hybe]['fiducial_how'] = how" in bsrc)
     check("and v2's seed fallback does not run for it",
           'FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None' in bsrc)
 
