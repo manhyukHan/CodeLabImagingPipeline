@@ -280,9 +280,26 @@ class ModelBuildDialog(QtWidgets.QDialog):
     # -- log ----------------------------------------------------------
 
     def _log(self, message):
-        self.LogListWidget.addItem(str(message))
-        self.LogListWidget.scrollToBottom()
-        self.logged.emit(str(message))
+        text = str(message)
+        lw = self.LogListWidget
+        # A LINE THAT REPEATS BECOMES A COUNT. A child that prints one
+        # warning per fit hands this list hundreds of thousands of
+        # identical items, and a QListWidget that size is what makes
+        # the dialog itself stop responding. The same line again is
+        # shown once with 'x N'; the main log gets it once.
+        last = lw.item(lw.count() - 1) if lw.count() else None
+        base = last.data(QtCore.Qt.UserRole) if last is not None else None
+        if last is not None and base == text:
+            n = int(last.data(QtCore.Qt.UserRole + 1) or 1) + 1
+            last.setData(QtCore.Qt.UserRole + 1, n)
+            last.setText(f'{text}   (x {n})')
+            return
+        item = QtWidgets.QListWidgetItem(text)
+        item.setData(QtCore.Qt.UserRole, text)
+        item.setData(QtCore.Qt.UserRole + 1, 1)
+        lw.addItem(item)
+        lw.scrollToBottom()
+        self.logged.emit(text)
 
     # -- 1  sources -----------------------------------------------------
 

@@ -422,6 +422,20 @@ def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
     return path, n_crop, n_cand
 
 
+def default_workers():
+    """cpu_count - 2, capped at 32.
+
+    The cap was 16. The measurement this module already cites -- 250,481
+    anchor fits in 17 min across 32 workers against 8.8 h serial -- was
+    made at 32, and the docstring below says the count should track
+    cores because the work is 99.8% fit. On a 64-core machine a cap of
+    16 was leaving that measured speed on the table. 16 against 32 has
+    NOT been compared head to head on one workload; --workers overrides.
+    """
+    import multiprocessing
+    return max(1, min(32, (multiprocessing.cpu_count() or 4) - 2))
+
+
 def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
             chunk=DEFAULT_CHUNK, on_task=None, **kw):
     """Build a whole bundle. (fov, hybe, cell-chunk) through ONE pool.
@@ -430,7 +444,7 @@ def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
     each chunk lands, so progress is visible without waiting on the
     slowest anything.
 
-    `workers` defaults to cpu_count-2 capped at 16. This workload is CPU
+    `workers` defaults to default_workers(). This workload is CPU
     bound -- 99.8% of a crop is the fit -- so unlike the alignment path,
     which is bandwidth bound and measured FASTER at 3 workers, here more
     readers do not contend and the count should track cores.
@@ -440,7 +454,7 @@ def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,
     os.makedirs(str(out_dir), exist_ok=True)
     tasks = plan(storage_path, fovs, hybes, channel, chunk=chunk)
     if workers is None:
-        workers = max(1, min(16, (multiprocessing.cpu_count() or 4) - 2))
+        workers = default_workers()
     workers = int(workers)
     results, done = [], 0
     if workers <= 1:

@@ -242,20 +242,32 @@ def main(argv=None):
     t0 = time.time()
     state = {'crops': 0, 'cands': 0}
 
+    workers = (int(a.workers) if a.workers
+               else X.default_workers())
+    print(f'workers {workers}', flush=True)
+
     def on_task(done, total, fov, hybe, path, n_crops, n_cands):
         state['crops'] += n_crops
         state['cands'] += n_cands
         el = time.time() - t0
-        rate = done / max(el, 1e-9)
-        eta = (total - done) / rate if rate else 0
+        # NO ETA FROM THE FIRST TASK OF A POOL. done/elapsed after one
+        # completion, while `workers` others are in flight, overstates
+        # the remaining time by about `workers` times -- a real run read
+        # '~1083 min left' for a build that took two hours. Rate means
+        # something once a full wave has landed.
+        if done >= workers:
+            rate = done / max(el, 1e-9)
+            tail = f'~{(total - done) / rate / 60:5.1f} min left'
+        else:
+            tail = f'ETA after {workers} tasks'
         print(f'  [{done:4d}/{total}] fov{fov:03d} {hybe:9s} '
               f'{n_crops:3d} crops {n_cands:6d} cand   '
-              f'{el / 60:5.1f} min elapsed, ~{eta / 60:5.1f} left',
+              f'{el / 60:5.1f} min elapsed, {tail}',
               flush=True)
 
     print()
     X.extract(store, fovs, hybes, int(a.channel), str(a.out),
-              workers=a.workers, chunk=int(a.chunk), pad=int(a.pad),
+              workers=workers, chunk=int(a.chunk), pad=int(a.pad),
               on_task=on_task)
     wall = time.time() - t0
 

@@ -248,6 +248,24 @@ def test_close_hides():
           not d.isVisible() and d.SourceListWidget.count() == len(SOURCES))
 
 
+def test_log_collapses_repeats():
+    print('log flooding')
+    d = make()
+    got = []
+    d.logged.connect(got.append)
+    n0 = d.LogListWidget.count()
+    for _ in range(3):
+        d._log('RuntimeWarning: invalid value encountered in sqrt')
+    d._log('a different line')
+    items = [d.LogListWidget.item(i).text()
+             for i in range(n0, d.LogListWidget.count())]
+    check('the same line three times is ONE item with a count',
+          len(items) == 2 and items[0].endswith('(x 3)'), str(items))
+    check('the main log received it once, not three times',
+          got.count('RuntimeWarning: invalid value encountered in sqrt') == 1
+          and 'a different line' in got)
+
+
 def main():
     test_sources()
     test_fovs()
@@ -256,6 +274,7 @@ def main():
     test_train_command()
     test_render_report()
     test_close_hides()
+    test_log_collapses_repeats()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1

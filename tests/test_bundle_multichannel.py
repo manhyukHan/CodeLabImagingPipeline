@@ -92,10 +92,29 @@ def test_a_rebuilt_channel_replaces_its_own_entry():
           "if not prior and was.get('channel') is not None" in src)
 
 
+def test_eta_and_workers():
+    """done/elapsed after ONE task of a 16-wide pool overstated a two-hour
+    build as '~1083 min left'. Rate means something once a full wave
+    of workers has landed, and the log must say how wide that wave is."""
+    print('ETA and workers')
+    import inspect
+    import tools.build_bundle as BB
+    from codelab_pipeline.training import extract as X
+    src = inspect.getsource(BB.main)
+    check('the worker count is printed', "print(f'workers {workers}'" in src)
+    check('no ETA before a full wave has landed', 'if done >= workers:' in src)
+    check('and the log says so instead', "ETA after {workers} tasks" in src)
+    check('the resolved count is what extract() gets', 'workers=workers,' in src)
+    w = X.default_workers()
+    check('default_workers() is an int in [1, 32]',
+          isinstance(w, int) and 1 <= w <= 32, str(w))
+
+
 def main():
     test_shard_names_carry_the_channel()
     test_the_real_two_channel_bundle()
     test_a_rebuilt_channel_replaces_its_own_entry()
+    test_eta_and_workers()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1

@@ -274,7 +274,15 @@ def fit_gaussian_3d_um(cubic, y0, x0, z0, voxel_um=DEFAULT_VOXEL_UM,
     rss = float(np.sum(res.fun ** 2))
     try:
         cov = (rss / dof) * np.linalg.pinv(res.jac.T @ res.jac)
-        se = np.sqrt(np.diag(cov))
+        # A NEGATIVE VARIANCE IS THE SIGNAL, NOT AN ERROR. pinv of a
+        # rank-deficient J^T J can put a negative on the diagonal; sqrt
+        # then gives NaN, and the test two lines down REJECTS the fit
+        # for exactly that. Left to numpy the same event also printed a
+        # RuntimeWarning per fit -- one line of stderr for every one of
+        # the hundreds of thousands of anchor fits a bundle build runs,
+        # all saying something the code already handles.
+        with np.errstate(invalid='ignore'):
+            se = np.sqrt(np.diag(cov))
     except Exception:
         return None
     if not np.all(np.isfinite(se)):
