@@ -165,6 +165,41 @@ def test_labels_stay_inside():
     plt.close(fig)
 
 
+def test_z_band_lines():
+    """The XZ panel draws the depth window: dashed at expected +/- half,
+    dotted at the expected depth, and nothing for a bound off the shown
+    planes."""
+    print('the depth window on the XZ panel')
+    # A DEEP crop: the shared fixture is shallow, and the shown window
+    # clamps to the stack, which is not what this test is about.
+    cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
+    cube[7, 7, 44] += 2000.0
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=(7.0, 7.0, 44.0),
+                           z_band=(42.0, 17.0), z_display_pad=19)
+    lines = ax_xz.get_lines()
+    ys = sorted(round(float(l.get_ydata()[0]), 3) for l in lines)
+    styles = sorted(l.get_linestyle() for l in lines)
+    check('three lines: expected -17, expected, expected +17, in the '
+          'shown planes (zmin 25)', ys == [0.0, 17.0, 34.0], str(ys))
+    check('dashed bounds, dotted centre', styles == ['--', '--', ':'],
+          str(styles))
+    check('white', all(l.get_color() == 'white' for l in lines))
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=(7.0, 7.0, 44.0),
+                           z_band=(42.0, 17.0))                # pad 15
+    ys = sorted(round(float(l.get_ydata()[0]), 3) for l in ax_xz.get_lines())
+    check('a bound outside the shown planes is not drawn (default pad 15 '
+          'cuts the lower one)', ys == [13.0, 30.0], str(ys))
+    plt.close(fig)
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=(7.0, 7.0, 44.0))
+    check('no band -> no lines', not ax_xz.get_lines())
+    plt.close(fig)
+
+
 def test_degenerate_inputs():
     print('degenerate crops do not raise')
     import matplotlib.pyplot as plt
@@ -309,6 +344,7 @@ def main():
     test_no_marker_falls_back()
     test_rejected_marker_is_used()
     test_labels_stay_inside()
+    test_z_band_lines()
     test_degenerate_inputs()
     test_helpers()
     test_markers_land_where_they_are_told()

@@ -7,7 +7,7 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
                          marker_size=130, z_display_pad=15, title_fontsize=9,
                          rejected=None, scale_half=2, scale_half_z=5,
                          lateral=None, labels=None, rejected_labels=None,
-                         all_primary=False):
+                         all_primary=False, z_band=None):
     """
     Renders one spot's fit-status: a YX max-projection (over Z) and an XZ
     max-projection (over Y -- X horizontal, Z vertical, same display
@@ -79,6 +79,10 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     crop's own lb quantile, so the noise floor still reads as noise.
     Falls back to whole-crop quantiles when there is no marker, or when
     the marked box is not brighter than that floor.
+    z_band: (expected depth, half-width) in planes -- the XZ panel draws
+        white dashed lines at expected +/- half and a faint dotted one at
+        the expected depth, so a candidate tagged 'z' can be seen to sit
+        outside the window the engine searched.
     labels / rejected_labels: one short string per centroid / rejected
     entry (a p_exist, say), drawn beside its ring on the YX panel.
     all_primary: every centroid is this spot's own (yellow), not the
@@ -236,6 +240,19 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             ax_yx.scatter([cx], [cy], s=marker_size, marker='o',
                           facecolors='none', edgecolors='white',
                           linewidths=1.2, linestyle='--')
+    if z_band is not None:
+        # THE DEPTH WINDOW, on the XZ panel: white dashed lines at the
+        # expected depth +/- the reach the engine searched, and a faint
+        # dotted line at the expected depth itself. A candidate tagged
+        # 'z' sits outside these lines, and now a person can see that
+        # rather than take it on trust. A bound outside the shown
+        # planes is simply not drawn: the whole view is then inside.
+        zc, half = float(z_band[0]), float(z_band[1])
+        for zb, style, alpha in ((zc - half, '--', 0.9), (zc + half, '--', 0.9),
+                                 (zc, ':', 0.45)):
+            if zmin <= zb < zmax:
+                ax_xz.axhline(zb - zmin, color='white', linestyle=style,
+                              linewidth=0.8, alpha=alpha)
     # PINNED. imshow's own extent, restated after every scatter and
     # annotation so nothing drawn can enlarge the axes.
     ax_yx.set_xlim(-0.5, w_img - 0.5)

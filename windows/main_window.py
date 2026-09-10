@@ -9271,6 +9271,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     w = w.replace(long, short)
                 return w[:34]
 
+            def _z_extras(d, kind):
+                """The depth window for the XZ panel: the expected depth
+                and the reach searched from it -- the lines a 'z' tag is
+                outside of. The fiducial's window (17 planes) is wider
+                than the panel's default +/-15, so its tile shows two
+                planes past the lines."""
+                zc = d.get(f'{kind}_zexp')
+                half = d.get('fiducial_z_window' if kind == 'fiducial'
+                             else 'readout_z_reach')
+                if zc is None or half is None or not np.isfinite(float(zc)):
+                    return {}
+                out = {'z_band': (float(zc), float(half))}
+                if kind == 'fiducial':
+                    out['z_display_pad'] = int(half) + 2
+                return out
+
             def _titled(hybe, occ, unc, channel):
                 """'Hyb_023 / occ 0.69 / at bound (z)' -- number AND verdict.
 
@@ -9356,14 +9372,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             {'labels': ([f'{pe:.2f}'] if centroid and pe is not None
                                         and np.isfinite(pe) else None),
                              'rejected_labels': d.get('fiducial_rejected_labels'),
-                             'all_primary': True}))
+                             'all_primary': True,
+                             **_z_extras(d, 'fiducial')}))
                     else:
                         rej = d.get('fiducial_rejected_centroid')
                         fid_results.append((d['fiducial_cubic'], centroid,
                                             _titled(hybe, d.get('fiducial_occupancy'),
                                                     d.get('fiducial_uncert_nm'),
                                                     'fiducial'),
-                                            [rej] if rej is not None else None))
+                                            [rej] if rej is not None else None,
+                                            _z_extras(d, 'fiducial')))
                 if d.get('readout_cubic') is not None:
                     if d.get('readout_engine') == 'v3':
                         # ONE BOX, EVERY CANDIDATE, EACH WITH ITS p_exist.
@@ -9389,13 +9407,15 @@ class MainWindow(QtWidgets.QMainWindow):
                             head, d.get('readout_rejected_centroids'),
                             {'labels': d.get('readout_labels'),
                              'rejected_labels': d.get('readout_rejected_labels'),
-                             'all_primary': True}))
+                             'all_primary': True,
+                             **_z_extras(d, 'readout')}))
                     else:
                         readout_results.append((d['readout_cubic'], d['readout_centroids'],
                                                 _titled(hybe, d.get('readout_occupancy'),
                                                         d.get('readout_uncert_nm'),
                                                         'readout'),
-                                                d.get('readout_rejected_centroids')))
+                                                d.get('readout_rejected_centroids'),
+                                                _z_extras(d, 'readout')))
 
             allele_label = f'FOV{fov:03d}_allele{allele.id}'
             # allele figures default into figures/{modality}/alleles/fov###/,

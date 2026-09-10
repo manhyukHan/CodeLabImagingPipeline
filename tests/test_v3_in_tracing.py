@@ -576,6 +576,15 @@ def test_main_window_wiring():
           'chp.populate_models(' in inspect.getsource(MW._refresh_model_list))
     check('the fiducial tile shows best-of-one with its p_exist',
           "d.get('fiducial_engine') == 'v3'" in src and 'best of' in src)
+    check('every tile, both engines, carries the depth window for the XZ '
+          'panel', src.count("_z_extras(d, 'fiducial')") == 2
+          and src.count("_z_extras(d, 'readout')") == 2
+          and "out['z_display_pad'] = int(half) + 2" in src)
+    bsrc2 = inspect.getsource(T2.build_chromatin_trace_allele)
+    check('and the builder records the expected depth and the reach',
+          "debug[hybe]['fiducial_zexp'] = float(z0)" in bsrc2
+          and "debug[hybe]['fiducial_z_window']" in bsrc2
+          and "debug[hybe]['readout_z_reach'] = int(p.z_reach())" in bsrc2)
 
 
 def main():

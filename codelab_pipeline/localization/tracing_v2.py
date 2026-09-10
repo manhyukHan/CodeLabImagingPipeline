@@ -1456,6 +1456,14 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug[hybe]['fiducial_seed'] = _seed(
                 cube, z0, p.voxel_um,
                 _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
+            # THE DEPTH WINDOW, for the XZ panel to draw: the expected
+            # depth and how far either engine looks from it (the
+            # Gaussian's seed window and the learned fiducial's window
+            # are the same 17 planes). A candidate tagged 'z' is outside
+            # these lines, and a person can now see that.
+            debug[hybe]['fiducial_zexp'] = float(z0)
+            debug[hybe]['fiducial_z_window'] = int(
+                fiducial_window_planes(p.voxel_um))
         if p.fiducial_engine is not None:
             # THE LEARNED FIDUCIAL, best of one. No Gaussian gate applies
             # -- a matched filter has no occupancy or CI -- the p_exist
@@ -1670,6 +1678,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                else own_native_z(cube, p.voxel_um))
         if debug is not None:
             debug[hybe]['readout_zexp'] = float(z_r)
+            debug[hybe]['readout_z_reach'] = int(p.z_reach())
             debug[hybe]['readout_seed'] = _seed(
                 cube, z_r, p.voxel_um,
                 _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
