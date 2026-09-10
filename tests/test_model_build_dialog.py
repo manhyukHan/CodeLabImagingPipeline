@@ -266,6 +266,56 @@ def test_log_collapses_repeats():
           and 'a different line' in got)
 
 
+def test_multispot_gets_the_trained_bank():
+    """Multispot review needs the PSF a training run measured, and Spot
+    Check only looks inside the bundle folder for it. The dialog hands
+    the run's bank over instead of asking a person to copy a file."""
+    print('the hinge between the two reviews')
+    import shutil
+    import tempfile
+    from codelab_pipeline.training import model_store as MS
+    d = make()
+    root = tempfile.mkdtemp(prefix='runs_')
+    try:
+        run = os.path.join(root, 'tester_20260910-120000')
+        os.makedirs(run)
+        open(os.path.join(run, 'psf_bank.h5'), 'wb').close()
+        empty = os.path.join(root, 'tester_20260910-130000')
+        os.makedirs(empty)                     # a run with no bank
+
+        real_default, real_avail = MS.default_model, MS.available
+        MS.default_model = lambda root=None: None
+        MS.available = lambda root=None: []
+        try:
+            d._last_run_dir = None
+            check('no run anywhere -> no bank, pass/fail only',
+                  d.psf_bank_for_review() is None)
+            d._last_run_dir = empty
+            check('a just-trained run WITHOUT a bank is skipped',
+                  d.psf_bank_for_review() is None)
+            d._last_run_dir = run
+            check('the just-trained run wins',
+                  d.psf_bank_for_review() == os.path.join(run, 'psf_bank.h5'))
+            d._last_run_dir = None
+            MS.default_model = lambda root=None: run
+            check('then the pinned default',
+                  d.psf_bank_for_review() == os.path.join(run, 'psf_bank.h5'))
+            MS.default_model = lambda root=None: None
+            MS.available = lambda root=None: [{'path': empty}, {'path': run}]
+            check('then the newest on disk that actually has one',
+                  d.psf_bank_for_review() == os.path.join(run, 'psf_bank.h5'))
+        finally:
+            MS.default_model, MS.available = real_default, real_avail
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    import inspect
+    src = inspect.getsource(d._open_spotcheck)
+    check("Open Spot Check passes --psf-bank when there is one",
+          "'--psf-bank'" in src)
+    check('and says pass/fail-only when there is not',
+          'only the pass/fail review' in src)
+
+
 def main():
     test_sources()
     test_fovs()
@@ -275,6 +325,7 @@ def main():
     test_render_report()
     test_close_hides()
     test_log_collapses_repeats()
+    test_multispot_gets_the_trained_bank()
     print()
     print('%d/%d checks passed' % (CHECKS[1], CHECKS[0]))
     return 0 if CHECKS[1] == CHECKS[0] else 1

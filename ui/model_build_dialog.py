@@ -560,6 +560,34 @@ class ModelBuildDialog(QtWidgets.QDialog):
 
     # -- 4  review ------------------------------------------------------
 
+    def psf_bank_for_review(self):
+        """The PSF bank multispot review should match with, or None.
+
+        THE TWO REVIEWS ARE SEQUENTIAL, and this is the hinge between
+        them. Multispot review judges the matches a PSF finds in the
+        pillar around each spot pass/fail already confirmed -- so it
+        needs a PSF, and the PSF comes from training on the pass/fail
+        verdicts. Spot Check looks for psf_bank.h5 INSIDE the bundle
+        folder and nothing ever put it there: after training M1 a person
+        opened multispot mode and was told to copy a file by hand. The
+        dialog knows which run was just trained, so it hands that run's
+        bank over. Newest run first, then the pinned default, then the
+        newest on disk; None means only pass/fail can run yet.
+        """
+        from codelab_pipeline.training import model_store as MS
+        cands = [self._last_run_dir, MS.default_model()]
+        try:
+            cands += [r['path'] for r in MS.available()]
+        except Exception:                                   # noqa: BLE001
+            pass
+        for run in cands:
+            if not run:
+                continue
+            bank = os.path.join(str(run), 'psf_bank.h5')
+            if os.path.exists(bank):
+                return bank
+        return None
+
     def _open_spotcheck(self):
         import subprocess
         b = self.bundle_dir()
@@ -567,6 +595,16 @@ class ModelBuildDialog(QtWidgets.QDialog):
             self._log('No bundle directory to review yet.')
             return
         cmd = [sys.executable, '-m', 'spotcheck.app', b]
+        bank = self.psf_bank_for_review()
+        if bank:
+            cmd += ['--psf-bank', bank]
+            self._log('multispot review will match with the PSF from '
+                      + os.path.basename(os.path.dirname(bank)))
+        else:
+            self._log('no trained run yet, so only the pass/fail review '
+                      'can run: multispot needs the PSF a training run '
+                      'measures from confirmed spots. Train (5) first, '
+                      'then open Spot Check again for multispot.')
         try:
             subprocess.Popen(cmd, cwd=self._repo)
         except Exception as exc:                            # noqa: BLE001
