@@ -478,7 +478,8 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
           all(len(c) == 4 for c in a5.polymer_adj['H']))
     _aa, ok_all, why_all, _dall = run(1.0)
     check('a threshold that keeps nothing REJECTS the hybe with a reason',
-          not ok_all and 'p_exist' in why_all, why_all[:60])
+          not ok_all and ('p<1' in why_all or 'p_exist' in why_all),
+          why_all[:60])
 
     saved = a5.save()
     pos, amp, n_cand = P.collapse_polymer(saved, ['H'])

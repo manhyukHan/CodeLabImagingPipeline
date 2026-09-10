@@ -219,9 +219,10 @@ def test_readout_multi_gates():
     check('every candidate reaches the grid with its p_exist',
           d['readout_engine'] == 'v3' and len(d['readout_p_exist']) == 6)
     check('kept ones carry labels', d['readout_labels'] == ['0.90', '0.80'])
-    check('dropped ones carry theirs and their reasons',
+    check('dropped ones carry theirs, tagged with why, and their reasons',
           len(d['readout_rejected_centroids']) == 4
-          and d['readout_rejected_labels'] == ['0.95', '0.88', '0.30', '0.70']
+          and d['readout_rejected_labels'] == ['0.95 z', '0.88 xy', '0.30 <',
+                                                '0.70 ~']
           and any('planes from the fiducial' in w for w in d['readout_dropped_why'])
           and any('px from the fiducial' in w for w in d['readout_dropped_why'])
           and any('p_exist 0.30 < 0.5' in w for w in d['readout_dropped_why'])
@@ -238,8 +239,8 @@ def test_readout_multi_gates():
     # Every candidate out of reach: the reason says so.
     far = [spot(8, 8, 2 * z_half + 20.0, 0.9), spot(8, 12, 2 * z_half + 25.0, 0.9)]
     a3, ok3, why3 = _run(FakeEngine(far), z_r=20.0)
-    check('all out of reach -> rejected with the reach named',
-          not ok3 and 'from the fiducial in z' in why3, why3)
+    check('all out of reach -> rejected with the breakdown naming the reach',
+          not ok3 and why3 == 'readout: none kept -- 2 z', why3)
 
     # THE PANEL'S Z WINDOW IS THE REACH. Six planes: a hit eight away is
     # dropped that would have been kept at the measured fourteen.
@@ -282,8 +283,39 @@ def test_readout_multi_gates():
 
     # And nothing more to check on the earlier out-of-reach run.
     a3, ok3, why3 = _run(FakeEngine(far), z_r=20.0)
-    check('all out of reach -> rejected with the reach named',
-          not ok3 and 'from the fiducial in z' in why3, why3)
+    check('all out of reach -> rejected with the breakdown naming the reach',
+          not ok3 and why3 == 'readout: none kept -- 2 z', why3)
+
+
+def test_rejected_labels_say_why():
+    """A rejected candidate's label carries a tag for WHY it lost, and a
+    readout that kept nothing says the breakdown, not the last reason."""
+    print('rejected labels say why')
+    M = T2.alt_marker
+    check('one tag per kind',
+          M('beyond the fiducial window (20.3 > 17 planes from expected)') == ' z'
+          and M('z 17.6 planes from the fiducial > 14') == ' z'
+          and M('7.0 px from the fiducial > 5') == ' xy'
+          and M('z 3.0 within 10 planes of the stack end') == ' e'
+          and M('no sub-voxel position') == ' ~'
+          and M('p_exist 0.30 < 0.5') == ' <'
+          and M('refined by the Gaussian fit') == ' g'
+          and M('not the best') == '' and M(None) == '')
+    import inspect
+    src = inspect.getsource(T2)
+    check('both label lists carry the tag',
+          src.count('{alt_marker(w)}') == 2)
+    z0 = _slab_z0(20.0, T2._seed_z_half(T2.READOUT_FIT_RADIUS_UM,
+                                        T2.DEFAULT_VOXEL_UM))
+    debug = {'H': {}}
+    a, ok, why = _run(FakeEngine([spot(8, 15, 20.0 - z0, 0.99),   # 7 px out
+                                  spot(8, 8, 20.0 - z0, 0.30)]),  # below p
+                      debug=debug)
+    check('nothing kept -> the breakdown by kind, short enough for a tile',
+          not ok and why == 'readout: none kept -- 1 xy, 1 p<0.5', why)
+    check('and the labels wear the tags',
+          debug['H']['readout_rejected_labels'] == ['0.99 xy', '0.30 <'],
+          str(debug['H']['readout_rejected_labels']))
 
 
 def test_display_box_is_a_hard_boundary():
@@ -550,6 +582,7 @@ def main():
     test_routing()
     test_params()
     test_readout_multi_gates()
+    test_rejected_labels_say_why()
     test_display_box_is_a_hard_boundary()
     test_learned_fiducial_best_of_one()
     test_panel()

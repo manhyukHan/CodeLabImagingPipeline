@@ -213,7 +213,7 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             if zmin <= cz < zmax:
                 ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
             if labels and i < len(labels) and labels[i]:
-                _label(ax_yx, cx, cy, str(labels[i]), color)
+                _label(ax_yx, cx, cy, str(labels[i]), color, w_img, h_img)
     if rejected_list:
         for i, (cx, cy, cz) in enumerate(rejected_list):
             if not _on_yx(cx, cy):
@@ -224,7 +224,8 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             if zmin <= cz < zmax:
                 ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
             if rejected_labels and i < len(rejected_labels) and rejected_labels[i]:
-                _label(ax_yx, cx, cy, str(rejected_labels[i]), 'deepskyblue')
+                _label(ax_yx, cx, cy, str(rejected_labels[i]), 'deepskyblue',
+                       w_img, h_img)
     if lateral_list:
         # YX ONLY, dashed. See the `lateral` paragraph above: this marks
         # WHICH blob is under discussion without claiming a z nobody
@@ -243,10 +244,28 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     ax_xz.set_ylim(xz_img.shape[0] - 0.5, -0.5)
 
 
-def _label(ax, x, y, text, color):
-    """A small tag just right of a ring, readable on either background."""
-    ax.annotate(text, (x, y), xytext=(4, -3), textcoords='offset points',
-                fontsize=6.5, color=color, ha='left', va='center',
+def _label(ax, x, y, text, color, w=None, h=None):
+    """A small tag beside a ring, readable on either background and kept
+    INSIDE the image.
+
+    Right of the ring by default. A ring on the top row put the tag's
+    box half above the image -- into the title of the tile above it --
+    and near the right edge the tag ran off the panel. So near the top
+    the tag hangs below the ring, near the bottom it sits above, near
+    the right edge it goes left; and it is clipped to the axes as the
+    last resort. `w`, `h` are the image's own size, because the axes are
+    pinned to it only after every tag is placed.
+    """
+    dx, ha = 4, 'left'
+    dy, va = -3, 'center'
+    if w is not None and float(x) > float(w) - 4.5:
+        dx, ha = -4, 'right'
+    if h is not None and float(y) < 1.5:
+        dy, va = -8, 'top'
+    elif h is not None and float(y) > float(h) - 2.5:
+        dy, va = 8, 'bottom'
+    ax.annotate(text, (x, y), xytext=(dx, dy), textcoords='offset points',
+                fontsize=6.5, color=color, ha=ha, va=va, clip_on=True,
                 bbox=dict(boxstyle='round,pad=0.15', fc='black', ec='none',
                           alpha=0.55))
 

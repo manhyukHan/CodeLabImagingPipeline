@@ -136,6 +136,35 @@ def test_rejected_marker_is_used():
     plt.close(fig)
 
 
+def test_labels_stay_inside():
+    """A tag on a ring at the top row used to sit half above the image,
+    in the title of the tile above; near the right edge it ran off the
+    panel. Tags now flip to stay inside, and are clipped as a last resort."""
+    print('tags stay inside the image')
+    cube = a_crop_with_a_brighter_neighbour()
+    h, w = cube.shape[:2]
+    fig, ax_yx, ax_xz = axes()
+    F.draw_spot_fit_status(ax_yx, ax_xz, cube, centroid=None,
+                           rejected=[(w - 1.0, 0.0, 20.0), (7.0, 7.0, 20.0),
+                                     (0.0, h - 1.0, 20.0)],
+                           rejected_labels=['1.00 z', '0.46 <', '0.90 ~'])
+    tags = {t.get_text(): t for t in ax_yx.texts}
+    check('three tags drawn', set(tags) == {'1.00 z', '0.46 <', '0.90 ~'},
+          str(sorted(tags)))
+    tr, tc, tb = tags.get('1.00 z'), tags.get('0.46 <'), tags.get('0.90 ~')
+    check('a tag at the top-right corner hangs below its ring and to the left',
+          tr is not None and tr.get_va() == 'top' and tr.get_ha() == 'right',
+          f'{tr.get_va()}/{tr.get_ha()}' if tr else '')
+    check('a tag in the middle sits right of its ring, centred',
+          tc is not None and tc.get_va() == 'center' and tc.get_ha() == 'left')
+    check('a tag on the bottom row sits above its ring',
+          tb is not None and tb.get_va() == 'bottom' and tb.get_ha() == 'left')
+    check('and every tag is clipped to the axes as a last resort',
+          all(t.get_clip_on() for t in tags.values()))
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
 def test_degenerate_inputs():
     print('degenerate crops do not raise')
     import matplotlib.pyplot as plt
@@ -279,6 +308,7 @@ def main():
     test_marked_spot_is_visible()
     test_no_marker_falls_back()
     test_rejected_marker_is_used()
+    test_labels_stay_inside()
     test_degenerate_inputs()
     test_helpers()
     test_markers_land_where_they_are_told()

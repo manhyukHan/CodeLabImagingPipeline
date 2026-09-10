@@ -741,6 +741,37 @@ LearnedFit = namedtuple('LearnedFit',
                         ['y', 'x', 'z', 'amplitude', 'p_exist', 'at_bound'])
 
 
+def alt_marker(why):
+    """A short tag beside a rejected candidate's p_exist: WHY it lost.
+
+        z    outside the depth window / z reach
+        xy   outside the fiducial's lateral reach
+        e    within the trimmed planes at a stack end
+        ~    no sub-voxel position (model 3 placed no peak)
+        <    below min p_exist
+        g    the engine's own candidate, which the Gaussian fit refined
+        (none)  'not the best': a lower p_exist inside the window -- and
+                ties lose on decimals the two-place label does not show
+
+    Two grids asked the same question -- 'why was this p 1.00 candidate
+    not taken?' -- and a label that is only a p cannot answer it.
+    """
+    w = str(why or '')
+    if 'px from the fiducial' in w:
+        return ' xy'
+    if 'stack end' in w:
+        return ' e'
+    if 'beyond the fiducial window' in w or 'planes from' in w:
+        return ' z'
+    if 'no sub-voxel' in w:
+        return ' ~'
+    if 'refined by the Gaussian' in w:
+        return ' g'
+    if 'p_exist' in w:
+        return ' <'
+    return ''
+
+
 def _learned_slab(cube, z_c, p, reach=None):
     """The z-slab a learned engine searches around z_c: the reach (the
     panel's, unless the caller has its own) padded by the engine's own
@@ -1050,17 +1081,26 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
             [(float(c.x) - ox, float(c.y) - oy, float(c.z))
              for c, _w in dropped] or None)
         debug[hybe]['readout_rejected_labels'] = (
-            [f'{float(c.p_exist):.2f}' for c, _w in dropped] or None)
+            [f'{float(c.p_exist):.2f}{alt_marker(w)}' for c, w in dropped]
+            or None)
         debug[hybe]['readout_dropped_why'] = [w for _c, w in dropped]
     if not kept:
-        if len(cands) - len(in_reach) == len(cands):
-            return False, (f'readout: every candidate more than {z_half} '
-                           f'planes from the fiducial in z')
-        if n_pre:
-            return False, ('readout: no candidate could be placed to '
-                           'sub-voxel precision')
-        return False, (f'readout: every candidate below p_exist {t:g}'
-                       if t is not None else 'readout found nothing')
+        if not dropped:
+            return False, 'readout found nothing'
+        # THE BREAKDOWN, NOT THE LAST REASON. 'every candidate below
+        # p_exist 0.5' on a tile whose 0.82 candidate had been cut by the
+        # lateral reach read as a contradiction. Every dropped candidate
+        # has its own reason; the title counts them by kind, in the same
+        # tags the labels carry (alt_marker), short enough for a tile.
+        names = {'xy': 'xy', 'z': 'z', 'e': 'end', '~': '~',
+                 '<': (f'p<{t:g}' if t is not None else 'p')}
+        counts = {}
+        for _c, w in dropped:
+            k = alt_marker(w).strip() or '?'
+            counts[k] = counts.get(k, 0) + 1
+        parts = [f'{counts[k]} {names.get(k, k)}'
+                 for k in ('xy', 'z', 'e', '<', '~', '?') if k in counts]
+        return False, 'readout: none kept -- ' + ', '.join(parts)
 
     adj, raw = [], []
     for c in kept:
@@ -1436,7 +1476,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                 debug[hybe]['fiducial_rejected_centroids'] = (
                     [(a.x, a.y, a.z) for a, _w in alts] or None)
                 debug[hybe]['fiducial_rejected_labels'] = (
-                    [f'{a.p_exist:.2f}' for a, _w in alts] or None)
+                    [f'{a.p_exist:.2f}{alt_marker(w)}' for a, w in alts]
+                    or None)
                 debug[hybe]['fiducial_dropped_why'] = [w for _a, w in alts]
         else:
             f = fit_fiducial(cube, z0, p)
