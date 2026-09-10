@@ -58,6 +58,8 @@ CENTRE: a symmetric model on a roughly symmetric object still gives an
 unbiased centre. Registration is kept as a QC cross-check (`qc_shift`),
 where its better tail behaviour is useful, not as the estimator.
 """
+import os
+
 import numpy as np
 
 from codelab_pipeline.localization import fit3d_um as U
@@ -343,8 +345,18 @@ class V2Params(object):
     def __init__(self, voxel_um=DEFAULT_VOXEL_UM, psf_family=None,
                  psf_shape=None, psf_label='', fiducial_gates=None,
                  readout_gates=None, qc_shift=True,
-                 readout_engine=None, min_p_exist=None, min_p3=None):
+                 readout_engine=None, min_p_exist=None, min_p3=None,
+                 readout_model_dir=None, engine_label=''):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # THE MODEL DIRECTORY, NOT THE ENGINE, is what crosses a process
+        # boundary. An engine holds torch weights and an HDF5 bank; a
+        # V2Params is pickled into every allele_task payload. The engine
+        # is built on first use in whichever process asks, and dropped
+        # from the pickle (__getstate__).
+        self.readout_model_dir = (str(readout_model_dir)
+                                  if readout_model_dir else None)
+        self.engine_label = str(engine_label or '')
+        self._readout_engine = readout_engine
         # None = no calibrated PSF, so the readout sigma is fitted per spot
         # like the fiducial's. Supported, but it gives up both the accuracy
         # and the 37% speed the fixed shape buys.
@@ -369,7 +381,6 @@ class V2Params(object):
         # other. v2 has only ever written lists of length one because
         # fit_readout returns one fit. A multispot engine here fills the
         # shape that was always declared.
-        self.readout_engine = readout_engine
         # NOTHING IS STORED ON p_exist, and that is deliberate. The
         # allele's 4-tuples are (y, x, z, amplitude) and stay that way --
         # widening them would change a persisted contract for a number
@@ -393,6 +404,28 @@ class V2Params(object):
         # confirmed spot), from multispot labels, per MATCH -- which is
         # the only one of the two that can tell siblings apart.
         self.min_p3 = None if min_p3 is None else float(min_p3)
+
+    @property
+    def readout_engine(self):
+        """The learned readout engine, built on first use, or None."""
+        if self._readout_engine is None and self.readout_model_dir:
+            from .engine import make_engine
+            self._readout_engine = make_engine(ROUTE_V3,
+                                               model_dir=self.readout_model_dir)
+        return self._readout_engine
+
+    @readout_engine.setter
+    def readout_engine(self, value):
+        self._readout_engine = value
+
+    @property
+    def is_learned(self):
+        return bool(self.readout_model_dir or self._readout_engine is not None)
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d['_readout_engine'] = None      # rebuilt in the child from the dir
+        return d
 
     @property
     def has_psf(self):
@@ -436,11 +469,17 @@ class V2Params(object):
                 label = doc.get('installed_from') or doc.get('label') or label
             else:
                 label = f'{label} [REJECTED: {"; ".join(why)}]'
+        v3 = params.get('v3') or {}
+        learned = route(params.get('engine', '')) == ROUTE_V3
         return cls(voxel_um=voxel, psf_family=fam, psf_shape=shape,
                    psf_label=label,
                    fiducial_gates=v2.get('fiducial'),
                    readout_gates=v2.get('readout'),
-                   qc_shift=v2.get('qc_shift', True))
+                   qc_shift=v2.get('qc_shift', True),
+                   readout_model_dir=(v3.get('model_dir') if learned else None),
+                   min_p_exist=(v3.get('min_p_exist') if learned else None),
+                   engine_label=str(params.get('engine_label') or
+                                    params.get('engine') or ''))
 
     def describe(self):
         """One line that reconstructs the run.
@@ -453,6 +492,13 @@ class V2Params(object):
         (readout sigma free instead of fixed) has to leave a record saying
         which run it became.
         """
+        if self.is_learned:
+            t = ('none' if self.min_p_exist is None
+                 else f'{self.min_p_exist:g}')
+            return (f'v3, readout by the learned engine from '
+                    f'{os.path.basename(str(self.readout_model_dir or "?"))} '
+                    f'(p_exist >= {t}); fiducial by v2 Gaussian; '
+                    f'voxel {self.voxel_um}')
         if not self.has_psf:
             why = f' ({self.psf_label})' if self.psf_label else ''
             return (f'v2, readout sigma FREE -- no usable calibrated PSF{why}; '
@@ -653,13 +699,37 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         # this module keeps: a hybe that cannot be fitted is a rejected
         # hybe with a reason, never an exception out of a worker.
         return False, f'readout engine failed: {type(exc).__name__}: {exc}'
+    if debug is not None:
+        debug[hybe]['readout_engine'] = 'v3'
+        debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
+        debug[hybe]['readout_n_before_p_gate'] = len(cands)
     if not cands:
         return False, 'readout found nothing'
 
     from . import p_gate as PG
     from . import psfmatcher as PSFM
+    # THE FIDUCIAL'S OWN AXIAL REACH. The crop is the box the fiducial
+    # anchors, and z_r is where this hybe's fiducial says the locus sits;
+    # a candidate further from that in z than v2's own readout search
+    # would have looked is a spot with a different z-drift from the
+    # fiducial's, which is exactly the spot this trace must not carry.
+    # Lateral reach needs no gate: the crop's own edges are it.
+    z_half = _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    dropped = []                    # (cand, why) for the grid
+    in_reach = []
+    for c in cands:
+        if (z_r is not None and np.isfinite(z_r)
+                and abs(float(c.z) - float(z_r)) > z_half):
+            dropped.append((c, f'z {abs(float(c.z) - float(z_r)):.1f} planes '
+                               f'from the fiducial > {z_half}'))
+        else:
+            in_reach.append(c)
     t = p.min_p_exist
-    kept = cands if t is None else PG.apply(cands, t, which=PG.CALIBRATED)
+    kept = (in_reach if t is None
+            else PG.apply(in_reach, t, which=PG.CALIBRATED))
+    for c in in_reach:
+        if c not in kept:
+            dropped.append((c, f'p_exist {float(c.p_exist):.2f} < {t:g}'))
     # AND ONLY CANDIDATES MODEL 3 ACTUALLY PLACED. polymer_adj is a list
     # of POSITIONS, and a candidate the matched filter could not place
     # keeps its anchor's INTEGER coordinate -- 208 nm here against a
@@ -686,13 +756,26 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         if debug is not None:
             debug[hybe]['readout_n_below_p3'] = before - len(kept)
     n_pre = len(kept)
-    kept = [c for c in kept if PSFM.is_refined(c)]
+    refined = [c for c in kept if PSFM.is_refined(c)]
+    for c in kept:
+        if c not in refined:
+            dropped.append((c, 'no sub-voxel position'))
+    kept = refined
     if debug is not None:
         debug[hybe]['readout_n_unrefined'] = n_pre - len(kept)
-    if debug is not None:
-        debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
-        debug[hybe]['readout_n_before_p_gate'] = len(cands)
+        debug[hybe]['readout_n_out_of_reach'] = len(cands) - len(in_reach)
+        # EVERY CANDIDATE REACHES THE GRID, kept or not, each with its
+        # own p_exist: the whole point of looking at one allele is to
+        # see the p_exist distribution and decide where to cut.
+        debug[hybe]['readout_rejected_centroids'] = (
+            [(float(c.x), float(c.y), float(c.z)) for c, _w in dropped] or None)
+        debug[hybe]['readout_rejected_labels'] = (
+            [f'{float(c.p_exist):.2f}' for c, _w in dropped] or None)
+        debug[hybe]['readout_dropped_why'] = [w for _c, w in dropped]
     if not kept:
+        if len(cands) - len(in_reach) == len(cands):
+            return False, (f'readout: every candidate more than {z_half} '
+                           f'planes from the fiducial in z')
         if n_pre:
             return False, ('readout: no candidate could be placed to '
                            'sub-voxel precision')
@@ -710,6 +793,8 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     allele.polymer_raw[hybe] = raw
     if debug is not None:
         debug[hybe]['readout_centroids'] = [(c.x, c.y, c.z) for c in kept]
+        debug[hybe]['readout_labels'] = [f'{float(c.p_exist):.2f}'
+                                         for c in kept]
     return True, ''
 
 
@@ -1326,7 +1411,10 @@ def allele_task(payload):
     # the serial path stamped them, which is worse than not stamping at all.
     import time as _time
     allele.provenance = {
-        'engine': 'v2', 'engine_label': 'v2',
+        'engine': ('v3' if params is not None and params.is_learned else 'v2'),
+        'engine_label': (params.engine_label or 'v2') if params else 'v2',
+        'readout_model_dir': (params.readout_model_dir if params else None),
+        'min_p_exist': (params.min_p_exist if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
@@ -1433,7 +1521,10 @@ def allele_task_with_debug(payload):
     allele = AnAllele()
     allele.set_metadata(**meta)
     allele.provenance = {
-        'engine': 'v2', 'engine_label': 'v2',
+        'engine': ('v3' if params is not None and params.is_learned else 'v2'),
+        'engine_label': (params.engine_label or 'v2') if params else 'v2',
+        'readout_model_dir': (params.readout_model_dir if params else None),
+        'min_p_exist': (params.min_p_exist if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
         'psf': (params.psf_label or None) if params else None,
@@ -1524,6 +1615,21 @@ def is_v2(engine):
     return route(engine) == ROUTE_V2
 
 
+def uses_v2_tracer(engine):
+    """v2 AND v3: the learned engine replaces only the READOUT fit.
+
+    v3 keeps everything else of the v2 path -- the fiducial fitted by
+    v2's own Gaussian (one major spot, no multispot search), the drift
+    and z-drift gates against the reference fiducial, and the readout
+    crop cut around the fiducial-mapped seed so a readout candidate is
+    judged inside the SAME box the fiducial anchors. Every dispatch that
+    asked is_v2() sent v3 down the v1 tracer, which has no readout
+    engine at all: v1's gates fired, no multispot ever formed, and the
+    grid showed v1's numbers. The panel's own docstring predicted it.
+    """
+    return route(engine) in (ROUTE_V2, ROUTE_V3)
+
+
 def is_v3(engine):
     """True for the learned route."""
     return route(engine) == ROUTE_V3
@@ -1560,10 +1666,11 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
     # only what is true of every engine.
     if allele is not None and hasattr(allele, 'provenance'):
         import time as _time
-        stamp = {'engine': 'v2' if is_v2(engine) else 'v1',
+        stamp = {'engine': ('v3' if is_v3(engine) else
+                            'v2' if is_v2(engine) else 'v1'),
                  'engine_label': str(engine or ''),
                  'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S')}
-        if is_v2(engine) and v2_params is not None:
+        if uses_v2_tracer(engine) and v2_params is not None:
             stamp.update({
                 'voxel_um': list(v2_params.voxel_um),
                 'psf': v2_params.psf_label or None,
@@ -1573,8 +1680,11 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
                 'readout_gates': {k: v for k, v in v2_params.readout_gates.items()
                                   if not isinstance(v, tuple)},
             })
+            if v2_params.is_learned:
+                stamp.update({'readout_model_dir': v2_params.readout_model_dir,
+                              'min_p_exist': v2_params.min_p_exist})
         allele.provenance = stamp
-    if not is_v2(engine):
+    if not uses_v2_tracer(engine):
         from codelab_pipeline.localization import localization as L
         return L.build_chromatin_trace_allele(
             allele, hybes, reference_hybe, hybe_fiducial_channels,

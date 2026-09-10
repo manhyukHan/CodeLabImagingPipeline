@@ -6,7 +6,8 @@ from codelab_pipeline.io import preprocess
 def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, title='',
                          marker_size=130, z_display_pad=15, title_fontsize=9,
                          rejected=None, scale_half=2, scale_half_z=5,
-                         lateral=None):
+                         lateral=None, labels=None, rejected_labels=None,
+                         all_primary=False):
     """
     Renders one spot's fit-status: a YX max-projection (over Z) and an XZ
     max-projection (over Y -- X horizontal, Z vertical, same display
@@ -78,6 +79,11 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
     crop's own lb quantile, so the noise floor still reads as noise.
     Falls back to whole-crop quantiles when there is no marker, or when
     the marked box is not brighter than that floor.
+    labels / rejected_labels: one short string per centroid / rejected
+    entry (a p_exist, say), drawn beside its ring on the YX panel.
+    all_primary: every centroid is this spot's own (yellow), not the
+    first plus context (blue). A learned engine's hit list has no
+    'primary' -- each hit is a traced position in its own right.
     lateral: (x, y) crop-local, or a list of them, for a spot whose Z
     was NEVER FITTED. Drawn WHITE and DASHED, and only on the YX panel,
     because "circled = fitted" is a convention the rest of this grid
@@ -183,16 +189,20 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
 
     if centroids:
         for i, (cx, cy, cz) in enumerate(centroids):
-            color = 'yellow' if i == 0 else 'blue'
+            color = 'yellow' if (i == 0 or all_primary) else 'blue'
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none', edgecolors=color, linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
             ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+            if labels and i < len(labels) and labels[i]:
+                _label(ax_yx, cx, cy, str(labels[i]), color)
     if rejected_list:
-        for cx, cy, cz in rejected_list:
+        for i, (cx, cy, cz) in enumerate(rejected_list):
             marker_kwargs = dict(s=marker_size, marker='o', facecolors='none',
                                  edgecolors='deepskyblue', linewidths=1.2)
             ax_yx.scatter([cx], [cy], **marker_kwargs)
             ax_xz.scatter([cx], [cz - zmin], **marker_kwargs)
+            if rejected_labels and i < len(rejected_labels) and rejected_labels[i]:
+                _label(ax_yx, cx, cy, str(rejected_labels[i]), 'deepskyblue')
     if lateral_list:
         # YX ONLY, dashed. See the `lateral` paragraph above: this marks
         # WHICH blob is under discussion without claiming a z nobody
@@ -201,6 +211,14 @@ def draw_spot_fit_status(ax_yx, ax_xz, cubic, centroid=None, lb=0.3, ub=0.9999, 
             ax_yx.scatter([cx], [cy], s=marker_size, marker='o',
                           facecolors='none', edgecolors='white',
                           linewidths=1.2, linestyle='--')
+
+
+def _label(ax, x, y, text, color):
+    """A small tag just right of a ring, readable on either background."""
+    ax.annotate(text, (x, y), xytext=(4, -3), textcoords='offset points',
+                fontsize=6.5, color=color, ha='left', va='center',
+                bbox=dict(boxstyle='round,pad=0.15', fc='black', ec='none',
+                          alpha=0.55))
 
 
 def _column_peak_z(cube, y, x):

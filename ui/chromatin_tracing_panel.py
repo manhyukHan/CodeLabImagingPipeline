@@ -63,6 +63,10 @@ CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 7.0,
                        'max_fiducial_drift_z': 15.0, 'z_boundary_trim': 10}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
+# v3: the p_exist cut. 0.5 is where a calibrated probability is
+# thresholded; MEASURED on the shipped model's own 661 judged matches it
+# sits within 0.006 F1 of the optimum across a range of pillar p1.
+V3_DEFAULTS = {'min_p_exist': 0.5}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
                   # v2 by default, per explicit request. Measured through the
                   # app on four experiments: 43-68% better same-locus repeat
@@ -453,6 +457,7 @@ class ChromatinTracingPanelUI(object):
         v1Outer.addLayout(grid)
         self.FitParamsStackedWidget.addWidget(v1Page)          # index 0 = v1
         self.FitParamsStackedWidget.addWidget(self._build_v2_page(double_spin))
+        self.FitParamsStackedWidget.addWidget(self._build_v3_page())  # index 2
         paramsOuter.addWidget(self.FitParamsStackedWidget)
 
         # The stack must follow DEFAULT_PARAMS['engine'] from the moment
@@ -803,6 +808,7 @@ class ChromatinTracingPanelUI(object):
                            or self.EngineComboBox.currentText()),
                 'engine_label': self.EngineComboBox.currentText(),
                 'v2': self.v2_params(),
+                'v3': self.v3_params(),
                 # NOT read here any more: voxel size is experiment-level
                 # and lives on the Ingestion panel. MainWindow injects it,
                 # so there is exactly one widget pair for it in the app.
@@ -811,6 +817,93 @@ class ChromatinTracingPanelUI(object):
                                or self.ReadoutPsfComboBox.currentText(),
                 'fiducial': self._read_channel_params(self.FiducialSpinBoxes),
                 'readout': self._read_channel_params(self.ReadoutSpinBoxes)}
+
+    def _build_v3_page(self):
+        """v3: the learned engine replaces the READOUT fit only.
+
+        What this page does NOT carry is as deliberate as what it does.
+        v3 has no peak bound, sigma bound, CI or peak/background ratio --
+        those are Gaussian-fit gates and a matched filter has none of
+        them -- so none is shown, and v1's page is not reused for it (it
+        was, and the run read as v1). The fiducial is still fitted by
+        v2's Gaussian on the same crop, so the fiducial gates on the v2
+        page still apply and are named here rather than duplicated.
+
+        THE THRESHOLD IS TYPED, NOT PREVIEWED. Fit + View Crop on one
+        allele shows every candidate's p_exist in the readout grid; a
+        person skims that across hybes and decides where to cut. That
+        is the histogram, one allele at a time, on the pixels that
+        matter -- so the number lives here, on the panel, and is what
+        both the preview and the batch run cut on.
+        """
+        page = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        form = QtWidgets.QFormLayout()
+        self.V3ModelComboBox = QtWidgets.QComboBox()
+        self.V3ModelComboBox.setMinimumWidth(240)
+        self.V3ModelComboBox.setProperty('config_uses_item_data', True)
+        self.V3ModelComboBox.setToolTip(
+            'A run under <repo>/models: its classifier (M1) scores every '
+            'candidate in the readout crop, its PSF bank places them, and '
+            'its multispot calibration (M2) is folded into p_exist. Build '
+            'one with Build model... on the Spot Localization tab.')
+        form.addRow('Model:', self.V3ModelComboBox)
+        self.V3MinPExistSpinBox = QtWidgets.QDoubleSpinBox()
+        self.V3MinPExistSpinBox.setRange(0.0, 1.0)
+        self.V3MinPExistSpinBox.setDecimals(2)
+        self.V3MinPExistSpinBox.setSingleStep(0.05)
+        self.V3MinPExistSpinBox.setValue(V3_DEFAULTS['min_p_exist'])
+        self.V3MinPExistSpinBox.setToolTip(
+            'Keep a readout candidate when p_exist >= this. p_exist is the '
+            'calibrated probability a real emitter is here -- the '
+            'classifier\'s answer times the matched filter\'s (M1 x M2). '
+            'Every candidate in the crop, kept or cut, is drawn in the '
+            'readout grid with its p_exist so this number can be chosen '
+            'from what one allele actually looks like.')
+        form.addRow('p_exist threshold (readout):', self.V3MinPExistSpinBox)
+        outer.addLayout(form)
+        note = QtWidgets.QLabel(
+            'The fiducial is still fitted by v2 (one Gaussian, the major '
+            'spot -- never a multispot search) inside the same crop, and '
+            'the drift / z-drift gates above still apply. Readout '
+            'candidates are kept only within the fiducial\'s own axial '
+            'reach, so a spot with a different z-drift from the fiducial is '
+            'not carried. v2\'s fiducial gates (occupancy, CI) are on the '
+            'v2 page and still in force.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #555;')
+        outer.addWidget(note)
+        outer.addStretch(1)
+        return page
+
+    def populate_models(self, runs, select=None):
+        """Same rows as Spot Localization's model combo."""
+        cb = self.V3ModelComboBox
+        cb.blockSignals(True)
+        cb.clear()
+        for r in runs or ():
+            bits = [r['name']]
+            if r.get('is_default'):
+                bits.append('(default)')
+            if not r.get('has_multispot'):
+                bits.append('- no multispot calibration')
+            if r.get('problems'):
+                bits.append('!! ' + r['problems'][0])
+            cb.addItem('  '.join(bits), r['path'])
+        if select:
+            i = cb.findData(select)
+            if i >= 0:
+                cb.setCurrentIndex(i)
+        cb.blockSignals(False)
+        return cb.count()
+
+    def selected_model_dir(self):
+        return self.V3ModelComboBox.currentData()
+
+    def v3_params(self):
+        return {'model_dir': self.selected_model_dir(),
+                'min_p_exist': float(self.V3MinPExistSpinBox.value())}
 
     def _build_v2_page(self, double_spin):
         """v2's own parameters, in v2's own units.
@@ -994,9 +1087,11 @@ class ChromatinTracingPanelUI(object):
         the same number, and carrying values across would be a unit bug
         waiting to happen.
         """
-        v2 = self.selected_engine_is_v2()
-        self.FitParamsStackedWidget.setCurrentIndex(1 if v2 else 0)
-        return v2
+        from codelab_pipeline.localization import tracing_v2 as R
+        eng = self.selected_engine()
+        index = 2 if R.is_v3(eng) else 1 if R.is_v2(eng) else 0
+        self.FitParamsStackedWidget.setCurrentIndex(index)
+        return R.is_v2(eng)
 
     def selected_engine(self):
         """The route this combo names -- itemData when it has one."""
@@ -1081,6 +1176,7 @@ class ChromatinTracingPanelUI(object):
                 v = gates[key]
                 w.setValue(0.0 if v is None else float(v))
         self.V2QcShiftCheckBox.setChecked(bool(V2.V2Params().qc_shift))
+        self.V3MinPExistSpinBox.setValue(V3_DEFAULTS['min_p_exist'])
         self.apply_engine_visibility()
         self.refresh_psf_entries(select=DEFAULT_READOUT_PSF)
         self.SpadSpinBox.setValue(CROSS_MODE_DEFAULTS['spad'])

@@ -1123,7 +1123,7 @@ class ChromatinTracingWorker(QtCore.QThread):
                     # per-hybe fan-out v1 uses has nothing to fan: keeping a
                     # whole allele in one child keeps that barrier inside
                     # one process and ships only the finished trace back.
-                    if executor is not None and tracing_v2.is_v2(self.engine):
+                    if executor is not None and tracing_v2.uses_v2_tracer(self.engine):
                         done = self._run_fov_alleles_parallel(
                             executor, storage_path, fov, alleles, fov_matrices,
                             done, total)
@@ -1922,7 +1922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # every control it ignores enabled and labelled in pixels. Every
         # other tracing widget above is connected; this one was not.
         chp.EngineComboBox.currentIndexChanged.connect(
-            lambda _: chp.apply_engine_visibility())
+            lambda _: self._on_trace_engine_changed())
         # Populate from the library at startup. Done here rather than in
         # setupUi so the panel stays importable without touching the disk.
         chp.refresh_psf_entries()
@@ -7056,6 +7056,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -- the learned mode -----------------------------------------------
 
+    def _on_trace_engine_changed(self):
+        """Tracing engine changed: swap the page; fill models on first use."""
+        chp = self.ui.ChromatinTracingPanel
+        chp.apply_engine_visibility()
+        if (tracing_v2.is_v3(chp.selected_engine())
+                and chp.V3ModelComboBox.count() == 0):
+            runs = self._refresh_model_list()
+            if not runs:
+                self.log('No trained models under <repo>/models yet -- '
+                         'Build model... on the Spot Localization tab.')
+
     def _refresh_model_list(self):
         """Fill the model combo from <repo>/models, keeping the choice."""
         from codelab_pipeline.training import model_store as MS
@@ -7063,6 +7074,14 @@ class MainWindow(QtWidgets.QMainWindow):
         want = sp.selected_model_dir()
         runs = MS.available()
         sp.populate_models(runs, select=want or MS.default_model())
+        # THE TRACING PANEL'S v3 PAGE LISTS THE SAME RUNS. Two combos, one
+        # source, refreshed together, so a model trained on one tab is
+        # offered on the other without a second refresh anyone has to
+        # know about.
+        chp = getattr(self.ui, 'ChromatinTracingPanel', None)
+        if chp is not None and hasattr(chp, 'populate_models'):
+            chp.populate_models(runs, select=chp.selected_model_dir()
+                                or MS.default_model())
         return runs
 
     def _on_spot_engine_changed(self):
@@ -9205,7 +9224,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # the QThread. One allele cannot use per-hybe fan-out (its
                 # consensus depth needs every crop first), so it uses the
                 # grain it does have.
-                if pool is not None and tracing_v2.is_v2(full_params.get('engine')):
+                if pool is not None and tracing_v2.uses_v2_tracer(full_params.get('engine')):
                     payload = (allele.save(), hybes, reference_hybe,
                                hybe_fiducial_channels, hybe_readout_channels,
                                storage_path, fov, modality, cell, fov_matrices,
@@ -9301,11 +9320,36 @@ class MainWindow(QtWidgets.QMainWindow):
                                                 'fiducial'),
                                         [rej] if rej is not None else None))
                 if d.get('readout_cubic') is not None:
-                    readout_results.append((d['readout_cubic'], d['readout_centroids'],
-                                            _titled(hybe, d.get('readout_occupancy'),
-                                                    d.get('readout_uncert_nm'),
-                                                    'readout'),
-                                            d.get('readout_rejected_centroids')))
+                    if d.get('readout_engine') == 'v3':
+                        # ONE BOX, EVERY CANDIDATE, EACH WITH ITS p_exist.
+                        # Kept ones ring yellow (all of them -- a v3 hit
+                        # list has no 'primary'), dropped ones blue, and
+                        # the title is the p_exist list a person skims to
+                        # choose the threshold. v2's occupancy and CI do
+                        # not exist for a matched filter and are not shown.
+                        pe = d.get('readout_p_exist') or []
+                        kept_n = len(d.get('readout_centroids') or [])
+                        why = str(rejected.get(hybe, '') or '')
+                        head = (f'{hybe}\np_exist ' + ', '.join(
+                            f'{v:.2f}' for v in sorted(pe, reverse=True)[:6])
+                            + (' ...' if len(pe) > 6 else '')
+                            + f'\n{kept_n} kept of {len(pe)}')
+                        if why and why.startswith('readout'):
+                            head += '\n' + why[len('readout'):].strip(' :')
+                        elif why:
+                            head += '\n' + why
+                        readout_results.append((
+                            d['readout_cubic'], d.get('readout_centroids'),
+                            head, d.get('readout_rejected_centroids'),
+                            {'labels': d.get('readout_labels'),
+                             'rejected_labels': d.get('readout_rejected_labels'),
+                             'all_primary': True}))
+                    else:
+                        readout_results.append((d['readout_cubic'], d['readout_centroids'],
+                                                _titled(hybe, d.get('readout_occupancy'),
+                                                        d.get('readout_uncert_nm'),
+                                                        'readout'),
+                                                d.get('readout_rejected_centroids')))
 
             allele_label = f'FOV{fov:03d}_allele{allele.id}'
             # allele figures default into figures/{modality}/alleles/fov###/,
@@ -9363,8 +9407,17 @@ class MainWindow(QtWidgets.QMainWindow):
         label, so the choice is visible in the experiment description too.
         """
         from codelab_pipeline.localization import psf_library as LIB
-        if not tracing_v2.is_v2(full_params.get('engine')):
+        if not tracing_v2.uses_v2_tracer(full_params.get('engine')):
             return None
+        if tracing_v2.is_v3(full_params.get('engine')):
+            v3 = full_params.get('v3') or {}
+            if not v3.get('model_dir'):
+                QtWidgets.QMessageBox.warning(
+                    self, 'Chromatin Tracing',
+                    'v3 needs a trained model. Pick one under Fit '
+                    'Parameters, or build one with Build model... on the '
+                    'Spot Localization tab.')
+                return None
         label = full_params.get('readout_psf')
         # install=False for PREVIEW. View Crop is documented as in-memory
         # only, and installing would rewrite <project>/analysis/psf.json --
