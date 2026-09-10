@@ -308,6 +308,20 @@ def test_the_gui_wiring():
     check('closing hides; a running build keeps reporting',
           'event.ignore()' in dsrc and 'self.hide()' in dsrc)
 
+    # A HIDDEN CONSOLE, NOT NONE. Detached gave the build child no
+    # console, and each of its pool workers then opened its own -- a
+    # desktop full of empty python.exe windows on a real build.
+    from ui import proc_stream as PS
+    kw = PS._detached_kwargs()
+    if sys.platform.startswith('win'):
+        import subprocess as _sp
+        flags = kw.get('creationflags', 0)
+        check('the child gets a hidden console its workers inherit',
+              flags & _sp.CREATE_NO_WINDOW and not (flags & _sp.DETACHED_PROCESS)
+              and flags & _sp.CREATE_NEW_PROCESS_GROUP)
+    else:
+        check('posix: its own session', kw.get('start_new_session') is True)
+
     # The regex has to match build_bundle's real format.
     fmt = '  [%4d/%4d] fov007 Hyb_101   3 crops   12 cand' % (12, 666)
     m = StreamingProcWorker._PROGRESS.match(fmt)

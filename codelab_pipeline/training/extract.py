@@ -429,18 +429,22 @@ def extract_fov(storage_path, fov, hybes, channel, out_dir, pad=DEFAULT_PAD,
     return path, n_crop, n_cand
 
 
-def default_workers():
-    """cpu_count - 2, capped at 32.
+DEFAULT_WORKERS = 6
 
-    The cap was 16. The measurement this module already cites -- 250,481
-    anchor fits in 17 min across 32 workers against 8.8 h serial -- was
-    made at 32, and the docstring below says the count should track
-    cores because the work is 99.8% fit. On a 64-core machine a cap of
-    16 was leaving that measured speed on the table. 16 against 32 has
-    NOT been compared head to head on one workload; --workers overrides.
+
+def default_workers():
+    """6, or fewer on a small machine. --workers overrides.
+
+    NOT the core count. The fit is 99.8% of a crop's CPU, but every crop
+    is first READ off the NAS, and readers contend there long before the
+    cores do: ingestion measured 117.6 MB/s at 12 workers against 66 MB/s
+    at 36. A cap of 32 was set here from the fit measurement alone and
+    made a real build slower, not faster. Six is the operator's chosen
+    default for this store; it is a setting on the Build model window,
+    not a constant to tune here.
     """
     import multiprocessing
-    return max(1, min(32, (multiprocessing.cpu_count() or 4) - 2))
+    return max(1, min(DEFAULT_WORKERS, (multiprocessing.cpu_count() or 4) - 2))
 
 
 def extract(storage_path, fovs, hybes, channel, out_dir, workers=None,

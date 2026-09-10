@@ -199,11 +199,21 @@ class ModelBuildDialog(QtWidgets.QDialog):
         f.addWidget(self.BundlePathLineEdit, 0, 1)
         self.BrowsePushButton = QtWidgets.QPushButton('Browse...')
         f.addWidget(self.BrowsePushButton, 0, 2)
+        f.addWidget(QtWidgets.QLabel('workers:'), 2, 0)
+        self.WorkersSpinBox = QtWidgets.QSpinBox()
+        self.WorkersSpinBox.setRange(1, 64)
+        self.WorkersSpinBox.setValue(6)
+        self.WorkersSpinBox.setToolTip(
+            'Parallel crop extractions. Each reads its crop off the NAS '
+            'before fitting, and readers contend there long before the '
+            'cores do -- more is not faster past about six on this store.')
+        self.WorkersSpinBox.setMaximumWidth(120)
+        f.addWidget(self.WorkersSpinBox, 2, 1, QtCore.Qt.AlignLeft)
         self.BuildBundlePushButton = QtWidgets.QPushButton('Build bundle')
         self.BuildBundlePushButton.setToolTip(
             'Runs tools/build_bundle.py once per checked channel, in the '
             'background, into this one directory. The app stays usable.')
-        f.addWidget(self.BuildBundlePushButton, 1, 0, 1, 3)
+        f.addWidget(self.BuildBundlePushButton, 3, 0, 1, 3)
         f.setColumnStretch(1, 1)
         lay.addWidget(g)
 
@@ -660,7 +670,8 @@ class ModelBuildDialog(QtWidgets.QDialog):
                          # default, which silently capped every draw
                          # the old chain made at FOV 41.
                          '--fov-pool', ','.join(str(f) for f in
-                                                (self._fov_pool or fovs))])
+                                                (self._fov_pool or fovs)),
+                         '--workers', str(int(self.WorkersSpinBox.value()))])
         return cmds
 
     def _build_bundle(self):

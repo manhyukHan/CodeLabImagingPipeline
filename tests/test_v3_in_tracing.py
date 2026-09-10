@@ -151,7 +151,7 @@ def test_params():
 
 def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None,
          seed_yx=(8.0, 8.0), z_window=None, z_boundary_trim=0,
-         display_offset=(0, 0)):
+         display_offset=(0, 0), display_shape=(17, 17)):
     from codelab_pipeline.models.allele import AnAllele
     a = AnAllele()
     a.polymer_adj, a.polymer_raw = {}, {}
@@ -163,7 +163,8 @@ def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None,
     ok, why = T2._readout_multi(
         a, 'H', cube, z_r, p, 0.0, 0.0, 0.0, 100, 200,
         lambda h, y, x, z, ymin, xmin: (y + ymin, x + xmin, z), debug,
-        seed_yx=seed_yx, display_offset=display_offset)
+        seed_yx=seed_yx, display_offset=display_offset,
+        display_shape=display_shape)
     return a, ok, why
 
 
@@ -285,6 +286,94 @@ def test_readout_multi_gates():
           not ok3 and 'from the fiducial in z' in why3, why3)
 
 
+def test_display_box_is_a_hard_boundary():
+    """A candidate whose localized position lies outside the display crop
+    is removed silently -- never counted, never listed, never drawn."""
+    print('the display box is a hard boundary')
+    z0 = _slab_z0(20.0, T2._seed_z_half(T2.READOUT_FIT_RADIUS_UM,
+                                        T2.DEFAULT_VOXEL_UM))
+    # search crop 27 wide (display 17 + BOX_R 7 each side): display offset
+    # (7, 7). A hit at search x=2 is display x=-5: outside.
+    spots = [spot(15, 15, 20.0 - z0, 0.9),      # display (8, 8): kept
+             spot(15, 2, 20.0 - z0, 0.99),      # display x=-5: gone
+             spot(26, 15, 20.0 - z0, 0.99)]     # display y=19: gone
+    debug = {'H': {}}
+    cube = np.random.RandomState(0).normal(300.0, 5.0, (31, 31, 105))
+    a, ok, why = _run(FakeEngine(spots), z_r=20.0, cube=cube,
+                      seed_yx=(15.0, 15.0), display_offset=(7, 7),
+                      debug=debug)
+    check('one written', ok and len(a.polymer_adj['H']) == 1, why)
+    d = debug['H']
+    check('the two outside the box were never counted or listed',
+          d['readout_n_before_p_gate'] == 1 and d['readout_p_exist'] == [0.9]
+          and not d.get('readout_rejected_centroids'),
+          str((d['readout_n_before_p_gate'], d['readout_p_exist'])))
+    # _run passes no display_shape by default; here it must.
+
+
+def test_learned_fiducial_best_of_one():
+    print('the learned fiducial: best of one')
+    p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0)
+    reach = p.z_reach()
+    z0 = _slab_z0(20.0, reach)
+    cands = [spot(8, 8, 20.0 - z0, 0.7),                 # good
+             spot(4, 8, 21.0 - z0, 0.95),                # BEST
+             spot(12, 8, 20.0 - z0, 0.99, p=float('nan')),  # unrefined
+             spot(8, 12, 20.0 + reach + 6 - z0, 0.98),   # out of reach
+             spot(8, 4, 20.0 - z0, 0.3),                 # below threshold
+             spot(8, 30, 20.0 - z0, 0.99)]               # outside the crop
+    p.fiducial_engine = FakeEngine(cands)
+    cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
+    f, why, alts = T2._fiducial_learned(cube, 20.0, p)
+    check('the highest p_exist within reach and threshold wins',
+          f is not None and (f.y, f.x) == (4.0, 8.0) and f.p_exist == 0.95,
+          str(f))
+    check('its z is back in the crop\'s planes', abs(f.z - 21.0) < 1e-9)
+    check('ONE answer -- the fit has no list', isinstance(f, T2.LearnedFit))
+    whys = [w for _a, w in alts]
+    check('every other candidate is an alternative with a reason',
+          len(alts) == 4 and 'not the best' in whys
+          and any('no sub-voxel' in w for w in whys)
+          and any('from expected' in w for w in whys)
+          and any('p_exist 0.30 < 0.5' in w for w in whys), str(whys))
+    check('the one outside the crop never existed', len(alts) + 1 == 5)
+
+    p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z0, 0.2)])
+    f2, why2, alts2 = T2._fiducial_learned(cube, 20.0, p)
+    check('none above the threshold -> None with the reason',
+          f2 is None and 'p_exist >= 0.5' in why2 and len(alts2) == 1, why2)
+    p.fiducial_engine = FakeEngine([])
+    f3, why3, _ = T2._fiducial_learned(cube, 20.0, p)
+    check('nothing found -> None, says so', f3 is None and 'nothing' in why3)
+
+    # V2Params carries the second model the same way as the first.
+    pp = T2.V2Params.from_panel(
+        {'engine': T2.ROUTE_V3, 'v2': {},
+         'v3': {'model_dir': MODEL, 'fiducial_model_dir': MODEL,
+                'min_p_exist': 0.5}}, None)
+    check('from_panel reads the fiducial model', pp.fiducial_model_dir == MODEL)
+    check('describe() says best-of-one', 'best-of-one' in pp.describe())
+    pp.fiducial_engine = FakeEngine([])
+    d = pickle.loads(pickle.dumps(pp))
+    check('pickling drops the built fiducial engine, keeps the dir',
+          d._fiducial_engine is None and d.fiducial_model_dir == MODEL)
+    if os.path.isdir(MODEL):
+        check('and it rebuilds lazily',
+              type(d.fiducial_engine).__name__ == 'PsfMatcherV3Engine')
+    q = T2.V2Params.from_panel({'engine': T2.ROUTE_V3, 'v2': {},
+                                'v3': {'model_dir': MODEL}}, None)
+    check('no fiducial model -> v2 Gaussian fiducial (engine None)',
+          q.fiducial_model_dir is None and q.fiducial_engine is None)
+
+    import inspect
+    bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
+    check('the builder branches on the fiducial engine',
+          'if p.fiducial_engine is not None:' in bsrc
+          and '_fiducial_learned(cube, z0, p)' in bsrc)
+    check("and v2's seed fallback does not run for it",
+          'FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None' in bsrc)
+
+
 def test_panel():
     print('the panel')
     from PyQt5 import QtWidgets
@@ -307,8 +396,20 @@ def test_panel():
     ui.V3MinPExistSpinBox.setValue(0.65)
     pr = ui.params()
     check("params() carries the v3 block",
-          pr['v3'] == {'model_dir': '/m/r1', 'min_p_exist': 0.65}
+          pr['v3'] == {'model_dir': '/m/r1', 'fiducial_model_dir': None,
+                       'min_p_exist': 0.65}
           and T2.route(pr['engine']) == T2.ROUTE_V3)
+    ui.populate_models([{'name': 'r1', 'path': '/m/r1', 'is_default': True,
+                         'has_multispot': True, 'problems': []}],
+                       select='/m/r1', select_fiducial='/m/r1')
+    check('the fiducial combo offers v2 Gaussian first, then the runs',
+          ui.V3FiducialModelComboBox.itemData(0) is None
+          and ui.V3FiducialModelComboBox.count() == 2)
+    check('and params() carries the chosen fiducial model',
+          ui.params()['v3']['fiducial_model_dir'] == '/m/r1')
+    ui.V3FiducialModelComboBox.setCurrentIndex(0)
+    check('back to v2 Gaussian -> None',
+          ui.params()['v3']['fiducial_model_dir'] is None)
     check('the v3 page shows no Gaussian-fit gate',
           not any(k in dir(ui) for k in ('V3PeakBoundSpinBox',
                                           'V3MaxSigmaSpinBox')))
@@ -386,12 +487,16 @@ def test_main_window_wiring():
           'def _short_reason(why):' in src and "[:4]" in src)
     check('the tracing panel gets the same model list as Spot Localization',
           'chp.populate_models(' in inspect.getsource(MW._refresh_model_list))
+    check('the fiducial tile shows best-of-one with its p_exist',
+          "d.get('fiducial_engine') == 'v3'" in src and 'best of' in src)
 
 
 def main():
     test_routing()
     test_params()
     test_readout_multi_gates()
+    test_display_box_is_a_hard_boundary()
+    test_learned_fiducial_best_of_one()
     test_panel()
     test_grid()
     test_main_window_wiring()

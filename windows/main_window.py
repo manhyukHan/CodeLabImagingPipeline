@@ -7081,7 +7081,8 @@ class MainWindow(QtWidgets.QMainWindow):
         chp = getattr(self.ui, 'ChromatinTracingPanel', None)
         if chp is not None and hasattr(chp, 'populate_models'):
             chp.populate_models(runs, select=chp.selected_model_dir()
-                                or MS.default_model())
+                                or MS.default_model(),
+                                select_fiducial=chp.selected_fiducial_model_dir())
         return runs
 
     def _on_spot_engine_changed(self):
@@ -9327,12 +9328,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 # fitted but gate-rejected, no circle = no fit at all.
                 if d.get('fiducial_cubic') is not None:
                     centroid = [d['fiducial_centroid']] if d['fiducial_centroid'] is not None else None
-                    rej = d.get('fiducial_rejected_centroid')
-                    fid_results.append((d['fiducial_cubic'], centroid,
-                                        _titled(hybe, d.get('fiducial_occupancy'),
-                                                d.get('fiducial_uncert_nm'),
-                                                'fiducial'),
-                                        [rej] if rej is not None else None))
+                    if d.get('fiducial_engine') == 'v3':
+                        # BEST OF ONE, and what it beat: the chosen spot
+                        # yellow with its p_exist, every other candidate
+                        # blue with its own, so a person can see whether
+                        # the alignment rests on a clear winner.
+                        pe = d.get('fiducial_p_exist')
+                        n = d.get('fiducial_n_candidates') or 0
+                        why = str(rejected.get(hybe, '') or '')
+                        head = (f'{hybe}\nfid p '
+                                + (f'{pe:.2f}' if pe is not None and np.isfinite(pe)
+                                   else '--')
+                                + f'  best of {n}')
+                        if why and why.startswith('fiducial'):
+                            head += '\n' + _short_reason(why[len('fiducial'):])
+                        fid_results.append((
+                            d['fiducial_cubic'], centroid, head,
+                            d.get('fiducial_rejected_centroids'),
+                            {'labels': ([f'{pe:.2f}'] if centroid and pe is not None
+                                        and np.isfinite(pe) else None),
+                             'rejected_labels': d.get('fiducial_rejected_labels'),
+                             'all_primary': True}))
+                    else:
+                        rej = d.get('fiducial_rejected_centroid')
+                        fid_results.append((d['fiducial_cubic'], centroid,
+                                            _titled(hybe, d.get('fiducial_occupancy'),
+                                                    d.get('fiducial_uncert_nm'),
+                                                    'fiducial'),
+                                            [rej] if rej is not None else None))
                 if d.get('readout_cubic') is not None:
                     if d.get('readout_engine') == 'v3':
                         # ONE BOX, EVERY CANDIDATE, EACH WITH ITS p_exist.

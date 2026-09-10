@@ -30,10 +30,21 @@ _PROGRESS = re.compile(r'^\s*\[\s*(\d+)\s*/\s*(\d+)\s*\]')
 
 
 def _detached_kwargs():
-    """Popen keywords that make the child outlive this process."""
+    """Popen keywords that make the child outlive this process.
+
+    CREATE_NO_WINDOW, NOT DETACHED_PROCESS. Detached means the child has
+    no console at all -- and every console-subsystem process IT then
+    starts (a build's spawn pool: 32 python.exe workers) is given a
+    brand-new console of its own, which on a real build put thirty-odd
+    empty black windows on the desktop. A child started with a HIDDEN
+    console keeps one its workers inherit, so nothing appears; the
+    console is the child's own, not this process's, so the child still
+    outlives us (the survival test in tests/test_bundle_background.py
+    runs with exactly these flags).
+    """
     if sys.platform.startswith('win'):
         return {'creationflags': (subprocess.CREATE_NEW_PROCESS_GROUP
-                                  | subprocess.DETACHED_PROCESS),
+                                  | subprocess.CREATE_NO_WINDOW),
                 'close_fds': True}
     return {'start_new_session': True, 'close_fds': True}
 

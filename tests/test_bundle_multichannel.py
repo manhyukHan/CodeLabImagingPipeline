@@ -111,8 +111,12 @@ def test_eta_and_workers():
           'elif total <= workers:' in src and 'tasks in flight' in src)
     check('the resolved count is what extract() gets', 'workers=workers,' in src)
     w = X.default_workers()
-    check('default_workers() is an int in [1, 32]',
-          isinstance(w, int) and 1 <= w <= 32, str(w))
+    # SIX, NOT THE CORE COUNT: crops are read off the NAS first, and
+    # readers contend there long before the cores do (ingestion measured
+    # 117.6 MB/s at 12 workers against 66 at 36). A cap of 32 made a
+    # real build slower.
+    check('default_workers() is at most 6',
+          isinstance(w, int) and 1 <= w <= 6, str(w))
 
 
 ETACHECK = 'D:/claude-tmp/etacheck'

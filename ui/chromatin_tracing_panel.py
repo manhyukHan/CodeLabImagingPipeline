@@ -866,7 +866,16 @@ class ChromatinTracingPanelUI(object):
             'candidate in the readout crop, its PSF bank places them, and '
             'its multispot calibration (M2) is folded into p_exist. Build '
             'one with Build model... on the Spot Localization tab.')
-        form.addRow('Model:', self.V3ModelComboBox)
+        form.addRow('Readout model:', self.V3ModelComboBox)
+        self.V3FiducialModelComboBox = QtWidgets.QComboBox()
+        self.V3FiducialModelComboBox.setMinimumWidth(240)
+        self.V3FiducialModelComboBox.setProperty('config_uses_item_data', True)
+        self.V3FiducialModelComboBox.setToolTip(
+            'Optional: a run trained on the FIDUCIAL channel. The fiducial '
+            'is then called by that model, BEST OF ONE -- the highest-'
+            'p_exist candidate within reach is the alignment, never a list. '
+            'Leave on the v2 Gaussian to keep the reference behaviour.')
+        form.addRow('Fiducial model:', self.V3FiducialModelComboBox)
         self.V3MinPExistSpinBox = QtWidgets.QDoubleSpinBox()
         self.V3MinPExistSpinBox.setRange(0.0, 1.0)
         self.V3MinPExistSpinBox.setDecimals(2)
@@ -895,12 +904,11 @@ class ChromatinTracingPanelUI(object):
         outer.addStretch(1)
         return page
 
-    def populate_models(self, runs, select=None):
-        """Same rows as Spot Localization's model combo."""
-        cb = self.V3ModelComboBox
-        cb.blockSignals(True)
-        cb.clear()
-        for r in runs or ():
+    def populate_models(self, runs, select=None, select_fiducial=None):
+        """Same rows as Spot Localization's model combo, in BOTH combos.
+        The fiducial combo keeps 'v2 Gaussian' as its first entry, so the
+        default stays the reference behaviour."""
+        def rows_of(r):
             bits = [r['name']]
             if r.get('is_default'):
                 bits.append('(default)')
@@ -908,19 +916,41 @@ class ChromatinTracingPanelUI(object):
                 bits.append('- no multispot calibration')
             if r.get('problems'):
                 bits.append('!! ' + r['problems'][0])
-            cb.addItem('  '.join(bits), r['path'])
+            return '  '.join(bits)
+
+        cb = self.V3ModelComboBox
+        cb.blockSignals(True)
+        cb.clear()
+        for r in runs or ():
+            cb.addItem(rows_of(r), r['path'])
         if select:
             i = cb.findData(select)
             if i >= 0:
                 cb.setCurrentIndex(i)
         cb.blockSignals(False)
+
+        fb = self.V3FiducialModelComboBox
+        want = select_fiducial if select_fiducial is not None else fb.currentData()
+        fb.blockSignals(True)
+        fb.clear()
+        fb.addItem('v2 Gaussian fit  (default -- one spot, no model)', None)
+        for r in runs or ():
+            fb.addItem(rows_of(r), r['path'])
+        if want:
+            i = fb.findData(want)
+            fb.setCurrentIndex(i if i >= 0 else 0)
+        fb.blockSignals(False)
         return cb.count()
 
     def selected_model_dir(self):
         return self.V3ModelComboBox.currentData()
 
+    def selected_fiducial_model_dir(self):
+        return self.V3FiducialModelComboBox.currentData()
+
     def v3_params(self):
         return {'model_dir': self.selected_model_dir(),
+                'fiducial_model_dir': self.selected_fiducial_model_dir(),
                 'min_p_exist': float(self.V3MinPExistSpinBox.value())}
 
     def _build_v2_page(self, double_spin):

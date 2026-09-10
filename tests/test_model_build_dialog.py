@@ -165,6 +165,12 @@ def test_build_commands():
               for c in cmds))
     check('every command runs the interpreter unbuffered',
           all(c[1] == '-u' for c in cmds))
+    wk = {c[c.index('--workers') + 1] for c in cmds}
+    check('the worker count is a setting, default 6',
+          wk == {'6'} and d.WorkersSpinBox.value() == 6, str(wk))
+    d.WorkersSpinBox.setValue(4)
+    check('and it is what the command carries',
+          all(c[c.index('--workers') + 1] == '4' for c in d.build_commands()))
 
     d.FovListLineEdit.setText('')
     check('no FOVs -> no commands, with a reason', d.build_commands() == [])

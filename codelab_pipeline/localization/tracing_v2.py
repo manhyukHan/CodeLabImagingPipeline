@@ -59,6 +59,7 @@ unbiased centre. Registration is kept as a QC cross-check (`qc_shift`),
 where its better tail behaviour is useful, not as the estimator.
 """
 import os
+from collections import namedtuple
 
 import numpy as np
 
@@ -347,8 +348,19 @@ class V2Params(object):
                  readout_gates=None, qc_shift=True,
                  readout_engine=None, min_p_exist=None, min_p3=None,
                  readout_model_dir=None, engine_label='',
-                 z_window=None, z_boundary_trim=10):
+                 z_window=None, z_boundary_trim=10,
+                 fiducial_model_dir=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # A SECOND MODEL FOR THE FIDUCIAL, optional. Trained on the
+        # fiducial channel, it calls fiducial spots the way the readout
+        # model calls readouts -- but the fiducial phase takes BEST OF
+        # ONE: the highest-p_exist candidate is the alignment, because a
+        # hybe's frame has one answer, never a list. None keeps v2's
+        # Gaussian fiducial, which is the default and stays the
+        # reference the learned one is measured against.
+        self.fiducial_model_dir = (str(fiducial_model_dir)
+                                   if fiducial_model_dir else None)
+        self._fiducial_engine = None
         # THE PANEL'S TWO Z CONTROLS, honoured by v2 and v3 alike. They
         # were v1's -- accepted by the v2 dispatcher and ignored, and
         # invisible once v3 had its own page -- so a person turning them
@@ -437,9 +449,23 @@ class V2Params(object):
     def is_learned(self):
         return bool(self.readout_model_dir or self._readout_engine is not None)
 
+    @property
+    def fiducial_engine(self):
+        """The learned fiducial engine, built on first use, or None."""
+        if self._fiducial_engine is None and self.fiducial_model_dir:
+            from .engine import make_engine
+            self._fiducial_engine = make_engine(
+                ROUTE_V3, model_dir=self.fiducial_model_dir)
+        return self._fiducial_engine
+
+    @fiducial_engine.setter
+    def fiducial_engine(self, value):
+        self._fiducial_engine = value
+
     def __getstate__(self):
         d = dict(self.__dict__)
         d['_readout_engine'] = None      # rebuilt in the child from the dir
+        d['_fiducial_engine'] = None
         return d
 
     @property
@@ -497,6 +523,8 @@ class V2Params(object):
                    z_window=params.get('z_window'),
                    z_boundary_trim=trim,
                    readout_model_dir=(v3.get('model_dir') if learned else None),
+                   fiducial_model_dir=(v3.get('fiducial_model_dir')
+                                       if learned else None),
                    min_p_exist=(v3.get('min_p_exist') if learned else None),
                    engine_label=str(params.get('engine_label') or
                                     params.get('engine') or ''))
@@ -515,10 +543,12 @@ class V2Params(object):
         if self.is_learned:
             t = ('none' if self.min_p_exist is None
                  else f'{self.min_p_exist:g}')
+            fid = (f'fiducial best-of-one from '
+                   f'{os.path.basename(str(self.fiducial_model_dir))}'
+                   if self.fiducial_model_dir else 'fiducial by v2 Gaussian')
             return (f'v3, readout by the learned engine from '
                     f'{os.path.basename(str(self.readout_model_dir or "?"))} '
-                    f'(p_exist >= {t}); fiducial by v2 Gaussian; '
-                    f'voxel {self.voxel_um}')
+                    f'(p_exist >= {t}); {fid}; voxel {self.voxel_um}')
         if not self.has_psf:
             why = f' ({self.psf_label})' if self.psf_label else ''
             return (f'v2, readout sigma FREE -- no usable calibrated PSF{why}; '
@@ -707,8 +737,81 @@ def _lateral_reach_px(fit_radius_um, voxel_um):
     return max(1, int(round(fit_radius_um[0] / float(voxel_um[0]))))
 
 
+LearnedFit = namedtuple('LearnedFit',
+                        ['y', 'x', 'z', 'amplitude', 'p_exist', 'at_bound'])
+
+
+def _learned_slab(cube, z_c, p):
+    """The z-slab a learned engine searches around z_c: the panel's reach
+    padded by the engine's own box, never into the trimmed ends. Returns
+    (slab, z0, z1, reach, z_off)."""
+    from .psfmatcher import BOX_RZ
+    reach = p.z_reach()
+    depth = int(np.asarray(cube).shape[2])
+    z_off = _z_trim_offset(depth, p.z_boundary_trim)
+    if z_c is not None and np.isfinite(z_c):
+        z0 = max(z_off, int(round(float(z_c))) - reach - BOX_RZ)
+        z1 = min(depth - z_off, int(round(float(z_c))) + reach + BOX_RZ + 1)
+    else:
+        z0, z1 = z_off, depth - z_off
+    if z1 <= z0:
+        return None, z0, z1, reach, z_off
+    return np.asarray(cube)[:, :, z0:z1], z0, z1, reach, z_off
+
+
+def _fiducial_learned(cube, z0, p):
+    """The fiducial by the learned engine, BEST OF ONE.
+
+    Returns (fit, why, alternatives): `fit` is a LearnedFit or None, `why`
+    the reason when None, `alternatives` every other candidate in the
+    crop as (LearnedFit, why) for the grid. One answer, not a list: the
+    fiducial's job is to place this hybe's frame, and a second candidate
+    is an ambiguity rather than a second alignment. The choice is the
+    highest p_exist among those inside the fiducial's own reach of the
+    expected depth and above the threshold.
+    """
+    slab, s0, s1, reach, z_off = _learned_slab(cube, z0, p)
+    if slab is None:
+        return None, 'no planes left between the trimmed ends', []
+    try:
+        cands = p.fiducial_engine.localize(slab, seed_yxz=None, n_max=None)
+    except Exception as exc:                                # noqa: BLE001
+        return None, f'engine failed: {type(exc).__name__}: {exc}', []
+    cands = [c._replace(z=float(c.z) + s0) for c in cands]
+    h, w = np.asarray(cube).shape[:2]
+    cands = [c for c in cands
+             if -0.5 <= float(c.y) < h - 0.5 and -0.5 <= float(c.x) < w - 0.5]
+    if not cands:
+        return None, 'engine found nothing', []
+    from . import psfmatcher as PSFM
+    t = p.min_p_exist
+    fits, alts = [], []
+    for c in cands:
+        dzr = (abs(float(c.z) - float(z0))
+               if z0 is not None and np.isfinite(z0) else 0.0)
+        lf = LearnedFit(float(c.y), float(c.x), float(c.z),
+                        float(c.amplitude) if np.isfinite(c.amplitude) else 0.0,
+                        float(c.p_exist), ())
+        if dzr > reach:
+            alts.append((lf, f'z {dzr:.1f} planes from expected > {reach}'))
+        elif t is not None and not (float(c.p_exist) >= t):
+            alts.append((lf, f'p_exist {float(c.p_exist):.2f} < {t:g}'))
+        elif not PSFM.is_refined(c):
+            alts.append((lf, 'no sub-voxel position'))
+        else:
+            fits.append(lf)
+    if not fits:
+        return None, (f'no candidate at p_exist >= {t:g} within reach'
+                      if t is not None else 'no candidate within reach'), alts
+    fits.sort(key=lambda f: -f.p_exist)
+    best = fits[0]
+    alts = [(f, 'not the best') for f in fits[1:]] + alts
+    return best, None, alts
+
+
 def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
-                   to_shared, debug=None, seed_yx=None, display_offset=(0, 0)):
+                   to_shared, debug=None, seed_yx=None, display_offset=(0, 0),
+                   display_shape=None):
     """Every readout candidate in one crop, via a learned engine.
 
     Returns (wrote_anything, reason). Fills polymer_adj / polymer_raw with
@@ -765,6 +868,18 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         # this module keeps: a hybe that cannot be fitted is a rejected
         # hybe with a reason, never an exception out of a worker.
         return False, f'readout engine failed: {type(exc).__name__}: {exc}'
+    # THE DISPLAY BOX IS A HARD BOUNDARY, not a viewing choice. The search
+    # crop is wider than the fiducial's box by the engine's own margin so
+    # a candidate near the box edge gets full template room; a candidate
+    # whose LOCALIZED position lies outside that box is a neighbour the
+    # margin caught, and it is removed here, silently -- never counted,
+    # never listed, never drawn. What survives is what is in the box.
+    if display_shape is not None:
+        oy, ox = (float(display_offset[0]), float(display_offset[1]))
+        h_d, w_d = int(display_shape[0]), int(display_shape[1])
+        cands = [c for c in cands
+                 if -0.5 <= float(c.y) - oy < h_d - 0.5
+                 and -0.5 <= float(c.x) - ox < w_d - 0.5]
     if debug is not None:
         debug[hybe]['readout_engine'] = 'v3'
         debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
@@ -1224,9 +1339,30 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             debug[hybe]['fiducial_seed'] = _seed(
                 cube, z0, p.voxel_um,
                 _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, p.voxel_um))
-        f = fit_fiducial(cube, z0, p)
-        ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
-        if not ok and FIDUCIAL_SEED_FALLBACK:
+        if p.fiducial_engine is not None:
+            # THE LEARNED FIDUCIAL, best of one. No Gaussian gate applies
+            # -- a matched filter has no occupancy or CI -- the p_exist
+            # threshold and the fiducial's own reach are the gate, and
+            # every other candidate reaches the grid, labelled, as what
+            # was NOT chosen. The Gaussian seed fallback below is v2's
+            # and does not run for it.
+            f, why, alts = _fiducial_learned(cube, z0, p)
+            ok = f is not None
+            if debug is not None:
+                debug[hybe]['fiducial_engine'] = 'v3'
+                debug[hybe]['fiducial_p_exist'] = (
+                    float(f.p_exist) if f is not None else float('nan'))
+                debug[hybe]['fiducial_n_candidates'] = (
+                    len(alts) + (1 if f is not None else 0))
+                debug[hybe]['fiducial_rejected_centroids'] = (
+                    [(a.x, a.y, a.z) for a, _w in alts] or None)
+                debug[hybe]['fiducial_rejected_labels'] = (
+                    [f'{a.p_exist:.2f}' for a, _w in alts] or None)
+                debug[hybe]['fiducial_dropped_why'] = [w for _a, w in alts]
+        else:
+            f = fit_fiducial(cube, z0, p)
+            ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
+        if not ok and FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None:
             # SECOND START FROM THE ARGMAX, only when the first fit failed
             # its gate. Faint extended fiducials (contrast ~1.5x, which
             # per-tile display normalization renders indistinguishable
@@ -1452,7 +1588,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                              dy, dx, dz, ymin_s, xmin_s,
                                              _to_shared, debug,
                                              seed_yx=seed_yx,
-                                             display_offset=(oy, ox))
+                                             display_offset=(oy, ox),
+                                             display_shape=cube.shape[:2])
             if not done:
                 allele.rejected_hybes[hybe] = why_multi
             continue
@@ -1536,6 +1673,7 @@ def allele_task(payload):
         'engine': ('v3' if params is not None and params.is_learned else 'v2'),
         'engine_label': (params.engine_label or 'v2') if params else 'v2',
         'readout_model_dir': (params.readout_model_dir if params else None),
+        'fiducial_model_dir': (params.fiducial_model_dir if params else None),
         'min_p_exist': (params.min_p_exist if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
@@ -1646,6 +1784,7 @@ def allele_task_with_debug(payload):
         'engine': ('v3' if params is not None and params.is_learned else 'v2'),
         'engine_label': (params.engine_label or 'v2') if params else 'v2',
         'readout_model_dir': (params.readout_model_dir if params else None),
+        'fiducial_model_dir': (params.fiducial_model_dir if params else None),
         'min_p_exist': (params.min_p_exist if params else None),
         'traced_at': _time.strftime('%Y-%m-%dT%H:%M:%S'),
         'voxel_um': list(params.voxel_um) if params else None,
@@ -1805,6 +1944,7 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
             })
             if v2_params.is_learned:
                 stamp.update({'readout_model_dir': v2_params.readout_model_dir,
+                              'fiducial_model_dir': v2_params.fiducial_model_dir,
                               'min_p_exist': v2_params.min_p_exist})
         allele.provenance = stamp
     if not uses_v2_tracer(engine):
