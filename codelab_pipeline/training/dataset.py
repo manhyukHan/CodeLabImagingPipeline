@@ -258,7 +258,14 @@ def boxes(label_rows, r=DEFAULT_R, rz=DEFAULT_RZ,
             cores.append(f['core'])
             cols.append(f['col'])
         i0 = i1
-    return kept, np.asarray(cores), np.asarray(cols)
+    # THE COLUMNS STAY A LIST. A column is as long as its crop is deep,
+    # and crops from two bundles of two experiments are not the same
+    # depth (MP58 110 planes, JP chr19 177) -- one rectangular array of
+    # them is impossible, and pooling those bundles into one model is
+    # exactly what happens next. features.many reads them one row at a
+    # time and never needed the array. The cores are one shape by
+    # construction and stay an array.
+    return kept, np.asarray(cores), cols
 
 
 def features_for_rows(label_rows, r=DEFAULT_R, rz=DEFAULT_RZ,

@@ -154,7 +154,8 @@ def calibrate_into(a):
     man = MS.read_manifest(run) or {}
     print(f'run     {run}')
     print(f"model   {man.get('model_id', '?')}  template {tpl_shape}")
-    cal, calrep = C.fit_multispot(a.bundle_dir, template=tpl_shape)
+    bundles = [os.path.abspath(str(b)) for b in a.bundle_dir]
+    cal, calrep = C.fit_multispot(bundles, template=tpl_shape)
     report['multispot'] = calrep
     if cal is None:
         print(f"multispot calibration: {calrep.get('skipped')}")
@@ -173,9 +174,12 @@ def calibrate_into(a):
     # REBOUND, with the run's own provenance kept: write_manifest hashes
     # every file afresh (so the new calibration is bound) but knows
     # nothing of reviewer or bundle unless told.
-    extra = {'bundle': man.get('bundle') or a.bundle_dir,
+    # RECORDED AS GIVEN, not absolutised: a path a person typed is what
+    # they will look for in the manifest.
+    extra = {'bundle': man.get('bundle') or a.bundle_dir[0],
              'reviewer': man.get('reviewer') or a.reviewer,
-             'calibrated_from': a.bundle_dir,
+             'calibrated_from': (list(a.bundle_dir) if len(a.bundle_dir) > 1
+                                 else a.bundle_dir[0]),
              'calibrated_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     new = MS.write_manifest(run, extra=extra)
     print(f"   manifest {man.get('model_id', '?')} -> {new['model_id']} "
@@ -188,9 +192,123 @@ def calibrate_into(a):
     return 0
 
 
+def _short_bundle(b):
+    """'<experiment>/<bundle>' -- the two path parts that tell bundles
+    apart, for reports and run listings."""
+    b = os.path.normpath(str(b))
+    exp = os.path.basename(os.path.dirname(os.path.dirname(b)))
+    return f'{exp}/{os.path.basename(b)}' if exp else os.path.basename(b)
+
+
+def _manifest_store(bundle_dir):
+    """The store a bundle was cut from, from its own manifest."""
+    try:
+        with open(os.path.join(bundle_dir, 'bundle_manifest.json'),
+                  encoding='utf-8') as f:
+            return json.load(f).get('storage_path')
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _per_bundle_val(clf, head, X, cores, y, groups, kept, bundles, a):
+    """The pooled head's validation numbers, per bundle.
+
+    The split is recomputed exactly as classify.train made it (same rows,
+    same seed), so 'validation' here is the same held-out cells -- just
+    read off one bundle at a time. This is the number that says whether
+    the pooled model serves each experiment, not only their average.
+    """
+    from codelab_pipeline.training import classify as C
+    tr, va = D.split_by_group([{'group': g} for g in groups],
+                              frac=a.val_frac, seed=a.seed)
+    p = clf.score(np.asarray(X) if head != 'conv' else None,
+                  np.asarray(cores) if head == 'conv' else None)
+    out = {}
+    for bi, b in enumerate(bundles):
+        idx = [i for i in va if kept[i].get('bundle') == bi]
+        yy = np.asarray([y[i] for i in idx], int)
+        e = {'n_val': len(idx), 'positive': int(yy.sum()) if len(idx) else 0}
+        if len(idx) and 0 < yy.sum() < len(idx):
+            pp = np.asarray([p[i] for i in idx], float)
+            e['val_pr_auc'] = float(C.pr_auc(yy, pp))
+            e['val_roc_auc'] = float(C.roc_auc(yy, pp))
+        else:
+            e['skipped'] = 'no held-out cells of both classes'
+        out[_short_bundle(b)] = e
+    return out
+
+
+def _transfer(X, cores, y, groups, kept, bundles, heads, a):
+    """A head trained on ONE bundle, scored on each of the others.
+
+    This is the direct measure of how far two experiments' spots differ:
+    a model that has never seen experiment B, judged on all of B's
+    labels. Its own held-out number is beside it, so 'transfers worse
+    than it validates' is read off one line. Heads that read pixels
+    (conv) are left out -- this is about the feature vectors.
+    """
+    from codelab_pipeline.training import classify as C
+    X = np.asarray(X)
+    y = np.asarray(y, int)
+    out = {}
+    for head in [h for h in heads if h != 'conv']:
+        out[head] = {}
+        for bi, b in enumerate(bundles):
+            src = [i for i in range(len(kept)) if kept[i].get('bundle') == bi]
+            ys = y[src]
+            if len(set(tuple(groups[i]) for i in src)) < 4 or ys.sum() == 0 \
+                    or ys.sum() == len(src):
+                out[head][_short_bundle(b)] = {'skipped': 'too few cells or '
+                                                          'one class only'}
+                continue
+            try:
+                clf, rp = C.train(X[src], [cores[i] for i in src], ys,
+                                  [groups[i] for i in src], head=head,
+                                  epochs=a.epochs, seed=a.seed,
+                                  val_frac=a.val_frac, verbose=False)
+            except Exception as exc:                         # noqa: BLE001
+                out[head][_short_bundle(b)] = {'skipped': f'{type(exc).__name__}: {exc}'}
+                continue
+            e = {'own_val_pr_auc': rp['val_pr_auc'],
+                 'own_val_roc_auc': rp['val_roc_auc'], 'n_train_rows': len(src),
+                 'to': {}}
+            for bj, b2 in enumerate(bundles):
+                if bj == bi:
+                    continue
+                dst = [i for i in range(len(kept)) if kept[i].get('bundle') == bj]
+                yd = y[dst]
+                if not len(dst) or yd.sum() == 0 or yd.sum() == len(dst):
+                    e['to'][_short_bundle(b2)] = {'skipped': 'one class only'}
+                    continue
+                pd = clf.score(X[dst], None)
+                e['to'][_short_bundle(b2)] = {
+                    'n': len(dst), 'positive_frac': float(yd.mean()),
+                    'pr_auc': float(C.pr_auc(yd, pd)),
+                    'roc_auc': float(C.roc_auc(yd, pd)),
+                    'says_yes_frac': float((pd >= 0.5).mean())}
+            out[head][_short_bundle(b)] = e
+            line = (f'   {head:6s} trained on {_short_bundle(b)} '
+                    f"(own val PR-AUC {rp['val_pr_auc']:.3f})")
+            for name, t in e['to'].items():
+                line += (f'  ->  {name}: '
+                         + (f"PR-AUC {t['pr_auc']:.3f}  ROC {t['roc_auc']:.3f}"
+                            f"  (n {t['n']}, {100 * t['positive_frac']:.0f}% "
+                            f"positive, says yes to {100 * t['says_yes_frac']:.0f}%)"
+                            if 'pr_auc' in t else t['skipped']))
+            print(line)
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
-    ap.add_argument('bundle_dir')
+    ap.add_argument('bundle_dir', nargs='+',
+                    help='one bundle, or several to POOL into one model. '
+                         'Each keeps its own bundle and verdicts; the run '
+                         'records all of them, validates the pooled heads '
+                         'per bundle, measures how a head trained on one '
+                         'transfers to the others, and fits a PSF template '
+                         'per bundle beside the pooled one -- the '
+                         'experiment-to-experiment difference, measured.')
     ap.add_argument('--reviewer', default=None,
                     help='WHO LABELLED THIS. It names the run -- '
                          '<reviewer>_<YYYYMMDD-HHMMSS> under <repo>/models '
@@ -246,21 +364,40 @@ def main(argv=None):
                          'This is how a second-stage review lands on the '
                          'model whose PSF it was judged with, instead of a '
                          'retrain whose bank merely happens to match.')
-    ap.add_argument('--storage-path', default=None,
+    ap.add_argument('--storage-path', action='append', default=None,
                     help='to compare the measured PSF against the analytic '
-                         'calibration in that store')
+                         'calibration in that store. Default: the store '
+                         'each bundle\'s own manifest names.')
     a = ap.parse_args(argv)
     voxel = tuple(float(v) for v in a.voxel_um.split(','))
     if a.calibrate_into:
         return calibrate_into(a)
 
-    rows = D.rows(a.bundle_dir)
+    bundles = [os.path.abspath(str(b)) for b in a.bundle_dir]
+    rows, per_bundle = [], []
+    for bi, b in enumerate(bundles):
+        rb = D.rows(b)
+        for r in rb:
+            # ONE POOL, DISTINCT CELLS. A cell is (fov, cell) inside its
+            # bundle, and two experiments both have a FOV 7 cell 12; a
+            # split by cell that could not tell them apart would put one
+            # experiment's cell on the other's validation side.
+            r['bundle'] = bi
+            r['group'] = (bi,) + tuple(r['group'])
+        sb = D.summary(rb)
+        per_bundle.append({'bundle': b, 'name': _short_bundle(b),
+                           'storage_path': _manifest_store(b), 'labels': sb})
+        print(f'bundle  {b}')
+        print(f'labels  {sb["positive"]} positive, {sb["negative"]} negative, '
+              f'{sb["contested"]} contested, {sb["added"]} added')
+        print(f'        over {sb["crops"]} crops and {sb["groups"]} cells, '
+              f'{len(sb["hybes"])} hybe(s), FOVs {sb["fovs"]}')
+        rows.extend(rb)
     s = D.summary(rows)
-    print(f'bundle  {a.bundle_dir}')
-    print(f'labels  {s["positive"]} positive, {s["negative"]} negative, '
-          f'{s["contested"]} contested, {s["added"]} added')
-    print(f'        over {s["crops"]} crops and {s["groups"]} cells, '
-          f'hybes {s["hybes"]}, FOVs {s["fovs"]}')
+    if len(bundles) > 1:
+        print(f'pooled  {s["positive"]} positive, {s["negative"]} negative '
+              f'over {s["crops"]} crops and {s["groups"]} cells from '
+              f'{len(bundles)} bundles')
     if not rows:
         print('nothing labelled here yet')
         return 1
@@ -308,7 +445,10 @@ def main(argv=None):
               f'from the old run is bound into the new one')
     print(f'writing the run to {a.out}')
 
-    report = {'bundle': a.bundle_dir, 'labels': s, 'provisional': provisional,
+    bundle_label = (a.bundle_dir[0] if len(bundles) == 1
+                    else ' + '.join(_short_bundle(b) for b in bundles))
+    report = {'bundle': bundle_label, 'bundles': per_bundle, 'labels': s,
+              'provisional': provisional,
               'n_boxes': len(kept), 'heads': {}, 'voxel_um': list(voxel),
               'template_r': a.template_r, 'template_rz': a.template_rz}
 
@@ -331,11 +471,27 @@ def main(argv=None):
         rep['all_pass'] = bool((p < clf.threshold).sum() == 0)
         path = clf.save(os.path.join(a.out, f'spot_classifier_{head}.json'))
         rep['path'] = path
+        if len(bundles) > 1:
+            rep['per_bundle'] = _per_bundle_val(clf, head, X, cores, y, groups,
+                                                kept, bundles, a)
+            for name, e in rep['per_bundle'].items():
+                print(f'          on {name}: '
+                      + (f"val PR-AUC {e['val_pr_auc']:.3f}  ROC "
+                         f"{e['val_roc_auc']:.3f}  (n {e['n_val']}, "
+                         f"{e['positive']} positive)"
+                         if 'val_pr_auc' in e else e['skipped']))
         report['heads'][head] = rep
         flag = ('  DEGENERATE' if rep['degenerate'] else
                 '  ALL-FAIL' if rep['all_fail'] else
                 '  ALL-PASS' if rep['all_pass'] else '')
         print(f'          -> {os.path.basename(path)}{flag}')
+
+    if len(bundles) > 1:
+        print('\ntransfer (a head trained on ONE bundle, scored on all of '
+              'another):')
+        report['transfer'] = _transfer(
+            X, cores, y, groups, kept, bundles,
+            [h.strip() for h in a.heads.split(',') if h.strip()], a)
 
     pos = [c for c, r in zip(cores, kept)
            if r['label'] == 1 and c is not None]
@@ -356,14 +512,67 @@ def main(argv=None):
               'from. Pass --bank-from RUN to reuse an earlier run\'s bank.')
     else:
         mean, comps, var = PB.build(pos, voxel, n_components=a.psf_components)
-        ref = analytic_reference(mean, voxel, a.storage_path)
+        store0 = ((a.storage_path or [None])[0]
+                  or per_bundle[0].get('storage_path'))
+        ref = analytic_reference(mean, voxel, store0)
+        # PER BUNDLE, BESIDE THE POOLED ONE: each experiment's own
+        # template, its best analytic fit, its cosine to the pooled
+        # template, and the templates' cosines to each other -- the
+        # experiment-to-experiment difference of the emitters, measured.
+        psf_per, psf_between = [], {}
+        if len(bundles) > 1:
+            means = {}
+            print('   per bundle:')
+            for bi, b in enumerate(bundles):
+                pos_b = [c for c, r in zip(cores, kept)
+                         if r['label'] == 1 and c is not None
+                         and r.get('bundle') == bi]
+                if len(pos_b) < 20:
+                    psf_per.append({'bundle': _short_bundle(b),
+                                    'n_spots': len(pos_b),
+                                    'skipped': 'fewer than 20 confirmed '
+                                               'spots with pixels'})
+                    print(f'      {_short_bundle(b)}: {len(pos_b)} spots, '
+                          f'too few for a template of its own')
+                    continue
+                mb, _cb, _vb = PB.build(pos_b, voxel)
+                ff = PB.fit_families(mb, voxel)
+                bf = ff['best']
+                means[bi] = mb
+                cos_pooled = float(PB.normalise(mb).ravel()
+                                   @ PB.normalise(mean).ravel())
+                prm = ff['fits'][bf]['params']
+                psf_per.append({'bundle': _short_bundle(b), 'n_spots': len(pos_b),
+                                'best_fit': {'family': bf,
+                                             'cosine': ff['fits'][bf]['cosine'],
+                                             'params': prm},
+                                'fits': {k: {'cosine': v['cosine'],
+                                             'params': v['params']}
+                                         for k, v in ff['fits'].items()},
+                                'cosine_to_pooled': cos_pooled})
+                print(f"      {_short_bundle(b)}: {len(pos_b)} spots, "
+                      f"best fit {bf} (cosine {ff['fits'][bf]['cosine']:.3f}, "
+                      f"sigma_xy {1000 * prm['sigma_xy_um']:.0f} nm, "
+                      f"sigma_z {1000 * prm['sigma_z_um']:.0f} nm), "
+                      f"cosine to the pooled template {cos_pooled:.3f}")
+            keys = sorted(means)
+            for i in keys:
+                for j in keys:
+                    if j > i:
+                        c = float(PB.normalise(means[i]).ravel()
+                                  @ PB.normalise(means[j]).ravel())
+                        psf_between[f'{_short_bundle(bundles[i])} | '
+                                    f'{_short_bundle(bundles[j])}'] = c
+                        print(f'      {_short_bundle(bundles[i])} vs '
+                              f'{_short_bundle(bundles[j])}: cosine {c:.3f}')
         reviewers = sorted({rv for r in rows
                             for rv in ([r.get('reviewer')] if r.get('reviewer')
                                        else [])})
         path = PB.save(
             os.path.join(a.out, 'psf_bank.h5'), mean, voxel,
             components=comps, explained_var=var, n_spots=len(pos),
-            source={'bundle': a.bundle_dir, 'store': kept[0].get('store'),
+            source={'bundle': bundle_label, 'bundles': bundles,
+                    'store': kept[0].get('store'),
                     'hybes': s['hybes'], 'fovs': s['fovs'],
                     'channel': kept[0]['channel']},
             labels={'reviewers': reviewers, 'n_positive': len(pos),
@@ -381,7 +590,7 @@ def main(argv=None):
         # matcher falls back to its sigma threshold.
         tpl_shape = (2 * a.template_r + 1, 2 * a.template_r + 1,
                      2 * a.template_rz + 1)
-        cal, calrep = C.fit_multispot(a.bundle_dir, template=tpl_shape)
+        cal, calrep = C.fit_multispot(bundles, template=tpl_shape)
         report['multispot'] = calrep
         if cal is None:
             print(f"\nmultispot calibration: {calrep.get('skipped')}")
@@ -418,6 +627,9 @@ def main(argv=None):
                          'explained_var': [float(v) for v in var],
                          'drift_median': float(np.median(d)),
                          'analytic_ref': ref}
+        if psf_per:
+            report['psf']['per_bundle'] = psf_per
+            report['psf']['between'] = psf_between
 
     # THE MANIFEST IS WRITTEN LAST, over finished artefacts, so it can
     # never describe a run that did not complete. It binds the three
@@ -427,7 +639,8 @@ def main(argv=None):
     rp = os.path.join(a.out, 'report.json')
     with open(rp, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=1)
-    man = MS.write_manifest(a.out, extra={'bundle': a.bundle_dir,
+    man = MS.write_manifest(a.out, extra={'bundle': bundle_label,
+                                          'bundles': list(a.bundle_dir),
                                           'reviewer': a.reviewer})
     if a.set_default:
         print(f'   pinned as the default model: {MS.set_default(a.out)}')

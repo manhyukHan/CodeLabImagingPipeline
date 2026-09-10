@@ -540,20 +540,32 @@ class MultispotCalibration(object):
 
 
 def fit_multispot(bundle_dir, template=None):
-    """(MultispotCalibration, report) from a bundle's multispot verdicts.
+    """(MultispotCalibration, report) from the multispot verdicts of one
+    bundle, or of several pooled.
 
     Returns (None, report) when there is nothing to fit -- no verdicts, or
     every match judged the same way. A calibration invented from one class
-    is a number with no evidence under it.
+    is a number with no evidence under it. With several bundles the
+    report names the ones that actually carried verdicts.
     """
     from . import verdicts as V
-    recs, _agree = V.merge(str(bundle_dir), kind=V.MULTISPOT_KIND)
+    dirs = ([str(bundle_dir)] if isinstance(bundle_dir, str)
+            else [str(b) for b in bundle_dir])
+    recs, used = [], []
+    for b in dirs:
+        rb, _agree = V.merge(b, kind=V.MULTISPOT_KIND)
+        if rb:
+            used.append(b)
+        recs.extend(rb)
     shown = [e for r in recs for e in (r.get('shown') or [])
              if e.get('p') is not None]
     rep = {'pillars': len(recs), 'n': len(shown),
-           'template': list(template) if template else None}
+           'template': list(template) if template else None,
+           'bundles': used}
     if not shown:
-        rep['skipped'] = 'no multispot verdicts in this bundle'
+        rep['skipped'] = ('no multispot verdicts in this bundle'
+                          if len(dirs) == 1 else
+                          'no multispot verdicts in any of these bundles')
         return None, rep
     y = np.asarray([1 if int(e.get('keep', 0)) == 1 else 0 for e in shown],
                    float)

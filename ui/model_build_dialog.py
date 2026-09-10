@@ -1253,6 +1253,11 @@ class ModelBuildDialog(QtWidgets.QDialog):
                  f"{s.get('fovs')}",
                  f"boxes      {r.get('n_boxes', '?')}    template "
                  f"r={r.get('template_r')} rz={r.get('template_rz')}"]
+        for b in (r.get('bundles') or []) if len(r.get('bundles') or []) > 1 else []:
+            lb = b.get('labels') or {}
+            lines.append(f"           {b.get('name')}: {lb.get('positive', 0)} "
+                         f"positive, {lb.get('negative', 0)} negative over "
+                         f"{lb.get('groups', 0)} cells")
         if r.get('provisional'):
             lines.append('PROVISIONAL: too few cells or hybes -- a check '
                          'that the pipeline runs, not a measure of it.')
@@ -1272,6 +1277,16 @@ class ModelBuildDialog(QtWidgets.QDialog):
                 f"  says yes {100 * rep.get('predicted_positive_frac', 0):.0f}%"
                 f"  ({rep.get('n_train', '?')} train / "
                 f"{rep.get('n_val', '?')} val)  {flag}")
+        for head, tr in (r.get('transfer') or {}).items():
+            for src, e in tr.items():
+                if 'to' not in e:
+                    continue
+                for dst, t in e['to'].items():
+                    if 'pr_auc' in t:
+                        lines.append(
+                            f"transfer   {head} from {src} -> {dst}: PR-AUC "
+                            f"{t['pr_auc']:.3f} ROC {t['roc_auc']:.3f} "
+                            f"(own val {e['own_val_pr_auc']:.3f})")
         ms = r.get('multispot') or {}
         if not ms:
             # A RUN OLDER THAN THE REPORT'S multispot BLOCK still ships
