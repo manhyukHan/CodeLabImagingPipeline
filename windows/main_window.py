@@ -9336,10 +9336,18 @@ class MainWindow(QtWidgets.QMainWindow):
                         pe = d.get('fiducial_p_exist')
                         n = d.get('fiducial_n_candidates') or 0
                         why = str(rejected.get(hybe, '') or '')
+                        how = str(d.get('fiducial_how') or '')
                         head = (f'{hybe}\nfid p '
                                 + (f'{pe:.2f}' if pe is not None and np.isfinite(pe)
                                    else '--')
-                                + f'  best of {n}')
+                                + f'  best of {n}'
+                                # HOW IT CAME, when not the plain way: past
+                                # the fiducial window (the drift gate
+                                # decided), or placed by the Gaussian fit
+                                # after the engine believed it without a
+                                # sub-voxel peak.
+                                + ('  beyond window' if how == 'v3 beyond window'
+                                   else '  +gauss' if how == 'v3+gauss' else ''))
                         if why and why.startswith('fiducial'):
                             head += '\n' + _short_reason(why[len('fiducial'):])
                         fid_results.append((
