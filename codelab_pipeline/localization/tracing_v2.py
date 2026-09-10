@@ -876,9 +876,10 @@ def _fiducial_learned(cube, z0, p):
         if ok and g is not None:
             return g, None, [(cand, 'refined by the Gaussian fit')] + rest, \
                 'v3+gauss'
-        return None, (f'the engine\'s candidate (p_exist {cand.p_exist:.2f}) '
-                      f'had no sub-voxel position and the Gaussian fit seeded '
-                      f'there failed its gate: {gwhy}'), \
+        # A TILE TITLE, so it is short: the gate that refused is the part
+        # a person needs, and the long form clipped it off the tile.
+        # Reads 'fiducial unrefined; refit occupancy 0.16 < 0.25' there.
+        return None, f'unrefined; refit {gwhy}', \
             [(cand, 'no sub-voxel position; Gaussian refinement failed')] \
             + rest, None
     return None, (f'no candidate at p_exist >= {t:g}'

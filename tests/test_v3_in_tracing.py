@@ -386,9 +386,10 @@ def test_learned_fiducial_best_of_one():
         fn, wn, an, hown = T2._fiducial_learned(cube_b, 20.0, p)
     finally:
         T2.gate = real_gate
-    check('but a Gaussian fit that fails its gate does not rescue it',
-          fn is None and hown is None and 'Gaussian fit' in wn
-          and 'occupancy 0.10' in wn
+    check('but a Gaussian fit that fails its gate does not rescue it -- and '
+          'the reason is short enough for a tile title',
+          fn is None and hown is None and wn.startswith('unrefined; refit')
+          and 'occupancy 0.10 < 0.25' in wn and len(wn) < 45
           and an and 'Gaussian refinement failed' in an[0][1], wn)
 
     p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z0, 0.2)])
