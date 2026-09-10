@@ -393,10 +393,15 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     if not os.path.exists('D:/models/mp58_rna/report.json'):
         check('the real model directory is present', False, 'skipped')
         return
+    # WITHIN THE FIDUCIAL'S LATERAL REACH. The readout is traced only
+    # within +/-5 px of the fiducial (the same +/-1 um v2's readout fit
+    # may move), so the two loci sit 4 px either side of the seed; the
+    # old geometry (15 and 25 around a centre of 19.5) put one of them
+    # 5.5 px out and the test then saw one candidate.
     rng = np.random.default_rng(2)
     cube = rng.normal(300, 6, (40, 40, 40))
-    cube += gauss((40, 40, 40), centre=(20, 15, 20), amp=600)
-    cube += gauss((40, 40, 40), centre=(20, 25, 20), amp=450)
+    cube += gauss((40, 40, 40), centre=(20, 16, 20), amp=600)
+    cube += gauss((40, 40, 40), centre=(20, 24, 20), amp=450)
     eng = E.make_engine('v3-psfmatcher', model_dir='D:/models/mp58_rna')
 
     # The builder's own frame closure, stubbed: this test is about the
@@ -408,35 +413,51 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
         p = T2.V2Params(readout_engine=eng, min_p_exist=t)
         a = AnAllele()
         a.polymer_adj, a.polymer_raw = {}, {}
+        dbg = {'H': {}}
         ok, why = T2._readout_multi(a, 'H', cube, 20.0, p, 0.0, 0.0, 0.0,
-                                    100, 200, shared)
-        return a, ok, why
+                                    100, 200, shared, debug=dbg,
+                                    seed_yx=(20.0, 20.0))
+        return a, ok, why, dbg['H']
 
-    a, ok, _why = run(None)
+    a, ok, _why, d0 = run(None)
     cands = a.polymer_adj['H']
     check('the readout writes a LIST, not a single fit', len(cands) > 1,
           f'{len(cands)} candidates')
     check('and every entry is still a 4-tuple -- no contract moved',
           all(len(c) == 4 for c in cands), str(len(cands[0])))
     check('both planted loci are in it',
-          {15, 25} <= {round(c[1] - 200) for c in cands},
+          {16, 24} <= {round(c[1] - 200) for c in cands},
           str(sorted({round(c[1] - 200) for c in cands})[:8]))
+    check('the search says how far it looked, laterally and in z',
+          d0.get('readout_search', {}).get('lateral_px') == 5
+          and 'reach' in d0.get('readout_search', {}),
+          str(d0.get('readout_search')))
     check('amplitude is finite, so max_brightness is a defined comparison',
           all(np.isfinite(c[3]) for c in cands))
 
     # THE GATE IS POSTERIOR AND CUTS BEFORE THE WRITE -- the same shape as
     # max_uncert, on a different number, and p_exist is never stored.
-    a5, _ok5, _w5 = run(0.5)
-    a9, _ok9, _w9 = run(0.9)
+    a5, _ok5, _w5, _d5 = run(0.5)
+    a9, _ok9, _w9, _d9 = run(0.9)
     n0, n5, n9 = (len(cands), len(a5.polymer_adj.get('H', [])),
                   len(a9.polymer_adj.get('H', [])))
-    # 0.9, NOT 0.999999: p_exist is now p1 * cal(p3), and the two real
-    # loci land at 0.9999979 -- a threshold of six nines is above
-    # EVERYTHING, so it stopped testing 'stricter cuts more' and started
-    # testing 'the hybe can be emptied', which the 1.0 case below already
-    # does. The cut that matters is 3 -> 2.
-    check('a threshold cuts the list', n0 > n5 >= n9 >= 1,
+    check('a stricter threshold never keeps more', n0 >= n5 >= n9 >= 1,
           f'{n0} -> {n5} -> {n9}')
+    # WHAT THE REAL ENGINE OFFERS HERE is the two loci at p_exist ~1.0
+    # and a spread of noise candidates 9-17 px away, every one of which
+    # the lateral reach drops and names with its distance. So this test
+    # cannot show a mid-threshold cut with the real engine, and does not
+    # pretend to: the p_exist gate itself is exercised with a fake
+    # engine in test_v3_in_tracing. What is checked is the reach's own
+    # record, which is the reason the list is short.
+    offered = len([v for v in (d0.get('readout_p_exist') or [])])
+    out = int(d0.get('readout_n_out_of_reach') or 0)
+    named = [str(w) for w in (d0.get('readout_dropped_why') or [])
+             if 'px from the fiducial > 5' in str(w)]
+    check('every candidate outside the lateral reach is dropped and named '
+          'with its distance', out >= 1 and len(named) == out
+          and out == offered - n0,
+          f'{out} out of reach, {len(named)} named, {offered} offered, {n0} written')
     # WHAT THE UNREFINED FILTER ALREADY REMOVED, before p_exist saw
     # anything: on this cube the engine offered 17 candidates and model 3
     # could place only 2. polymer_adj is a list of POSITIONS and an
@@ -451,11 +472,11 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     # order changed -- and the old check read that as the bright locus
     # being cut, which it was not.
     check('the brightest locus survives every threshold',
-          15 in {round(c[1] - 200) for c in a9.polymer_adj['H']},
+          16 in {round(c[1] - 200) for c in a9.polymer_adj['H']},
           str(sorted(round(c[1] - 200) for c in a9.polymer_adj['H'])))
     check('p_exist is NOT in the stored tuple',
           all(len(c) == 4 for c in a5.polymer_adj['H']))
-    _aa, ok_all, why_all = run(1.0)
+    _aa, ok_all, why_all, _dall = run(1.0)
     check('a threshold that keeps nothing REJECTS the hybe with a reason',
           not ok_all and 'p_exist' in why_all, why_all[:60])
 
@@ -477,8 +498,13 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     line = src[src.index('allele.fiducial_trace_adj[hybe] ='):].split('\n')[0]
     check('fiducial_trace_adj is still assigned ONE tuple, not a list',
           not line.split('=', 1)[1].strip().startswith('['), line[:72])
-    check('and the engine is consulted on the readout side only',
-          'readout_engine' in src and 'fiducial_engine' not in src)
+    # THE FIDUCIAL MAY ALSO BE LEARNED NOW -- by its own, optional model
+    # -- but it still answers with ONE fit, never a list: best of one.
+    check('a learned fiducial is one answer, not a list',
+          'def _fiducial_learned' in src and 'BEST OF ONE' in src
+          and 'fits.sort' not in src[src.index('def _fiducial_learned'):
+                                     src.index('def _readout_multi')]
+          or 'inside.sort(key=lambda f: -f.p_exist)' in src)
 
 
 def test_a_learned_spot_is_recognisable_without_a_new_field():
