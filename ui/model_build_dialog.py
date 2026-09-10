@@ -607,6 +607,7 @@ class ModelBuildDialog(QtWidgets.QDialog):
 
     def _on_path_edited(self):
         self._remember_bundle_path()
+        self.restore_from_manifest()
         self._refresh_review()
         self._reattach_if_building()
 
@@ -643,7 +644,88 @@ class ModelBuildDialog(QtWidgets.QDialog):
             if b and os.path.isdir(str(b)):
                 self.BundlePathLineEdit.setText(str(b))
                 self._log('bundle path recalled from the last session: ' + str(b))
+                self.restore_from_manifest()
                 return
+
+    def restore_from_manifest(self):
+        """Put the bundle's OWN settings back on the window, so that Build
+        bundle appends exactly what is missing.
+
+        WHY. A build outlives the app, and an interrupted one is resumed
+        by pressing Build again with the SAME sources, FOVs and crops --
+        the planner skips every shard on disk and the draw is a function
+        of those settings. But a relaunched window recalled only the
+        path; sources and FOVs came back empty, Build refused with
+        'List the FOVs to use', and re-typing them by hand had to match
+        the manifest to the FOV. The manifest already records all of it
+        (one entry per channel run: storage_path, hybes, fovs, n_crops,
+        draw_seed, workers), so it is read from there.
+
+        A person's own choices stand: nothing is restored over checked
+        sources or a FOV list already on the window. Returns the
+        manifest, or None when there is none to read.
+        """
+        b = self.bundle_dir()
+        if not b:
+            return None
+        try:
+            with open(os.path.join(b, 'bundle_manifest.json'),
+                      encoding='utf-8') as f:
+                m = json.load(f) or {}
+        except Exception:                                   # noqa: BLE001
+            return None
+        runs = list(m.get('runs') or [])
+        if not runs and m.get('channel') is not None:
+            runs = [m]
+        if not runs:
+            return None
+        if self.checked_sources() or self.fovs():
+            return m
+        sp = str(m.get('storage_path') or runs[0].get('storage_path') or '')
+
+        def _norm(x):
+            return os.path.normcase(os.path.normpath(str(x or '')))
+        modality = None
+        for mod in dict.fromkeys(src[0] for src in self._sources):
+            if _norm(self._storage_for(mod)) == _norm(sp):
+                modality = mod
+                break
+        if modality is None:
+            # ANOTHER EXPERIMENT'S BUNDLE (Spot Check's last session can
+            # point at one): its FOVs and hybes mean nothing here, and a
+            # build from this experiment's stores could not extend it.
+            self._log("the bundle's manifest names a store that is not one "
+                      f"of this experiment's ({sp}) -- settings not restored")
+            return m
+        wanted = {(str(h), int(r['channel'])) for r in runs
+                  for h in (r.get('hybes') or [])}
+        lw = self.SourceListWidget
+        lw.blockSignals(True)
+        n = 0
+        for i in range(lw.count()):
+            item = lw.item(i)
+            mod, h, ch = item.data(QtCore.Qt.UserRole)
+            if mod == modality and (str(h), int(ch)) in wanted:
+                item.setCheckState(QtCore.Qt.Checked)
+                n += 1
+        lw.blockSignals(False)
+        fovs = [int(f) for f in (runs[-1].get('fovs') or [])]
+        self.FovListLineEdit.setText(','.join(str(f) for f in fovs))
+        total = sum(int(r.get('n_crops') or 0) for r in runs)
+        self.CropsSpinBox.setValue(int(total))
+        w = runs[-1].get('workers')
+        if w:
+            self.WorkersSpinBox.setValue(int(w))
+        missing = len(wanted) - n
+        self._log(f"settings restored from the bundle's manifest: {n} "
+                  f'source(s), {len(fovs)} FOV(s), '
+                  + ('every cell' if not total else f'{total:,} crops')
+                  + f', workers {self.WorkersSpinBox.value()} -- Build '
+                    f'bundle appends what is missing'
+                  + (f'  (WARNING: {missing} source(s) of the manifest are '
+                     f"not on this experiment's list)" if missing else ''))
+        self._explain_crops()
+        return m
 
     # -- what state a bundle directory is in ------------------------------
 

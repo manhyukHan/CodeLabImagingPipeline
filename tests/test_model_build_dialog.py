@@ -15,6 +15,7 @@ model under D:/models/mp58_rna.
 
 Run:  QT_QPA_PLATFORM=offscreen python tests/test_model_build_dialog.py
 """
+import json
 import os
 import sys
 
@@ -58,15 +59,21 @@ def make(fov_pool=(7, 8, 9, 14, 19)):
     # traceback at all. Found by tracing; the dialog was never at fault.
     global _APP
     _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    d = ModelBuildDialog(SOURCES, list(fov_pool), STORES.get, REPO)
-    # START FROM AN EMPTY PATH. The dialog recalls the last bundle path
-    # from spotcheck/build_model_last.json in THIS repo, which the real
-    # app writes -- so with a build running on this machine every test
-    # here inherited G:/.../DNA_ch555 and the path-suggestion check
-    # failed on the app's memory, not on the code. The recall itself is
-    # tested in test_memory_and_target against its own file.
-    d.BundlePathLineEdit.setText('')
-    return d
+    # BUILT WITHOUT THE RECALL. The constructor recalls the last bundle
+    # path from this repo's spotcheck/build_model_last.json, else Spot
+    # Check's last_session.json -- both written by the REAL app on this
+    # machine -- and then restores that bundle's settings. With a build
+    # running here every test window inherited G:/.../DNA_ch555, its
+    # FOV list and all, and checks failed on the app's memory, not on
+    # the code. The recall and the restore are tested explicitly, on
+    # files of their own, in test_memory_and_target and
+    # test_restore_from_manifest.
+    recall = ModelBuildDialog._recall_bundle_path
+    ModelBuildDialog._recall_bundle_path = lambda self: None
+    try:
+        return ModelBuildDialog(SOURCES, list(fov_pool), STORES.get, REPO)
+    finally:
+        ModelBuildDialog._recall_bundle_path = recall
 
 
 def set_checked(d, pred):
@@ -266,6 +273,74 @@ def test_train_during_build():
           'reader never sees half of it',
           inspect.getsource(BB.main).count('_write_json_atomic(mpath') == 2
           and 'os.replace(tmp, path)' in inspect.getsource(BB._write_json_atomic))
+
+
+def test_restore_from_manifest():
+    """A relaunched window puts the bundle's own settings back, so Build
+    appends exactly -- the manifest is the record of what was built."""
+    print('restore from the manifest after a relaunch')
+    import tempfile
+    root = tempfile.mkdtemp(prefix='resume_', dir='D:/claude-tmp')
+    runs = [dict(storage_path=STORES['RNA'], channel=555,
+                 hybes=['Hyb_101', 'Hyb_103'], fovs=[7, 14, 19],
+                 n_crops=5000, draw_seed=0, workers=6),
+            dict(storage_path=STORES['RNA'], channel=635,
+                 hybes=['Hyb_101', 'Hyb_103'], fovs=[7, 14, 19],
+                 n_crops=5000, draw_seed=0, workers=6)]
+    man = dict(runs[-1])
+    man.update(runs=runs, channels=[555, 635])
+    with open(os.path.join(root, 'bundle_manifest.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump(man, f)
+    d = make(fov_pool=(7, 8, 9, 14, 19))
+    d._memory_path = lambda: os.path.join(root, 'mem.json')
+    d.BundlePathLineEdit.setText(root)
+    d._on_path_edited()
+    check("the manifest's sources are checked, and nothing else",
+          d.checked_sources() == [('RNA', 'Hyb_101', 635), ('RNA', 'Hyb_101', 555),
+                                  ('RNA', 'Hyb_103', 635), ('RNA', 'Hyb_103', 555)],
+          str(d.checked_sources()))
+    check("its FOVs are the FOV list", d.fovs() == [7, 14, 19])
+    check("its crops are the bundle total, its workers its own",
+          d.CropsSpinBox.value() == 10000 and d.WorkersSpinBox.value() == 6)
+    cmds = d.build_commands()
+    check('and Build would append with the SAME budgets the manifest records',
+          [c[c.index('--n-crops') + 1] for c in cmds] == ['5000', '5000']
+          and {c[c.index('--fovs') + 1] for c in cmds} == {'7,14,19'}
+          and [c[c.index('--channel') + 1] for c in cmds] == ['555', '635'],
+          str([(c[c.index('--channel') + 1], c[c.index('--n-crops') + 1])
+               for c in cmds]))
+    check('it says so in the log',
+          any('restored from the bundle' in d.LogListWidget.item(i).text()
+              and '4 source(s), 3 FOV(s), 10,000 crops' in
+              d.LogListWidget.item(i).text()
+              for i in range(d.LogListWidget.count())))
+    # A PERSON'S CHOICES STAND
+    lw = d.SourceListWidget
+    lw.item(4).setCheckState(QtCore.Qt.Checked)             # DNA row
+    d.FovListLineEdit.setText('1-2')
+    d.restore_from_manifest()
+    check('restoring again over hand-made choices changes nothing',
+          d.fovs() == [1, 2] and ('DNA', 'Hyb_201', 635) in d.checked_sources())
+    # A FRESH WINDOW RECALLING THIS PATH restores too
+    with open(os.path.join(root, 'mem.json'), 'w', encoding='utf-8') as f:
+        json.dump({'bundle': root}, f)
+    d2 = make(fov_pool=(7, 8, 9, 14, 19))
+    d2._memory_path = lambda: os.path.join(root, 'mem.json')
+    d2.BundlePathLineEdit.setText('')
+    d2._recall_bundle_path()
+    check('a relaunched window that recalls the path restores the settings',
+          d2.bundle_dir() == root and d2.fovs() == [7, 14, 19]
+          and len(d2.checked_sources()) == 4
+          and d2.CropsSpinBox.value() == 10000)
+    d3 = make()
+    d3._memory_path = lambda: os.path.join(root, 'nope.json')
+    d3.BundlePathLineEdit.setText(os.path.join(root, 'no-such-dir'))
+    check('no manifest -> nothing restored, no error',
+          d3.restore_from_manifest() is None and d3.fovs() == []
+          and not d3.checked_sources())
+    import shutil
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def test_review_status():
@@ -589,6 +664,7 @@ def main():
     test_fovs()
     test_build_commands()
     test_train_during_build()
+    test_restore_from_manifest()
     test_review_status()
     test_train_command()
     test_render_report()
