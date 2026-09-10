@@ -58,7 +58,15 @@ def make(fov_pool=(7, 8, 9, 14, 19)):
     # traceback at all. Found by tracing; the dialog was never at fault.
     global _APP
     _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    return ModelBuildDialog(SOURCES, list(fov_pool), STORES.get, REPO)
+    d = ModelBuildDialog(SOURCES, list(fov_pool), STORES.get, REPO)
+    # START FROM AN EMPTY PATH. The dialog recalls the last bundle path
+    # from spotcheck/build_model_last.json in THIS repo, which the real
+    # app writes -- so with a build running on this machine every test
+    # here inherited G:/.../DNA_ch555 and the path-suggestion check
+    # failed on the app's memory, not on the code. The recall itself is
+    # tested in test_memory_and_target against its own file.
+    d.BundlePathLineEdit.setText('')
+    return d
 
 
 def set_checked(d, pred):
