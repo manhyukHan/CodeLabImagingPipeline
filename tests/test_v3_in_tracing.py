@@ -88,6 +88,29 @@ def test_routing():
     bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
     check("the caller hands _readout_multi the fiducial's own position",
           'seed_yx=seed_yx' in bsrc and 'fid_local[hybe][0]' in bsrc)
+    check('and a search crop wider than the display crop by the engine box',
+          'pad=spad + BOX_R' in bsrc and 'display_offset=(oy, ox)' in bsrc)
+
+    # v2 honours the two z controls too.
+    pp = T2.V2Params.from_panel({'engine': T2.ROUTE_V2, 'v2': {},
+                                 'z_window': 9, 'z_boundary_trim': 7}, None)
+    check('from_panel carries z_window and the trim onto V2Params',
+          pp.z_window == 9 and pp.z_reach() == 9 and pp.z_boundary_trim == 7
+          and pp.readout_gates.get('z_boundary_trim') == 7
+          and pp.fiducial_gates.get('z_boundary_trim') == 7)
+
+    class Fit(object):
+        at_bound = ()
+        ci_y_um = ci_x_um = ci_z_um = 0.01
+
+        def __init__(self, z):
+            self.y, self.x, self.z = 8.0, 8.0, float(z)
+    cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
+    ok_edge, why_edge = T2.gate(Fit(2.0), cube, {'z_boundary_trim': 10,
+                                                 'min_occupancy': None},
+                                T2.DEFAULT_VOXEL_UM)
+    check("v2's gate rejects a fit inside the shaved planes",
+          not ok_edge and 'of the stack end' in str(why_edge), str(why_edge))
     check('and stamps v3 as v3', "'v3' if is_v3(engine)" in src)
     for fn in (T2.allele_task, T2.allele_task_with_debug):
         s = inspect.getsource(fn)
@@ -127,19 +150,29 @@ def test_params():
 
 
 def _run(engine, z_r=20.0, min_p_exist=0.5, cube=None, debug=None,
-         seed_yx=(8.0, 8.0)):
+         seed_yx=(8.0, 8.0), z_window=None, z_boundary_trim=0,
+         display_offset=(0, 0)):
     from codelab_pipeline.models.allele import AnAllele
     a = AnAllele()
     a.polymer_adj, a.polymer_raw = {}, {}
-    p = T2.V2Params(min_p_exist=min_p_exist)
+    p = T2.V2Params(min_p_exist=min_p_exist, z_window=z_window,
+                    z_boundary_trim=z_boundary_trim)
     p.readout_engine = engine
     if cube is None:
         cube = np.random.RandomState(0).normal(300.0, 5.0, (17, 17, 105))
     ok, why = T2._readout_multi(
         a, 'H', cube, z_r, p, 0.0, 0.0, 0.0, 100, 200,
         lambda h, y, x, z, ymin, xmin: (y + ymin, x + xmin, z), debug,
-        seed_yx=seed_yx)
+        seed_yx=seed_yx, display_offset=display_offset)
     return a, ok, why
+
+
+def _slab_z0(z_r, reach, trim=0, depth=105):
+    """Where the search slab starts -- the same rule _readout_multi uses,
+    so a fake engine that echoes slab-local z can be fed absolute z."""
+    from codelab_pipeline.localization.psfmatcher import BOX_RZ
+    off = T2._z_trim_offset(depth, trim)
+    return max(off, int(round(z_r)) - reach - BOX_RZ)
 
 
 def test_readout_multi_gates():
@@ -151,20 +184,27 @@ def test_readout_multi_gates():
     check('and the lateral reach is the same radius in pixels',
           r_lat >= 1, f'{r_lat} px')
     # THE ENGINE SEES THE SLAB, so a fake that echoes its inputs must
-    # speak slab-local z: z0 = z_r - z_half, and a hit at slab z_half is
-    # at the fiducial's own plane.
-    z0 = 20 - z_half
-    spots = [spot(8, 8, float(z_half), 0.9),               # kept, at z_r
-             spot(8, 12, float(z_half + 2), 0.8),          # kept: a second locus
-             spot(8, 4, float(2 * z_half + 5), 0.95),      # beyond the reach in z
-             spot(8, 16, float(z_half), 0.88),             # beyond the reach laterally
-             spot(4, 8, float(z_half), 0.3),               # below the threshold
-             spot(12, 8, float(z_half + 1), 0.7, p=float('nan'))]  # never refined
+    # speak slab-local z. The slab is the reach PADDED by the engine's
+    # own box (BOX_RZ) each way: a hit at the reach still needs its
+    # 25-plane feature box and 11-plane template.
+    from codelab_pipeline.localization.psfmatcher import BOX_RZ
+    z0 = _slab_z0(20.0, z_half)
+    spots = [spot(8, 8, 20.0 - z0, 0.9),                    # kept, at z_r
+             spot(8, 12, 22.0 - z0, 0.8),                   # kept: a second locus
+             spot(8, 4, 20.0 + z_half + 5 - z0, 0.95),      # beyond the reach in z
+             spot(8, 16, 20.0 - z0, 0.88),                  # beyond the reach laterally
+             spot(4, 8, 20.0 - z0, 0.3),                    # below the threshold
+             spot(12, 8, 21.0 - z0, 0.7, p=float('nan'))]   # never refined
     eng = FakeEngine(spots)
     debug = {'H': {}}
     a, ok, why = _run(eng, z_r=20.0, min_p_exist=0.5, debug=debug)
-    check("the engine saw the fiducial's SLAB, not the whole column",
-          eng.seen == (17, 17, 2 * z_half + 1), str(eng.seen))
+    z1 = min(105, 20 + z_half + BOX_RZ + 1)
+    check("the engine saw the fiducial's slab, padded by its own box",
+          eng.seen == (17, 17, z1 - z0), f'{eng.seen} vs z0 {z0} z1 {z1}')
+    check('and the slab is recorded for the record',
+          debug['H']['readout_search'] == {'z0': z0, 'z1': z1, 'reach': z_half,
+                                           'lateral_px': r_lat, 'trim': 0},
+          str(debug['H'].get('readout_search')))
     check('it wrote', ok, why)
     adj = a.polymer_adj['H']
     check('TWO loci written as a list -- the multispot the panel never got',
@@ -200,6 +240,50 @@ def test_readout_multi_gates():
     check('all out of reach -> rejected with the reach named',
           not ok3 and 'from the fiducial in z' in why3, why3)
 
+    # THE PANEL'S Z WINDOW IS THE REACH. Six planes: a hit eight away is
+    # dropped that would have been kept at the measured fourteen.
+    z0w = _slab_z0(20.0, 6)
+    debug = {'H': {}}
+    a4, ok4, _ = _run(FakeEngine([spot(8, 8, 20.0 - z0w, 0.9),
+                                  spot(8, 12, 28.0 - z0w, 0.9)]),
+                      z_r=20.0, z_window=6, debug=debug)
+    check('z_window from the panel sets the reach',
+          ok4 and len(a4.polymer_adj['H']) == 1
+          and any('> 6' in w for w in debug['H']['readout_dropped_why']),
+          str(debug['H'].get('readout_dropped_why')))
+
+    # THE TRIM SHAVES THE SLAB and drops what lands in the shaved planes.
+    off = T2._z_trim_offset(105, 10)
+    z0t = _slab_z0(12.0, z_half, trim=10)
+    debug = {'H': {}}
+    # Plane 8 is INSIDE a 10-plane trim (planes 0-9 are shaved); plane 11
+    # is not -- the first draft of this check used 11 and proved nothing.
+    a5, ok5, _ = _run(FakeEngine([spot(8, 8, 12.0 - z0t, 0.9),
+                                  spot(8, 12, 8.0 - z0t, 0.9)]),
+                      z_r=12.0, z_boundary_trim=10, debug=debug)
+    check('the search slab starts at the trim, never before it',
+          debug['H']['readout_search']['z0'] == off == 10
+          and debug['H']['readout_search']['trim'] == 10)
+    # slab-local 8 - z0t is -2 -> below the slab: the real engine cannot
+    # return that, the fake does, and the trim gate is what catches it.
+    check('a hit inside the shaved planes is dropped, and says so',
+          ok5 and len(a5.polymer_adj['H']) == 1
+          and any('of the stack end' in w for w in debug['H']['readout_dropped_why']),
+          str(debug['H'].get('readout_dropped_why')))
+
+    # THE DISPLAY OFFSET: hits come back in the display crop's frame.
+    debug = {'H': {}}
+    _run(FakeEngine([spot(8, 8, 20.0 - z0, 0.9)]), z_r=20.0,
+         seed_yx=(8.0, 8.0), display_offset=(3, 4), debug=debug)
+    cx, cy, _cz = debug['H']['readout_centroids'][0]
+    check('debug centroids are shifted into the display crop',
+          (cx, cy) == (4.0, 5.0), str((cx, cy)))
+
+    # And nothing more to check on the earlier out-of-reach run.
+    a3, ok3, why3 = _run(FakeEngine(far), z_r=20.0)
+    check('all out of reach -> rejected with the reach named',
+          not ok3 and 'from the fiducial in z' in why3, why3)
+
 
 def test_panel():
     print('the panel')
@@ -228,6 +312,16 @@ def test_panel():
     check('the v3 page shows no Gaussian-fit gate',
           not any(k in dir(ui) for k in ('V3PeakBoundSpinBox',
                                           'V3MaxSigmaSpinBox')))
+    # THE TWO Z CONTROLS ARE SHARED, not v1's: they must not live on the
+    # v1 page (index 0), or a v3 selection hides them.
+    v1page = ui.FitParamsStackedWidget.widget(0)
+    check('Z search window and Z boundary trim are off the v1 page',
+          not v1page.isAncestorOf(ui.ZWindowSpinBox)
+          and not v1page.isAncestorOf(ui.ZBoundaryTrimSpinBox))
+    check('and are read into params() for every engine',
+          pr['z_window'] == ui.ZWindowSpinBox.value()
+          and pr['z_boundary_trim'] == ui.ZBoundaryTrimSpinBox.value()
+          and ui.ZWindowSpinBox.suffix() == ' planes')
     ui.reset_defaults()
     check('Reset restores the p_exist default',
           abs(ui.V3MinPExistSpinBox.value() - V3_DEFAULTS['min_p_exist'])

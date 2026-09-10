@@ -346,8 +346,18 @@ class V2Params(object):
                  psf_shape=None, psf_label='', fiducial_gates=None,
                  readout_gates=None, qc_shift=True,
                  readout_engine=None, min_p_exist=None, min_p3=None,
-                 readout_model_dir=None, engine_label=''):
+                 readout_model_dir=None, engine_label='',
+                 z_window=None, z_boundary_trim=10):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # THE PANEL'S TWO Z CONTROLS, honoured by v2 and v3 alike. They
+        # were v1's -- accepted by the v2 dispatcher and ignored, and
+        # invisible once v3 had its own page -- so a person turning them
+        # changed nothing for two of the three engines. z_window: how far
+        # in planes from the fiducial's z a readout is looked for (None =
+        # the measured fit radius); z_boundary_trim: planes shaved off
+        # each stack end, where everything is out of focus.
+        self.z_window = None if z_window is None else int(z_window)
+        self.z_boundary_trim = int(z_boundary_trim or 0)
         # THE MODEL DIRECTORY, NOT THE ENGINE, is what crosses a process
         # boundary. An engine holds torch weights and an HDF5 bank; a
         # V2Params is pickled into every allele_task payload. The engine
@@ -404,6 +414,11 @@ class V2Params(object):
         # confirmed spot), from multispot labels, per MATCH -- which is
         # the only one of the two that can tell siblings apart.
         self.min_p3 = None if min_p3 is None else float(min_p3)
+
+    def z_reach(self):
+        """Readout axial reach in planes: the panel's, else the measured."""
+        return (self.z_window if self.z_window is not None
+                else _seed_z_half(READOUT_FIT_RADIUS_UM, self.voxel_um))
 
     @property
     def readout_engine(self):
@@ -471,11 +486,16 @@ class V2Params(object):
                 label = f'{label} [REJECTED: {"; ".join(why)}]'
         v3 = params.get('v3') or {}
         learned = route(params.get('engine', '')) == ROUTE_V3
+        trim = int(params.get('z_boundary_trim', 10) or 0)
+        fg = dict(v2.get('fiducial') or {}, z_boundary_trim=trim)
+        rg = dict(v2.get('readout') or {}, z_boundary_trim=trim)
         return cls(voxel_um=voxel, psf_family=fam, psf_shape=shape,
                    psf_label=label,
-                   fiducial_gates=v2.get('fiducial'),
-                   readout_gates=v2.get('readout'),
+                   fiducial_gates=fg,
+                   readout_gates=rg,
                    qc_shift=v2.get('qc_shift', True),
+                   z_window=params.get('z_window'),
+                   z_boundary_trim=trim,
                    readout_model_dir=(v3.get('model_dir') if learned else None),
                    min_p_exist=(v3.get('min_p_exist') if learned else None),
                    engine_label=str(params.get('engine_label') or
@@ -672,13 +692,23 @@ def fit_fiducial_from(cube, seed, p):
         background='linear', apply_gates=False)
 
 
+def _z_trim_offset(depth, z_boundary_trim, min_fit_depth=9):
+    """How many planes to shave off EACH end -- v1's own rule, kept so
+    the two engines agree: the outermost planes of a stack are out of
+    focus wherever the allele sits, and the trim is clamped so at least
+    min_fit_depth planes remain."""
+    if not z_boundary_trim or z_boundary_trim <= 0:
+        return 0
+    return max(0, min(int(z_boundary_trim), (int(depth) - min_fit_depth) // 2))
+
+
 def _lateral_reach_px(fit_radius_um, voxel_um):
     """Lateral reach in PIXELS, from the same radius the axial one uses."""
     return max(1, int(round(fit_radius_um[0] / float(voxel_um[0]))))
 
 
 def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
-                   to_shared, debug=None, seed_yx=None):
+                   to_shared, debug=None, seed_yx=None, display_offset=(0, 0)):
     """Every readout candidate in one crop, via a learned engine.
 
     Returns (wrote_anything, reason). Fills polymer_adj / polymer_raw with
@@ -707,13 +737,25 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     # everything it returns is inside the picture a person sees. Lateral
     # extent stays the crop's: the engine's own boxes are 15 px wide and
     # need room; reach is gated below instead.
-    z_half = _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um)
+    # PADDED BY THE ENGINE'S OWN BOX, then gated to the reach. A slab cut
+    # to exactly the reach hands the engine a candidate at its edge with
+    # no room for the 25-plane feature box or the 11-plane template --
+    # the same boundary pinning the matcher had laterally before its
+    # window was widened. So the search runs on reach + BOX_RZ each way,
+    # and the reach is applied to what comes back. The trim is applied
+    # to the slab itself: shaved planes are never searched.
+    from .psfmatcher import BOX_RZ
+    z_half = p.z_reach()
     depth = int(np.asarray(cube).shape[2])
+    z_off = _z_trim_offset(depth, p.z_boundary_trim)
     if z_r is not None and np.isfinite(z_r):
-        z0 = max(0, int(round(float(z_r))) - z_half)
-        z1 = min(depth, int(round(float(z_r))) + z_half + 1)
+        z0 = max(z_off, int(round(float(z_r))) - z_half - BOX_RZ)
+        z1 = min(depth - z_off, int(round(float(z_r))) + z_half + BOX_RZ + 1)
     else:
-        z0, z1 = 0, depth
+        z0, z1 = z_off, depth - z_off
+    if z1 <= z0:
+        return False, (f'readout: the stack has no planes left between the '
+                       f'trimmed ends ({z_off} each side)')
     slab = np.asarray(cube)[:, :, z0:z1]
     try:
         cands = p.readout_engine.localize(slab, seed_yxz=None, n_max=None)
@@ -752,6 +794,9 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         if dzr > z_half:
             dropped.append((c, f'z {dzr:.1f} planes from the fiducial '
                                f'> {z_half}'))
+        elif z_off and (float(c.z) < z_off or float(c.z) > depth - 1 - z_off):
+            dropped.append((c, f'z {float(c.z):.1f} within {z_off} planes '
+                               f'of the stack end'))
         elif dlat > r_lat:
             # THE FIDUCIAL'S OWN LATERAL REACH, the same +/-1 um v2's
             # readout fit is allowed to move from its seed. A candidate
@@ -796,14 +841,22 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         if c not in refined:
             dropped.append((c, 'no sub-voxel position'))
     kept = refined
+    oy, ox = (float(display_offset[0]), float(display_offset[1]))
     if debug is not None:
         debug[hybe]['readout_n_unrefined'] = n_pre - len(kept)
         debug[hybe]['readout_n_out_of_reach'] = len(cands) - len(in_reach)
+        debug[hybe]['readout_search'] = {'z0': int(z0), 'z1': int(z1),
+                                         'reach': int(z_half),
+                                         'lateral_px': int(r_lat),
+                                         'trim': int(z_off)}
         # EVERY CANDIDATE REACHES THE GRID, kept or not, each with its
         # own p_exist: the whole point of looking at one allele is to
-        # see the p_exist distribution and decide where to cut.
+        # see the p_exist distribution and decide where to cut. Drawn in
+        # the DISPLAY crop's coordinates: the search crop is wider by the
+        # engine's box, and the grid shows the crop the fiducial shows.
         debug[hybe]['readout_rejected_centroids'] = (
-            [(float(c.x), float(c.y), float(c.z)) for c, _w in dropped] or None)
+            [(float(c.x) - ox, float(c.y) - oy, float(c.z))
+             for c, _w in dropped] or None)
         debug[hybe]['readout_rejected_labels'] = (
             [f'{float(c.p_exist):.2f}' for c, _w in dropped] or None)
         debug[hybe]['readout_dropped_why'] = [w for _c, w in dropped]
@@ -827,7 +880,8 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     allele.polymer_adj[hybe] = adj
     allele.polymer_raw[hybe] = raw
     if debug is not None:
-        debug[hybe]['readout_centroids'] = [(c.x, c.y, c.z) for c in kept]
+        debug[hybe]['readout_centroids'] = [(float(c.x) - ox, float(c.y) - oy,
+                                             float(c.z)) for c in kept]
         debug[hybe]['readout_labels'] = [f'{float(c.p_exist):.2f}'
                                          for c in kept]
     return True, ''
@@ -847,8 +901,7 @@ def fit_readout(cube, z_centre, p):
     """
     if cube is None or not np.isfinite(cube).any():
         return None
-    sy, sx, sz = _seed(cube, z_centre, p.voxel_um,
-                       _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
+    sy, sx, sz = _seed(cube, z_centre, p.voxel_um, p.z_reach())
     if not p.has_psf:
         # The FREE-sigma fallback must carry the validated ceilings too.
         # Passing neither leaves fit3d_um's own defaults (0.520 / 1.000 um)
@@ -969,6 +1022,17 @@ def gate(fit, cube, gates, voxel_um=DEFAULT_VOXEL_UM):
     """
     if fit is None:
         return False, 'fit failed'
+    # THE STACK'S OUTERMOST PLANES ARE OUT OF FOCUS wherever the allele
+    # sits (v1's boundary trim, its reasoning). v2's fit domain can reach
+    # into them from a seed near an end; a fit that lands there is the
+    # junk v1 refuses to look at, and is rejected with the plane named.
+    trim = gates.get('z_boundary_trim')
+    if trim:
+        depth = int(np.asarray(cube).shape[2])
+        off = _z_trim_offset(depth, trim)
+        z = float(getattr(fit, 'z', float('nan')))
+        if off and np.isfinite(z) and (z < off or z > depth - 1 - off):
+            return False, f'z {z:.1f} within {off} planes of the stack end'
     railed = getattr(fit, 'at_bound', None) or ()
     if isinstance(railed, str):
         railed = (railed,)
@@ -1086,13 +1150,13 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     shared_xy = (float(allele.coordinate[0]), float(allele.coordinate[1]))
     mod = modality if modality is not None else getattr(cell, 'reference_modality', None)
 
-    def _cut(hybe, channel):
+    def _cut(hybe, channel, pad=None):
         raw_y, raw_x = spot_mapper.reference_to_raw(
             shared_xy, hybe, fov_matrices, modality=modality, cell=cell,
             resolver=resolver)
         cube, (ymin, xmin) = spot_mapper.crop_for_localization(
-            storage_path, fov, hybe, channel, (raw_y, raw_x), pad=spad,
-            use_stack=True)
+            storage_path, fov, hybe, channel, (raw_y, raw_x),
+            pad=(spad if pad is None else int(pad)), use_stack=True)
         return cube, ymin, xmin
 
     def _to_shared(hybe, yf, xf, zf, ymin, xmin):
@@ -1368,12 +1432,27 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # centre with the same pad, so fid_local's (y, x) is valid
             # here -- and that, not the crop centre, is what a readout
             # candidate has to be near.
-            seed_yx = ((float(fid_local[hybe][0]), float(fid_local[hybe][1]))
+            # THE SEARCH CROP IS WIDER THAN THE DISPLAY CROP by the
+            # engine's own lateral box: a candidate within reach of the
+            # fiducial but near the display crop's edge would otherwise
+            # get a padded feature box and no template room (the
+            # boundary pinning the matcher had before). Same centre,
+            # same channel; the hits are reported in the display crop's
+            # coordinates so the grid keeps showing the fiducial's box.
+            from .psfmatcher import BOX_R
+            try:
+                cube_s, ymin_s, xmin_s = _cut(hybe, channel, pad=spad + BOX_R)
+            except (OSError, ValueError):
+                cube_s, ymin_s, xmin_s = cube, ymin, xmin
+            oy, ox = ymin - ymin_s, xmin - xmin_s
+            seed_yx = ((float(fid_local[hybe][0]) + oy,
+                        float(fid_local[hybe][1]) + ox)
                        if hybe in fid_local else None)
-            done, why_multi = _readout_multi(allele, hybe, cube, z_r, p,
-                                             dy, dx, dz, ymin, xmin,
+            done, why_multi = _readout_multi(allele, hybe, cube_s, z_r, p,
+                                             dy, dx, dz, ymin_s, xmin_s,
                                              _to_shared, debug,
-                                             seed_yx=seed_yx)
+                                             seed_yx=seed_yx,
+                                             display_offset=(oy, ox))
             if not done:
                 allele.rejected_hybes[hybe] = why_multi
             continue
@@ -1696,11 +1775,12 @@ def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
     parameter for direct callers (it is the reference implementation and
     stays unchanged); the dispatcher simply never asks for it.
 
-    v1 keeps every other argument it had. The ones v2 has no use for are dropped
-    rather than accepted and ignored: z_window is a mixture-mode seed
-    search (v2 fits one emitter), z_boundary_trim shaves the pillar ends
-    (v2 fits a box placed at the consensus depth, so the ends are already
-    out of the domain), and the per-channel *_params carry v1's gate
+    v1 keeps every other argument it had. z_window and z_boundary_trim
+    are HONOURED by v2 and v3 too, carried on V2Params (from_panel reads
+    them): the readout's axial reach around the fiducial, and the planes
+    shaved off each stack end. They used to be dropped here as v1-only,
+    which left two of the three engines deaf to the two z controls on
+    the panel. The per-channel *_params stay v1's: they carry v1's gate
     constants, which do not transfer to a local background.
     """
     # STAMP HOW THIS TRACE WAS MADE, whichever engine runs. Free-form on

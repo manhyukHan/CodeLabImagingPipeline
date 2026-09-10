@@ -396,6 +396,35 @@ class ChromatinTracingPanelUI(object):
         # would "correct" every readout in that hybe by a bogus dz.
         crossForm.addRow('Max fiducial Z drift vs. reference (planes):', self.MaxFiducialDriftZSpinBox)
 
+        # SHARED, NOT v1's. These two sat on the v1 page and were read
+        # for every engine -- v2 accepted and ignored them, and once v3
+        # had its own page they were not even visible for it. They are
+        # planes, not pixels, and every engine now uses them.
+        self.ZWindowSpinBox = QtWidgets.QSpinBox()
+        self.ZWindowSpinBox.setRange(1, 200)
+        self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
+        self.ZWindowSpinBox.setSuffix(' planes')
+        self.ZWindowSpinBox.setToolTip(
+            'How far in z from the fiducial a readout is looked for.\n'
+            'v1: the mixture-mode seed window around the seed.\n'
+            'v2: the readout seed search half-depth (measured default 15).\n'
+            'v3: the reach -- candidates further from the fiducial\'s z '
+            'than this are dropped, and the search slab is this plus the '
+            'engine\'s own box so a candidate at the reach still gets '
+            'full template room.')
+        crossForm.addRow('Z search window (+/- planes from the fiducial):',
+                         self.ZWindowSpinBox)
+
+        self.ZBoundaryTrimSpinBox = QtWidgets.QSpinBox()
+        self.ZBoundaryTrimSpinBox.setRange(0, 100)
+        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
+        self.ZBoundaryTrimSpinBox.setSuffix(' planes')
+        self.ZBoundaryTrimSpinBox.setToolTip(
+            'Planes shaved off EACH end of the stack: out of focus wherever '
+            'the allele sits.\nv1 fits the stack minus these; v2 rejects a '
+            'fit that lands in them; v3 never searches them.')
+        crossForm.addRow('Z boundary trim (each end):', self.ZBoundaryTrimSpinBox)
+
         # -- per-channel: independently tunable fiducial vs. readout
         # columns, per explicit request -- a fiducial bead and a real
         # genomic-locus probe can have genuinely different brightness/PSF
@@ -415,17 +444,6 @@ class ChromatinTracingPanelUI(object):
         v1Outer.setContentsMargins(0, 0, 0, 0)
         v1Form = QtWidgets.QFormLayout()
         v1Outer.addLayout(v1Form)
-
-        self.ZWindowSpinBox = QtWidgets.QSpinBox()
-        self.ZWindowSpinBox.setRange(1, 200)
-        self.ZWindowSpinBox.setValue(CROSS_MODE_DEFAULTS['z_window'])
-        v1Form.addRow('Z search window (+/-px, mixture mode only):', self.ZWindowSpinBox)
-
-        self.ZBoundaryTrimSpinBox = QtWidgets.QSpinBox()
-        self.ZBoundaryTrimSpinBox.setRange(0, 100)
-        self.ZBoundaryTrimSpinBox.setValue(CROSS_MODE_DEFAULTS['z_boundary_trim'])
-        self.ZBoundaryTrimSpinBox.setSuffix(' planes')
-        v1Form.addRow('Z boundary trim (each end):', self.ZBoundaryTrimSpinBox)
 
         grid = QtWidgets.QGridLayout()
         grid.addWidget(QtWidgets.QLabel('Fiducial'), 0, 1)
