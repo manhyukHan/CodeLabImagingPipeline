@@ -107,8 +107,11 @@ def main():
     check('and reports an empty dict rather than raising -- those traces are '
           'good, they just do not know how they were made',
           old[0]['provenance'] == {}, repr(old[0]['provenance']))
-    check('its real data is untouched',
-          old[0]['polymer_adj']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)],
+    import math
+    got = old[0]['polymer_adj']['Hyb_020']
+    check('its real data is untouched (widened to five, quality NaN)',
+          len(got) == 1 and tuple(got[0][:4]) == (1.0, 2.0, 3.0, 500.0)
+          and len(got[0]) == 5 and math.isnan(got[0][4]),
           str(old[0]['polymer_adj']))
 
     print('\nthe engines stamp it')

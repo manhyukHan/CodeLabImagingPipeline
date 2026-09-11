@@ -1,15 +1,34 @@
 import numpy as np
 
 
-def _tuples(d):
-    """{hybe -> (y,x,z,amp) or None}, copied and normalised."""
-    return {k: (tuple(v) if v is not None else None)
+SPOT_WIDTH = 5          # (y, x, z, amplitude, quality)
+_NAN = float('nan')
+
+
+def _spot(v, width=SPOT_WIDTH):
+    """One stored position, widened to (y, x, z, amplitude, quality).
+
+    Traces written before the quality slot existed are 4 wide; they load
+    with quality NaN -- 'no such number', which is also what an engine
+    without one writes -- so every consumer sees one width. A value that
+    is not a run of numbers is returned as it is (tests stage markers).
+    """
+    try:
+        t = tuple(float(x) for x in v)
+    except (TypeError, ValueError):
+        return v
+    return t + (_NAN,) * (width - len(t)) if len(t) < width else t
+
+
+def _tuples(d, width=SPOT_WIDTH):
+    """{hybe -> spot or None}, copied and normalised."""
+    return {k: (_spot(v, width) if v is not None else None)
             for k, v in dict(d or {}).items()}
 
 
 def _lists(d):
-    """{hybe -> [candidate tuples]}, copied and normalised."""
-    return {k: list(v) for k, v in dict(d or {}).items()}
+    """{hybe -> [spots]}, copied and normalised."""
+    return {k: [_spot(c) for c in v] for k, v in dict(d or {}).items()}
 
 
 class AnAllele():
@@ -57,19 +76,38 @@ class AnAllele():
        (fiducial_trace_adj[reference] - fiducial_trace_adj[hybe]), and
        both fiducials are kept.
 
-     fiducial_trace_raw: dict[hybe (str) -> (y, x, z, amplitude) or None]
-       -- the fiducial fit in THAT hybe's own raw frame.
-     fiducial_trace_adj: dict[hybe (str) -> (y, x, z, amplitude) or None]
-       -- the same fit in the pipeline's ONE shared reference frame
-       (None = no real fiducial peak found in that hybe's crop). Used to
+     EVERY STORED SPOT IS (y, x, z, amplitude, quality). `quality` is
+       the number the engine that placed the spot would gate it on --
+       the learned engine's p_exist for a readout or a learned fiducial,
+       the peak NCC for a fiducial found by correlation with the
+       reference -- and NaN where the engine has no such number (a
+       Gaussian fit; every trace written before the slot existed, which
+       loads widened). It is stored so a later judgement (review,
+       filtering, a threshold chosen after the fact) can use it without
+       re-tracing; nothing in the tracer reads it back.
+     fiducial_trace_raw: dict[hybe (str) -> spot or None]
+       -- the fiducial in THAT hybe's own raw frame.
+     fiducial_trace_adj: dict[hybe (str) -> spot or None]
+       -- the same fiducial in the pipeline's ONE shared reference frame.
+       A hybe KEY that is present with None means the fiducial was looked
+       for and not accepted (rejected_hybes says why); a missing key
+       means it was never tried. Both engines write it that way. Used to
        compute each hybe's own local drift correction relative to the
        configured reference hybe -- not itself the chromatin trace, just
        the per-hybe anchor the trace is corrected by. Carries NO fiducial
        correction of its own.
-     polymer_raw: dict[hybe (str) -> list of (y, x, z, amplitude)] -- the
-       accepted readout detections in that hybe's own raw frame,
-       uncorrected.
-     polymer_adj: dict[hybe (str) -> list of (y, x, z, amplitude)] -- THE
+     fiducial_drift: dict[hybe (str) -> (dy, dx, dz) or None] -- the
+       correction this hybe's readouts receive, in the shared frame:
+       fiducial_trace_adj[reference] - fiducial_trace_adj[hybe], in
+       voxels, rasterized order. Redundant with the two fiducials by
+       construction and kept in step with them (reconcile re-derives
+       it), so a per-hybe drift is one lookup rather than a subtraction
+       that every reader would write for itself. None where either
+       fiducial is missing. Present does NOT mean applied: a drift past
+       the gate is recorded here and refused in rejected_hybes.
+     polymer_raw: dict[hybe (str) -> list of spots] -- the accepted
+       readout detections in that hybe's own raw frame, uncorrected.
+     polymer_adj: dict[hybe (str) -> list of spots] -- THE
        FINAL per-hybe positions: shared frame AND fiducial-drift
        corrected. Every ACCEPTED readout-channel detection near this
        allele's anchor for that hybe, not just the brightest one
@@ -118,6 +156,7 @@ class AnAllele():
         self.raw_coordinate = (0.0, 0.0, 0.0)
         self.fiducial_trace_adj = {}
         self.fiducial_trace_raw = {}
+        self.fiducial_drift = {}
         self.polymer_adj = {}
         self.polymer_raw = {}
         self.rejected_hybes = {}
@@ -147,6 +186,8 @@ class AnAllele():
             self.fiducial_trace_adj = _tuples(kwargs['fiducial_trace'])
         if 'fiducial_trace_raw' in kwargs:
             self.fiducial_trace_raw = _tuples(kwargs['fiducial_trace_raw'])
+        if 'fiducial_drift' in kwargs:
+            self.fiducial_drift = _tuples(kwargs['fiducial_drift'], width=3)
         if 'polymer_adj' in kwargs:
             self.polymer_adj = _lists(kwargs['polymer_adj'])
         elif 'polymer' in kwargs:
@@ -180,6 +221,8 @@ class AnAllele():
                                        for k, v in self.fiducial_trace_adj.items()},
                 'fiducial_trace_raw': {k: (tuple(r2(x) for x in v) if v is not None else None)
                                        for k, v in self.fiducial_trace_raw.items()},
+                'fiducial_drift': {k: (tuple(r2(x) for x in v) if v is not None else None)
+                                   for k, v in (self.fiducial_drift or {}).items()},
                 'polymer_adj': {k: [tuple(r2(x) for x in candidate) for candidate in v]
                                 for k, v in self.polymer_adj.items()},
                 'polymer_raw': {k: [tuple(r2(x) for x in candidate) for candidate in v]

@@ -155,8 +155,9 @@ def _peak_above(stack, y, x, z, background):
 
     A MEASURED PEAK, NOT A FITTED AMPLITUDE. psf-match runs no Gaussian,
     so there is no fitted amplitude and LocalizedSpot.amplitude is NaN by
-    design -- but AnAllele.polymer_adj carries a 4-tuple whose last
-    element is what analysis.polymer.max_brightness compares, and NaN
+    design -- but AnAllele.polymer_adj carries (y, x, z, amplitude,
+    quality) tuples whose amplitude is what analysis.polymer.max_brightness
+    compares, and NaN
     there does not raise. It makes the comparison undefined and the
     selector silently returns whichever candidate came first: MEASURED on
     real v3 output, exactly that happened, and the collapsed position was

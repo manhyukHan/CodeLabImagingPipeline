@@ -125,7 +125,7 @@ def collapse_polymer(allele_dict, hybes, selector=max_brightness):
         if not cands:
             continue
         n_cand[j] = len(cands)
-        y, x, z, a = selector(cands)
+        y, x, z, a = selector(cands)[:4]
         pos[j] = (y, x, z)
         amp[j] = a
     return pos, amp, n_cand

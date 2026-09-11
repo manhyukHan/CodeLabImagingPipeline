@@ -990,7 +990,7 @@ class ChromatinTracingWorker(QtCore.QThread):
     def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
-                max_fiducial_drift_z=10.0, z_boundary_trim=0, workers=None,
+                max_fiducial_drift_z=22.0, z_boundary_trim=0, workers=None,
                 engine=None, v2_params=None):
         super().__init__()
         # THE WORKER HAS NO APPEND CONCEPT AT ALL. It fits every allele it
@@ -9377,7 +9377,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # after the engine believed it without a
                                 # sub-voxel peak.
                                 + ('  beyond window' if how == 'v3 beyond window'
-                                   else '  +gauss' if how == 'v3+gauss' else ''))
+                                   else '  +gauss' if how == 'v3+gauss'
+                                   else '  +xc' if how == 'v3+xc' else ''))
                         if why and why.startswith('fiducial'):
                             head += '\n' + _short_reason(why[len('fiducial'):])
                         fid_results.append((
@@ -9388,6 +9389,26 @@ class MainWindow(QtWidgets.QMainWindow):
                              'rejected_labels': d.get('fiducial_rejected_labels'),
                              'all_primary': True,
                              **_z_extras(d, 'fiducial')}))
+                    elif d.get('fiducial_engine') == 'xc':
+                        # BY CORRELATION WITH THE REFERENCE: the title
+                        # carries the peak NCC (the gate) and the shift
+                        # it found, in voxels from where the reference's
+                        # fiducial was expected -- the number a person
+                        # compares against the drift gate.
+                        ncc = d.get('fiducial_ncc')
+                        sh = d.get('fiducial_shift')
+                        why = str(rejected.get(hybe, '') or '')
+                        head = (f'{hybe}\nfid ncc '
+                                + (f'{ncc:.2f}' if ncc is not None and np.isfinite(ncc)
+                                   else '--')
+                                + (f'  shift {sh[0]:+.1f},{sh[1]:+.1f},{sh[2]:+.1f}'
+                                   if sh else ''))
+                        if why and why.startswith('fiducial'):
+                            head += '\n' + _short_reason(why[len('fiducial'):])
+                        rej = d.get('fiducial_rejected_centroid')
+                        fid_results.append((d['fiducial_cubic'], centroid, head,
+                                            [rej] if rej is not None else None,
+                                            _z_extras(d, 'fiducial')))
                     else:
                         rej = d.get('fiducial_rejected_centroid')
                         fid_results.append((d['fiducial_cubic'], centroid,
@@ -14119,6 +14140,7 @@ One PNG PER MODALITY: each modality has its own reference and its
             # above lands on v3, before these are applied.
             'v3_readout_model': ('ChromatinTracingPanel', 'V3ModelComboBox'),
             'v3_fiducial_model': ('ChromatinTracingPanel', 'V3FiducialModelComboBox'),
+            'v3_fiducial_method': ('ChromatinTracingPanel', 'V3FiducialMethodComboBox'),
             'v3_min_p_exist': ('ChromatinTracingPanel', 'V3MinPExistSpinBox'),
             'v3_min_p_exist_fiducial': ('ChromatinTracingPanel', 'V3FiducialMinPExistSpinBox'),
             'v3_lateral_reach_px': ('ChromatinTracingPanel', 'V3LateralReachSpinBox'),

@@ -1136,7 +1136,7 @@ def max_tracing_workers(hard_ceiling=32):
 
 def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices, max_fiducial_drift=7.0,
-                                 max_fiducial_drift_z=15.0,
+                                 max_fiducial_drift_z=22.0,
                                  spad=8, z_window=15, fiducial_params=None, readout_params=None,
                                  collect_debug=False, resolver=None, z_boundary_trim=10, executor=None,
                                  append=False):
@@ -1286,9 +1286,17 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                                          'readout_cubic': None, 'readout_centroids': None}
             fid_todo.append((reference_hybe, ref_channel))
 
+    def _widen(v):
+        # (y, x, z, amplitude) -> (y, x, z, amplitude, quality): v1's
+        # Gaussian has no gate number, so NaN. See AnAllele.
+        if v is None:
+            return None
+        t = tuple(float(x) for x in v)
+        return t + (float('nan'),) * (5 - len(t)) if len(t) < 5 else t
+
     def _store_fiducial(hybe, fid_result, fid_cubic, fid_centroid, fid_raw=None):
-        allele.fiducial_trace_adj[hybe] = fid_result
-        allele.fiducial_trace_raw[hybe] = fid_raw
+        allele.fiducial_trace_adj[hybe] = _widen(fid_result)
+        allele.fiducial_trace_raw[hybe] = _widen(fid_raw)
         if debug is not None:
             debug[hybe]['fiducial_cubic'] = fid_cubic
             debug[hybe]['fiducial_centroid'] = fid_centroid
@@ -1377,6 +1385,16 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
     # -- phase 2c: bookkeeping, in the caller's own hybe order --
     for hybe in hybes:
         reject_reason, _delta, readout_channel = gate[hybe]
+        # THE DRIFT AS STORED DATA, from the two fiducials themselves
+        # (the gate's delta is zeroed when it refused). See AnAllele.
+        fid_h = allele.fiducial_trace_adj.get(hybe)
+        base = allele.fiducial_trace_adj.get(reference_hybe)
+        if not hasattr(allele, 'fiducial_drift') or allele.fiducial_drift is None:
+            allele.fiducial_drift = {}
+        allele.fiducial_drift[hybe] = (
+            (float(base[0] - fid_h[0]), float(base[1] - fid_h[1]),
+             float(base[2] - fid_h[2]))
+            if fid_h is not None and base is not None else None)
         if hybe not in ro_results:
             if readout_channel is None or (reject_reason is not None and debug is None):
                 allele.rejected_hybes[hybe] = reject_reason
@@ -1389,8 +1407,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
             allele.rejected_hybes[hybe] = reject_reason
             continue
         if candidates:
-            allele.polymer_adj[hybe] = candidates
-            allele.polymer_raw[hybe] = raw_cands
+            allele.polymer_adj[hybe] = [_widen(c) for c in candidates]
+            allele.polymer_raw[hybe] = [_widen(c) for c in (raw_cands or [])]
         else:
             allele.rejected_hybes[hybe] = 'no readout peak accepted'
     return (allele, debug) if collect_debug else allele

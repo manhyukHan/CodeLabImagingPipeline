@@ -60,9 +60,9 @@ def _xyz(value, n=3):
     while len(v) < 3:
         v.append(float('nan'))
     out = (v[1], v[0], v[2])            # x, y, z
-    if n == 4:
-        out = out + (v[3] if len(v) > 3 else float('nan'),)
-    return out
+    # then amplitude, quality, ... as far as `n` asks; NaN where absent
+    extra = tuple(v[3:n]) + (float('nan'),) * max(0, n - max(3, len(v)))
+    return out + extra[:max(0, n - 3)]
 
 
 def _um(xyz, voxel_um):
@@ -167,12 +167,15 @@ ALLELE_COLUMNS = (
     'candidate_index', 'n_candidates', 'is_selected', 'selection_rule',
     'fiducial_found', 'rejected_reason',
     'readout_adj_x', 'readout_adj_y', 'readout_adj_z', 'readout_adj_amplitude',
+    'readout_quality',
     'readout_raw_x', 'readout_raw_y', 'readout_raw_z', 'readout_raw_amplitude',
     'readout_adj_x_um', 'readout_adj_y_um', 'readout_adj_z_um',
     'final_x', 'final_y', 'final_z',
     'final_x_um', 'final_y_um', 'final_z_um',
     'fiducial_adj_x', 'fiducial_adj_y', 'fiducial_adj_z', 'fiducial_adj_amplitude',
+    'fiducial_quality',
     'fiducial_raw_x', 'fiducial_raw_y', 'fiducial_raw_z', 'fiducial_raw_amplitude',
+    'fiducial_drift_x', 'fiducial_drift_y', 'fiducial_drift_z',
     'anchor_uid', 'anchor_hybe', 'anchor_channel',
     'anchor_adj_x', 'anchor_adj_y', 'anchor_adj_z',
     'anchor_raw_x', 'anchor_raw_y', 'anchor_raw_z',
@@ -291,8 +294,11 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
             cands_adj = list(adj_by_hybe.get(hybe) or [])
             cands_raw = list(raw_by_hybe.get(hybe) or [])
             paired = len(cands_raw) == len(cands_adj)
-            fa = _xyz(fid_adj.get(hybe), n=4)
-            fr = _xyz(fid_raw.get(hybe), n=4)
+            fa = _xyz(fid_adj.get(hybe), n=5)
+            fr = _xyz(fid_raw.get(hybe), n=5)
+            fdr = (a.get('fiducial_drift') or {}).get(hybe)
+            fdr = ((float(fdr[1]), float(fdr[0]), float(fdr[2]))   # x, y, z
+                   if fdr is not None else _NAN3)
             # committed positions are indexed by GENOMIC bin; a QC round
             # (bin_index -1) has no committed position by construction
             fin = _final_for_bin(committed, j) if j >= 0 else _NAN3
@@ -314,8 +320,11 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                 'final_z_um': fin_um[2],
                 'fiducial_adj_x': fa[0], 'fiducial_adj_y': fa[1],
                 'fiducial_adj_z': fa[2], 'fiducial_adj_amplitude': fa[3],
+                'fiducial_quality': fa[4],
                 'fiducial_raw_x': fr[0], 'fiducial_raw_y': fr[1],
                 'fiducial_raw_z': fr[2], 'fiducial_raw_amplitude': fr[3],
+                'fiducial_drift_x': fdr[0], 'fiducial_drift_y': fdr[1],
+                'fiducial_drift_z': fdr[2],
             })
             if not cands_adj:
                 # the bin still gets a row -- see the module docstring
@@ -325,6 +334,7 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                     'readout_adj_x': float('nan'), 'readout_adj_y': float('nan'),
                     'readout_adj_z': float('nan'),
                     'readout_adj_amplitude': float('nan'),
+                    'readout_quality': float('nan'),
                     'readout_raw_x': float('nan'), 'readout_raw_y': float('nan'),
                     'readout_raw_z': float('nan'),
                     'readout_raw_amplitude': float('nan'),
@@ -335,8 +345,8 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                 rows.append(empty)
                 continue
             for k, cand in enumerate(cands_adj):
-                ca = _xyz(cand, n=4)
-                cr = _xyz(cands_raw[k], n=4) if paired else _xyz(None, n=4)
+                ca = _xyz(cand, n=5)
+                cr = _xyz(cands_raw[k], n=5) if paired else _xyz(None, n=5)
                 ca_um = _um(ca[:3], voxel_um)
                 row = dict(per_bin)
                 row.update({
@@ -349,6 +359,7 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                                                      atol=0.01, rtol=0.0)),
                     'readout_adj_x': ca[0], 'readout_adj_y': ca[1],
                     'readout_adj_z': ca[2], 'readout_adj_amplitude': ca[3],
+                    'readout_quality': ca[4],
                     'readout_raw_x': cr[0], 'readout_raw_y': cr[1],
                     'readout_raw_z': cr[2], 'readout_raw_amplitude': cr[3],
                     'readout_adj_x_um': ca_um[0], 'readout_adj_y_um': ca_um[1],

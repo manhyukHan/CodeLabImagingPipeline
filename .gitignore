@@ -41,4 +41,4 @@ spotcheck/last_session.json
 # Build model window: last bundle path, per machine
 spotcheck/build_model_last.json
 # trained spot models (train_spotmodel runs): data, not code
-models/
+/models/

@@ -64,6 +64,7 @@ from collections import namedtuple
 import numpy as np
 
 from codelab_pipeline.localization import fit3d_um as U
+from codelab_pipeline.localization import fiducial_xcorr as FX
 from codelab_pipeline.localization import fit3d_mle as M
 
 DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
@@ -351,8 +352,42 @@ class V2Params(object):
                  z_window=None, z_boundary_trim=10,
                  fiducial_model_dir=None, lateral_reach_px=None,
                  fiducial_z_window=None, min_p_exist_fiducial=None,
-                 genomic_resolution_kb=None, template_mode='select'):
+                 genomic_resolution_kb=None, template_mode='select',
+                 fiducial_method=None, fiducial_refine='gauss',
+                 fiducial_min_ncc=None, xcorr_template_half=None):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # HOW THE FIDUCIAL IS FOUND on every hybe but the reference:
+        # 'xcorr' -- ChrTracer3's way, the hybe's crop REGISTERED to the
+        # reference's by 3D normalized cross-correlation
+        # (fiducial_xcorr.register), the reference itself still placed
+        # by the Gaussian or the learned engine -- or 'gaussian' (v2's
+        # fit per hybe, or the learned engine when a fiducial model is
+        # set, subtracted). THE DEFAULT IS THE CORRELATION, by
+        # measurement (tools/fiducial_ab.py, replicate distance on the
+        # common pairs, 48 alleles per experiment): MP58 0.086 um vs
+        # the Gaussian's 0.166 (-47%) and the learned fiducial's 0.101;
+        # JP chr19 -45% with 97 pairs against 78; HoxA the Gaussian's
+        # coverage. With the learned readout (v3) it kept the most pairs
+        # of any arm (104 vs 88 for the learned fiducial) at -43%. The
+        # Gaussian stays selectable on the v3 page and in the A/B.
+        # And how a learned candidate WITHOUT a sub-voxel position is
+        # refined: 'gauss' (v2's fit seeded there) or 'xcorr'
+        # (correlation with the reference around it).
+        self.fiducial_method = str(fiducial_method or DEFAULT_FIDUCIAL_METHOD)
+        self.fiducial_refine = str(fiducial_refine or 'gauss')
+        if self.fiducial_method not in ('gaussian', 'xcorr'):
+            raise ValueError(f'fiducial_method {self.fiducial_method!r}')
+        if self.fiducial_refine not in ('gauss', 'xcorr'):
+            raise ValueError(f'fiducial_refine {self.fiducial_refine!r}')
+        self.fiducial_min_ncc = (None if fiducial_min_ncc is None
+                                 else float(fiducial_min_ncc))
+        self.xcorr_template_half = (None if xcorr_template_half is None
+                                    else tuple(int(v) for v in xcorr_template_half))
+        if self.xcorr_template_half is not None and (
+                len(self.xcorr_template_half) != 3
+                or any(v < 1 for v in self.xcorr_template_half)):
+            raise ValueError(f'xcorr_template_half {xcorr_template_half!r}: '
+                             f'three half-sizes (y, x, z) of at least 1')
         # Which PSF template a learned engine matches with when its bank
         # carries one per experiment: 'select' by this experiment's
         # resolution (the default), 'pooled', or 'all' (A/B only).
@@ -426,12 +461,12 @@ class V2Params(object):
         # other. v2 has only ever written lists of length one because
         # fit_readout returns one fit. A multispot engine here fills the
         # shape that was always declared.
-        # NOTHING IS STORED ON p_exist, and that is deliberate. The
-        # allele's 4-tuples are (y, x, z, amplitude) and stay that way --
-        # widening them would change a persisted contract for a number
-        # that has already done its job by the time a candidate is
-        # written. So p_exist gates HERE, exactly the way max_uncert
-        # does: cut before the write, never carried past it.
+        # p_exist GATES HERE, exactly the way max_uncert does: cut before
+        # the write. It is ALSO written, as the fifth slot of every stored
+        # spot (AnAllele: (y, x, z, amplitude, quality)) -- not for the
+        # tracer, which never reads it back, but for a judgement made
+        # later (review, a threshold chosen after the fact) that would
+        # otherwise have to re-trace to get the number the engine had.
         self.min_p_exist = (None if min_p_exist is None
                             else float(min_p_exist))
         # AND THE MATCHER'S OWN GATE, AS A CALIBRATED PROBABILITY. The
@@ -472,6 +507,17 @@ class V2Params(object):
         default FIDUCIAL_MIN_P1 (0.3) -- not the readout's."""
         return (self.min_p_exist_fiducial
                 if self.min_p_exist_fiducial is not None else FIDUCIAL_MIN_P1)
+
+    def template_half(self):
+        """The correlation template's (y, x, z) half-sizes in voxels."""
+        return (self.xcorr_template_half
+                if self.xcorr_template_half is not None
+                else FX.DEFAULT_TEMPLATE_HALF)
+
+    def min_ncc(self):
+        """The correlation fiducial's acceptance: peak NCC at least this."""
+        return (self.fiducial_min_ncc if self.fiducial_min_ncc is not None
+                else FIDUCIAL_MIN_NCC)
 
     @property
     def readout_engine(self):
@@ -586,11 +632,28 @@ class V2Params(object):
                                      if learned else None),
                    fiducial_z_window=(v3.get('fiducial_z_window')
                                       if learned else None),
+                   # the v3 page's fiducial method for v3; v2 has no
+                   # control for it and takes the measured default
+                   fiducial_method=((v3.get('fiducial_method')
+                                     or DEFAULT_FIDUCIAL_METHOD)
+                                    if learned else DEFAULT_FIDUCIAL_METHOD),
                    genomic_resolution_kb=params.get('genomic_resolution_kb'),
                    engine_label=str(params.get('engine_label') or
                                     params.get('engine') or ''))
 
     def describe(self):
+        """One line that reconstructs the run, the fiducial's method
+        included when it is not the engine's own."""
+        line = self._describe_engine()
+        if self.fiducial_method == 'xcorr':
+            line += (f'; fiducial by 3D correlation with the reference '
+                     f'(ncc >= {self.min_ncc():g}, template half '
+                     f'{self.template_half()})')
+        elif self.fiducial_refine == 'xcorr' and self.fiducial_model_dir:
+            line += '; unrefined learned fiducials refined by correlation'
+        return line
+
+    def _describe_engine(self):
         """One line that reconstructs the run.
 
         BOTH branches name the voxel size and whatever is known about the
@@ -819,6 +882,23 @@ LearnedFit = namedtuple('LearnedFit',
 # alignment per hybe that the drift gate still checks.
 FIDUCIAL_MIN_P1 = 0.3
 
+# THE CORRELATION FIDUCIAL'S GATE: peak NCC between the reference's
+# template and this hybe's crop. A number to MEASURE, not to reason
+# about: MATLAB's Register3D accepts its SSD score at 0.99 and otherwise
+# falls back to 2D projections. Reported per hybe by tools/fiducial_ab.py
+# (fiducial_ncc) so the threshold is set from a real distribution.
+FIDUCIAL_MIN_NCC = 0.5
+# The fiducial method every engine uses unless told otherwise. See the
+# measurement at V2Params.__init__.
+DEFAULT_FIDUCIAL_METHOD = 'xcorr'
+# How far a learned candidate may move when the correlation refines it:
+# it named the voxel, the correlation names the sub-voxel position.
+XCORR_REFINE_REACH = (2, 2, 3)
+# The correlation fiducial searches this much PAST the drift gate, so a
+# drift right at the gate is bracketed (a peak on the search edge is
+# refused as unmeasured) and the gate in phase 3 makes the decision.
+XCORR_SEARCH_MARGIN = 2
+
 
 def alt_marker(why):
     """A short tag beside a rejected candidate's p_exist: WHY it lost.
@@ -890,7 +970,38 @@ def fiducial_window_planes(voxel_um):
     return _seed_z_half(FIDUCIAL_FIT_RADIUS_UM, voxel_um)
 
 
-def _fiducial_learned(cube, z0, p):
+def fiducial_quality(f):
+    """The stored quality of a fiducial: the number its method gates on.
+    p_exist for a learned candidate (also one the Gaussian or the
+    correlation refined), the peak NCC for a correlation fiducial, NaN
+    for a Gaussian fit, which has no single such number."""
+    for name in ('p_exist', 'ncc'):
+        v = getattr(f, name, None)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float('nan')
+    return float('nan')
+
+
+def _xcorr_gate(f, why, cube, p):
+    """(passed, reason) for a correlation fiducial: it must exist, its
+    peak must be bracketed (not on the search bound), its NCC at least
+    the threshold, and its depth clear of the trimmed stack ends. No
+    occupancy, no CI: a registration has neither."""
+    if f is None:
+        return False, str(why or 'registration failed')
+    if f.at_bound:
+        return False, f'shift at the search bound ({", ".join(f.at_bound)})'
+    thr = p.min_ncc()
+    if not np.isfinite(f.ncc) or f.ncc < thr:
+        return False, f'ncc {f.ncc:.2f} < {thr:.2f}'
+    return gate(f, cube, {'z_boundary_trim': p.fiducial_gates.get('z_boundary_trim'),
+                          'reject_at_bound': False}, p.voxel_um)
+
+
+def _fiducial_learned(cube, z0, p, ref=None):
     """The fiducial by the learned engine, BEST OF ONE.
 
     Returns (fit, why, alternatives, how): `fit` is a LearnedFit -- or a
@@ -906,6 +1017,11 @@ def _fiducial_learned(cube, z0, p):
                            sub-voxel peak; v2's Gaussian fit, seeded
                            there and passed through v2's own gates,
                            gives it the position
+        'v3+xc'            the same case with p.fiducial_refine ==
+                           'xcorr' and `ref` = (reference crop, its
+                           fiducial): correlation with the reference's
+                           template, searched XCORR_REFINE_REACH around
+                           the candidate, gives it the position
 
     One answer, not a list: the fiducial's job is to place this hybe's
     frame, and a second candidate is an ambiguity rather than a second
@@ -1006,10 +1122,24 @@ def _fiducial_learned(cube, z0, p):
         # centroid.
         unrefined.sort(key=lambda fd: -fd[0].p_exist)
         cand, _d = unrefined[0]
-        g = fit_fiducial_from(cube, (cand.y, cand.x, cand.z), p)
-        ok, gwhy = gate(g, cube, p.fiducial_gates, p.voxel_um)
         rest = ([(f, 'no sub-voxel position') for f, _dd in unrefined[1:]]
                 + alts)
+        if p.fiducial_refine == 'xcorr' and ref is not None:
+            ref_cube, ref_pos = ref
+            xf, xwhy = FX.register(ref_cube, ref_pos, cube,
+                                   (cand.y, cand.x, cand.z),
+                                   max_shift=XCORR_REFINE_REACH,
+                                   half=p.template_half())
+            xok, xwhy = _xcorr_gate(xf, xwhy, cube, p)
+            if xok:
+                return xf, None, \
+                    [(cand, 'refined by correlation with the reference')] \
+                    + rest, 'v3+xc'
+            return None, f'unrefined; xcorr {xwhy}', \
+                [(cand, 'no sub-voxel position; correlation refinement '
+                        'failed')] + rest, None
+        g = fit_fiducial_from(cube, (cand.y, cand.x, cand.z), p)
+        ok, gwhy = gate(g, cube, p.fiducial_gates, p.voxel_um)
         if ok and g is not None:
             return g, None, [(cand, 'refined by the Gaussian fit')] + rest, \
                 'v3+gauss'
@@ -1211,10 +1341,13 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     adj, raw = [], []
     for c in kept:
         sy, sx, sz = to_shared(hybe, c.y, c.x, c.z, ymin, xmin)
+        # THE FIFTH SLOT IS THE ENGINE'S OWN GATE NUMBER -- p_exist here
+        # -- so a judgement made later has what the engine had.
+        q = float(c.p_exist) if np.isfinite(c.p_exist) else float('nan')
         adj.append((float(sy + dy), float(sx + dx), float(sz + dz),
-                    float(c.amplitude)))
+                    float(c.amplitude), q))
         raw.append((float(c.y + ymin), float(c.x + xmin), float(c.z),
-                    float(c.amplitude)))
+                    float(c.amplitude), q))
     allele.polymer_adj[hybe] = adj
     allele.polymer_raw[hybe] = raw
     if debug is not None:
@@ -1438,7 +1571,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                  hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices,
                                  params=None, max_fiducial_drift=7.0,
-                                 max_fiducial_drift_z=15.0, spad=8,
+                                 max_fiducial_drift_z=22.0, spad=8,
                                  collect_debug=False, resolver=None):
     """
     v2's counterpart to localization.build_chromatin_trace_allele, filling
@@ -1472,6 +1605,7 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     # estimates inside one polymer_adj.
     allele.fiducial_trace_adj, allele.polymer_adj = {}, {}
     allele.fiducial_trace_raw, allele.polymer_raw = {}, {}
+    allele.fiducial_drift = {}
     allele.rejected_hybes = {}
     debug = {} if collect_debug else None
     # (y, x). NOT (x, y). allele.coordinate is rasterized order (y, x, z)
@@ -1496,6 +1630,38 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             storage_path, fov, hybe, channel, (raw_y, raw_x),
             pad=(spad if pad is None else int(pad)), use_stack=True)
         return cube, ymin, xmin
+
+    def _raw_centre(hybe):
+        """The allele's shared coordinate in `hybe`'s raw frame -- the
+        point every crop of this allele is cut around."""
+        return spot_mapper.reference_to_raw(
+            shared_xy, hybe, fov_matrices, modality=modality, cell=cell,
+            resolver=resolver)
+
+    def _template_crop(hybe, f, origin, cube):
+        """The reference's crop RE-CUT around its fitted fiducial, for the
+        correlation template: (cube, (y, x, z) in it, (ymin, xmin)).
+
+        The display crop is cut around the allele's anchor, and the
+        reference fiducial's fit may land at its edge and still be the
+        reference (it is accepted whenever it fitted at all). A template
+        centred there would hold the crop's corner. MEASURED, smoke run:
+        one of four alleles had its reference at x = -1.5 in a 17 px
+        crop, and every one of its 72 hybes was refused for want of a
+        template. Register3D's box is around the reference PEAK for the
+        same reason. Falls back to the display crop when the re-cut
+        fails."""
+        ymin, xmin = origin
+        raw = (float(f.y) + ymin, float(f.x) + xmin)
+        try:
+            c2, (ymin2, xmin2) = spot_mapper.crop_for_localization(
+                storage_path, fov, hybe, hybe_fiducial_channels[hybe], raw,
+                pad=spad, use_stack=True)
+        except (OSError, ValueError):
+            c2 = None
+        if c2 is None or c2.size == 0:
+            return cube, (float(f.y), float(f.x), float(f.z)), (ymin, xmin)
+        return c2, (raw[0] - ymin2, raw[1] - xmin2, float(f.z)), (ymin2, xmin2)
 
     def _to_shared(hybe, yf, xf, zf, ymin, xmin):
         sy, sx = spot_mapper.raw_to_reference(
@@ -1541,7 +1707,19 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     # -- phase 2: fit the fiducials at their own expected depth ---------
     fid_local, ref_note = {}, None
     precut = {}     # hybe -> (cube, ymin, xmin) already read for the preview
-    for hybe, cube in fid_cubes.items():
+    # THE REFERENCE FIRST. The correlation fiducial measures every other
+    # hybe AGAINST the reference's crop and position, and so does the
+    # learned fiducial's correlation refinement, so the reference's own
+    # fiducial has to exist before theirs are looked for. ref_ctx is
+    # (template crop, its fiducial in that crop, the crop's origin) once
+    # it does -- the crop re-cut around the fiducial, see _template_crop.
+    ref_ctx = None
+    wants_ref = p.fiducial_method == 'xcorr' or (
+        p.fiducial_engine is not None and p.fiducial_refine == 'xcorr')
+    order = ([reference_hybe] if reference_hybe in fid_cubes else []) + \
+        [h for h in fid_cubes if h != reference_hybe]
+    for hybe in order:
+        cube = fid_cubes[hybe]
         if debug is not None:
             debug.setdefault(hybe, {'fiducial_cubic': None, 'fiducial_centroid': None,
                                     'readout_cubic': None, 'readout_centroids': None,
@@ -1569,18 +1747,105 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # these lines, and a person can now see that.
             debug[hybe]['fiducial_zexp'] = float(z0)
             debug[hybe]['fiducial_z_window'] = int(p.fiducial_window())
-        if p.fiducial_engine is not None:
+        used_xcorr = False
+        if p.fiducial_method == 'xcorr' and hybe != reference_hybe:
+            # THE FIDUCIAL BY IMAGE CORRELATION WITH THE REFERENCE --
+            # ChrTracer3's Register3D. The reference's crop around its
+            # own fiducial is the template; this hybe's crop is cut
+            # WIDER by the drift gate's reach, so a shift as large as
+            # the gate allows still has the whole template inside it;
+            # the search is centred where the reference's fiducial
+            # lands in this crop by the two crops' origins (and the
+            # hybes' z offsets), and bounded by the drift gate, because
+            # a shift beyond it would only be refused in phase 3. The
+            # position comes back in this hybe's DISPLAY crop
+            # coordinates so everything downstream -- the origins, the
+            # shared-frame conversion, the tiles -- is the Gaussian's.
+            used_xcorr = True
+            f, how, ok, why = None, None, False, None
+            if ref_ctx is None:
+                why = 'reference fiducial not found (no template)'
+            else:
+                ms_xy = int(np.ceil(float(max_fiducial_drift))) + XCORR_SEARCH_MARGIN
+                ms_z = int(np.ceil(float(max_fiducial_drift_z))) + XCORR_SEARCH_MARGIN
+                ref_cube, (ry, rx, rz), (ymin_r, xmin_r) = ref_ctx
+                ymin, xmin = fid_origin[hybe]
+                half = p.template_half()
+                # THE SEARCH CROP IS CUT AROUND THE EXPECTED FIDUCIAL, not
+                # around the allele's anchor: the reference fiducial may
+                # sit several px from the anchor (measured -9.5 px on one
+                # smoke allele), and a crop centred on the anchor then
+                # ran out of room on that side, so the template shrank
+                # (9 -> 7 -> 5 px) or the range was clipped, silently.
+                # The crop has the whole template plus the whole range on
+                # every side of the expected position.
+                cy_r, cx_r = _raw_centre(reference_hybe)
+                cy_h, cx_h = _raw_centre(hybe)
+                exp_y = float(cy_h) + (float(ry) + ymin_r - float(cy_r))
+                exp_x = float(cx_h) + (float(rx) + xmin_r - float(cx_r))
+                try:
+                    wide, (ymin_w, xmin_w) = spot_mapper.crop_for_localization(
+                        storage_path, fov, hybe, hybe_fiducial_channels[hybe],
+                        (exp_y, exp_x), pad=int(max(half[0], half[1])) + ms_xy + 1,
+                        use_stack=True)
+                except (OSError, ValueError):
+                    wide = None
+                if wide is None or wide.size == 0:
+                    why = 'fiducial crop unreadable'
+                else:
+                    # WHERE THE REFERENCE'S FIDUCIAL IS EXPECTED IN THIS
+                    # CROP. The display crops of this allele are all cut
+                    # around the same shared coordinate mapped into each
+                    # hybe's raw frame, so the reference fiducial's offset
+                    # from ITS crop centre carries over to this hybe's
+                    # mapped centre -- that is exp_y/exp_x above. The
+                    # crop ORIGINS alone would not do: they sit in two raw
+                    # frames that differ by the inter-hybe alignment (5-7
+                    # px on MP58), and using them put that translation
+                    # into the shift, which then ran into the search
+                    # bound on a third of the hybes -- measured on the
+                    # smoke run: 'shift at the search bound (y)' at
+                    # exactly 7.0 px, NCC 0.85.
+                    # depth: native_h = native_ref + off_ref - off_h,
+                    # since shared = native + off (consensus_native_z)
+                    centre = (exp_y - ymin_w, exp_x - xmin_w,
+                              rz + z_offsets.get(reference_hybe, 0.0)
+                              - z_offsets.get(hybe, 0.0))
+                    xf, xwhy = FX.register(
+                        ref_cube, (ry, rx, rz), wide, centre,
+                        max_shift=(ms_xy, ms_xy, ms_z), half=half)
+                    if xf is not None:
+                        xf = xf._replace(y=xf.y + ymin_w - ymin,
+                                         x=xf.x + xmin_w - xmin)
+                    ok, why = _xcorr_gate(xf, xwhy, cube, p)
+                    f, how = xf, ('xcorr' if ok else None)
+            if debug is not None:
+                debug[hybe]['fiducial_engine'] = 'xc'
+                debug[hybe]['fiducial_how'] = how
+                debug[hybe]['fiducial_ncc'] = (float(f.ncc) if f is not None
+                                               else float('nan'))
+                debug[hybe]['fiducial_shift'] = (tuple(f.shift) if f is not None
+                                                 else None)
+        elif p.fiducial_engine is not None:
             # THE LEARNED FIDUCIAL, best of one. No Gaussian gate applies
             # -- a matched filter has no occupancy or CI -- the p_exist
             # threshold and the fiducial's own reach are the gate, and
             # every other candidate reaches the grid, labelled, as what
             # was NOT chosen. The Gaussian seed fallback below is v2's
             # and does not run for it.
-            f, why, alts, how = _fiducial_learned(cube, z0, p)
+            f, why, alts, how = _fiducial_learned(
+                cube, z0, p,
+                ref=(ref_ctx[:2] if ref_ctx is not None
+                     and p.fiducial_refine == 'xcorr' else None))
             ok = f is not None
             if debug is not None:
                 debug[hybe]['fiducial_engine'] = 'v3'
                 debug[hybe]['fiducial_how'] = how
+                # the correlation's own facts, when it did the refining
+                # (an XcorrFit carries them; a LearnedFit does not)
+                if getattr(f, 'ncc', None) is not None:
+                    debug[hybe]['fiducial_ncc'] = float(f.ncc)
+                    debug[hybe]['fiducial_shift'] = tuple(f.shift)
                 debug[hybe]['fiducial_p_exist'] = (
                     float(getattr(f, 'p_exist', float('nan')))
                     if f is not None else float('nan'))
@@ -1595,7 +1860,8 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         else:
             f = fit_fiducial(cube, z0, p)
             ok, why = gate(f, cube, p.fiducial_gates, p.voxel_um)
-        if not ok and FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None:
+        if (not ok and FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None
+                and not used_xcorr):
             # SECOND START FROM THE ARGMAX, only when the first fit failed
             # its gate. Faint extended fiducials (contrast ~1.5x, which
             # per-tile display normalization renders indistinguishable
@@ -1625,7 +1891,11 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # gate()'s signature (and its many callers) untouched, and costs
         # nothing in a batch run, where debug is None.
         if debug is not None:
-            debug[hybe]['fiducial_occupancy'] = occupancy(cube, f, p.voxel_um)
+            # a correlation position may lie outside the display crop
+            # (the search ran on a wider one), where occupancy would be
+            # measured at a clipped voxel; the tile does not show it
+            debug[hybe]['fiducial_occupancy'] = (
+                float('nan') if used_xcorr else occupancy(cube, f, p.voxel_um))
             debug[hybe]['fiducial_uncert_nm'] = uncertainty_nm(f)
             debug[hybe]['fiducial_at_bound'] = tuple(
                 getattr(f, 'at_bound', None) or ())
@@ -1653,17 +1923,26 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             if debug is not None and f is not None:
                 debug[hybe]['fiducial_rejected_centroid'] = (f.x, f.y, f.z)
             allele.rejected_hybes[hybe] = f'fiducial {why}'
+            # THE KEY STAYS, WITH None: looked for and not accepted, which
+            # v1 has always written and readers (export's fiducial_found)
+            # already distinguish from 'never tried'.
+            allele.fiducial_trace_adj[hybe] = None
+            allele.fiducial_trace_raw[hybe] = None
+            allele.fiducial_drift[hybe] = None
             continue
         ymin, xmin = fid_origin[hybe]
+        q = fiducial_quality(f)
         allele.fiducial_trace_adj[hybe] = _to_shared(hybe, f.y, f.x, f.z, ymin, xmin) \
-            + (float(f.amplitude),)
+            + (float(f.amplitude), q)
         # The SAME fit, before any matrix: crop-local plus the crop's own
         # origin. ymin/xmin are the actual origin, clamp included, so this
         # indexes that hybe's full frame directly and the image can be
         # re-reached without inverting anything.
         allele.fiducial_trace_raw[hybe] = (float(f.y + ymin), float(f.x + xmin),
-                                           float(f.z), float(f.amplitude))
+                                           float(f.z), float(f.amplitude), q)
         fid_local[hybe] = (f.y, f.x, f.z)
+        if hybe == reference_hybe and wants_ref:
+            ref_ctx = _template_crop(hybe, f, fid_origin[hybe], cube)
         if debug is not None:
             debug[hybe]['fiducial_centroid'] = (f.x, f.y, f.z)
     if ref_note:
@@ -1729,12 +2008,18 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         fid = allele.fiducial_trace_adj.get(hybe)
         if baseline is None:
             allele.rejected_hybes[hybe] = 'reference hybe fiducial not found'
+            allele.fiducial_drift[hybe] = None
             continue
         if fid is None:
             allele.rejected_hybes[hybe] = 'fiducial not found'
+            allele.fiducial_drift[hybe] = None
             continue
         dy, dx, dz = (baseline[0] - fid[0], baseline[1] - fid[1],
                       baseline[2] - fid[2])
+        # Recorded BEFORE the gates: a drift past the gate is a fact
+        # about this hybe worth keeping, and rejected_hybes says it was
+        # refused. See AnAllele.fiducial_drift.
+        allele.fiducial_drift[hybe] = (float(dy), float(dx), float(dz))
         drift = float(np.hypot(dx, dy))
         if drift > max_fiducial_drift:
             allele.rejected_hybes[hybe] = f'drift {drift:.1f}px > max {max_fiducial_drift}px'
@@ -1855,13 +2140,13 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # traced position relative to v1 while remaining a perfectly
         # well-formed 4-tuple that nothing downstream can detect.
         allele.polymer_adj[hybe] = [(float(sy + dy), float(sx + dx), float(sz + dz),
-                                     float(r.amplitude))]
+                                     float(r.amplitude), float('nan'))]
         # Raw carries NO correction of any kind -- neither the alignment
         # nor the fiducial drift. adj - raw for a READOUT is therefore
         # alignment PLUS fiducial correction, one term more than the same
         # difference on a fiducial. See AnAllele's docstring.
         allele.polymer_raw[hybe] = [(float(r.y + ymin), float(r.x + xmin),
-                                     float(r.z), float(r.amplitude))]
+                                     float(r.z), float(r.amplitude), float('nan'))]
         if debug is not None:
             debug[hybe]['readout_centroids'] = [(r.x, r.y, r.z)]
     return allele, debug
@@ -1943,7 +2228,8 @@ def allele_task(payload):
     return (int(meta['id']), allele.fiducial_trace_adj, allele.polymer_adj,
             allele.fiducial_trace_raw, allele.polymer_raw,
             allele.rejected_hybes, getattr(allele, 'reference_warning', None),
-            dict(getattr(allele, 'provenance', {}) or {}))
+            dict(getattr(allele, 'provenance', {}) or {}),
+            dict(getattr(allele, 'fiducial_drift', {}) or {}))
 
 
 def stored_allele_debug(payload):
@@ -2059,17 +2345,19 @@ def allele_task_with_debug(payload):
     return ((int(meta['id']), allele.fiducial_trace_adj, allele.polymer_adj,
              allele.fiducial_trace_raw, allele.polymer_raw,
              allele.rejected_hybes, getattr(allele, 'reference_warning', None),
-             dict(allele.provenance or {})), debug)
+             dict(allele.provenance or {}),
+             dict(getattr(allele, 'fiducial_drift', {}) or {})), debug)
 
 
 def apply_allele_result(allele, result):
     """Merge a child's result into the parent's own AnAllele, in place."""
     (_aid, fiducial_trace_adj, polymer_adj, fiducial_trace_raw, polymer_raw,
-     rejected, warning, provenance) = result
+     rejected, warning, provenance, fiducial_drift) = result
     allele.fiducial_trace_adj = fiducial_trace_adj
     allele.polymer_adj = polymer_adj
     allele.fiducial_trace_raw = fiducial_trace_raw
     allele.polymer_raw = polymer_raw
+    allele.fiducial_drift = dict(fiducial_drift or {})
     allele.rejected_hybes = rejected
     if warning:
         allele.reference_warning = warning
@@ -2143,7 +2431,7 @@ def is_v3(engine):
 def trace_allele(engine, allele, hybes, reference_hybe, hybe_fiducial_channels,
                  hybe_readout_channels, storage_path, fov, modality, cell,
                  fov_matrices, v2_params=None, max_fiducial_drift=7.0,
-                 max_fiducial_drift_z=15.0, spad=8, z_window=15,
+                 max_fiducial_drift_z=22.0, spad=8, z_window=15,
                  fiducial_params=None, readout_params=None, collect_debug=False,
                  resolver=None, z_boundary_trim=10, executor=None):
     """

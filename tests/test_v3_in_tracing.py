@@ -221,8 +221,9 @@ def test_readout_multi_gates():
           str(debug['H'].get('readout_search')))
     check('it wrote', ok, why)
     adj = a.polymer_adj['H']
-    check('TWO loci written as a list -- the multispot the panel never got',
-          len(adj) == 2 and all(len(t) == 4 for t in adj))
+    check('TWO loci written as a list -- the multispot the panel never got, '
+          'each (y, x, z, amplitude, p_exist)',
+          len(adj) == 2 and all(len(t) == 5 for t in adj))
     check('their z is back in the CROP\'s planes, not the slab\'s',
           sorted(round(t[2]) for t in adj) == [20, 22],
           str([t[2] for t in adj]))
@@ -537,8 +538,8 @@ def test_learned_fiducial_best_of_one():
     import inspect
     bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
     check('the builder branches on the fiducial engine and records how',
-          'if p.fiducial_engine is not None:' in bsrc
-          and 'f, why, alts, how = _fiducial_learned(cube, z0, p)' in bsrc
+          'elif p.fiducial_engine is not None:' in bsrc
+          and 'f, why, alts, how = _fiducial_learned(' in bsrc
           and "debug[hybe]['fiducial_how'] = how" in bsrc)
     check("and v2's seed fallback does not run for it",
           'FIDUCIAL_SEED_FALLBACK and p.fiducial_engine is None' in bsrc)
@@ -567,6 +568,7 @@ def test_panel():
     pr = ui.params()
     check("params() carries the v3 block, reach settings included",
           pr['v3'] == {'model_dir': '/m/r1', 'fiducial_model_dir': None,
+                       'fiducial_method': 'xcorr',
                        'min_p_exist': 0.65, 'min_p_exist_fiducial': 0.3,
                        'lateral_reach_px': 5, 'fiducial_z_window': 17}
           and T2.route(pr['engine']) == T2.ROUTE_V3)
@@ -586,6 +588,25 @@ def test_panel():
           ui.V3LateralReachSpinBox.value() == 5
           and ui.V3FiducialZWindowSpinBox.value() == 17
           and ui.V3FiducialMinPExistSpinBox.value() == 0.3)
+    check('the fiducial METHOD combo: Gaussian/model or correlation, '
+          'correlation by default (measured), item data is the V2Params value',
+          ui.V3FiducialMethodComboBox.count() == 2
+          and ui.V3FiducialMethodComboBox.itemData(0) == 'gaussian'
+          and ui.V3FiducialMethodComboBox.itemData(1) == 'xcorr'
+          and ui.selected_fiducial_method() == 'xcorr'
+          and ui.v3_params()['fiducial_method'] == 'xcorr')
+    ui.V3FiducialMethodComboBox.setCurrentIndex(0)
+    pm = T2.V2Params.from_panel({'engine': T2.ROUTE_V3, 'v3': ui.v3_params(),
+                                 'z_boundary_trim': 10}, None)
+    check('from_panel carries the choice onto V2Params under v3; v2 takes the default',
+          pm.fiducial_method == 'gaussian'
+          and T2.V2Params.from_panel({'engine': T2.ROUTE_V2, 'v3': ui.v3_params(),
+                                      'z_boundary_trim': 10}, None
+                                     ).fiducial_method == T2.DEFAULT_FIDUCIAL_METHOD)
+    ui.V3FiducialMethodComboBox.setCurrentIndex(1)
+    check('the z drift gate defaults to 22 planes (measured: real drifts of 16-20)',
+          ui.MaxFiducialDriftZSpinBox.value() == 22.0
+          and ui.params()['max_fiducial_drift_z'] == 22.0)
     check('the v3 page shows no Gaussian-fit gate',
           not any(k in dir(ui) for k in ('V3PeakBoundSpinBox',
                                           'V3MaxSigmaSpinBox')))
@@ -676,7 +697,8 @@ def test_main_window_wiring():
           "('occupancy', 'occ')" in src and "('; refit ', ', ')" in src
           and "w = 'fid ' + w[len('fiducial '):]" in src)
     check('every tile, both engines, carries the depth window for the XZ '
-          'panel', src.count("_z_extras(d, 'fiducial')") == 2
+          'panel (three fiducial branches: v3, xc, Gaussian)',
+          src.count("_z_extras(d, 'fiducial')") == 3
           and src.count("_z_extras(d, 'readout')") == 2
           and "out['z_display_pad'] = int(half) + 2" in src)
     bsrc2 = inspect.getsource(T2.build_chromatin_trace_allele)

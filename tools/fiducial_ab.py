@@ -5,9 +5,15 @@ store, scored by replicate distance.
 WHAT IS COMPARED. Three arms on the SAME alleles, each through the
 production tracer (tracing_v2.build_chromatin_trace_allele):
 
-    v2      Gaussian fiducial, Gaussian readout          -- the reference
-    v2+lf   Gaussian readout, LEARNED fiducial (best of one)
-    v3+lf   learned readout, learned fiducial            -- the app's v3 page
+    v2        Gaussian fiducial, Gaussian readout        -- the reference
+    v2+xc     Gaussian readout, fiducial by 3D CORRELATION with the
+              reference (ChrTracer3's Register3D; fiducial_xcorr.py)
+    v2+xc/6   the same with a larger template (+/-6 px, +/-12 planes)
+    v2+lf     Gaussian readout, LEARNED fiducial (best of one)
+    v2+lf/xc  learned fiducial, unrefined candidates refined by
+              correlation with the reference instead of the Gaussian
+    v3+lf     learned readout, learned fiducial          -- the app's v3 page
+    v3+xc     learned readout, fiducial by correlation with the reference
 
 v2 and v2+lf share the readout engine, so any difference between them
 in the same-locus repeat distance is the fiducial alignment alone. v3+lf
@@ -52,8 +58,13 @@ VOXEL = (0.208, 0.208, 0.2)
 DEFAULT_OUT = os.path.join('notes', 'chromatin_tracing_optimization')
 
 
+ARM_ORDER = ('v2', 'v2+xc', 'v2+xc/6', 'v2+lf', 'v2+lf/xc', 'v2+lf/pooled',
+             'v2+lf/all', 'v3+lf', 'v3+xc')
+
+
 def _params(psf_label, fid_model=None, read_model=None, min_p=0.5,
-            resolution_kb=None, template_mode='select', fid_min_p=None):
+            resolution_kb=None, template_mode='select', fid_min_p=None,
+            method='gaussian', refine='gauss', half=None):
     from codelab_pipeline.localization import psf_library as LIB
     doc = LIB.read(psf_label)
     got = LIB.shape_tuple(doc) if doc else None
@@ -67,7 +78,9 @@ def _params(psf_label, fid_model=None, read_model=None, min_p=0.5,
                        min_p_exist=min_p,
                        min_p_exist_fiducial=fid_min_p,
                        genomic_resolution_kb=resolution_kb,
-                       template_mode=template_mode)
+                       template_mode=template_mode,
+                       fiducial_method=method, fiducial_refine=refine,
+                       xcorr_template_half=half)
 
 
 def _init(exp_name, psf_label, fid_model, read_model, min_p, arms_wanted=None):
@@ -87,19 +100,38 @@ def _init(exp_name, psf_label, fid_model, read_model, min_p, arms_wanted=None):
     # genomic resolution; 'select' matches with the bank's template for
     # it, 'pooled' with the pooled mean, 'all' with every candidate.
     kb = exp.step_kb
-    arms = [('v2', _params(psf_label)),
+    # EVERY GAUSSIAN OR LEARNED-FIDUCIAL ARM ASKS FOR method='gaussian':
+    # the correlation is V2Params' default now, and a learned fiducial
+    # only places every hybe when the method is the Gaussian one.
+    G = 'gaussian'
+    arms = [('v2', _params(psf_label, method=G)),
+            ('v2+xc', _params(psf_label, method='xcorr')),
+            ('v2+xc/6', _params(psf_label, method='xcorr', half=(6, 6, 12))),
             ('v2+lf', _params(psf_label, fid_model=fid_model, min_p=min_p,
-                              resolution_kb=kb, template_mode='select')),
+                              resolution_kb=kb, template_mode='select', method=G)),
+            ('v2+lf/xc', _params(psf_label, fid_model=fid_model, min_p=min_p,
+                                 resolution_kb=kb, template_mode='select',
+                                 refine='xcorr', method=G)),
             ('v2+lf/pooled', _params(psf_label, fid_model=fid_model, min_p=min_p,
-                                     resolution_kb=kb, template_mode='pooled')),
+                                     resolution_kb=kb, template_mode='pooled',
+                                     method=G)),
             ('v2+lf/all', _params(psf_label, fid_model=fid_model, min_p=min_p,
-                                  resolution_kb=kb, template_mode='all'))]
+                                  resolution_kb=kb, template_mode='all',
+                                  method=G))]
     if read_model:
         arms.append(('v3+lf', _params(psf_label, fid_model=fid_model,
                                       read_model=read_model, min_p=min_p,
-                                      resolution_kb=kb)))
+                                      resolution_kb=kb, method=G)))
+        # learned readout with the CORRELATION fiducial: the reference
+        # by the Gaussian, every other hybe registered to it
+        arms.append(('v3+xc', _params(psf_label, read_model=read_model,
+                                      min_p=min_p, resolution_kb=kb,
+                                      method='xcorr')))
     if arms_wanted:
         arms = [a for a in arms if a[0] in arms_wanted]
+        if not arms:
+            raise SystemExit(f'--arms {arms_wanted} selects nothing; known: '
+                             f'{[a for a in ARM_ORDER]}')
     return {'exp': exp, 'mw': mw, 'sp': sp, 'hybes': hybes, 'fid_ch': fid_ch,
             'read_ch': read_ch, 'arms': arms, 'fov': None}
 
@@ -144,6 +176,8 @@ def _one(item, st):
             facts[h] = {'engine': dh.get('fiducial_engine'),
                         'how': dh.get('fiducial_how'),
                         'p': dh.get('fiducial_p_exist'),
+                        'ncc': dh.get('fiducial_ncc'),
+                        'shift': dh.get('fiducial_shift'),
                         'n_cand': dh.get('fiducial_n_candidates'),
                         'why': dh.get('fiducial_dropped_why')
                         or (allele.rejected_hybes or {}).get(h)}
@@ -182,6 +216,12 @@ def _kind(why):
     text = ' '.join(why) if isinstance(why, (list, tuple)) else str(why)
     if 'found nothing' in text:
         return 'learned: engine found nothing'
+    if 'no template' in text:
+        return 'xcorr: reference fiducial not found'
+    if 'search bound' in text:
+        return 'xcorr: shift at the search bound'
+    if 'ncc ' in text:
+        return 'xcorr: ncc below threshold'
     kinds = []
     if 'no sub-voxel' in text:
         kinds.append('unrefined')
@@ -205,6 +245,8 @@ def _fiducial_stats(good, key, hybes, ref_key='v2'):
           if f.get('p') is not None and np.isfinite(f['p'])]
     shifts_xy, shifts_z = [], []
     for r in good:
+        if ref_key not in r or key == ref_key:
+            break
         a, b = r[key]['fiducial_adj'], r[ref_key]['fiducial_adj']
         for h in a:
             if h in b:
@@ -231,6 +273,17 @@ def _fiducial_stats(good, key, hybes, ref_key='v2'):
                          'p10': round(float(np.percentile(ps, 10)), 3),
                          'frac_ge_0.5': round(float((ps >= 0.5).mean()), 3),
                          'frac_ge_0.9': round(float((ps >= 0.9).mean()), 3)}
+    # THE NCC DISTRIBUTION, accepted and refused alike, so the threshold
+    # can be set from what real fiducials score rather than assumed.
+    nccs = [f['ncc'] for r in good for f in r[key]['facts'].values()
+            if f.get('ncc') is not None and np.isfinite(f['ncc'])]
+    if nccs:
+        nc = np.array(nccs, float)
+        st['ncc'] = {'n': int(len(nc)), 'median': round(float(np.median(nc)), 3),
+                     'p10': round(float(np.percentile(nc, 10)), 3),
+                     'p90': round(float(np.percentile(nc, 90)), 3),
+                     'frac_ge_0.5': round(float((nc >= 0.5).mean()), 3),
+                     'frac_ge_0.7': round(float((nc >= 0.7).mean()), 3)}
     if shifts_xy and key != ref_key:
         st['shift_vs_gaussian'] = {
             'n': len(shifts_xy),
@@ -293,8 +346,7 @@ def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p,
     if not good:
         raise RuntimeError('no allele traced')
 
-    arms = [k for k in ('v2', 'v2+lf', 'v2+lf/pooled', 'v2+lf/all', 'v3+lf')
-            if k in good[0]]
+    arms = [k for k in ARM_ORDER if k in good[0]]
     D = {k: _pairs(good, pairs, k)[0] for k in arms}
     common = sorted(set.intersection(*[set(D[k]) for k in arms]))
     row = {'experiment': name, 'alleles': len(good), 'hybes': len(hybes),
@@ -330,6 +382,18 @@ def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p,
         row['lf_change_pct'] = round(float(100 * (m2 - m1) / m1), 1)
         row['lf_closer_pairs'] = sum(1 for c in common
                                      if D['v2+lf'][c][0] < D['v2'][c][0])
+    # EVERY ARM AGAINST v2 on the common pairs, the same way.
+    if common and 'v2' in D:
+        m1 = np.median([D['v2'][c][0] for c in common])
+        row['change_vs_v2_pct'] = {}
+        row['closer_than_v2'] = {}
+        for k in arms:
+            if k == 'v2':
+                continue
+            mk = np.median([D[k][c][0] for c in common])
+            row['change_vs_v2_pct'][k] = round(float(100 * (mk - m1) / m1), 1)
+            row['closer_than_v2'][k] = sum(1 for c in common
+                                           if D[k][c][0] < D['v2'][c][0])
     return row
 
 
@@ -345,7 +409,7 @@ def main():
     ap.add_argument('--min-p', type=float, default=0.5)
     ap.add_argument('--out', default=DEFAULT_OUT)
     ap.add_argument('--arms', default=None,
-                    help='comma list of arms to run, e.g. v2,v2+lf,v2+lf/pooled')
+                    help='comma list of arms to run, e.g. v2,v2+xc,v2+lf,v2+lf/xc')
     a = ap.parse_args()
 
     row = run_one(a.exp, a.alleles, a.jobs, a.psf, os.path.abspath(a.fid_model),
@@ -367,6 +431,9 @@ def main():
           + (f'learned fiducial change {row["lf_change_pct"]:+.1f}%  '
              f'(closer on {row["lf_closer_pairs"]}/{row["common_pairs"]})'
              if 'lf_change_pct' in row else ''))
+    for k, ch in (row.get('change_vs_v2_pct') or {}).items():
+        print(f'    {k:<12} vs v2 on common pairs: {ch:+.1f}%   '
+              f'closer on {row["closer_than_v2"][k]}/{row["common_pairs"]}')
     for k, r in row['arms'].items():
         f = r['fiducial']
         print(f'\n{k}: fiducial on {f["hybes_with_fiducial"]}/{f["hybes_possible"]} hybes')
@@ -374,6 +441,8 @@ def main():
             print(f'    how      {f["how"]}')
         if 'p_exist' in f:
             print(f'    p_exist  {f["p_exist"]}')
+        if 'ncc' in f:
+            print(f'    ncc      {f["ncc"]}')
         if 'shift_vs_gaussian' in f:
             print(f'    shift vs Gaussian  {f["shift_vs_gaussian"]}')
         for w, n in f['refusals'].items():

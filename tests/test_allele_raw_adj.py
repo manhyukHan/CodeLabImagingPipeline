@@ -63,14 +63,26 @@ def roundtrip(dicts):
 print('both frames survive a round trip')
 out, _ = roundtrip([make(1).save()])
 d = out[0]
-check('fiducial_trace_adj kept', d['fiducial_trace_adj']['Hyb_020'] == (11.0, 21.0, 31.0, 800.0),
-      str(d['fiducial_trace_adj']))
-check('fiducial_trace_raw kept', d['fiducial_trace_raw']['Hyb_020'] == (17.0, 27.0, 31.0, 800.0),
-      str(d['fiducial_trace_raw']))
-check('polymer_adj kept', d['polymer_adj']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)],
-      str(d['polymer_adj']))
-check('polymer_raw kept', d['polymer_raw']['Hyb_020'] == [(7.0, 8.0, 3.0, 500.0)],
-      str(d['polymer_raw']))
+import math
+
+
+def four(t):
+    return tuple(t[:4])
+
+
+def nanq(t):
+    return len(t) == 5 and math.isnan(t[4])
+
+
+check('fiducial_trace_adj kept, widened to 5 with quality NaN',
+      four(d['fiducial_trace_adj']['Hyb_020']) == (11.0, 21.0, 31.0, 800.0)
+      and nanq(d['fiducial_trace_adj']['Hyb_020']), str(d['fiducial_trace_adj']))
+check('fiducial_trace_raw kept', four(d['fiducial_trace_raw']['Hyb_020']) == (17.0, 27.0, 31.0, 800.0)
+      and nanq(d['fiducial_trace_raw']['Hyb_020']), str(d['fiducial_trace_raw']))
+check('polymer_adj kept', four(d['polymer_adj']['Hyb_020'][0]) == (1.0, 2.0, 3.0, 500.0)
+      and nanq(d['polymer_adj']['Hyb_020'][0]), str(d['polymer_adj']))
+check('polymer_raw kept', four(d['polymer_raw']['Hyb_020'][0]) == (7.0, 8.0, 3.0, 500.0)
+      and nanq(d['polymer_raw']['Hyb_020'][0]), str(d['polymer_raw']))
 check('raw and adj are NOT the same values (the test would be vacuous)',
       d['polymer_adj']['Hyb_020'] != d['polymer_raw']['Hyb_020'])
 
@@ -79,7 +91,7 @@ a = make(2)
 a.polymer_raw = {}                      # an engine that fills adj and no raw
 out, _ = roundtrip([a.save()])
 check('adj alone round-trips with raw empty',
-      out[0]['polymer_adj']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)]
+      four(out[0]['polymer_adj']['Hyb_020'][0]) == (1.0, 2.0, 3.0, 500.0)
       and out[0]['polymer_raw'] == {}, str(out[0]['polymer_raw']))
 a = make(3)
 a.fiducial_trace_raw = {'Hyb_099': (1.0, 1.0, 1.0, 1.0)}   # disjoint hybes
@@ -92,8 +104,8 @@ check('raw may name hybes adj does not, without cross-assignment',
 print('\nmultiple alleles keep their own rows')
 out, _ = roundtrip([make(1).save(), make(2).save(), make(3).save()])
 check('three alleles, each with both frames intact',
-      all(o['polymer_raw']['Hyb_020'] == [(7.0, 8.0, 3.0, 500.0)]
-          and o['fiducial_trace_raw']['Hyb_016'] == (14.0, 24.0, 30.0, 900.0)
+      all(four(o['polymer_raw']['Hyb_020'][0]) == (7.0, 8.0, 3.0, 500.0)
+          and four(o['fiducial_trace_raw']['Hyb_016']) == (14.0, 24.0, 30.0, 900.0)
           for o in out) and len(out) == 3)
 
 print('\na store written before raw existed still reads')
@@ -109,9 +121,10 @@ check('and reports empty raw -- those traces are good, they just did not '
       'record a hybe-native position',
       old[0]['polymer_raw'] == {} and old[0]['fiducial_trace_raw'] == {},
       str(old[0]['polymer_raw']))
-check('its adj data is untouched',
-      old[0]['polymer_adj']['Hyb_020'] == [(1.0, 2.0, 3.0, 500.0)]
-      and old[0]['fiducial_trace_adj']['Hyb_020'] == (11.0, 21.0, 31.0, 800.0))
+check('its adj data is untouched (a 4-column file reads widened)',
+      four(old[0]['polymer_adj']['Hyb_020'][0]) == (1.0, 2.0, 3.0, 500.0)
+      and nanq(old[0]['polymer_adj']['Hyb_020'][0])
+      and four(old[0]['fiducial_trace_adj']['Hyb_020']) == (11.0, 21.0, 31.0, 800.0))
 
 print('\nthe legacy unsuffixed keys still load (v1 stores outlive the rename)')
 a = AnAllele()
@@ -120,9 +133,11 @@ a.set_metadata(id=9, fov=1, cell=1, anchor_hybe='Hyb_016', anchor_channel=555,
                fiducial_trace={'Hyb_020': (5.0, 6.0, 7.0, 8.0)},
                polymer={'Hyb_020': [(1.0, 1.0, 1.0, 1.0)]})
 check("'fiducial_trace' loads into fiducial_trace_adj",
-      a.fiducial_trace_adj == {'Hyb_020': (5.0, 6.0, 7.0, 8.0)}, str(a.fiducial_trace_adj))
+      four(a.fiducial_trace_adj['Hyb_020']) == (5.0, 6.0, 7.0, 8.0)
+      and nanq(a.fiducial_trace_adj['Hyb_020']), str(a.fiducial_trace_adj))
 check("'polymer' loads into polymer_adj",
-      a.polymer_adj == {'Hyb_020': [(1.0, 1.0, 1.0, 1.0)]}, str(a.polymer_adj))
+      four(a.polymer_adj['Hyb_020'][0]) == (1.0, 1.0, 1.0, 1.0)
+      and nanq(a.polymer_adj['Hyb_020'][0]), str(a.polymer_adj))
 check('and raw stays empty, not invented', a.polymer_raw == {} and a.fiducial_trace_raw == {})
 a2 = AnAllele()
 a2.set_metadata(polymer={'A': [(0., 0., 0., 0.)]},

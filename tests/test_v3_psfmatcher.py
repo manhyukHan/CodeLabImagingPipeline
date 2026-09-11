@@ -423,8 +423,9 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     cands = a.polymer_adj['H']
     check('the readout writes a LIST, not a single fit', len(cands) > 1,
           f'{len(cands)} candidates')
-    check('and every entry is still a 4-tuple -- no contract moved',
-          all(len(c) == 4 for c in cands), str(len(cands[0])))
+    check('and every entry is (y, x, z, amplitude, p_exist) -- the quality '
+          'slot the store now carries',
+          all(len(c) == 5 for c in cands), str(len(cands[0])))
     check('both planted loci are in it',
           {16, 24} <= {round(c[1] - 200) for c in cands},
           str(sorted({round(c[1] - 200) for c in cands})[:8]))
@@ -474,8 +475,9 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     check('the brightest locus survives every threshold',
           16 in {round(c[1] - 200) for c in a9.polymer_adj['H']},
           str(sorted(round(c[1] - 200) for c in a9.polymer_adj['H'])))
-    check('p_exist is NOT in the stored tuple',
-          all(len(c) == 4 for c in a5.polymer_adj['H']))
+    check("p_exist IS the stored tuple's fifth slot, and at least the gate",
+          all(len(c) == 5 and c[4] >= 0.5 for c in a5.polymer_adj['H']),
+          str([c[4] for c in a5.polymer_adj['H']]))
     _aa, ok_all, why_all, _dall = run(1.0)
     check('a threshold that keeps nothing REJECTS the hybe with a reason',
           not ok_all and ('p<1' in why_all or 'p_exist' in why_all),

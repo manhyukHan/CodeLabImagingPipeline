@@ -60,13 +60,18 @@ DEFAULT_READOUT_PSF = 'universal-default'
 # looser than the bound cannot fire (the fit rails first and is rejected as
 # at-bound); a gate tighter than the bound just moves the rejection.
 CROSS_MODE_DEFAULTS = {'spad': 8, 'z_window': 15, 'max_fiducial_drift': 7.0,
-                       'max_fiducial_drift_z': 15.0, 'z_boundary_trim': 10}
+                       # 22 planes, MEASURED on MP58 (2026-09-11): real
+                       # inter-round z drifts of 16-20 planes, found by
+                       # the Gaussian and the correlation alike at NCC
+                       # >= 0.75, were refused by the old 15
+                       'max_fiducial_drift_z': 22.0, 'z_boundary_trim': 10}
 SHARED_FIT_DEFAULTS = {'peak_bound': 2.0, 'max_sigma': 2.5, 'max_uncert': 2.0, 'min_ah_ratio': 0.25}
 READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 # v3: the p_exist cut. 0.5 is where a calibrated probability is
 # thresholded; MEASURED on the shipped model's own 661 judged matches it
 # sits within 0.006 F1 of the optimum across a range of pillar p1.
-V3_DEFAULTS = {'min_p_exist': 0.5, 'min_p_exist_fiducial': 0.3,
+V3_DEFAULTS = {'fiducial_method': 'xcorr',
+               'min_p_exist': 0.5, 'min_p_exist_fiducial': 0.3,
                'lateral_reach_px': 5, 'fiducial_z_window': 17}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
                   # v2 by default, per explicit request. Measured through the
@@ -881,6 +886,36 @@ class ChromatinTracingPanelUI(object):
             'p_exist candidate within reach is the alignment, never a list. '
             'Leave on the v2 Gaussian to keep the reference behaviour.')
         form.addRow('Fiducial model:', self.V3FiducialModelComboBox)
+        # HOW EVERY HYBE BUT THE REFERENCE IS ALIGNED. The reference's
+        # fiducial is always placed by the Gaussian (or the fiducial
+        # model above); the others are either placed the same way and
+        # subtracted, or REGISTERED to the reference's crop by 3D
+        # normalized cross-correlation -- ChrTracer3's Register3D.
+        # MEASURED on three experiments (tools/fiducial_ab.py, replicate
+        # distance on common pairs): correlation -47% vs the Gaussian on
+        # MP58 (0.086 vs 0.166 um), -45% on JP chr19 with more pairs
+        # (97 vs 78), same coverage as the Gaussian on HoxA; the learned
+        # fiducial -38% / -18%; with the learned readout 104 pairs at
+        # -43% against 88 for the learned fiducial. So the correlation
+        # is the default; the config carries the choice either way.
+        self.V3FiducialMethodComboBox = QtWidgets.QComboBox()
+        self.V3FiducialMethodComboBox.setProperty('config_uses_item_data', True)
+        self.V3FiducialMethodComboBox.addItem(
+            'Gaussian fit / fiducial model, subtracted per hybe', 'gaussian')
+        self.V3FiducialMethodComboBox.addItem(
+            '3D correlation with the reference crop (ChrTracer3)', 'xcorr')
+        self.V3FiducialMethodComboBox.setCurrentIndex(
+            0 if V3_DEFAULTS['fiducial_method'] == 'gaussian' else 1)
+        self.V3FiducialMethodComboBox.setToolTip(
+            'Gaussian / model: each hybe\'s fiducial is placed on its own '
+            'and the reference\'s position minus it is the drift. '
+            'Correlation: a template around the reference\'s fiducial is '
+            'matched over each hybe\'s crop (normalized cross-correlation, '
+            'sub-voxel), as ChrTracer3\'s Register3D does; the reference '
+            'itself is still placed by the Gaussian or the fiducial model. '
+            'Measured: repeat distance -47% vs the Gaussian on MP58, -45% '
+            'on JP chr19, same coverage on HoxA.')
+        form.addRow('Fiducial method:', self.V3FiducialMethodComboBox)
         self.V3MinPExistSpinBox = QtWidgets.QDoubleSpinBox()
         self.V3MinPExistSpinBox.setRange(0.0, 1.0)
         self.V3MinPExistSpinBox.setDecimals(2)
@@ -999,9 +1034,13 @@ class ChromatinTracingPanelUI(object):
     def selected_fiducial_model_dir(self):
         return self.V3FiducialModelComboBox.currentData()
 
+    def selected_fiducial_method(self):
+        return str(self.V3FiducialMethodComboBox.currentData() or 'gaussian')
+
     def v3_params(self):
         return {'model_dir': self.selected_model_dir(),
                 'fiducial_model_dir': self.selected_fiducial_model_dir(),
+                'fiducial_method': self.selected_fiducial_method(),
                 'min_p_exist': float(self.V3MinPExistSpinBox.value()),
                 'min_p_exist_fiducial': float(
                     self.V3FiducialMinPExistSpinBox.value()),

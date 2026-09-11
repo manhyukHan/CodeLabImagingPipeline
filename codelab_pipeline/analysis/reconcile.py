@@ -181,8 +181,17 @@ def reconcile_allele_dicts(alleles, resolver, cells_by_id, modality=None,
             old = (d.get('fiducial_trace_adj') or {}).get(h)
             if old is not None:
                 shifts_fid.append(float(np.hypot(fy - old[0], fx - old[1])))
-            new_fid[h] = (fy, fx, fz, float(v[3]))
+            # amplitude and quality ride along untouched
+            new_fid[h] = (fy, fx, fz) + tuple(float(q) for q in v[3:])
         d['fiducial_trace_adj'] = new_fid
+        # fiducial_drift is derived from the two fiducials and must move
+        # with them -- see AnAllele.fiducial_drift.
+        base_d = new_fid.get(ref)
+        d['fiducial_drift'] = {
+            h: ((float(base_d[0] - v[0]), float(base_d[1] - v[1]),
+                 float(base_d[2] - v[2]))
+                if v is not None and base_d is not None else None)
+            for h, v in new_fid.items()}
 
         # polymer: project raw, re-apply the ref-relative drift correction
         poly_raw = d.get('polymer_raw') or {}
@@ -208,7 +217,8 @@ def reconcile_allele_dicts(alleles, resolver, cells_by_id, modality=None,
                         if old:
                             shifts_poly.append(float(np.hypot(
                                 cy + dy - old[0][0], cx + dx - old[0][1])))
-                        out.append((cy + dy, cx + dx, cz + dz, float(c[3])))
+                        out.append((cy + dy, cx + dx, cz + dz)
+                                   + tuple(float(q) for q in c[3:]))
                     new_poly[h] = out
                 d['polymer_adj'] = new_poly
         updated += 1

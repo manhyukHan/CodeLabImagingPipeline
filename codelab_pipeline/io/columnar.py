@@ -258,6 +258,32 @@ def unpack_spots(grp):
 
 # -- alleles -------------------------------------------------------------
 
+# One stored spot is (y, x, z, amplitude, quality) -- models/allele.py.
+# Files written before the quality slot have 4 columns and are WIDENED on
+# read (quality NaN); nothing needs migrating.
+SPOT_WIDTH = 5
+DRIFT_WIDTH = 3
+
+
+def _row(v, width):
+    """One spot as a float row of exactly `width`, NaN-padded."""
+    a = np.asarray(v, dtype=np.float64).ravel()[:width]
+    if len(a) < width:
+        a = np.concatenate([a, np.full(width - len(a), np.nan)])
+    return a
+
+
+def _widen(vals, width):
+    """A stored (n, k) block as (n, width): k < width was written before
+    a slot existed and reads as NaN there."""
+    vals = np.asarray(vals, dtype=np.float64).reshape(-1, vals.shape[-1]) \
+        if np.asarray(vals).ndim == 2 else np.asarray(vals, dtype=np.float64).reshape(-1, width)
+    if vals.shape[1] >= width:
+        return vals[:, :width]
+    pad = np.full((vals.shape[0], width - vals.shape[1]), np.nan)
+    return np.concatenate([vals, pad], axis=1)
+
+
 def pack_alleles(grp, dicts):
     n = len(dicts)
     tab = np.zeros(n, dtype=[('id', 'i4'), ('fov', 'i4'), ('cell', 'i4'),
@@ -281,6 +307,7 @@ def pack_alleles(grp, dicts):
     trr = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
     pl = {'allele': [], 'hybe': [], 'vals': []}
     plr = {'allele': [], 'hybe': [], 'vals': []}
+    fd = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
     rj = {'allele': [], 'hybe': [], 'reason': []}
     fp, fp_off = [], [0]
     for i, d in enumerate(dicts):
@@ -294,13 +321,18 @@ def pack_alleles(grp, dicts):
             for hybe, v in (d.get(key) or {}).items():
                 col['allele'].append(i); col['hybe'].append(_s(hybe))
                 col['isnone'].append(v is None)
-                col['vals'].append(np.zeros(4) if v is None
-                                   else np.asarray(v, dtype=np.float64))
+                col['vals'].append(np.zeros(SPOT_WIDTH) if v is None
+                                   else _row(v, SPOT_WIDTH))
+        for hybe, v in (d.get('fiducial_drift') or {}).items():
+            fd['allele'].append(i); fd['hybe'].append(_s(hybe))
+            fd['isnone'].append(v is None)
+            fd['vals'].append(np.zeros(DRIFT_WIDTH) if v is None
+                              else _row(v, DRIFT_WIDTH))
         for col, key in ((pl, 'polymer_adj'), (plr, 'polymer_raw')):
             for hybe, cands in (d.get(key) or {}).items():
                 for cand in cands:
                     col['allele'].append(i); col['hybe'].append(_s(hybe))
-                    col['vals'].append(np.asarray(cand, dtype=np.float64))
+                    col['vals'].append(_row(cand, SPOT_WIDTH))
         for hybe, reason in (d.get('rejected_hybes') or {}).items():
             rj['allele'].append(i); rj['hybe'].append(_s(hybe)); rj['reason'].append(_s(reason))
         f = np.asarray(d.get('final_polymer', np.empty((0, 3))), dtype=np.float64).reshape(-1, 3)
@@ -313,13 +345,18 @@ def pack_alleles(grp, dicts):
         _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
         _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
         _write(grp, pre + '_isnone', np.asarray(col['isnone'], dtype=np.uint8))
-        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, 4)
-               if col['vals'] else np.empty((0, 4)))
+        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, SPOT_WIDTH)
+               if col['vals'] else np.empty((0, SPOT_WIDTH)))
+    _write(grp, 'fd_allele', np.asarray(fd['allele'], dtype=np.int32))
+    _write(grp, 'fd_hybe', np.asarray(fd['hybe'], dtype=_STR))
+    _write(grp, 'fd_isnone', np.asarray(fd['isnone'], dtype=np.uint8))
+    _write(grp, 'fd_vals', np.asarray(fd['vals']).reshape(-1, DRIFT_WIDTH)
+           if fd['vals'] else np.empty((0, DRIFT_WIDTH)))
     for pre, col in (('pl', pl), ('plr', plr)):
         _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
         _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
-        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, 4)
-               if col['vals'] else np.empty((0, 4)))
+        _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, SPOT_WIDTH)
+               if col['vals'] else np.empty((0, SPOT_WIDTH)))
     _write(grp, 'rj_allele', np.asarray(rj['allele'], dtype=np.int32))
     _write(grp, 'rj_hybe', np.asarray(rj['hybe'], dtype=_STR))
     _write(grp, 'rj_reason', np.asarray(rj['reason'], dtype='S256'))
@@ -348,6 +385,7 @@ def unpack_alleles(grp):
             'coordinate': (float(tab['y'][i]), float(tab['x'][i]), float(tab['z'][i])),
             'raw_coordinate': (float(tab['ry'][i]), float(tab['rx'][i]), float(tab['rz'][i])),
             'fiducial_trace_adj': {}, 'fiducial_trace_raw': {},
+            'fiducial_drift': {},
             'polymer_adj': {}, 'polymer_raw': {}, 'rejected_hybes': {},
             # empty comes back shape-(0,) exactly as AnAllele.save()
             # produces it (np.array([]) of an empty polymer)
@@ -358,10 +396,12 @@ def unpack_alleles(grp):
             'linked_at': la if la else None})
     # trr_*/plr_* ABSENT means the file predates the raw fields, exactly
     # as a missing provenance column does -- an honest empty, not an error.
-    for pre, key in (('tr', 'fiducial_trace_adj'), ('trr', 'fiducial_trace_raw')):
+    for pre, key, width in (('tr', 'fiducial_trace_adj', SPOT_WIDTH),
+                            ('trr', 'fiducial_trace_raw', SPOT_WIDTH),
+                            ('fd', 'fiducial_drift', DRIFT_WIDTH)):
         if pre + '_allele' not in grp:
             continue
-        vals = grp[pre + '_vals'][()]
+        vals = _widen(grp[pre + '_vals'][()], width)
         hybe = grp[pre + '_hybe'][()]
         none = grp[pre + '_isnone'][()]
         for j, ai in enumerate(grp[pre + '_allele'][()]):
@@ -369,7 +409,7 @@ def unpack_alleles(grp):
     for pre, key in (('pl', 'polymer_adj'), ('plr', 'polymer_raw')):
         if pre + '_allele' not in grp:
             continue
-        vals = grp[pre + '_vals'][()]
+        vals = _widen(grp[pre + '_vals'][()], SPOT_WIDTH)
         hybe = grp[pre + '_hybe'][()]
         for j, ai in enumerate(grp[pre + '_allele'][()]):
             out[ai][key].setdefault(_rd(hybe[j]), []).append(tuple(vals[j]))
