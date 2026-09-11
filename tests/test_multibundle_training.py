@@ -57,23 +57,39 @@ def test_source():
           and 'used.append(b)' in inspect.getsource(C.fit_multispot))
     check('the manifest records every bundle',
           "'bundles': bundles," in src)
+    check('a model is a model of ONE channel: --channel leaves other '
+          "channels' rows out, counted", "'--channel'" in src
+          and "rb = [r for r in rb if int(r.get('channel', -1)) == int(a.channel)]" in src)
+    check('the pooled multispot report names the banks the verdicts were '
+          'judged with', "'banks': banks" in inspect.getsource(C.fit_multispot))
 
 
 def test_pooled_multispot():
-    print('multispot verdicts pooled from bundles with and without them')
+    print('multispot verdicts pooled from several bundles')
     if not (os.path.isdir(MP58) and os.path.isdir(JP)):
         check('both real bundles are present', False, 'skipped')
         return
+    import tempfile
     from codelab_pipeline.training import classify as C
-    one, r1 = C.fit_multispot(MP58, template=(7, 7, 11))
+    a, ra = C.fit_multispot(MP58, template=(7, 7, 11))
+    b, rb = C.fit_multispot(JP, template=(7, 7, 11))
     both, r2 = C.fit_multispot([JP, MP58], template=(7, 7, 11))
-    check('JP has no multispot verdicts, so the pool IS MP58\'s: same fit',
-          one is not None and both is not None and r1['n'] == r2['n']
-          and r1['platt'] == r2['platt'] and r2['bundles'] == [MP58],
-          str((r1.get('n'), r2.get('n'), r2.get('bundles'))))
-    none, r3 = C.fit_multispot([JP], template=(7, 7, 11))
+    have = [x for x, r in ((MP58, ra), (JP, rb)) if r.get('n')]
+    check('the pool is the sum of the bundles that have verdicts, and '
+          'names them',
+          both is not None and r2['n'] == ra.get('n', 0) + rb.get('n', 0)
+          and set(r2['bundles']) == set(have)
+          and isinstance(r2.get('banks'), list),
+          str((ra.get('n'), rb.get('n'), r2.get('n'), r2.get('bundles'))))
+    empty = tempfile.mkdtemp(prefix='nomulti_', dir='D:/claude-tmp')
+    none, r3 = C.fit_multispot([empty], template=(7, 7, 11))
     check('and a bundle without any says so',
           none is None and 'no multispot verdicts' in r3['skipped'])
+    alone, r4 = C.fit_multispot([empty, MP58], template=(7, 7, 11))
+    check('pooling with an empty bundle changes nothing',
+          alone is not None and r4['n'] == ra['n'] and r4['bundles'] == [MP58]
+          and r4['platt'] == ra['platt'])
+    os.rmdir(empty)
 
 
 def test_the_two_real_bundles():
@@ -84,7 +100,7 @@ def test_the_two_real_bundles():
     out = subprocess.run(
         [sys.executable, '-u', 'tools/train_spotmodel.py', MP58, JP,
          '--reviewer', 'Manhyuk', '--out', OUT, '--heads', 'linear,mlp',
-         '--epochs', '200'],
+         '--epochs', '200', '--channel', '555'],
         capture_output=True, text=True, timeout=1800,
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     text = out.stdout
@@ -122,9 +138,14 @@ def test_the_two_real_bundles():
     check('and the two templates\' cosine to each other',
           len(psf.get('between') or {}) == 1, str(psf.get('between')))
     ms = r.get('multispot') or {}
-    check('the multispot calibration came from the bundle that has verdicts',
-          ms.get('bundles') == [os.path.abspath(MP58)] and 'platt' in ms,
-          str(ms.get('bundles')))
+    check('the multispot calibration pooled the bundles that have verdicts, '
+          'and names their banks',
+          set(ms.get('bundles') or []) <= {os.path.abspath(MP58), os.path.abspath(JP)}
+          and 'platt' in ms and isinstance(ms.get('banks'), list),
+          str((ms.get('bundles'), ms.get('banks'))))
+    check("JP's two judged ch635 crops were left out of the ch555 model",
+          r.get('channel') == 555 and all(
+              b.get('channel') == 555 for b in r.get('bundles') or []))
     for line in text.splitlines():
         if line.startswith('   linear trained on') or line.startswith('   mlp    trained on') \
                 or 'cosine to the pooled' in line or ' vs ' in line:

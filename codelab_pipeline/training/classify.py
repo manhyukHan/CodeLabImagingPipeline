@@ -594,9 +594,14 @@ def fit_multispot(bundle_dir, template=None):
         recs.extend(rb)
     shown = [e for r in recs for e in (r.get('shown') or [])
              if e.get('p') is not None]
+    # WHICH BANK SCORED THEM. Each record carries the bank Spot Check was
+    # matching with; pooled bundles may have been judged against
+    # different banks, and a calibration fitted across them should say
+    # so rather than look like one measurement.
+    banks = sorted({str(r.get('bank_path')) for r in recs if r.get('bank_path')})
     rep = {'pillars': len(recs), 'n': len(shown),
            'template': list(template) if template else None,
-           'bundles': used}
+           'bundles': used, 'banks': banks}
     if not shown:
         rep['skipped'] = ('no multispot verdicts in this bundle'
                           if len(dirs) == 1 else

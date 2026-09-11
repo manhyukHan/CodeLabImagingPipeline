@@ -380,6 +380,12 @@ def main(argv=None):
                          'it becomes a feature of the model '
                          '(features.CONTEXT_NAMES); one value across all '
                          'rows is metadata, recorded but not learned on.')
+    ap.add_argument('--channel', type=int, default=None,
+                    help='train on this channel\'s crops only. A bundle may '
+                         'hold several channels (each build adds its own '
+                         'shards) and a reviewer may have judged a few of '
+                         'the other one; a model is a model of ONE channel. '
+                         'Rows of other channels are counted and left out.')
     ap.add_argument('--storage-path', action='append', default=None,
                     help='to compare the measured PSF against the analytic '
                          'calibration in that store. Default: the store '
@@ -393,6 +399,13 @@ def main(argv=None):
     rows, per_bundle = [], []
     for bi, b in enumerate(bundles):
         rb = D.rows(b)
+        if a.channel is not None:
+            other = [r for r in rb if int(r.get('channel', -1)) != int(a.channel)]
+            if other:
+                print(f'channel {a.channel}: {len(other)} labelled row(s) of '
+                      f'other channel(s) in {_short_bundle(b)} left out '
+                      f'({sorted({int(r["channel"]) for r in other})})')
+            rb = [r for r in rb if int(r.get('channel', -1)) == int(a.channel)]
         for r in rb:
             # ONE POOL, DISTINCT CELLS. A cell is (fov, cell) inside its
             # bundle, and two experiments both have a FOV 7 cell 12; a
@@ -402,7 +415,8 @@ def main(argv=None):
             r['group'] = (bi,) + tuple(r['group'])
         sb = D.summary(rb)
         per_bundle.append({'bundle': b, 'name': _short_bundle(b),
-                           'storage_path': _manifest_store(b), 'labels': sb})
+                           'storage_path': _manifest_store(b), 'labels': sb,
+                           'channel': a.channel})
         print(f'bundle  {b}')
         print(f'labels  {sb["positive"]} positive, {sb["negative"]} negative, '
               f'{sb["contested"]} contested, {sb["added"]} added')
@@ -505,6 +519,7 @@ def main(argv=None):
     bundle_label = (a.bundle_dir[0] if len(bundles) == 1
                     else ' + '.join(_short_bundle(b) for b in bundles))
     report = {'bundle': bundle_label, 'bundles': per_bundle, 'labels': s,
+              'channel': a.channel,
               'context': report_context, 'features': feature_names,
               'provisional': provisional,
               'n_boxes': len(kept), 'heads': {}, 'voxel_um': list(voxel),
