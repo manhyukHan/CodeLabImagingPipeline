@@ -107,6 +107,18 @@ EXPERIMENTS = {
         scope_mb=18.5, step_kb=200, barcodes=91,
         locus='chr19:40000000-54716295 + 54864547-58617616',
         note='tiles chr19 after the centromere; 6mA spreading study'),
+    'Chr19_JP': Experiment(
+        'Chr19_JP', 'configs/2026-09-08-JP_new_chr19_downstream.xml', 'DNA',
+        anchor_hybe='Hyb_002', anchor_channel=555, reference_hybe='Hyb_002',
+        scope_mb=18.5, step_kb=200, barcodes=91,
+        locus='chr19:40000000-54716295 + 54864547-58617616',
+        note='the SAME probe design as Chr19 (hg38, tiling chr19 after the '
+             'centromere, bad region avoided; designed for the 6mA spreading '
+             'study with the AAVS1 locus; BC1-91 at 200 kb), imaged again by '
+             'JP on 2026-01-26 at G:/JP/2026-01-26-JP-chr19_downstream. Its '
+             'DNA ch555 review bundle is one of the three pooled into the '
+             'first cross-experiment fiducial model (with MP58 at 50 kb and '
+             'HoxA at 5 kb).'),
     'CrossMod': Experiment(
         'CrossMod', 'configs/2026-01-26-JP-C7cSP8.xml', 'DNA',
         anchor_hybe='Hyb_002', anchor_channel=555, reference_hybe='Hyb_002',
