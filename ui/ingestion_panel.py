@@ -212,10 +212,24 @@ class IngestionPanelUI(object):
             'config, written into every bundle built from this experiment, '
             'and used as a feature of the fiducial model once bundles of '
             'different resolutions are pooled. Leave empty if unknown.')
+        self.ApplyResolutionPushButton = QtWidgets.QPushButton('Apply')
+        self.ApplyResolutionPushButton.setToolTip(
+            'Commit the typed resolution. Like the voxel size, nothing '
+            'reads the box until you press this, so a half-typed number '
+            'is never in force. Empty + Apply = unknown.')
+        self.ResolutionStatusLabel = QtWidgets.QLabel('')
+        self.ResolutionStatusLabel.setStyleSheet('color: #555;')
         resLayout.addWidget(self.GenomicResolutionLineEdit)
         resLayout.addWidget(QtWidgets.QLabel('kb per readout step'))
-        resLayout.addStretch(1)
+        resLayout.addWidget(self.ApplyResolutionPushButton)
+        resLayout.addWidget(self.ResolutionStatusLabel, 1)
         form.addRow('Genomic resolution:', resRow)
+        # What is IN FORCE, as opposed to what is typed -- the voxel
+        # size's own rule. None = unknown, and unknown is never a guess.
+        self._resolution_committed = None
+        self.ApplyResolutionPushButton.clicked.connect(
+            self.apply_genomic_resolution)
+        self.apply_genomic_resolution()
 
         # What is actually IN FORCE, as opposed to what is typed. Committed
         # only by apply_voxel(); every reader asks for this.
@@ -615,16 +629,37 @@ class IngestionPanelUI(object):
 
 
     def genomic_resolution_kb(self):
-        """kb per readout step, or None when the field is empty or not a
-        number -- unknown is a legitimate state and is never a guess."""
+        """The COMMITTED kb per readout step, or None for unknown. Every
+        reader asks for this, never for the text in the box."""
+        return self._resolution_committed
+
+    def apply_genomic_resolution(self):
+        """Commit the typed resolution, or refuse it and say why.
+
+        Empty commits None -- unknown is a legitimate state and is
+        recorded as such. A non-number or a non-positive value is
+        refused and the value in force is left as it was, with the
+        refusal on screen; the voxel size refuses the same way.
+        """
         text = self.GenomicResolutionLineEdit.text().strip().replace(',', '.')
         if not text:
-            return None
+            self._resolution_committed = None
+            self.ResolutionStatusLabel.setText('in force: unknown')
+            self.ResolutionStatusLabel.setStyleSheet('color: #555;')
+            return True
         try:
             v = float(text)
         except ValueError:
-            return None
-        return v if v > 0 else None
+            v = None
+        if v is None or not (0.01 <= v <= 1000000.0):
+            self.ResolutionStatusLabel.setText(
+                f'NOT applied -- "{text}" is not a resolution in kb')
+            self.ResolutionStatusLabel.setStyleSheet('color: #b00;')
+            return False
+        self._resolution_committed = float(v)
+        self.ResolutionStatusLabel.setText(f'in force: {v:g} kb per step')
+        self.ResolutionStatusLabel.setStyleSheet('color: #555;')
+        return True
 
     def voxel_um(self):
         """(dy, dx, dz) currently IN FORCE -- never the raw edit text."""

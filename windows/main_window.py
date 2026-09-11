@@ -14379,6 +14379,12 @@ One PNG PER MODALITY: each modality has its own reference and its
                     pending.append((w, value))
         for w, value in pending:
             self._apply_widget_value(w, value)
+        # The genomic resolution has the same explicit Apply as the voxel
+        # size, so a loaded config commits it too; a config that never
+        # carried it applies an empty box, which commits 'unknown'.
+        if not self.ui.IngestionPanel.apply_genomic_resolution():
+            self.log('genomic resolution from the config was NOT applied -- '
+                     'see the Ingestion tab')
         # The voxel edits are text with an explicit Apply, so loading a
         # config must COMMIT them -- otherwise the file would say one thing
         # and the value in force would still be the default, with nothing

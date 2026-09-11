@@ -50,11 +50,23 @@ def test_field_and_config():
     from windows.main_window import MainWindow
     w = MainWindow(None)
     ip = w.ui.IngestionPanel
-    check('empty is unknown, not zero', ip.genomic_resolution_kb() is None)
+    check('empty is unknown, not zero', ip.genomic_resolution_kb() is None
+          and 'unknown' in ip.ResolutionStatusLabel.text())
     ip.GenomicResolutionLineEdit.setText('50')
-    check('50 kb reads back', ip.genomic_resolution_kb() == 50.0)
+    check('typed is not yet in force', ip.genomic_resolution_kb() is None)
+    check('Apply commits it, and says so',
+          ip.apply_genomic_resolution() and ip.genomic_resolution_kb() == 50.0
+          and 'in force: 50 kb' in ip.ResolutionStatusLabel.text())
     ip.GenomicResolutionLineEdit.setText('abc')
-    check('a non-number is unknown', ip.genomic_resolution_kb() is None)
+    check('a non-number is REFUSED and the value in force stays',
+          not ip.apply_genomic_resolution() and ip.genomic_resolution_kb() == 50.0
+          and 'NOT applied' in ip.ResolutionStatusLabel.text())
+    ip.GenomicResolutionLineEdit.setText('')
+    check('empty + Apply is unknown again',
+          ip.apply_genomic_resolution() and ip.genomic_resolution_kb() is None)
+    check('loading a config commits it like the voxel size',
+          'IngestionPanel.apply_genomic_resolution()' in inspect.getsource(
+              MainWindow._apply_config_params))
     m = MainWindow._CONFIG_PARAM_MAP['acquisition']
     check('it is config-shaped state beside the voxel size',
           m.get('genomic_resolution_kb') == ('IngestionPanel',
@@ -65,7 +77,8 @@ def test_field_and_config():
     check('and hands it to the Build model window',
           'genomic_resolution_kb=self._genomic_resolution_kb' in src)
     ip.GenomicResolutionLineEdit.setText('200')
-    check("the window reads it", w._genomic_resolution_kb() == 200.0)
+    ip.apply_genomic_resolution()
+    check("the window reads the committed value", w._genomic_resolution_kb() == 200.0)
     chp = w.ui.ChromatinTracingPanel
     chp._genomic_resolution_kb = w._genomic_resolution_kb()
     check("the tracing panel's params carry it",
