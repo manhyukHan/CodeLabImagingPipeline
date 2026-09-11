@@ -646,6 +646,19 @@ class ModelBuildDialog(QtWidgets.QDialog):
                 continue
             if b and os.path.isdir(str(b)):
                 self.BundlePathLineEdit.setText(str(b))
+                theirs = self.bundle_store()
+                mine = [self._storage_for(m) for m in
+                        dict.fromkeys(src[0] for src in self._sources)]
+                if theirs and not any(self._same_path(theirs, m)
+                                      for m in mine if m):
+                    # ANOTHER EXPERIMENT'S BUNDLE. Recalling it here is
+                    # how a build of this store ended up in it.
+                    self.BundlePathLineEdit.setText('')
+                    self._log(f'the last session\'s bundle ({b}) belongs to '
+                              f'{theirs}, not to this experiment -- path '
+                              f'left empty; check sources and one is '
+                              f'suggested beside this store.')
+                    return
                 self._log('bundle path recalled from the last session: ' + str(b))
                 self.restore_from_manifest()
                 return
@@ -803,6 +816,29 @@ class ModelBuildDialog(QtWidgets.QDialog):
     def bundle_dir(self):
         return self.BundlePathLineEdit.text().strip()
 
+    def bundle_store(self):
+        """The store the bundle at the current path was cut from, from
+        its manifest, or None (no bundle, or no manifest)."""
+        b = self.bundle_dir()
+        if not b:
+            return None
+        try:
+            with open(os.path.join(b, 'bundle_manifest.json'),
+                      encoding='utf-8') as f:
+                m = json.load(f) or {}
+        except Exception:                                   # noqa: BLE001
+            return None
+        sp = m.get('storage_path')
+        if not sp:
+            runs = m.get('runs') or []
+            sp = runs[-1].get('storage_path') if runs else None
+        return str(sp) if sp else None
+
+    @staticmethod
+    def _same_path(a, b):
+        return (os.path.normcase(os.path.normpath(str(a or '')))
+                == os.path.normcase(os.path.normpath(str(b or ''))))
+
     def build_commands(self):
         """The build_bundle command per checked channel, or [] with a
         logged reason. Pure: reads widgets, runs nothing."""
@@ -816,6 +852,20 @@ class ModelBuildDialog(QtWidgets.QDialog):
         fovs = self.fovs()
         if not fovs:
             self._log('List the FOVs to use (2), or draw some.')
+            return []
+        # ONE BUNDLE, ONE STORE -- across sessions too. The path is
+        # recalled from the last session, and a person who then checks
+        # another experiment's sources gets a build of THAT store into
+        # THIS bundle: it happened, the HoxA store's shards landed in the
+        # JP chr19 bundle and its manifest was overwritten with HoxA's
+        # run. The manifest names the store, so the mismatch is known
+        # before anything is written.
+        theirs = self.bundle_store()
+        if theirs and not self._same_path(theirs, sp):
+            self._log(f'REFUSED: the bundle at {out} was cut from {theirs}, '
+                      f'and the checked sources are from {sp}. One bundle '
+                      f'holds one store. Pick another path (3) -- clear the '
+                      f'field and a path beside this store is suggested.')
             return []
         by_ch = {}
         for _m, folder, ch in self.checked_sources():

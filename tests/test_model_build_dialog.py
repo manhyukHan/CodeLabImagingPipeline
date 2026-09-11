@@ -343,6 +343,58 @@ def test_restore_from_manifest():
     shutil.rmtree(root, ignore_errors=True)
 
 
+def test_one_bundle_one_store_across_sessions():
+    """A bundle cut from one store never takes a build from another --
+    it happened: the HoxA store's shards landed in the JP chr19 bundle
+    and overwrote its manifest -- and a recalled path from another
+    experiment is not kept."""
+    print('one bundle, one store, across sessions')
+    import tempfile
+    root = tempfile.mkdtemp(prefix='foreign_', dir='D:/claude-tmp')
+    with open(os.path.join(root, 'bundle_manifest.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({'storage_path': 'G:/Somebody/other-experiment/DNA',
+                   'channel': 555, 'runs': [
+                       {'storage_path': 'G:/Somebody/other-experiment/DNA',
+                        'channel': 555, 'hybes': ['Hyb_001'], 'fovs': [1]}]}, f)
+    d = make(fov_pool=(7, 8, 9, 14, 19))
+    d._memory_path = lambda: os.path.join(root, 'mem.json')
+    set_checked(d, lambda m, h, c: m == 'RNA')
+    d.FovListLineEdit.setText('7,14')
+    d.BundlePathLineEdit.setText(root)
+    check("the bundle's store is read from its manifest",
+          d.bundle_store() == 'G:/Somebody/other-experiment/DNA')
+    check('a build of this store into that bundle is REFUSED, with both '
+          'stores named',
+          d.build_commands() == []
+          and any('REFUSED' in d.LogListWidget.item(i).text()
+                  and 'other-experiment' in d.LogListWidget.item(i).text()
+                  for i in range(d.LogListWidget.count())))
+    with open(os.path.join(root, 'bundle_manifest.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({'storage_path': STORES['RNA'], 'channel': 555,
+                   'runs': [{'storage_path': STORES['RNA'], 'channel': 555,
+                             'hybes': ['Hyb_101'], 'fovs': [7, 14]}]}, f)
+    check('the same store is fine', len(d.build_commands()) == 2)
+    # a recalled path that belongs to another experiment is dropped
+    with open(os.path.join(root, 'bundle_manifest.json'), 'w',
+              encoding='utf-8') as f:
+        json.dump({'storage_path': 'G:/Somebody/other-experiment/DNA',
+                   'channel': 555, 'runs': []}, f)
+    with open(os.path.join(root, 'mem.json'), 'w', encoding='utf-8') as f:
+        json.dump({'bundle': root}, f)
+    d2 = make(fov_pool=(7, 8, 9, 14, 19))
+    d2._memory_path = lambda: os.path.join(root, 'mem.json')
+    d2.BundlePathLineEdit.setText('')
+    d2._recall_bundle_path()
+    check("a last-session bundle of another experiment is not recalled",
+          d2.bundle_dir() == '' and any(
+              'belongs to' in d2.LogListWidget.item(i).text()
+              for i in range(d2.LogListWidget.count())))
+    import shutil
+    shutil.rmtree(root, ignore_errors=True)
+
+
 def test_review_status():
     print('4  review status on the real two-channel bundle')
     if not os.path.isdir(TWOCH):
@@ -665,6 +717,7 @@ def main():
     test_build_commands()
     test_train_during_build()
     test_restore_from_manifest()
+    test_one_bundle_one_store_across_sessions()
     test_review_status()
     test_train_command()
     test_render_report()
