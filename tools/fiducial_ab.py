@@ -52,7 +52,8 @@ VOXEL = (0.208, 0.208, 0.2)
 DEFAULT_OUT = os.path.join('notes', 'chromatin_tracing_optimization')
 
 
-def _params(psf_label, fid_model=None, read_model=None, min_p=0.5):
+def _params(psf_label, fid_model=None, read_model=None, min_p=0.5,
+            resolution_kb=None, template_mode='select'):
     from codelab_pipeline.localization import psf_library as LIB
     doc = LIB.read(psf_label)
     got = LIB.shape_tuple(doc) if doc else None
@@ -63,10 +64,12 @@ def _params(psf_label, fid_model=None, read_model=None, min_p=0.5):
                        qc_shift=False,
                        fiducial_model_dir=fid_model,
                        readout_model_dir=read_model,
-                       min_p_exist=min_p)
+                       min_p_exist=min_p,
+                       genomic_resolution_kb=resolution_kb,
+                       template_mode=template_mode)
 
 
-def _init(exp_name, psf_label, fid_model, read_model, min_p):
+def _init(exp_name, psf_label, fid_model, read_model, min_p, arms_wanted=None):
     exp = EXPERIMENTS[exp_name]
     mw, sp = open_session(exp)
     records = mw._hybe_records_for_storage_path(sp)
@@ -79,11 +82,23 @@ def _init(exp_name, psf_label, fid_model, read_model, min_p):
         others = [c for c in by_folder[h]['channels']
                   if c != by_folder[h]['fiducial_channel']]
         read_ch[h] = others[0] if others else by_folder[h]['fiducial_channel']
+    # THE TEMPLATE ARMS. The registry's step_kb is the experiment's
+    # genomic resolution; 'select' matches with the bank's template for
+    # it, 'pooled' with the pooled mean, 'all' with every candidate.
+    kb = exp.step_kb
     arms = [('v2', _params(psf_label)),
-            ('v2+lf', _params(psf_label, fid_model=fid_model, min_p=min_p))]
+            ('v2+lf', _params(psf_label, fid_model=fid_model, min_p=min_p,
+                              resolution_kb=kb, template_mode='select')),
+            ('v2+lf/pooled', _params(psf_label, fid_model=fid_model, min_p=min_p,
+                                     resolution_kb=kb, template_mode='pooled')),
+            ('v2+lf/all', _params(psf_label, fid_model=fid_model, min_p=min_p,
+                                  resolution_kb=kb, template_mode='all'))]
     if read_model:
         arms.append(('v3+lf', _params(psf_label, fid_model=fid_model,
-                                      read_model=read_model, min_p=min_p)))
+                                      read_model=read_model, min_p=min_p,
+                                      resolution_kb=kb)))
+    if arms_wanted:
+        arms = [a for a in arms if a[0] in arms_wanted]
     return {'exp': exp, 'mw': mw, 'sp': sp, 'hybes': hybes, 'fid_ch': fid_ch,
             'read_ch': read_ch, 'arms': arms, 'fov': None}
 
@@ -226,7 +241,8 @@ def _fiducial_stats(good, key, hybes, ref_key='v2'):
     return st
 
 
-def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p):
+def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p,
+            arms_wanted=None):
     exp = EXPERIMENTS[name]
     mw, sp = open_session(exp)
     records = mw._hybe_records_for_storage_path(sp)
@@ -250,7 +266,8 @@ def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p):
 
     print(f'=== {name} ({exp.scope_mb} Mb) ===')
     print(f'  store      : {sp}')
-    print(f'  fiducial   : {fid_model}   (min p_exist {min_p})')
+    print(f'  fiducial   : {fid_model}   (min p_exist {min_p}, resolution '
+          f'{exp.step_kb} kb)')
     print(f'  readout v3 : {read_model or "-- (no v3 arm)"}')
     print(f'  alleles    : {len(items)} over FOV {fovs}   hybes {len(hybes)}   '
           f'pairs/allele: {len(pairs)}   possible: {len(pairs) * len(items)}',
@@ -265,7 +282,8 @@ def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p):
                   f'eta {(total - n) * el / max(n, 1) / 60:5.1f} min', flush=True)
 
     res = PL.pmap(_one, items, kind='io', jobs=jobs, initializer=_init,
-                  initargs=(name, psf_label, fid_model, read_model, min_p),
+                  initargs=(name, psf_label, fid_model, read_model, min_p,
+                            arms_wanted),
                   on_done=prog, chunksize=1)
     good = PL.ok(res)
     wall = time.perf_counter() - t0
@@ -274,7 +292,8 @@ def run_one(name, n_alleles, jobs, psf_label, fid_model, read_model, min_p):
     if not good:
         raise RuntimeError('no allele traced')
 
-    arms = [k for k in ('v2', 'v2+lf', 'v3+lf') if k in good[0]]
+    arms = [k for k in ('v2', 'v2+lf', 'v2+lf/pooled', 'v2+lf/all', 'v3+lf')
+            if k in good[0]]
     D = {k: _pairs(good, pairs, k)[0] for k in arms}
     common = sorted(set.intersection(*[set(D[k]) for k in arms]))
     row = {'experiment': name, 'alleles': len(good), 'hybes': len(hybes),
@@ -324,11 +343,13 @@ def main():
     ap.add_argument('--psf', default='universal-default')
     ap.add_argument('--min-p', type=float, default=0.5)
     ap.add_argument('--out', default=DEFAULT_OUT)
+    ap.add_argument('--arms', default=None,
+                    help='comma list of arms to run, e.g. v2,v2+lf,v2+lf/pooled')
     a = ap.parse_args()
 
     row = run_one(a.exp, a.alleles, a.jobs, a.psf, os.path.abspath(a.fid_model),
                   os.path.abspath(a.read_model) if a.read_model else None,
-                  a.min_p)
+                  a.min_p, [x.strip() for x in a.arms.split(',')] if a.arms else None)
     print()
     print('=' * 96)
     print(f'{"arm":<8}{"pairs":>12}  {"median 3D":>10}{"common 3D":>11}'
@@ -362,7 +383,7 @@ def main():
         with open(dpath, 'w', encoding='utf-8') as fh:
             json.dump(row.pop('_details'), fh)
         print(f'per-hybe details: {dpath}')
-    path = os.path.join(a.out, 'fiducial_ab.json')
+    path = os.path.join(a.out, f'fiducial_ab_{a.exp}.json')
     with open(path, 'w', encoding='utf-8') as fh:
         json.dump(row, fh, indent=2)
     print(f'\nwrote {path}')

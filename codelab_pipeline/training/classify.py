@@ -526,12 +526,36 @@ class MultispotCalibration(object):
     buying a number that can be SHIPPED.
     """
 
-    def __init__(self, platt, template=None, meta=None):
+    def __init__(self, platt, template=None, meta=None, per_resolution=None):
         self.platt = (float(platt[0]), float(platt[1]))
         self.template = tuple(template) if template else None
         self.meta = dict(meta or {})
+        # A PLATT PER RESOLUTION, beside the pooled one. p3 is an NCC
+        # against a template, and the template an engine matches with
+        # is chosen by the design's resolution (psf_bank.select_template),
+        # so the calibration of that template's own verdicts applies
+        # when there are enough of them; the pooled pair is the fallback.
+        # {kb (str): {'platt': [a, b], 'n': int, 'bundle': str, ...}}
+        self.per_resolution = {str(k): dict(v) for k, v in
+                               (per_resolution or {}).items()}
 
-    def score(self, p3):
+    def platt_for(self, resolution_kb=None):
+        """(a, b) for this resolution: its own pair when one was fitted
+        (exact, else the nearest in log10(kb) within 20%), else the
+        pooled pair."""
+        if not resolution_kb or not self.per_resolution:
+            return self.platt
+        kb = float(resolution_kb)
+        best, bd = None, None
+        for k, v in self.per_resolution.items():
+            d = abs(np.log10(float(k)) - np.log10(kb))
+            if bd is None or d < bd:
+                best, bd = v, d
+        if best is None or bd > np.log10(1.2):
+            return self.platt
+        return (float(best['platt'][0]), float(best['platt'][1]))
+
+    def score(self, p3, resolution_kb=None):
         """Raw matcher score -> calibrated probability, strictly in (0, 1).
 
         float64 and clipped for the reason SpotClassifier.score gives at
@@ -540,7 +564,7 @@ class MultispotCalibration(object):
         """
         p = np.clip(np.asarray(p3, dtype=np.float64), 1e-9, 1.0 - 1e-9)
         logit = np.log(p / (1.0 - p))
-        a, b = self.platt
+        a, b = self.platt_for(resolution_kb)
         z = np.clip(logit * a + b, -30.0, 30.0)
         return np.clip(1.0 / (1.0 + np.exp(-z)), 1e-12, 1.0 - 1e-12)
 
@@ -559,7 +583,7 @@ class MultispotCalibration(object):
     def save(self, path):
         doc = {'platt': list(self.platt),
                'template': list(self.template) if self.template else None,
-               'meta': self.meta}
+               'meta': self.meta, 'per_resolution': self.per_resolution}
         tmp = str(path) + '.part'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(doc, f, indent=1)
@@ -571,7 +595,7 @@ class MultispotCalibration(object):
         with open(str(path), encoding='utf-8') as f:
             doc = json.load(f)
         return MultispotCalibration(doc['platt'], doc.get('template'),
-                                    doc.get('meta'))
+                                    doc.get('meta'), per_resolution=doc.get('per_resolution'))
 
 
 def fit_multispot(bundle_dir, template=None):

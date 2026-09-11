@@ -351,8 +351,12 @@ class V2Params(object):
                  z_window=None, z_boundary_trim=10,
                  fiducial_model_dir=None, lateral_reach_px=None,
                  fiducial_z_window=None, min_p_exist_fiducial=None,
-                 genomic_resolution_kb=None):
+                 genomic_resolution_kb=None, template_mode='select'):
         self.voxel_um = tuple(float(v) for v in voxel_um)
+        # Which PSF template a learned engine matches with when its bank
+        # carries one per experiment: 'select' by this experiment's
+        # resolution (the default), 'pooled', or 'all' (A/B only).
+        self.template_mode = str(template_mode or 'select')
         # kb per readout step, from the Ingestion tab; a learned head
         # trained with it as a feature needs it to score. None = unknown.
         self.genomic_resolution_kb = (float(genomic_resolution_kb)
@@ -487,6 +491,8 @@ class V2Params(object):
         if engine is not None and hasattr(engine, 'context'):
             engine.context = dict(getattr(engine, 'context', None) or {},
                                   **self.context())
+            if hasattr(engine, 'template_mode'):
+                engine.template_mode = self.template_mode
 
     @readout_engine.setter
     def readout_engine(self, value):

@@ -539,7 +539,8 @@ class PsfMatchEngine(LocalizeEngine):
 
     def __init__(self, templates=None, bank=None, storage_path=None,
                  voxel_um=None, r=None, rz=None,
-                 min_distance=3, threshold=None, k_sigma=None, **_ignored):
+                 min_distance=3, threshold=None, k_sigma=None,
+                 resolution_kb=None, template_mode='select', **_ignored):
         from . import psf_bank as PB
         r = PB.DEFAULT_R if r is None else int(r)
         rz = PB.DEFAULT_RZ if rz is None else int(rz)
@@ -568,20 +569,40 @@ class PsfMatchEngine(LocalizeEngine):
                          'source': 'store calibration'}
         elif bank:
             mean, comps, meta = PB.load(bank, voxel_um=voxel_um)
-            # CUT IT TO THE SEARCH SIZE. A bank is stored at the size it
-            # was measured at -- train_spotmodel averages the
-            # classifier's 15 x 15 x 25 boxes -- and ncc() scores only
-            # where the template fits, so handing that straight to a
-            # 15 x 15 pillar leaves ONE lateral position to search and
-            # every neighbour is unfindable at any threshold. See
-            # psf_bank.centre_crop, which measured it.
             meta = dict(meta)
             meta['stored_shape'] = list(np.asarray(mean).shape)
-            if tuple(np.asarray(mean).shape) != (2 * r + 1, 2 * r + 1,
-                                                 2 * rz + 1):
-                mean = PB.normalise(PB.centre_crop(mean, r, rz))
-                meta['cropped_to'] = [2 * r + 1, 2 * r + 1, 2 * rz + 1]
-            templates = [mean]
+            # WHICH TEMPLATE. A bank may carry one measured template per
+            # experiment pooled into it, tagged with the design's genomic
+            # resolution (psf_bank.select_template says why). 'select'
+            # takes the one for this experiment's resolution -- exact,
+            # else nearest with its axial extent moved to what the
+            # candidates predict -- and the pooled mean when no
+            # resolution is known; 'pooled' forces the mean; 'all' hands
+            # every candidate and the mean to the matcher, which scores
+            # each position by the best of them (an A/B arm, not a
+            # default: the maximum over templates inflates an NCC).
+            cands = PB.candidates(bank)
+            mode = str(template_mode or 'select')
+            if mode == 'pooled':
+                chosen = [(np.asarray(mean, float),
+                           {'how': 'pooled', 'source': 'pooled mean'})]
+            elif mode == 'all':
+                chosen = [(np.asarray(mean, float),
+                           {'how': 'all', 'source': 'pooled mean'})] + [
+                    (np.asarray(t, float), dict(m, how='all'))
+                    for t, m in cands]
+            else:
+                chosen = [PB.select_template(mean, cands, resolution_kb)]
+            meta['template_mode'] = mode
+            meta['template_choice'] = chosen[0][1]
+            meta['n_candidates'] = len(cands)
+            size = (2 * r + 1, 2 * r + 1, 2 * rz + 1)
+            templates = []
+            for t, _m in chosen:
+                if tuple(np.asarray(t).shape) != size:
+                    t = PB.normalise(PB.centre_crop(t, r, rz))
+                    meta['cropped_to'] = list(size)
+                templates.append(t)
             self.meta = meta
         else:
             raise ValueError('psf-match needs templates=, bank= or '

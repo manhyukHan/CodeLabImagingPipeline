@@ -299,8 +299,16 @@ def _digest(mean, comps):
 
 def save(path, mean, voxel_um, components=None, explained_var=None,
          centre=None, n_spots=0, source=None, labels=None,
-         analytic_ref=None):
-    """Write a bank entry atomically (.part + os.replace)."""
+         analytic_ref=None, candidates=None):
+    """Write a bank entry atomically (.part + os.replace).
+
+    `candidates`: [{'template': array like `mean`, 'genomic_resolution_kb',
+    'n_spots', 'source', 'sigma_xy_um', 'sigma_z_um'}, ...] -- one
+    measured template per experiment pooled into `mean`, tagged with the
+    design's genomic resolution. See select_template for what they are
+    for. The pooled mean stays the entry's template for a caller that
+    names no resolution.
+    """
     import h5py
     mean = np.asarray(mean, np.float32)
     comps = np.zeros((0,) + mean.shape, np.float32) if components is None \
@@ -319,15 +327,133 @@ def save(path, mean, voxel_um, components=None, explained_var=None,
         analytic_ref=analytic_ref or {},
         built_at=time.strftime('%Y-%m-%dT%H:%M:%S'),
         sha256=_digest(mean, comps))
+    cands = list(candidates or [])
+    for c in cands:
+        if tuple(np.asarray(c['template']).shape) != tuple(mean.shape):
+            raise ValueError('a candidate template must have the shape of '
+                             f'the mean, {tuple(mean.shape)}, not '
+                             f'{tuple(np.asarray(c["template"]).shape)}')
+    doc['candidates'] = [{k: v for k, v in c.items() if k != 'template'}
+                         for c in cands]
     tmp = str(path) + '.part'
     os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
     with h5py.File(tmp, 'w') as f:
         f.create_dataset('mean', data=mean, compression='gzip')
         f.create_dataset('components', data=comps, compression='gzip')
+        if cands:
+            f.create_dataset('candidates', compression='gzip',
+                             data=np.stack([np.asarray(c['template'], np.float32)
+                                            for c in cands]))
         for k, v in doc.items():
             f.attrs[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
     os.replace(tmp, str(path))
     return str(path)
+
+
+def candidates(path):
+    """[(template, meta), ...] -- the per-experiment templates a bank
+    carries, or [] for a bank written without them."""
+    import h5py
+    with h5py.File(str(path), 'r') as f:
+        if 'candidates' not in f:
+            return []
+        arr = np.asarray(f['candidates'][...], float)
+        raw = f.attrs.get('candidates', '[]')
+        meta = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    return [(arr[i], dict(meta[i]) if i < len(meta) else {})
+            for i in range(arr.shape[0])]
+
+
+def rescale_axial(template, factor):
+    """The template widened (factor > 1) or narrowed along z about its
+    centre plane, on the same grid. Linear interpolation, then the
+    outer planes fade to the edge value rather than to zero, so the
+    result is still a template and not a template on a shelf."""
+    from scipy.ndimage import map_coordinates
+    t = np.asarray(template, float)
+    ny, nx, nz = t.shape
+    cz = (nz - 1) / 2.0
+    z = (np.arange(nz) - cz) / float(factor) + cz
+    out = np.empty_like(t)
+    for i in range(ny):
+        for j in range(nx):
+            out[i, j, :] = map_coordinates(t[i, j, :], [z], order=1,
+                                           mode='nearest')
+    return out
+
+
+def _sigma_z_at(cands, kb):
+    """sigma_z (um) expected at resolution `kb`, from a least-squares
+    line of the candidates' sigma_z on log10(kb). None with fewer than
+    two distinct resolutions, or when no candidate carries a sigma_z."""
+    pts = [(float(m['genomic_resolution_kb']), float(m['sigma_z_um']))
+           for _t, m in cands
+           if m.get('genomic_resolution_kb') and m.get('sigma_z_um')]
+    if len({k for k, _s in pts}) < 2:
+        return None
+    x = np.log10([k for k, _s in pts])
+    y = np.array([s for _k, s in pts])
+    slope, icpt = np.polyfit(x, y, 1)
+    return float(slope * np.log10(float(kb)) + icpt)
+
+
+def select_template(mean, cands, resolution_kb=None, rescale_beyond=0.2):
+    """The template for an experiment of `resolution_kb`, and how it was
+    chosen.
+
+    THE FIDUCIAL'S SHAPE TRACKS THE DESIGN, axially. MEASURED on the three
+    DNA ch555 bundles pooled first (HoxA 5 kb, MP58 50 kb, chr19 200 kb):
+    sigma_z 641 / 760 / 1068 nm and halo_frac 0.22 / 0.32 / 0.42 grow
+    with the kb per readout step, while sigma_xy does not (220 / 279 /
+    270 nm). The pooled mean served chr19 worst (cosine 0.946 to its own
+    template, 0.98+ for the others). So a bank carries each experiment's
+    own template as a candidate, and an engine that knows the design's
+    resolution takes:
+
+        the candidate of that resolution                     'exact'
+        else the nearest in log10(kb); when that is further
+          than `rescale_beyond` (a ratio, 0.2 = 20%), it is
+          widened or narrowed along z by the sigma_z the
+          candidates' own line predicts for this resolution  'nearest'
+        the pooled mean when no resolution is known, or the
+          bank has no candidates                              'pooled'
+
+    A measured template rescaled along z keeps its measured lateral and
+    halo structure; only the axial extent moves. That is the whole of
+    the 'axial spread as a variable' idea, applied to pixels rather than
+    to a formula, because for a filter cleaner beats better-fitted.
+
+    Returns (template, {'how': ..., 'source': ..., 'resolution_kb': ...,
+    'axial_factor': ...}).
+    """
+    mean = np.asarray(mean, float)
+    if not cands or not resolution_kb or not float(resolution_kb) > 0:
+        return mean, {'how': 'pooled', 'source': 'pooled mean',
+                      'resolution_kb': None, 'axial_factor': 1.0}
+    kb = float(resolution_kb)
+    tagged = [(t, m) for t, m in cands if m.get('genomic_resolution_kb')]
+    if not tagged:
+        return mean, {'how': 'pooled', 'source': 'pooled mean',
+                      'resolution_kb': None, 'axial_factor': 1.0}
+    dist = [abs(np.log10(float(m['genomic_resolution_kb'])) - np.log10(kb))
+            for _t, m in tagged]
+    i = int(np.argmin(dist))
+    t, m = tagged[i]
+    src = str(m.get('source') or f'candidate {i}')
+    ratio = kb / float(m['genomic_resolution_kb'])
+    if abs(ratio - 1.0) <= 1e-6:
+        return np.asarray(t, float), {'how': 'exact', 'source': src,
+                                      'resolution_kb': kb, 'axial_factor': 1.0}
+    factor = 1.0
+    if abs(ratio - 1.0) > float(rescale_beyond):
+        want = _sigma_z_at(cands, kb)
+        have = m.get('sigma_z_um')
+        if want and have and float(have) > 0:
+            factor = float(np.clip(want / float(have), 0.5, 2.0))
+    tpl = rescale_axial(t, factor) if abs(factor - 1.0) > 1e-3 else np.asarray(t, float)
+    return tpl, {'how': 'nearest', 'source': src, 'resolution_kb': kb,
+                 'nearest_kb': float(m['genomic_resolution_kb']),
+                 'axial_factor': factor}
 
 
 def load(path, voxel_um=None, tol=1e-6):

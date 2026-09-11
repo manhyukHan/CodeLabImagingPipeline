@@ -113,7 +113,7 @@ def is_refined(spot):
     return bool(np.isfinite(getattr(spot, 'p', float('nan'))))
 
 
-def _joint(p1, p3, cal):
+def _joint(p1, p3, cal, resolution_kb=None):
     """P(a real emitter is HERE) = p1 * P(this match is real | pillar real).
 
     THIS IS THE CHAIN RULE, NOT AN INDEPENDENCE ASSUMPTION, and that is
@@ -141,7 +141,13 @@ def _joint(p1, p3, cal):
     p1 = float(p1)
     if cal is None or not _np.isfinite(p3):
         return p1
-    return p1 * float(cal.score(float(p3)))
+    # Asked WITH the resolution only when one is known: a calibration
+    # that knows no resolutions (an older file, a test double) is scored
+    # the plain way, and MultispotCalibration.platt_for falls back to
+    # the pooled pair for a resolution it never fitted.
+    if resolution_kb is None:
+        return p1 * float(cal.score(float(p3)))
+    return p1 * float(cal.score(float(p3), resolution_kb=resolution_kb))
 
 
 def _peak_above(stack, y, x, z, background):
@@ -224,6 +230,9 @@ class PsfMatcherV3Engine(LocalizeEngine):
         # runs the engine -- the tracer, from the Ingestion tab's field.
         # A head that needs one refuses to score without it.
         self.context = {}
+        # 'select' (the template for this experiment's resolution),
+        # 'pooled' (the mean) or 'all' (every candidate; A/B only).
+        self.template_mode = 'select'
         self._refines = None
         self._no_refine = None
         self._cal = False              # False = not looked for yet
@@ -262,7 +271,9 @@ class PsfMatcherV3Engine(LocalizeEngine):
             self._match = make_engine(
                 'psf-match', bank=bank, voxel_um=self._voxel_um,
                 r=self._r, rz=self._rz, k_sigma=self._k_sigma,
-                min_distance=self._min_distance)
+                min_distance=self._min_distance,
+                resolution_kb=(self.context or {}).get('genomic_resolution_kb'),
+                template_mode=self.template_mode)
         return self._match
 
     @property
@@ -494,7 +505,9 @@ class PsfMatcherV3Engine(LocalizeEngine):
         for hh in hits:
             fy, fx, fz = hh.y + y0, hh.x + x0, hh.z
             out.append(_spot(fy, fx, fz, hh.p,
-                             p_exist=_joint(p1, hh.p, cal),
+                             p_exist=_joint(p1, hh.p, cal,
+                                            (self.context or {}).get(
+                                                'genomic_resolution_kb')),
                              amplitude=_peak_above(st, fy, fx, fz, bg)))
         if out:
             return out

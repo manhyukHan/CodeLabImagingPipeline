@@ -615,7 +615,9 @@ def test_each_hit_carries_its_own_p_exist():
     # fallback does not.
     import inspect
     src = inspect.getsource(PM.PsfMatcherV3Engine._refine)
-    check('_refine multiplies per hit', '_joint(p1, hh.p, cal)' in src)
+    check('_refine multiplies per hit, asking the calibration with the '
+          "experiment's resolution",
+          '_joint(p1, hh.p, cal,' in src and "'genomic_resolution_kb'" in src)
     check('an unrefined anchor keeps the pillar number',
           src.rstrip().endswith('amplitude=_peak_above(st, y, x, z, bg))]')
           and 'p_exist=p1,' in src.split('cal = self.multispot_cal')[1])

@@ -126,6 +126,14 @@ EXPERIMENTS = {
         locus='chr19:40000000-54716295 + 54864547-58617616',
         note='SAME probe design as Chr19 -- so the two are a reproducibility '
              'check on the calibration, not two independent scope points'),
+    'HoxA_0822': Experiment(
+        'HoxA_0822', 'configs/2026-09-01-DI_HoxA.xml', 'DNA',
+        anchor_hybe='Hyb_010', anchor_channel=555, reference_hybe='Hyb_010',
+        scope_mb=0.29, step_kb=5, barcodes=58,
+        note='the HoxA design imaged again on 2026-08-22 (RNA + DNA) at '
+             'G:/Dariya/2026-08-22-RNA_DNA_HoxA; its DNA ch555 bundle is one '
+             'of the three pooled into the first cross-experiment fiducial '
+             'model.'),
     'HoxA': Experiment(
         'HoxA', 'configs/2026-07-22-DI-DNA-HoxA.xml', 'DNA',
         anchor_hybe='Hyb_006', anchor_channel=555, reference_hybe='Hyb_006',

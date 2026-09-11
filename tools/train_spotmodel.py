@@ -593,7 +593,7 @@ def main(argv=None):
         # template, its best analytic fit, its cosine to the pooled
         # template, and the templates' cosines to each other -- the
         # experiment-to-experiment difference of the emitters, measured.
-        psf_per, psf_between = [], {}
+        psf_per, psf_between, bank_cands = [], {}, []
         if len(bundles) > 1:
             means = {}
             print('   per bundle:')
@@ -623,7 +623,19 @@ def main(argv=None):
                                 'fits': {k: {'cosine': v['cosine'],
                                              'params': v['params']}
                                          for k, v in ff['fits'].items()},
-                                'cosine_to_pooled': cos_pooled})
+                                'cosine_to_pooled': cos_pooled,
+                                'genomic_resolution_kb': res_by_bundle.get(bi)})
+                if res_by_bundle.get(bi):
+                    # A CANDIDATE TEMPLATE, tagged with its resolution, so
+                    # an engine that knows an experiment's design can
+                    # match with the template measured at that design
+                    # (psf_bank.select_template).
+                    bank_cands.append({'template': mb,
+                                       'genomic_resolution_kb': res_by_bundle[bi],
+                                       'n_spots': len(pos_b),
+                                       'source': _short_bundle(b),
+                                       'sigma_xy_um': prm['sigma_xy_um'],
+                                       'sigma_z_um': prm['sigma_z_um']})
                 print(f"      {_short_bundle(b)}: {len(pos_b)} spots, "
                       f"best fit {bf} (cosine {ff['fits'][bf]['cosine']:.3f}, "
                       f"sigma_xy {1000 * prm['sigma_xy_um']:.0f} nm, "
@@ -653,7 +665,12 @@ def main(argv=None):
                     'n_negative': s['negative'], 'n_contested': s['contested'],
                     'selection': 'labels() positive bucket',
                     'provisional': provisional},
-            analytic_ref=ref)
+            analytic_ref=ref, candidates=bank_cands)
+        if bank_cands:
+            print(f'   {len(bank_cands)} candidate template(s) in the bank, '
+                  f'tagged by resolution: '
+                  + ', '.join(f"{c['source']} {c['genomic_resolution_kb']:g} kb"
+                              for c in bank_cands))
         # THE MATCHER'S OWN OPERATING POINT, fitted here so it SHIPS.
         # Without it the matched filter has no calibrated threshold and a
         # caller either hard-codes one experiment's answer as a universal
@@ -666,6 +683,26 @@ def main(argv=None):
                      2 * a.template_rz + 1)
         cal, calrep = C.fit_multispot(bundles, template=tpl_shape)
         report['multispot'] = calrep
+        if cal is not None and len(bundles) > 1:
+            # A PLATT PER RESOLUTION, from each bundle's own verdicts when
+            # it has enough of them (150 judged matches), beside the
+            # pooled pair. The engine matches with the template of the
+            # experiment's resolution, and the calibration of that
+            # template's own verdicts is the one that applies.
+            per = {}
+            for bi, b in enumerate(bundles):
+                kb = res_by_bundle.get(bi)
+                if not kb:
+                    continue
+                cb, rb = C.fit_multispot(b, template=tpl_shape)
+                if cb is None or int(rb.get('n', 0)) < 150:
+                    continue
+                per[f'{kb:g}'] = {'platt': list(cb.platt), 'n': int(rb['n']),
+                                  'bundle': _short_bundle(b),
+                                  'banks': rb.get('banks') or [],
+                                  'raw_pr_auc': rb.get('raw_pr_auc')}
+            cal.per_resolution = per
+            calrep['per_resolution'] = per
         if cal is None:
             print(f"\nmultispot calibration: {calrep.get('skipped')}")
         else:
@@ -675,6 +712,10 @@ def main(argv=None):
             print(f"   raw PR-AUC {calrep['raw_pr_auc']:.3f}  ->  at p 0.5: "
                   f"precision {calrep['precision_at_half']:.3f}, "
                   f"recall {calrep['recall_at_half']:.3f}")
+            for kb, e in (calrep.get('per_resolution') or {}).items():
+                print(f"   per resolution {kb} kb ({e['bundle']}): {e['n']} "
+                      f"judged matches, platt {e['platt'][0]:.3f}, "
+                      f"{e['platt'][1]:.3f}, raw PR-AUC {e['raw_pr_auc']:.3f}")
             print(f'   -> {os.path.basename(cp)}')
         warn = PB.cosine_warning(ref, n_spots=len(pos))
         if warn:

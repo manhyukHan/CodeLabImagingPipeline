@@ -100,7 +100,8 @@ def test_the_two_real_bundles():
     out = subprocess.run(
         [sys.executable, '-u', 'tools/train_spotmodel.py', MP58, JP,
          '--reviewer', 'Manhyuk', '--out', OUT, '--heads', 'linear,mlp',
-         '--epochs', '200', '--channel', '555'],
+         '--epochs', '200', '--channel', '555',
+         '--genomic-resolution-kb', '50', '--genomic-resolution-kb', '200'],
         capture_output=True, text=True, timeout=1800,
         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     text = out.stdout
@@ -154,6 +155,15 @@ def test_the_two_real_bundles():
     clf, why = C.load_best(OUT)
     check('and the run loads like any other', clf is not None
           and why['head'] in ('linear', 'mlp'), str(why.get('head')))
+    from codelab_pipeline.localization import psf_bank as PB
+    cands = PB.candidates(os.path.join(OUT, 'psf_bank.h5'))
+    check('the bank carries a candidate template per bundle, tagged with its '
+          'resolution', sorted(m['genomic_resolution_kb'] for _t, m in cands) == [50.0, 200.0]
+          and all(m.get('sigma_z_um') for _t, m in cands), str([m for _t, m in cands]))
+    cal = C.MultispotCalibration.load(os.path.join(OUT, 'psf_multispot.json'))
+    check('and the calibration has a Platt per resolution where a bundle had '
+          '150+ judged matches (MP58 does)', '50' in cal.per_resolution
+          and cal.per_resolution['50']['n'] >= 150, str(list(cal.per_resolution)))
 
 
 def main():
