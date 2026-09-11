@@ -598,7 +598,22 @@ class MultispotCalibration(object):
                                     doc.get('meta'), per_resolution=doc.get('per_resolution'))
 
 
-def fit_multispot(bundle_dir, template=None):
+def bank_cosine(bank_path, target):
+    """Cosine between a bank's template and `target` (both 15x15x25,
+    normalised), or None when the bank cannot be read."""
+    from ..localization import psf_bank as PB
+    try:
+        mean, _c, _m = PB.load(str(bank_path))
+    except Exception:                                        # noqa: BLE001
+        return None
+    a, b = np.asarray(mean, float), np.asarray(target, float)
+    if a.shape != b.shape:
+        return None
+    return float(PB.normalise(a).ravel() @ PB.normalise(b).ravel())
+
+
+def fit_multispot(bundle_dir, template=None, target=None,
+                  min_bank_cosine=0.9):
     """(MultispotCalibration, report) from the multispot verdicts of one
     bundle, or of several pooled.
 
@@ -606,6 +621,19 @@ def fit_multispot(bundle_dir, template=None):
     every match judged the same way. A calibration invented from one class
     is a number with no evidence under it. With several bundles the
     report names the ones that actually carried verdicts.
+
+    ONLY VERDICTS JUDGED WITH A MATCHING BANK. Each judged match carries
+    the p the reviewer saw, and that p is an NCC against whichever bank
+    Spot Check was handed. A Platt fitted on p's from another template
+    calibrates nothing about this one -- MEASURED: JP chr19's 244 matches
+    had been judged against the RNA readout bank (a 137 nm point-source
+    template on 270 nm fiducials); the per-resolution Platt fitted from
+    them refused half of every hybe's fiducials in the A/B while the
+    template choice changed nothing. With `target` (the template this
+    calibration will serve), records whose bank's template has cosine
+    below `min_bank_cosine` to it are excluded and the report says how
+    many, and from which bank; a bank that cannot be read is kept, as
+    unverified, and named.
     """
     from . import verdicts as V
     dirs = ([str(bundle_dir)] if isinstance(bundle_dir, str)
@@ -616,6 +644,26 @@ def fit_multispot(bundle_dir, template=None):
         if rb:
             used.append(b)
         recs.extend(rb)
+    excluded, unverified, bank_cos = {}, [], {}
+    if target is not None and recs:
+        keep = []
+        for r in recs:
+            bp = str(r.get('bank_path') or '')
+            if not bp:
+                keep.append(r)
+                continue
+            if bp not in bank_cos:
+                bank_cos[bp] = bank_cosine(bp, target)
+            c = bank_cos[bp]
+            if c is None:
+                if bp not in unverified:
+                    unverified.append(bp)
+                keep.append(r)
+            elif c < float(min_bank_cosine):
+                excluded[bp] = excluded.get(bp, 0) + 1
+            else:
+                keep.append(r)
+        recs = keep
     shown = [e for r in recs for e in (r.get('shown') or [])
              if e.get('p') is not None]
     # WHICH BANK SCORED THEM. Each record carries the bank Spot Check was
@@ -625,7 +673,10 @@ def fit_multispot(bundle_dir, template=None):
     banks = sorted({str(r.get('bank_path')) for r in recs if r.get('bank_path')})
     rep = {'pillars': len(recs), 'n': len(shown),
            'template': list(template) if template else None,
-           'bundles': used, 'banks': banks}
+           'bundles': used, 'banks': banks,
+           'bank_cosine': {k: v for k, v in bank_cos.items() if v is not None},
+           'excluded_pillars_by_bank': excluded,
+           'unverified_banks': unverified}
     if not shown:
         rep['skipped'] = ('no multispot verdicts in this bundle'
                           if len(dirs) == 1 else

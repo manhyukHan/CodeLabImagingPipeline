@@ -53,7 +53,7 @@ def test_source():
           "report['psf']['per_bundle'] = psf_per" in src
           and "report['psf']['between'] = psf_between" in src)
     check('the multispot calibration pools every bundle that has verdicts',
-          'C.fit_multispot(bundles, template=tpl_shape)' in src
+          'C.fit_multispot(bundles, template=tpl_shape, target=mean)' in src
           and 'used.append(b)' in inspect.getsource(C.fit_multispot))
     check('the manifest records every bundle',
           "'bundles': bundles," in src)
@@ -62,6 +62,11 @@ def test_source():
           and "rb = [r for r in rb if int(r.get('channel', -1)) == int(a.channel)]" in src)
     check('the pooled multispot report names the banks the verdicts were '
           'judged with', "'banks': banks" in inspect.getsource(C.fit_multispot))
+    check('verdicts judged with a bank whose template does not match the '
+          "calibration's are excluded, and named",
+          'min_bank_cosine' in inspect.getsource(C.fit_multispot)
+          and 'excluded_pillars_by_bank' in inspect.getsource(C.fit_multispot)
+          and 'target=mean' in src)
 
 
 def test_pooled_multispot():

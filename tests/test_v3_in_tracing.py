@@ -375,7 +375,7 @@ def test_reach_settings_are_honoured():
     p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z17, 0.9)])
     f2, why2, _a, _h = T2._fiducial_learned(cube, 20.0, p)
     check("the fiducial's own threshold gates the fiducial, not the "
-          "readout's", f2 is None and 'p_exist >= 0.95' in why2, why2)
+          "readout's", f2 is None and 'p1 >= 0.95' in why2, why2)
     check('and the readout threshold is untouched', p.min_p_exist == 0.5)
 
 
@@ -431,7 +431,7 @@ def test_learned_fiducial_best_of_one():
           len(alts) == 4 and 'not the best' in whys
           and any('no sub-voxel' in w for w in whys)
           and any('beyond the fiducial window' in w for w in whys)
-          and any('p_exist 0.30 < 0.5' in w for w in whys), str(whys))
+          and any('p1 0.30 < 0.5' in w for w in whys), str(whys))
     check('the one outside the crop never existed', len(alts) + 1 == 5)
     check('the slab the engine saw spans the window plus its box',
           p.fiducial_engine.seen[2] >= 2 * window + 1)
@@ -488,7 +488,28 @@ def test_learned_fiducial_best_of_one():
     p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 - z0, 0.2)])
     f2, why2, alts2, _h = T2._fiducial_learned(cube, 20.0, p)
     check('none above the threshold -> None with the reason',
-          f2 is None and 'p_exist >= 0.5' in why2 and len(alts2) == 1, why2)
+          f2 is None and 'p1 >= 0.5' in why2 and len(alts2) == 1, why2)
+
+    # THE GATE IS p1. With a multispot calibration on the engine, a
+    # candidate whose p_exist is 0.3 only because the calibration is
+    # steep (p1 0.9, cal 0.33) passes; without a calibration p_exist is
+    # p1 and the same number is refused.
+    class Cal:
+        def score(self, p3, resolution_kb=None):
+            return 0.33
+    eng = FakeEngine([spot(8, 8, 20.0 - z0, 0.9 * 0.33, p=0.7)])
+    eng.multispot_cal = Cal()
+    p.fiducial_engine = eng
+    f4, why4, alts4, how4 = T2._fiducial_learned(cube, 20.0, p)
+    check('a candidate the classifier believes (p1 0.90) passes even when '
+          'a steep calibration leaves p_exist at 0.30',
+          f4 is not None and abs(f4.p_exist - 0.297) < 1e-9 and how4 == 'v3',
+          str((f4, why4)))
+    eng2 = FakeEngine([spot(8, 8, 20.0 - z0, 0.297, p=0.7)])
+    p.fiducial_engine = eng2
+    f5, why5, alts5, _h = T2._fiducial_learned(cube, 20.0, p)
+    check('and the same p_exist with no calibration is p1 and is refused',
+          f5 is None and 'p1 0.30 < 0.5' in alts5[0][1], str(alts5))
     p.fiducial_engine = FakeEngine([])
     f3, why3, _, _h = T2._fiducial_learned(cube, 20.0, p)
     check('nothing found -> None, says so', f3 is None and 'nothing' in why3)

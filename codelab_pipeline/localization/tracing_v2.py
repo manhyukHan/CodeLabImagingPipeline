@@ -831,7 +831,7 @@ def alt_marker(why):
         return ' ~'
     if 'refined by the Gaussian' in w:
         return ' g'
-    if 'p_exist' in w:
+    if 'p_exist' in w or w.startswith('p1 '):
         return ' <'
     return ''
 
@@ -924,6 +924,32 @@ def _fiducial_learned(cube, z0, p):
         return None, 'engine found nothing', [], None
     from . import psfmatcher as PSFM
     t = p.fiducial_min_p()
+    # THE GATE IS p1, THE RANK IS p_exist. p_exist = p1 x cal(p3): the
+    # classifier's belief that a spot is here, times the multispot
+    # calibration's belief that THIS match is a real emitter among
+    # several in a pillar. The second factor answers a different
+    # question from 'is there a fiducial here', and a steep calibration
+    # (fitted on a reviewer's multispot standard) refused real
+    # fiducials wholesale -- MEASURED on three experiments: coverage
+    # 84.6 / 49.5 / 66.8% against the Gaussian's 96 / 84 / 98%, nearly
+    # every refusal 'below min p_exist', while the fiducials that passed
+    # aligned better than the Gaussian's (-50% repeat distance on MP58).
+    # A fiducial at NCC 0.7 is still a sub-voxel position. So the
+    # threshold applies to p1, recovered exactly as p_exist / cal(p3)
+    # when the engine has a calibration, and the ranking keeps p_exist.
+    cal = getattr(p.fiducial_engine, 'multispot_cal', None)
+    kb = (getattr(p.fiducial_engine, 'context', None) or {}).get(
+        'genomic_resolution_kb')
+
+    def p1_of(c):
+        pe = float(c.p_exist)
+        if cal is None or not np.isfinite(c.p):
+            return pe
+        q = cal.score(float(c.p)) if kb is None else cal.score(
+            float(c.p), resolution_kb=kb)
+        q = float(np.asarray(q).ravel()[0])
+        return float(min(1.0, pe / q)) if q > 0 else pe
+
     inside, beyond, unrefined, alts = [], [], [], []
     for c in cands:
         dzr = (abs(float(c.z) - float(z0))
@@ -931,8 +957,9 @@ def _fiducial_learned(cube, z0, p):
         lf = LearnedFit(float(c.y), float(c.x), float(c.z),
                         float(c.amplitude) if np.isfinite(c.amplitude) else 0.0,
                         float(c.p_exist), ())
-        if t is not None and not (float(c.p_exist) >= t):
-            alts.append((lf, f'p_exist {float(c.p_exist):.2f} < {t:g}'))
+        p1 = p1_of(c)
+        if t is not None and not (p1 >= t):
+            alts.append((lf, f'p1 {p1:.2f} < {t:g} (p_exist {float(c.p_exist):.2f})'))
         elif not PSFM.is_refined(c):
             unrefined.append((lf, dzr))
         elif dzr > window:
@@ -977,7 +1004,7 @@ def _fiducial_learned(cube, z0, p):
         return None, f'unrefined; refit {gwhy}', \
             [(cand, 'no sub-voxel position; Gaussian refinement failed')] \
             + rest, None
-    return None, (f'no candidate at p_exist >= {t:g}'
+    return None, (f'no candidate at p1 >= {t:g}'
                   if t is not None else 'no candidate'), alts, None
 
 

@@ -681,8 +681,13 @@ def main(argv=None):
         # matcher falls back to its sigma threshold.
         tpl_shape = (2 * a.template_r + 1, 2 * a.template_r + 1,
                      2 * a.template_rz + 1)
-        cal, calrep = C.fit_multispot(bundles, template=tpl_shape)
+        cal, calrep = C.fit_multispot(bundles, template=tpl_shape, target=mean)
         report['multispot'] = calrep
+        for bp, n in (calrep.get('excluded_pillars_by_bank') or {}).items():
+            print(f'   EXCLUDED {n} judged pillar(s) from the pooled calibration: '
+                  f'judged with {os.path.basename(os.path.dirname(bp))}, whose '
+                  f"template has cosine {calrep['bank_cosine'].get(bp, float('nan')):.3f} "
+                  f'to this one (< 0.9)')
         if cal is not None and len(bundles) > 1:
             # A PLATT PER RESOLUTION, from each bundle's own verdicts when
             # it has enough of them (150 judged matches), beside the
@@ -694,7 +699,13 @@ def main(argv=None):
                 kb = res_by_bundle.get(bi)
                 if not kb:
                     continue
-                cb, rb = C.fit_multispot(b, template=tpl_shape)
+                cb, rb = C.fit_multispot(b, template=tpl_shape,
+                                         target=means.get(bi, mean))
+                for bp, n in (rb.get('excluded_pillars_by_bank') or {}).items():
+                    print(f'   EXCLUDED {n} judged pillar(s) of {_short_bundle(b)} '
+                          f'from its {kb:g} kb calibration: judged with '
+                          f'{os.path.basename(os.path.dirname(bp))} (cosine '
+                          f"{rb['bank_cosine'].get(bp, float('nan')):.3f} < 0.9)")
                 if cb is None or int(rb.get('n', 0)) < 150:
                     continue
                 per[f'{kb:g}'] = {'platt': list(cb.platt), 'n': int(rb['n']),

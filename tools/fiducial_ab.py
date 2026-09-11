@@ -379,7 +379,7 @@ def main():
             print(f'    {n:>5}  {w}')
     os.makedirs(a.out, exist_ok=True)
     if row.get('_details'):
-        dpath = os.path.join(a.out, 'fiducial_ab_details.json')
+        dpath = os.path.join(a.out, f'fiducial_ab_details_{a.exp}.json')
         with open(dpath, 'w', encoding='utf-8') as fh:
             json.dump(row.pop('_details'), fh)
         print(f'per-hybe details: {dpath}')

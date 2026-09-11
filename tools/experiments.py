@@ -110,6 +110,9 @@ EXPERIMENTS = {
     'Chr19_JP': Experiment(
         'Chr19_JP', 'configs/2026-09-08-JP_new_chr19_downstream.xml', 'DNA',
         anchor_hybe='Hyb_002', anchor_channel=555, reference_hybe='Hyb_002',
+        # FOV 7 is the one with localized spots, and it is outside the
+        # ch555 bundle's FOVs (14, 18, 34, 40): an A/B here is out of sample
+        fovs=(7,), seed=20260911,
         scope_mb=18.5, step_kb=200, barcodes=91,
         locus='chr19:40000000-54716295 + 54864547-58617616',
         note='the SAME probe design as Chr19 (hg38, tiling chr19 after the '
@@ -129,6 +132,9 @@ EXPERIMENTS = {
     'HoxA_0822': Experiment(
         'HoxA_0822', 'configs/2026-09-01-DI_HoxA.xml', 'DNA',
         anchor_hybe='Hyb_010', anchor_channel=555, reference_hybe='Hyb_010',
+        # outside the ch555 bundle's FOVs (11, 29, 30, 33); only one
+        # replicate pair (Hyb_029~Rep_029), so the repeat distance is thin
+        fovs=(2, 3, 5, 7), seed=20260911,
         scope_mb=0.29, step_kb=5, barcodes=58,
         note='the HoxA design imaged again on 2026-08-22 (RNA + DNA) at '
              'G:/Dariya/2026-08-22-RNA_DNA_HoxA; its DNA ch555 bundle is one '
