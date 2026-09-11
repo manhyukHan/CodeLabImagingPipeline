@@ -127,9 +127,9 @@ def test_params():
           p.readout_model_dir == MODEL and p.min_p_exist == 0.6
           and p.is_learned)
     check('unset, the three reach settings are the measured values: 5 px, '
-          '17 planes, and the readout threshold for the fiducial',
+          '17 planes, and 0.3 on p1 for the fiducial (not the readout\'s)',
           p.lateral_reach() == 5 and p.fiducial_window() == 17
-          and p.fiducial_min_p() == 0.6)
+          and p.fiducial_min_p() == T2.FIDUCIAL_MIN_P1 == 0.3)
     r = T2.V2Params.from_panel(
         {'engine': T2.ROUTE_V3,
          'v3': {'model_dir': MODEL, 'min_p_exist': 0.6,
@@ -363,7 +363,8 @@ def test_reach_settings_are_honoured():
           ok2 and len(a2.polymer_adj['H']) == 1
           and d2['readout_search']['lateral_px'] == 8)
 
-    p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0, fiducial_z_window=8)
+    p = T2.V2Params(min_p_exist=0.5, min_p_exist_fiducial=0.5,
+                    z_boundary_trim=0, fiducial_z_window=8)
     zs = _slab_z0(20.0, 8)
     p.fiducial_engine = FakeEngine([spot(8, 8, 20.0 + 12 - zs, 0.9)])
     f, _w, _a, how = T2._fiducial_learned(cube, 20.0, p)
@@ -406,7 +407,7 @@ def test_display_box_is_a_hard_boundary():
 
 def test_learned_fiducial_best_of_one():
     print('the learned fiducial: best of one, in the Gaussian\'s own window')
-    p = T2.V2Params(min_p_exist=0.5, z_boundary_trim=0)
+    p = T2.V2Params(min_p_exist=0.5, min_p_exist_fiducial=0.5, z_boundary_trim=0)
     window = T2.fiducial_window_planes(p.voxel_um)
     check("the window is the Gaussian fiducial's seed window (17 planes at "
           "0.2 um), not the readout reach (14)",
@@ -566,7 +567,7 @@ def test_panel():
     pr = ui.params()
     check("params() carries the v3 block, reach settings included",
           pr['v3'] == {'model_dir': '/m/r1', 'fiducial_model_dir': None,
-                       'min_p_exist': 0.65, 'min_p_exist_fiducial': 0.5,
+                       'min_p_exist': 0.65, 'min_p_exist_fiducial': 0.3,
                        'lateral_reach_px': 5, 'fiducial_z_window': 17}
           and T2.route(pr['engine']) == T2.ROUTE_V3)
     ui.populate_models([{'name': 'r1', 'path': '/m/r1', 'is_default': True,
@@ -584,7 +585,7 @@ def test_panel():
           'defaults',
           ui.V3LateralReachSpinBox.value() == 5
           and ui.V3FiducialZWindowSpinBox.value() == 17
-          and ui.V3FiducialMinPExistSpinBox.value() == 0.5)
+          and ui.V3FiducialMinPExistSpinBox.value() == 0.3)
     check('the v3 page shows no Gaussian-fit gate',
           not any(k in dir(ui) for k in ('V3PeakBoundSpinBox',
                                           'V3MaxSigmaSpinBox')))

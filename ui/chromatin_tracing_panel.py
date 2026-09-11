@@ -66,7 +66,7 @@ READOUT_ONLY_FIT_DEFAULTS = {'min_sep': 3.0, 'multi_mode': False}
 # v3: the p_exist cut. 0.5 is where a calibrated probability is
 # thresholded; MEASURED on the shipped model's own 661 judged matches it
 # sits within 0.006 F1 of the optimum across a range of pillar p1.
-V3_DEFAULTS = {'min_p_exist': 0.5, 'min_p_exist_fiducial': 0.5,
+V3_DEFAULTS = {'min_p_exist': 0.5, 'min_p_exist_fiducial': 0.3,
                'lateral_reach_px': 5, 'fiducial_z_window': 17}
 DEFAULT_PARAMS = {**CROSS_MODE_DEFAULTS, **VOXEL_DEFAULTS,
                   # v2 by default, per explicit request. Measured through the
@@ -930,11 +930,13 @@ class ChromatinTracingPanelUI(object):
         self.V3FiducialMinPExistSpinBox.setValue(
             V3_DEFAULTS['min_p_exist_fiducial'])
         self.V3FiducialMinPExistSpinBox.setToolTip(
-            'Keep a fiducial candidate when p_exist >= this, then best of '
-            'one among those. Separate from the readout\'s threshold '
-            'because the fiducial model is a different model; it applies '
-            'only when a fiducial model is chosen.')
-        form.addRow('p_exist threshold (fiducial):',
+            'Keep a fiducial candidate when the classifier\'s p1 >= this, '
+            'then best of one by p_exist among those. The gate is p1, not '
+            'p_exist: the multispot factor answers a different question. '
+            'Measured on MP58: 0.3 keeps 93% of hybes at the same alignment '
+            'accuracy as 0.5 (88%). Applies only when a fiducial model is '
+            'chosen.')
+        form.addRow('p1 threshold (fiducial):',
                     self.V3FiducialMinPExistSpinBox)
         outer.addLayout(form)
         note = QtWidgets.QLabel(

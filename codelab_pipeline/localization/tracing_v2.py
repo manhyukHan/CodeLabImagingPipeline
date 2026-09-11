@@ -468,10 +468,10 @@ class V2Params(object):
                 else fiducial_window_planes(self.voxel_um))
 
     def fiducial_min_p(self):
-        """The learned fiducial's p_exist threshold: its own, else the
-        readout's."""
+        """The learned fiducial's p1 threshold: its own, else the measured
+        default FIDUCIAL_MIN_P1 (0.3) -- not the readout's."""
         return (self.min_p_exist_fiducial
-                if self.min_p_exist_fiducial is not None else self.min_p_exist)
+                if self.min_p_exist_fiducial is not None else FIDUCIAL_MIN_P1)
 
     @property
     def readout_engine(self):
@@ -803,6 +803,21 @@ def _lateral_reach_px(fit_radius_um, voxel_um):
 
 LearnedFit = namedtuple('LearnedFit',
                         ['y', 'x', 'z', 'amplitude', 'p_exist', 'at_bound'])
+
+# THE FIDUCIAL'S GATE ON p1, BY DEFAULT 0.3 -- not the readout's 0.5.
+# MEASURED on MP58 (48 alleles, out-of-sample FOVs, pooled ch555 model):
+#
+#     fiducial p1 >=   coverage   common-pair median   vs v2 Gaussian
+#     0.5              88.2%      0.098 um             -46% (52 pairs)
+#     0.3              93.2%      0.101 um             -40% (62 pairs)
+#     (v2 Gaussian)    96.4%      0.166 um
+#
+# The fiducials the classifier is only 0.3-0.5 sure of align as well as
+# the ones it is sure of; refusing them cost a twentieth of the hybes
+# for nothing. The readout keeps 0.5: a readout candidate is a trace
+# position and a false one is a wrong distance, while a fiducial is one
+# alignment per hybe that the drift gate still checks.
+FIDUCIAL_MIN_P1 = 0.3
 
 
 def alt_marker(why):

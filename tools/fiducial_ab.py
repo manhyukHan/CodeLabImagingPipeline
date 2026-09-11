@@ -53,7 +53,7 @@ DEFAULT_OUT = os.path.join('notes', 'chromatin_tracing_optimization')
 
 
 def _params(psf_label, fid_model=None, read_model=None, min_p=0.5,
-            resolution_kb=None, template_mode='select'):
+            resolution_kb=None, template_mode='select', fid_min_p=None):
     from codelab_pipeline.localization import psf_library as LIB
     doc = LIB.read(psf_label)
     got = LIB.shape_tuple(doc) if doc else None
@@ -65,6 +65,7 @@ def _params(psf_label, fid_model=None, read_model=None, min_p=0.5,
                        fiducial_model_dir=fid_model,
                        readout_model_dir=read_model,
                        min_p_exist=min_p,
+                       min_p_exist_fiducial=fid_min_p,
                        genomic_resolution_kb=resolution_kb,
                        template_mode=template_mode)
 
