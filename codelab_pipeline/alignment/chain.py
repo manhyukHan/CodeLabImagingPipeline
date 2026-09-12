@@ -62,7 +62,13 @@ ANGLE_QUANTUM_DEG = 0.5
 # low-signal crop is documented in compute_cell_alignment). It remains a
 # backstop, not the primary defence -- the reconstruction-residual quality gate
 # beside it is what actually rejects bad fits, and caught 8.2% here on its own.
-MAX_CELL_Z_SHIFT_PLANES = 15.0
+# 55, not 15 (2026-09-12, per request): every real config already carried
+# 55 -- the 130-plane DNA stacks drift by up to 22 planes between rounds
+# (measured for the fiducial gate) and a 15-plane cap truncated real
+# shifts on the first project it met, so the panel's default now says
+# what the runs actually use. The reconstruction-residual gate, not this
+# bound, is what rejects a bad fit.
+MAX_CELL_Z_SHIFT_PLANES = 55.0
 
 
 def _center_displacement(H, shape):

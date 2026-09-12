@@ -153,7 +153,15 @@ def _filter_and_relabel(mask, min_size, max_size):
     mask[np.isin(mask, v[c > max_size])] = 0
     for i, id in enumerate(np.unique(mask)[1:], start=1):
         mask[mask == id] = -i
-    return (-1 * mask).astype(np.uint8)
+    # uint16, NOT uint8. The label image is the cell identity, and a
+    # dense field holds more than 255 cells: MEASURED on JP_001 (BF,
+    # Cellpose diameter 40, 1024x1024), 12 of 30 FOVs reported exactly
+    # 255 cells because label 256 wrapped to background and 257 onward
+    # wrapped onto cells 1, 2, ... -- a distant cell's pixels silently
+    # became part of another cell's mask. _merge_append_mask already
+    # returns uint16 for the same reason; every consumer builds per-cell
+    # boolean masks from the labels and never depends on the width.
+    return (-1 * mask).astype(np.uint16)
 
 
 def segment_fov_classical(storage_path, fov, reference_hybe, channel, method='otsu',

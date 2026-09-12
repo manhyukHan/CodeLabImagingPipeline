@@ -149,6 +149,27 @@ class CellContainer():
         fov_cells = self.data.get(fov, {})
         return [fov_cells.pop(int(i)) for i in cell_ids if int(i) in fov_cells]
 
+    def edge_cell_ids(self, fov):
+        """Ids of the cells whose mask touches their frame boundary.
+
+        The displayer's Remove Edge Cells criterion (a label on the first
+        or last row or column), asked of the container's own native masks
+        so a batch can apply it to every FOV without rendering one. A cell
+        clipped by the field of view has a partial mask: its centroid is
+        biased inward and its area is arbitrary, and its residual fit and
+        every per-cell number downstream inherit that. A cell with no
+        frame size on record (legacy) cannot be judged and is kept.
+        """
+        out = []
+        for cid, cell in self.data.get(fov, {}).items():
+            y, x = cell.area
+            h, w = cell.frame_shape
+            if len(y) == 0 or h <= 0 or w <= 0:
+                continue
+            if y.min() <= 0 or x.min() <= 0 or y.max() >= h - 1 or x.max() >= w - 1:
+                out.append(int(cid))
+        return sorted(out)
+
     def sync_from(self, other, fov):
         """
         Diff-driven tier transfer, replacing whole-dict deepcopy: compare

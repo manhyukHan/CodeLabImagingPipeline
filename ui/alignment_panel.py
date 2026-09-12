@@ -299,6 +299,21 @@ class AlignmentPanelUI(object):
         # before committing to the whole FOV, so a second review step here
         # would just be redundant.
         cellLayout.addRow(self.RunCellAlignmentPushButton)
+        # The batch form of the displayer's Remove Edge Cells (per request,
+        # 2026-09-12): before the all-FOVs run fits anything, every cell
+        # touching its frame boundary is removed from every FOV in the
+        # list and the FOV is SAVED (cells written, spots recast) -- the
+        # three steps a manual removal followed by Save performs. On by
+        # default: a clipped cell's residual and every per-cell number
+        # downstream are built on a partial mask.
+        self.CellAlignRemoveEdgeCheckBox = QtWidgets.QCheckBox(
+            'remove edge cells first, then save (all FOVs run)')
+        self.CellAlignRemoveEdgeCheckBox.setToolTip(
+            'Before fitting, remove every cell whose mask touches the frame '
+            'boundary from each FOV in the list and save that FOV. Same '
+            'criterion as the Cell Displayer\'s Remove Edge Cells.')
+        self.CellAlignRemoveEdgeCheckBox.setChecked(True)
+        cellLayout.addRow('', self.CellAlignRemoveEdgeCheckBox)
         self.RunCellAlignmentAllPushButton = QtWidgets.QPushButton(
             'Align All Cells in ALL FOVs (Auto-Save)')
         # Every FOV in the Ingestion tab's list, computed AND saved

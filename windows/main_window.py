@@ -12560,6 +12560,53 @@ One PNG PER MODALITY: each modality has its own reference and its
                 'No segmented cells in any FOV of the list -- run Cell Segmentation first.')
             return
 
+        # REMOVE EDGE CELLS FIRST, per FOV, and SAVE (per request) -- the
+        # batch form of the displayer's Remove Edge Cells. It runs on the
+        # container that is about to be aligned, drops the same ids from
+        # the other tier when that tier holds the FOV, writes the FOV to
+        # every store and recasts its spots: the three steps a manual
+        # removal followed by Save performs. No undo streak: the removal
+        # is persisted at once, like the alignment that follows it, and
+        # a batch spanning 30 FOVs is not reviewable in the undo sense.
+        # A FOV emptied by the removal drops out of the run.
+        if ap.CellAlignRemoveEdgeCheckBox.isChecked():
+            n_removed_total, touched = 0, []
+            storage_paths = self._all_analysis_storage_paths()
+            for fov in sorted(cells_by_fov):
+                container = containers_by_fov[fov]
+                ids = container.edge_cell_ids(fov)
+                if not ids:
+                    continue
+                container.remove(fov, ids)
+                other = (self.cell_container if container is self.cell_container_permanent
+                         else self.cell_container_permanent)
+                if other is not None and other.data.get(fov):
+                    other.remove(fov, ids)
+                if storage_paths:
+                    analysis_store.mirror_write_cells(storage_paths, fov, container)
+                    try:
+                        self._recast_persisted_spots(fov)
+                    except Exception as e:
+                        self.log(f'cell alignment: FOV{fov:03d} spots could not be '
+                                 f'recast after the edge removal ({e})')
+                cells_by_fov[fov] = container.get_cells(fov)
+                n_removed_total += len(ids)
+                touched.append(fov)
+                self.log(f'cell alignment: FOV{fov:03d}: removed {len(ids)} edge '
+                         f'cell(s), {len(cells_by_fov[fov])} remain, saved.')
+            for fov in [f for f, cells in cells_by_fov.items() if not cells]:
+                cells_by_fov.pop(fov)
+                containers_by_fov.pop(fov, None)
+            if touched:
+                self.log(f'cell alignment: {n_removed_total} edge cell(s) removed '
+                         f'across {len(touched)} FOV(s) before fitting.')
+            if not cells_by_fov:
+                QtWidgets.QMessageBox.warning(
+                    self, 'Run Cell Alignment (all FOVs)',
+                    'Every cell in the list touched the frame boundary and was '
+                    'removed -- nothing left to align.')
+                return
+
         first = cells_by_fov[sorted(cells_by_fov)[0]][0]
         cell_modality = first.reference_modality
         cell_reference_hybe = ap.current_cell_reference_hybe(cell_modality) or None
@@ -14081,6 +14128,7 @@ One PNG PER MODALITY: each modality has its own reference and its
             'pad': ('AlignmentPanel', 'CellPadSpinBox'),
             'max_z_shift': ('AlignmentPanel', 'CellZMaxShiftSpinBox'),
             'overlay_autosave_threshold_px': ('AlignmentPanel', 'CellOverlayAutoSaveThresholdSpinBox'),
+            'remove_edge_cells': ('AlignmentPanel', 'CellAlignRemoveEdgeCheckBox'),
         },
         'spot_localization': {
             'hybe': ('SpotLocalizationPanel', 'HybeComboBox'),
