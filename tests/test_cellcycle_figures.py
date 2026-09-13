@@ -163,11 +163,17 @@ def main():
                            w_h, m.grid, 215.0)
     check('with_post_m splits the first arc and keeps the rest', [a['name'] for a in split] == ['post-M', 'G1', 'S']
           and split[0]['start_deg'] == 215.0 and split[1]['start_deg'] == split[0]['end_deg'] and split[1]['end_deg'] == 320.0)
-    tau_h, _tg, _th = FC.cycle_time_map(w_h, m.grid, 215.0, 'uniform')
+    split_s = FC.with_post_m([{'name': 'G1', 'start_deg': 215.0, 'end_deg': 320.0}, {'name': 'S', 'start_deg': 320.0, 'end_deg': 215.0}],
+                             w_h, m.grid, 215.0, share=0.05)
+    check('a sparse stretch wins over the share', split_s[0]['end_deg'] == split[0]['end_deg'], str((split_s[0], split[0])))
+    w_u = np.ones(72) / 72.0
+    tau_u, _tg, _th = FC.cycle_time_map(w_u, m.grid, 215.0, 'uniform')
     split2 = FC.with_post_m([{'name': 'G1', 'start_deg': 215.0, 'end_deg': 320.0}, {'name': 'S', 'start_deg': 320.0, 'end_deg': 215.0}],
-                            w_h, m.grid, 215.0, share=0.05)
-    check('with a share the split sits at that cycle time after birth', split2[0]['name'] == 'post-M'
-          and abs(tau_h(split2[0]['end_deg']) - 0.05) < 0.02, str((split2[0], float(tau_h(split2[0]['end_deg'])))))
+                            w_u, m.grid, 215.0, share=0.05)
+    check('without a sparse stretch the share is the floor: the split at that cycle time after birth', split2[0]['name'] == 'post-M'
+          and abs(tau_u(split2[0]['end_deg']) - 0.05) < 0.02, str((split2[0], float(tau_u(split2[0]['end_deg'])))))
+    check('no share and no sparse stretch: unchanged', FC.with_post_m([{'name': 'G1', 'start_deg': 215.0, 'end_deg': 320.0}], w_u, m.grid, 215.0)
+          == [{'name': 'G1', 'start_deg': 215.0, 'end_deg': 320.0}])
     fig = FC.fig_phase_hist(th, groups=groups, marks=marks)
     conventions(fig, 'phase hist')
     check('phase histogram draws a line per group plus all', len(fig.axes[0].lines) == 3)

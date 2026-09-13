@@ -284,14 +284,17 @@ class CellCyclePanelUI(object):
         self.PhaseSharesLineEdit = QtWidgets.QLineEdit('post-M 5, G1 40, S 33, G2/M 22')
         self.PhaseSharesLineEdit.setToolTip('Phases in order from birth with their share of the cycle (%). '
                                             'Default: cultured mammalian cells, ~24 h cycle; post-M is the first 5% '
-                                            'after division, and its share is also what the DAPI and role proposals '
-                                            'split off their first arc when the box below is on.')
+                                            'after division, and its share is the floor the DAPI and role proposals '
+                                            'use for their post-M arc when the clock shows no sparse stretch after '
+                                            'division (box below).')
         bform.addRow('Phase time shares (%):', self.PhaseSharesLineEdit)
-        self.PostMCheckBox = QtWidgets.QCheckBox('split a post-M arc off the first arc (the post-M share of cycle time after birth)')
+        self.PostMCheckBox = QtWidgets.QCheckBox('split a post-M arc off the first arc (the sparse stretch after birth, else the post-M share)')
         self.PostMCheckBox.setChecked(True)
-        self.PostMCheckBox.setToolTip('Right after division the cells are 2N but their composition may still carry the '
-                                      'mitotic transcripts: the first few percent of the cycle. The share comes from the '
-                                      'shares line (post-M 5 = 5% of cycle time), the angle from the training clock.')
+        self.PostMCheckBox.setToolTip('Right after division the cells are 2N and, where the mitotic transcripts outlive '
+                                      'division (cyclin panels), their composition changes fast: few cells per degree. '
+                                      'The arc ends where the training density recovers to half its median (JP_002: '
+                                      '~28 deg); when there is no sparse stretch (chr19, the Tirosh-list panel) it ends '
+                                      'at the post-M share of cycle time from the shares line (5% = 6-9 deg there).')
         bform.addRow('', self.PostMCheckBox)
         catLayout.addLayout(bform)
         self.ApplyCategoriesPushButton = QtWidgets.QPushButton('Apply categories and gates to the stored model')

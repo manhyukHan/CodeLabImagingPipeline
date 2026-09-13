@@ -956,22 +956,25 @@ def post_division_end(w, grid, birth_deg=0.0, level=0.5, smooth=5):
 
 def with_post_m(arcs, w, grid, birth_deg=0.0, level=0.5, name='post-M', share=None):
     """Split the arc that starts at birth into 'post-M' and the rest.
-    With `share` (a fraction of cycle time, e.g. 0.05) the split sits at
-    that time after birth on the clock `w` gives -- the same definition
-    in every experiment; measured, the sparse stretch after division
-    exists only where the mitotic transcripts outlive division (JP_002:
-    cyclins, 2.3x at 0 deg), while the Tirosh-list panel has them gone
-    by division and chr19 keeps them for half a turn, so neither the
-    density nor the profiles give one rule. Without `share` the density
-    recovery is used (None when nothing is sparse). The arcs come back
-    unchanged when the split lies beyond the first arc's end."""
+    The split sits where the sparse (fast) stretch after division ends
+    -- the density back to `level` x its median -- when the clock shows
+    one; otherwise, with `share` given, at that fraction of cycle time
+    after birth (the floor). Measured on the training clocks: JP_002
+    (cyclins, which outlive division) runs at 11-16 deg per 1% of time
+    over 0-35 deg and recovers at 27.5 deg; chr19 and the Tirosh-list
+    panel (JP_001) show no fast stretch at all after division (speed
+    rising slowly to a first maximum at 50 / 40 deg, i.e. mid-G1), so
+    an end 'at the speed maximum' would swallow a third of G1 there,
+    while in JP_002 the maximum itself sits at 5 deg with the fast
+    stretch lasting to 35. Without `share` and without a sparse stretch
+    the arcs come back unchanged; also when the split lies beyond the
+    first arc's end."""
     if not arcs:
         return arcs
-    if share is not None:
+    end = post_division_end(w, grid, birth_deg, level)
+    if end is None and share is not None:
         _tau, _tg, theta = cycle_time_map(w, grid, birth_deg, 'uniform')
         end = float(theta(float(share)))
-    else:
-        end = post_division_end(w, grid, birth_deg, level)
     if end is None:
         return arcs
     first = arcs[0]
