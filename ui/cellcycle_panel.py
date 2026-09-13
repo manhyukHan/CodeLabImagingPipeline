@@ -281,15 +281,17 @@ class CellCyclePanelUI(object):
         self.BirthDegSpinBox.setToolTip('Where the cycle-time clock starts (cell birth, M exit). Proposed from the G2/M '
                                         'profiles\' descent to their mean; the clock itself is the training spectrum.')
         bform.addRow('Birth angle for cycle time (deg):', self.BirthDegSpinBox)
-        self.PhaseSharesLineEdit = QtWidgets.QLineEdit('G1 45, S 33, G2/M 22')
+        self.PhaseSharesLineEdit = QtWidgets.QLineEdit('post-M 5, G1 40, S 33, G2/M 22')
         self.PhaseSharesLineEdit.setToolTip('Phases in order from birth with their share of the cycle (%). '
-                                            'Default: cultured mammalian cells, ~24 h cycle.')
+                                            'Default: cultured mammalian cells, ~24 h cycle; post-M is the first 5% '
+                                            'after division, and its share is also what the DAPI and role proposals '
+                                            'split off their first arc when the box below is on.')
         bform.addRow('Phase time shares (%):', self.PhaseSharesLineEdit)
-        self.PostMCheckBox = QtWidgets.QCheckBox('split a post-M arc off the first arc (birth to where the cell density recovers)')
+        self.PostMCheckBox = QtWidgets.QCheckBox('split a post-M arc off the first arc (the post-M share of cycle time after birth)')
         self.PostMCheckBox.setChecked(True)
-        self.PostMCheckBox.setToolTip('Right after division the cells are 2N but their composition still carries the '
-                                      'mitotic transcripts and changes fast: few cells, a few percent of the cycle. '
-                                      'On by default so G1 starts where the density recovers (JP_002: ~30 deg).')
+        self.PostMCheckBox.setToolTip('Right after division the cells are 2N but their composition may still carry the '
+                                      'mitotic transcripts: the first few percent of the cycle. The share comes from the '
+                                      'shares line (post-M 5 = 5% of cycle time), the angle from the training clock.')
         bform.addRow('', self.PostMCheckBox)
         catLayout.addLayout(bform)
         self.ApplyCategoriesPushButton = QtWidgets.QPushButton('Apply categories and gates to the stored model')

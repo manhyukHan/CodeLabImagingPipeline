@@ -954,13 +954,25 @@ def post_division_end(w, grid, birth_deg=0.0, level=0.5, smooth=5):
     return None
 
 
-def with_post_m(arcs, w, grid, birth_deg=0.0, level=0.5, name='post-M'):
-    """Split the arc that starts at birth into 'post-M' (birth -> the
-    density recovery) and the rest; the arcs come back unchanged when
-    no sparse stretch follows birth or the recovery lies beyond the
-    first arc's end."""
-    end = post_division_end(w, grid, birth_deg, level)
-    if end is None or not arcs:
+def with_post_m(arcs, w, grid, birth_deg=0.0, level=0.5, name='post-M', share=None):
+    """Split the arc that starts at birth into 'post-M' and the rest.
+    With `share` (a fraction of cycle time, e.g. 0.05) the split sits at
+    that time after birth on the clock `w` gives -- the same definition
+    in every experiment; measured, the sparse stretch after division
+    exists only where the mitotic transcripts outlive division (JP_002:
+    cyclins, 2.3x at 0 deg), while the Tirosh-list panel has them gone
+    by division and chr19 keeps them for half a turn, so neither the
+    density nor the profiles give one rule. Without `share` the density
+    recovery is used (None when nothing is sparse). The arcs come back
+    unchanged when the split lies beyond the first arc's end."""
+    if not arcs:
+        return arcs
+    if share is not None:
+        _tau, _tg, theta = cycle_time_map(w, grid, birth_deg, 'uniform')
+        end = float(theta(float(share)))
+    else:
+        end = post_division_end(w, grid, birth_deg, level)
+    if end is None:
         return arcs
     first = arcs[0]
     span = (first['end_deg'] - first['start_deg']) % 360.0

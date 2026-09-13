@@ -534,12 +534,12 @@ class CellCycleWiring(QtCore.QObject):
                 arcs_from = 'cycle time'
             except Exception:                                   # noqa: BLE001
                 arcs = []
-        if arcs and self.panel.PostMCheckBox.isChecked():
-            # the sparse, fast stretch right after division as its own arc:
-            # 2N by DAPI, the mitotic transcripts still decaying, a few
-            # percent of the cycle -- kept out of G1 when the user wants a
-            # clean G1 (user question 2026-09-13: is 0-30 deg G1?)
-            arcs = FC.with_post_m(arcs, w_train, m.grid, birth_used)
+        if arcs and arcs_from != 'cycle time' and self.panel.PostMCheckBox.isChecked():
+            # the first few percent of the cycle after division as its own
+            # arc (2N, mitotic transcripts may remain) -- the share from the
+            # shares line, the angle from the training clock; the cycle-time
+            # proposal carries post-M as its own first share already
+            arcs = FC.with_post_m(arcs, w_train, m.grid, birth_used, share=self._post_m_share(shares))
         return arcs, arcs_from
 
     def set_origin(self):
@@ -890,6 +890,13 @@ class CellCycleWiring(QtCore.QObject):
             title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg)'), None),
             'cycle_time')
 
+    @staticmethod
+    def _post_m_share(shares):
+        for n, s in shares:
+            if n.lower().replace('_', '-') in ('post-m', 'postm', 'post m'):
+                return float(s)
+        return 0.05
+
     def propose_arcs_from_dapi(self):
         """Arcs from the measured DNA content of the training cells."""
         p = self.panel
@@ -915,7 +922,7 @@ class CellCycleWiring(QtCore.QObject):
             p.ProposeFromDapiPushButton.setEnabled(True)
             arcs, info = res
             if p.PostMCheckBox.isChecked():
-                arcs = FC.with_post_m(arcs, self._training_spectrum(), self.model.grid, birth)
+                arcs = FC.with_post_m(arcs, self._training_spectrum(), self.model.grid, birth, share=self._post_m_share(p.phase_shares()))
             p.set_arcs(arcs)
             p.CategoryStatusLabel.setText(
                 f'proposed from DAPI (G1 level {info["g1_level"]:.2f}, plateau {info["top"]:.2f}, ratio {info["ratio"]:.2f}): '
@@ -933,8 +940,6 @@ class CellCycleWiring(QtCore.QObject):
         shares = self.panel.phase_shares()
         birth = float(self.panel.BirthDegSpinBox.value())
         arcs = FC.propose_arcs_from_time(self._training_spectrum(), m.grid, birth, shares=shares)
-        if self.panel.PostMCheckBox.isChecked():
-            arcs = FC.with_post_m(arcs, self._training_spectrum(), m.grid, birth)
         self.panel.set_arcs(arcs)
         self.panel.CategoryStatusLabel.setText(
             'proposed from cycle time: ' + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs)
@@ -1095,7 +1100,7 @@ class CellCycleWiring(QtCore.QObject):
         birth = float(self.panel.BirthDegSpinBox.value())
         arcs = FC.propose_arcs_from_profiles(m, self.roles or {}, birth_deg=birth)
         if self.panel.PostMCheckBox.isChecked() and self.placed is not None:
-            arcs = FC.with_post_m(arcs, self._training_spectrum(), m.grid, birth)
+            arcs = FC.with_post_m(arcs, self._training_spectrum(), m.grid, birth, share=self._post_m_share(self.panel.phase_shares()))
         self.panel.set_arcs(arcs)
         self.panel.CategoryStatusLabel.setText(
             'proposed from the roles (a phase starts where its genes rise above their cycle mean; G1 at birth '
