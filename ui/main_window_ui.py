@@ -5,6 +5,7 @@ from ui.alignment_panel import AlignmentPanelUI
 from ui.cell_segment_panel import CellSegmentPanelUI
 from ui.spot_localization_panel import SpotLocalizationPanelUI
 from ui.celltype_determination_panel import CelltypeDeterminationPanelUI
+from ui.cellcycle_panel import CellCyclePanelUI
 from ui.chromatin_tracing_panel import ChromatinTracingPanelUI
 from ui.analysis_panel import AnalysisPanelUI
 
@@ -55,6 +56,14 @@ class MainWindowUI(object):
         self.CelltypeDeterminationPanel = CelltypeDeterminationPanelUI()
         self.CelltypeDeterminationPanel.setupUi(self.CelltypeDeterminationPanelWidget)
         self.tabWidget.addTab(self._scrollable(self.CelltypeDeterminationPanelWidget), 'Celltype Determination')
+
+        # The cell-cycle phase is a cell attribute like celltype, so its
+        # stage sits here, after the celltypes it trains on and before
+        # the tracing that reads it (user decision 2026-09-13).
+        self.CellCyclePanelWidget = QtWidgets.QWidget()
+        self.CellCyclePanel = CellCyclePanelUI()
+        self.CellCyclePanel.setupUi(self.CellCyclePanelWidget)
+        self.tabWidget.addTab(self._scrollable(self.CellCyclePanelWidget), 'Cell Cycle')
 
         self.ChromatinTracingPanelWidget = QtWidgets.QWidget()
         self.ChromatinTracingPanel = ChromatinTracingPanelUI()

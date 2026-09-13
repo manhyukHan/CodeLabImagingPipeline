@@ -1,0 +1,694 @@
+"""
+The Cell Cycle tab's wiring: widget values -> codelab_pipeline/analysis/
+cellcycle -> the store and the figure displayer.
+
+A separate module like analysis_wiring.py, for the same reason: every
+computation below is a toolbox call that runs identically headless,
+and MainWindow only instantiates CellCycleWiring(self). Counting, the
+fit and the heavier figures run inside FnWorker threads; count_table's
+per-FOV store reads fan out to child processes (pmap) inside.
+
+What the stage persists (design 7, store contract of 2026-09-13):
+  analysis/fov###/cellcycle.json   every placed cell of the FOV --
+                                   theta_deg, R, fit_z, bf_ring,
+                                   radius, total
+  analysis/cellcycle_model.json    the one model with its provenance
+                                   (sources -> genes, roles, proxy,
+                                   alpha, training celltypes, bridges)
+                                   and the user's category arcs and
+                                   verdict gates
+The category itself is never stored per cell: population.py derives it
+from the arcs and gates when placements are read, so re-drawing a
+boundary is a re-read, not a refit.
+"""
+import datetime
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from PyQt5 import QtCore, QtWidgets
+
+from codelab_pipeline.analysis import cellcycle as CC
+from codelab_pipeline.analysis import figures_cellcycle as FC
+from codelab_pipeline.io import analysis_store, paths
+from canvas.analysis_figure_displayer import AnalysisFigureDisplayer
+
+TAB_TITLE = 'Cell Cycle'
+
+
+class CellCycleWiring(QtCore.QObject):
+    def __init__(self, mw):
+        super().__init__(mw)
+        self.mw = mw
+        self.panel = mw.ui.CellCyclePanel
+        self.tidy = None          # count_table's tidy rows
+        self.names = None         # {(modality, hybe, channel): gene}
+        self.roles = None         # {gene: role}
+        self.model = None         # CycleModel
+        self.spec = None          # the model file payload
+        self.placed = None        # DataFrame: fov, cell, celltype, theta_deg, R, fit_z, bf_ring, radius, total
+        self.q = None             # (n, T) posteriors of the placed cells
+        self.X = None             # (n, G) counts of the placed cells
+        self.displayers = []
+        p = self.panel
+        p.BuildCountsPushButton.clicked.connect(lambda: self._guard(self.build_counts))
+        p.ExportCountsPushButton.clicked.connect(lambda: self._guard(self.export_counts))
+        p.AlphaHeldOutPushButton.clicked.connect(lambda: self._guard(self.alpha_held_out))
+        p.AddBridgePushButton.clicked.connect(lambda: self._guard(self.add_bridge))
+        p.RemoveBridgePushButton.clicked.connect(self.remove_bridge)
+        p.FitPushButton.clicked.connect(lambda: self._guard(self.fit))
+        p.PlacePushButton.clicked.connect(lambda: self._guard(self.place))
+        p.LoadModelPushButton.clicked.connect(lambda: self._guard(self.load_model))
+        p.SaveModelPushButton.clicked.connect(lambda: self._guard(self.save_model))
+        p.SpectrumPushButton.clicked.connect(lambda: self._guard(self.view_spectrum))
+        p.ProfilesPushButton.clicked.connect(lambda: self._guard(self.view_profiles))
+        p.EmbeddingsPushButton.clicked.connect(lambda: self._guard(self.view_embeddings))
+        p.VerdictsPushButton.clicked.connect(lambda: self._guard(self.view_verdicts))
+        p.ContributionPushButton.clicked.connect(lambda: self._guard(self.view_contribution))
+        p.GroupTablePushButton.clicked.connect(lambda: self._guard(self.view_groups))
+        p.HalfPanelPushButton.clicked.connect(lambda: self._guard(self.view_half_panel))
+        p.CycleTimePushButton.clicked.connect(lambda: self._guard(self.view_cycle_time))
+        p.ProposeArcsPushButton.clicked.connect(lambda: self._guard(self.propose_arcs))
+        p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
+        mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
+
+    # -- plumbing -----------------------------------------------------------
+
+    def _guard(self, fn):
+        """Every exception contained (see analysis_wiring._guard: an
+        escaping one is a qFatal, not a traceback)."""
+        try:
+            fn()
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self.mw, TAB_TITLE, str(e))
+        except Exception as e:                                  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self.mw, f'{TAB_TITLE} error', f'{type(e).__name__}: {e}')
+
+    def _start(self, fn, ok, fail):
+        from windows.main_window import FnWorker
+        self._worker = FnWorker(fn)
+        self._worker.finished_ok.connect(lambda r: self._guard(lambda: ok(r)))
+        self._worker.failed.connect(fail)
+        self._worker.start()
+
+    def _on_tab_changed(self, index):
+        tabs = self.mw.ui.tabWidget
+        if tabs.tabText(index) != TAB_TITLE:
+            return
+        self.panel.set_celltype_names(list(self.mw.current_celltype_list or []))
+        if self.model is None:
+            try:
+                self._restore_from_store()
+            except Exception as e:                              # noqa: BLE001
+                self.mw.log(f'{TAB_TITLE}: stored model not restored: {type(e).__name__}: {e}')
+
+    def _storage(self):
+        modality = next(iter(self.mw.hybe_records_by_modality or {}), None)
+        sp = self.mw._storage_path_for_modality(modality) if modality else None
+        if not sp:
+            raise ValueError('No storage path -- set up Ingestion first.')
+        return sp
+
+    def _experiment_name(self):
+        return os.path.basename(os.path.normpath(paths.project_root(self._storage())))
+
+    def _fovs(self):
+        text = self.panel.FovListLineEdit.text().strip()
+        if not text:
+            text = self.mw.ui.IngestionPanel.FovListLineEdit.text()
+        fovs = self.mw._parse_fov_list(text)
+        if not fovs:
+            raise ValueError('No FOVs.')
+        return [int(f) for f in fovs]
+
+    def _log(self, msg):
+        self.mw.log(f'{TAB_TITLE}: {msg}')
+
+    def populate_sources(self):
+        """Called by MainWindow after the layouts parse."""
+        self.panel.populate_sources(self.mw.hybe_records_by_modality or {})
+
+    # -- 1. counts --------------------------------------------------------------
+
+    def _panel_genes(self):
+        rows = self.panel.checked_genes()
+        if len(rows) < 3:
+            raise ValueError('Check at least three sources as genes in section 1.')
+        genes = [g for _s, g, _r in rows]
+        dup = {g for g in genes if genes.count(g) > 1}
+        if dup:
+            raise ValueError(f'One gene name per source: {sorted(dup)} appear more than once.')
+        names = {tuple(s): g for s, g, _r in rows}
+        roles = {g: r for _s, g, r in rows}
+        return names, roles
+
+    def build_counts(self):
+        p = self.panel
+        sp = self._storage()
+        fovs = self._fovs()
+        names, roles = self._panel_genes()
+        sources = list(names)
+        p.BuildCountsPushButton.setEnabled(False)
+        p.CountStatusLabel.setText(f'counting {len(sources)} sources over {len(fovs)} FOVs...')
+
+        def _compute():
+            return CC.count_table(sp, fovs, sources, gate=CC.COUNT_GATE)
+
+        def _done(res):
+            tidy, fails = res
+            p.BuildCountsPushButton.setEnabled(True)
+            self.tidy, self.names, self.roles = tidy, names, roles
+            n_cells = tidy.groupby(['fov', 'cell']).ngroups if len(tidy) else 0
+            notes = []
+            if fails:
+                notes.append(f'{len(fails)} FOV(s) FAILED: {fails[0][1]}')
+            empty = sorted({h for h, n in zip(tidy['hybe'], tidy['n_stored']) if n == 0}) if len(tidy) else []
+            if empty:
+                notes.append(f'no stored spots for {len(empty)} source(s) in some FOV: {empty[:6]}')
+            pmin = tidy.groupby('hybe')['p_min'].min() if len(tidy) else pd.Series(dtype=float)
+            # a store gated AT 0.5 holds p_exist values from 0.500x up; only
+            # a clear margin above the count gate means a stricter store gate
+            above = sorted(pmin[pmin > CC.COUNT_GATE + 0.02].index)
+            if above:
+                notes.append(f'{len(above)} source(s) were stored with a p_exist gate above {CC.COUNT_GATE}: '
+                             f'their count is the store\'s gate ({above[:6]})')
+            p.CountStatusLabel.setText(f'{n_cells} cells x {len(sources)} sources over {len(fovs)} FOVs'
+                                       + (' | ' + ' | '.join(notes) if notes else ''))
+            self._log(p.CountStatusLabel.text())
+
+        def _fail(msg):
+            p.BuildCountsPushButton.setEnabled(True)
+            p.CountStatusLabel.setText(f'FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
+    def _dataset(self, names=None):
+        """(X, genes, celltype, keys) of every cell with at least the
+        minimum panel total, from the built counts."""
+        if self.tidy is None:
+            raise ValueError('Build counts first (section 1).')
+        names = names or self.names
+        metric = self.panel.proxy_metric()
+        table, celltype = CC.gene_table(self.tidy, names, metric=metric)
+        keep = table.sum(axis=1) >= self.panel.MinTotalSpinBox.value()
+        table, celltype = table[keep], celltype[keep]
+        if len(table) == 0:
+            raise ValueError('No cell reaches the minimum panel total.')
+        return (table.to_numpy(float), list(table.columns),
+                celltype.to_numpy().astype(object), table.index)
+
+    def export_counts(self):
+        X, genes, ct, keys = self._dataset()
+        name = self._experiment_name()
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.mw, 'Export counts', os.path.join(self._default_dir(), f'{name}_cellcycle_counts.json'), 'JSON (*.json)')
+        if not path:
+            return
+        payload = {'version': 1, 'name': name, 'genes': genes, 'X': X.astype(int).tolist(),
+                   'groups': [str(c) for c in ct], 'alpha': float(self.panel.AlphaSpinBox.value()),
+                   'roles': self.roles, 'train_celltypes': self.panel.training_celltypes(),
+                   'proxy': self.panel.proxy_metric(), 'fov': [int(f) for f, _c in keys],
+                   'cell': [int(c) for _f, c in keys]}
+        with open(path, 'w') as f:
+            json.dump(payload, f)
+        self._log(f'exported {len(X)} cells x {len(genes)} genes to {path}')
+
+    # -- 2. model ----------------------------------------------------------------
+
+    def _role_lists(self, roles):
+        early = [g for g, r in roles.items() if r == 'S']
+        late = [g for g, r in roles.items() if r == 'G2/M']
+        hk = [g for g, r in roles.items() if r == 'housekeeping'] + list(CC.HOUSEKEEPING)
+        return early, late, hk
+
+    @staticmethod
+    def load_bridge(path):
+        """An exported counts file -> a Dataset of its training cells."""
+        with open(path) as f:
+            d = json.load(f)
+        X = np.asarray(d['X'], float)
+        groups = np.asarray(d.get('groups', ['all'] * len(X)), dtype=object)
+        train = d.get('train_celltypes') or []
+        k = np.isin(groups, train) if train else np.ones(len(X), bool)
+        if k.sum() < 20:
+            raise ValueError(f'{os.path.basename(path)}: only {int(k.sum())} training cells')
+        return CC.Dataset(d['name'], X[k], d['genes'], groups[k], alpha=d.get('alpha', CC.DEFAULT_ALPHA)), d
+
+    def add_bridge(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self.mw, 'Add exported counts', self._default_dir(), 'JSON (*.json)')
+        if not path:
+            return
+        ds, d = self.load_bridge(path)
+        self.panel.BridgeListWidget.addItem(path)
+        self._log(f'bridge {ds.name}: {len(ds.X)} training cells x {len(ds.genes)} genes '
+                  f'({", ".join(ds.genes[:8])}{"..." if len(ds.genes) > 8 else ""})')
+
+    def remove_bridge(self):
+        lw = self.panel.BridgeListWidget
+        for item in lw.selectedItems():
+            lw.takeItem(lw.row(item))
+
+    def alpha_held_out(self):
+        X, genes, ct, keys = self._dataset()
+        train = self.panel.training_celltypes()
+        k = np.isin(ct, train) if train else np.ones(len(X), bool)
+        Xt = X[k]
+        p = self.panel
+        p.AlphaHeldOutPushButton.setEnabled(False)
+        p.ModelStatusLabel.setText(f'held-out evidence over alpha on {len(Xt)} training cells...')
+
+        def _compute():
+            return CC.select_alpha(Xt)
+
+        def _done(scores):
+            # {alpha: held-out mean evidence}, None = multinomial
+            p.AlphaHeldOutPushButton.setEnabled(True)
+            best = max(scores, key=lambda a: scores[a])
+            table = ', '.join(f'{"multinomial" if a is None else f"{a:g}"}: {v:.4f}' for a, v in scores.items())
+            if best is None:
+                p.ModelStatusLabel.setText(f'held-out evidence prefers the multinomial (no over-dispersion); alpha left as is [{table}]')
+            else:
+                p.AlphaSpinBox.setValue(float(best))
+                p.ModelStatusLabel.setText(f'alpha by held-out evidence: {best:g} [{table}]')
+            self._log(p.ModelStatusLabel.text())
+
+        def _fail(msg):
+            p.AlphaHeldOutPushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
+    def fit(self):
+        p = self.panel
+        sp = self._storage()
+        fovs = self._fovs()
+        X, genes, ct, keys = self._dataset()
+        name = self._experiment_name()
+        train = p.training_celltypes()
+        k = np.isin(ct, train) if train else np.ones(len(X), bool)
+        if k.sum() < 50:
+            raise ValueError(f'Only {int(k.sum())} training cells -- check the training celltypes.')
+        alpha = float(p.AlphaSpinBox.value())
+        early, late, hk = self._role_lists(self.roles)
+        bridges = []
+        for path in p.bridges():
+            ds, _d = self.load_bridge(path)
+            bridges.append(ds)
+        datasets = [CC.Dataset(name, X[k], genes, ct[k], alpha=alpha)] + bridges
+        orient_by = (early, late) if early and late else None
+        if orient_by is None:
+            self._log('no S and G2/M roles set: the circle keeps an arbitrary orientation and the bridges choose the reflection')
+        roles, names_map, metric, min_total = dict(self.roles), dict(self.names), p.proxy_metric(), p.MinTotalSpinBox.value()
+        previous = analysis_store.read_cellcycle_model(sp) or {}
+        arcs, gates, birth = p.arcs() or previous.get('categories', []), p.gates(), float(p.BirthDegSpinBox.value())
+        p.FitPushButton.setEnabled(False)
+        p.ModelStatusLabel.setText(f'fitting on {int(k.sum())} training cells' + (f' with {len(bridges)} bridge(s)' if bridges else '') + '...')
+
+        def _compute():
+            m = CC.CycleModel().fit(datasets, bridge_exclude=hk, orient_by=orient_by)
+            if orient_by is not None:
+                m.orient(early, late)
+            placed = m.place(name, X)
+            spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
+                    'sources': {CC.source_key(s): g for s, g in names_map.items()},
+                    'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
+                    'train_celltypes': list(train), 'fovs': fovs, 'min_total': int(min_total),
+                    'n_train': int(k.sum()), 'n_placed': int(len(X)),
+                    'bridges': [d.name for d in bridges], 'orient_by': [early, late],
+                    'align_report': {f'{a}->{b}': {kk: vv for kk, vv in r.items() if kk != 'residual_deg'}
+                                     for (a, b), r in m.align_report.items()},
+                    'fitted_at': datetime.datetime.now().isoformat(timespec='seconds'),
+                    'categories': arcs, 'gates': gates, 'birth_deg': birth}
+            self._persist(sp, spec, placed, keys, X)
+            return m, placed, spec
+
+        def _done(res):
+            m, placed, spec = res
+            p.FitPushButton.setEnabled(True)
+            self._adopt(m, spec, placed, keys, ct, X)
+            rep = '; '.join(f'{k_}: flip {v.get("flip")} shift {v.get("shift_deg", float("nan")):.0f} '
+                            f'residual {v.get("err_deg", float("nan")):.0f} deg'
+                            for k_, v in spec['align_report'].items() if 'flip' in v)
+            p.ModelStatusLabel.setText(
+                f'fitted {spec["fitted_at"]}: {spec["n_train"]} training cells, {spec["n_placed"]} placed over '
+                f'{len(fovs)} FOVs; alpha {alpha:g}; evidence {m.history[-1]:.3f}'
+                + (f'; bridges {rep}' if rep else ''))
+            self._log(p.ModelStatusLabel.text())
+
+        def _fail(msg):
+            p.FitPushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
+    def _persist(self, sp, spec, placed, keys, X):
+        """The per-FOV capsules and the model file, written atomically by
+        the store. Runs in the worker (no widgets)."""
+        fov_of = np.array([int(f) for f, _c in keys])
+        cell_of = np.array([int(c) for _f, c in keys])
+        totals = X.sum(1)
+        for fov in sorted(set(fov_of.tolist())):
+            k = fov_of == fov
+            sub = {key: np.asarray(v)[k] for key, v in placed.items() if key != 'posterior'}
+            rows = CC.capsule_rows(sub, cell_of[k], totals[k])
+            analysis_store.write_fov_cellcycle(sp, fov, {
+                'version': CC.CAPSULE_VERSION, 'model': spec['fitted_at'],
+                'stamp': analysis_store.fov_input_stamp(sp, fov), 'rows': rows})
+        analysis_store.write_cellcycle_model(sp, spec)
+
+    def _adopt(self, m, spec, placed, keys, ct, X):
+        self.model, self.spec, self.X = m, spec, X
+        self.q = placed['posterior']
+        self.placed = pd.DataFrame({
+            'fov': [int(f) for f, _c in keys], 'cell': [int(c) for _f, c in keys],
+            'celltype': [str(c) for c in ct],
+            'theta_deg': np.degrees(placed['theta']) % 360.0, 'R': placed['R'],
+            'fit_z': placed['fit_z'], 'bf_ring': placed['bf_ring'], 'radius': placed['radius'],
+            'total': X.sum(1)})
+        self.panel.set_arcs(spec.get('categories') or [])
+        self.panel.set_gates(spec.get('gates') or {})
+        if spec.get('birth_deg') is not None:
+            self.panel.BirthDegSpinBox.setValue(float(spec['birth_deg']))
+        self._refresh_category_counts()
+
+    def place(self):
+        """Every cell of the built counts through the current model."""
+        p = self.panel
+        if self.model is None:
+            raise ValueError('No model: fit one or load one first.')
+        sp = self._storage()
+        names = self._names_from_spec() if self.tidy is not None and self.spec is not None else self.names
+        X, genes, ct, keys = self._dataset(names)
+        name = self.spec.get('experiment', self._experiment_name()) if self.spec else self._experiment_name()
+        if name not in self.model.panels:
+            raise ValueError(f'the model carries no panel named {name!r} (it has {list(self.model.panels)})')
+        want = self.model.panels[name]
+        if list(genes) != list(want):
+            missing = [g for g in want if g not in genes]
+            if missing:
+                raise ValueError(f'the built counts lack the model\'s genes {missing}')
+            X = X[:, [genes.index(g) for g in want]]
+        m, spec = self.model, dict(self.spec or {})
+        spec['placed_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+        spec.setdefault('fitted_at', spec['placed_at'])
+        p.PlacePushButton.setEnabled(False)
+        p.ModelStatusLabel.setText(f'placing {len(X)} cells...')
+
+        def _compute():
+            placed = m.place(name, X)
+            self._persist(sp, spec, placed, keys, X)
+            return placed
+
+        def _done(placed):
+            p.PlacePushButton.setEnabled(True)
+            self._adopt(m, spec, placed, keys, ct, X)
+            p.ModelStatusLabel.setText(f'placed {len(X)} cells with the model of {spec.get("fitted_at")}')
+            self._log(p.ModelStatusLabel.text())
+
+        def _fail(msg):
+            p.PlacePushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
+    def _names_from_spec(self):
+        out = {}
+        for key, gene in (self.spec.get('sources') or {}).items():
+            m, h, ch = key.split('|')
+            out[(m, h, int(ch))] = gene
+        return out
+
+    def _restore_from_store(self):
+        """A stored model file restores the stage's state on the first
+        visit: the model, the panel's genes/roles/arcs/gates."""
+        sp = self._storage()
+        spec = analysis_store.read_cellcycle_model(sp)
+        if not spec or 'model' not in spec:
+            return
+        self._adopt_spec(spec)
+        self.panel.ModelStatusLabel.setText(
+            f'model of {spec.get("fitted_at")} restored from the store ({spec.get("n_placed", "?")} cells placed); '
+            f'build counts and Place to refresh')
+
+    def _adopt_spec(self, spec):
+        self.model = CC.CycleModel.from_dict(spec['model'])
+        self.spec = spec
+        self.roles = dict(spec.get('roles') or {})
+        self.names = self._names_from_spec()
+        p = self.panel
+        p.set_gene_config(','.join(f'{m}|{h}|{ch}|{g}|{self.roles.get(g, "-")}' for (m, h, ch), g in self.names.items()))
+        p.set_celltype_names(list(self.mw.current_celltype_list or []))
+        p.set_training_celltypes(spec.get('train_celltypes') or [])
+        if spec.get('alpha'):
+            p.AlphaSpinBox.setValue(float(spec['alpha']))
+        p.set_arcs(spec.get('categories') or [])
+        p.set_gates(spec.get('gates') or {})
+        if spec.get('birth_deg') is not None:
+            p.BirthDegSpinBox.setValue(float(spec['birth_deg']))
+        p.ProxyComboBox.setCurrentIndex(1 if spec.get('proxy') == 'soft' else 0)
+        if spec.get('min_total') is not None:
+            p.MinTotalSpinBox.setValue(int(spec['min_total']))
+
+    def load_model(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self.mw, 'Load cell-cycle model', self._default_dir(), 'JSON (*.json)')
+        if not path:
+            return
+        with open(path) as f:
+            spec = json.load(f)
+        if 'model' not in spec:
+            raise ValueError('not a cell-cycle model file (no "model" entry)')
+        self._adopt_spec(spec)
+        self.placed = self.q = self.X = None
+        self.panel.ModelStatusLabel.setText(f'loaded {os.path.basename(path)} (fitted {spec.get("fitted_at")}, '
+                                            f'experiment {spec.get("experiment")}); Place to write placements')
+        self._log(self.panel.ModelStatusLabel.text())
+
+    def save_model(self):
+        if self.spec is None:
+            raise ValueError('No model to save.')
+        spec = dict(self.spec)
+        spec['categories'], spec['gates'], spec['birth_deg'] = self.panel.arcs(), self.panel.gates(), float(self.panel.BirthDegSpinBox.value())
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.mw, 'Save cell-cycle model', os.path.join(self._default_dir(), f'{spec.get("experiment", "model")}_cellcycle_model.json'), 'JSON (*.json)')
+        if not path:
+            return
+        with open(path, 'w') as f:
+            json.dump(spec, f)
+        self._log(f'model saved to {path}')
+
+    # -- 3. figures ------------------------------------------------------------------
+
+    def _need_model(self, placed=False):
+        if self.model is None:
+            raise ValueError('No model: fit one or load one first (section 2).')
+        if placed and self.placed is None:
+            raise ValueError('No placements in memory: Fit, or Place with the loaded model.')
+        return self.model
+
+    def _name(self):
+        return (self.spec or {}).get('experiment', self._experiment_name())
+
+    def _default_dir(self):
+        try:
+            return paths.figure_dir(self._storage(), 'cellcycle', 0)
+        except Exception:
+            return ''
+
+    def _show(self, fig, name, tables=None, params=None):
+        d = AnalysisFigureDisplayer(title=f'{TAB_TITLE} -- {name}', parent=self.mw)
+        d.set_figure(fig, name=name, tables=tables, pop=None, condition=None,
+                     params=params or {'model': (self.spec or {}).get('fitted_at')},
+                     default_dir=self._default_dir())
+        d.show()
+        d.raise_()
+        self.displayers.append(d)
+
+    def _view(self, label, compute, name, tables_of=None):
+        """Run `compute` -> (fig, tables) in a worker, then show."""
+        self.panel.ModelStatusLabel.setText(f'{label}...')
+
+        def _done(res):
+            fig, tables = res if isinstance(res, tuple) else (res, None)
+            self.panel.ModelStatusLabel.setText(f'{label}: shown')
+            self._show(fig, name, tables=tables)
+
+        def _fail(msg):
+            self.panel.ModelStatusLabel.setText(f'{label} FAILED: {msg}')
+
+        self._start(compute, _done, _fail)
+
+    def _training_mask(self):
+        train = (self.spec or {}).get('train_celltypes') or self.panel.training_celltypes()
+        ct = self.placed['celltype'].to_numpy()
+        return np.isin(ct, train) if train else np.ones(len(ct), bool)
+
+    def view_spectrum(self):
+        m = self._need_model(placed=True)
+        groups, q, totals, name = self.placed['celltype'].to_numpy(), self.q, self.placed['total'].to_numpy(), self._name()
+        self._view('spectrum', lambda: FC.fig_spectrum_and_totals(m, groups, q, totals, title=name), 'spectrum_and_totals')
+
+    def view_profiles(self):
+        m = self._need_model()
+        roles = self.roles or {}
+        rd = {'S indicators': [g for g in m.genes if roles.get(g) == 'S'],
+              'G2/M indicators': [g for g in m.genes if roles.get(g) == 'G2/M'],
+              'unassigned': [g for g in m.genes if roles.get(g) not in ('S', 'G2/M')]}
+        self._view('gene profiles', lambda: FC.fig_profiles_by_role(m, rd, title=f'{self._name()}: fitted gene profiles'), 'profiles_by_role')
+
+    def view_embeddings(self):
+        m = self._need_model(placed=True)
+        k = self._training_mask()
+        X, th, name = self.X[k], self.placed['theta_deg'].to_numpy()[k], self._name()
+
+        def _compute():
+            fig, notes = FC.fig_embeddings(m, name, X, th, title=f'{name}: {int(k.sum())} training cells, coloured by phase')
+            if notes:
+                self.mw.log(f'{TAB_TITLE}: embeddings: ' + '; '.join(notes))
+            return fig, None
+        self._view('embeddings (tSNE/UMAP take a minute)', _compute, 'embeddings')
+
+    def view_verdicts(self):
+        self._need_model(placed=True)
+        placed = self.placed.copy()
+
+        def _compute():
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 4, figsize=(16, 3.6))
+            conds = list(dict.fromkeys(placed['celltype']))
+            pal = FC.gene_palette(len(conds))
+            specs = (('R', 'R (posterior concentration)', (0, 1)), ('fit_z', 'fit_z (vs training cells)', (-8, 4)),
+                     ('bf_ring', 'log BF_ring (ring vs centre)', (-10, 20)), ('radius', 'centre ratio (plane radius)', (0, 3)))
+            for ax, (col, lab, rng) in zip(axes, specs):
+                for cond, c in zip(conds, pal):
+                    v = placed.loc[placed['celltype'] == cond, col].to_numpy(float)
+                    v = v[np.isfinite(v)]
+                    if len(v):
+                        ax.hist(np.clip(v, *rng), bins=40, range=rng, histtype='step', color=c, lw=1.5, density=True,
+                                label=f'{cond or "Unassigned"} (n={len(v)})')
+                ax.set_xlabel(lab)
+                ax.set_yticks([])
+            axes[0].legend(fontsize=7, frameon=False)
+            fig.suptitle(f'{self._name()}: per-cell verdicts by condition')
+            fig.tight_layout()
+            return fig, {'placements': placed}
+        self._view('verdicts', _compute, 'verdicts')
+
+    def view_contribution(self):
+        m = self._need_model()
+        name = self._name()
+
+        def _compute():
+            import matplotlib.pyplot as plt
+            share = m.fisher_share(name)
+            pk, f = m.peak_phase()
+            amp = np.exp(f.max(0) - f.min(0))
+            rows = [{'gene': g, 'role': (self.roles or {}).get(g, '-'), 'fisher_share_%': round(100 * float(share[g]), 1),
+                     'peak_deg': int(round(np.degrees(pk[m.gi[g]]) % 360)), 'amplitude': round(float(amp[m.gi[g]]), 2)}
+                    for g in m.panels[name]]
+            tab = pd.DataFrame(rows).sort_values('fisher_share_%', ascending=False)
+            fig, ax = plt.subplots(figsize=(max(6, 0.45 * len(tab)), 3.6))
+            cols = ['#0072B2' if r == 'S' else '#D55E00' if r == 'G2/M' else '#999999' for r in tab['role']]
+            ax.bar(tab['gene'], tab['fisher_share_%'], color=cols)
+            ax.set_ylabel('Fisher information share (%)')
+            ax.set_title(f'{name}: what each gene contributes to the phase (blue S, orange G2/M, grey other)')
+            ax.tick_params(axis='x', rotation=60)
+            fig.tight_layout()
+            return fig, {'contribution': tab}
+        self._view('contribution', _compute, 'contribution')
+
+    def view_groups(self):
+        m = self._need_model(placed=True)
+        name, X, groups, q = self._name(), self.X, self.placed['celltype'].to_numpy(), self.q
+
+        def _compute():
+            rows = []
+            for c, r in m.group_summary(name, X, groups).items():
+                r.update({'condition': c or 'Unassigned'})
+                rows.append(r)
+            tab = pd.DataFrame(rows)
+            entries = [(name, c or 'Unassigned', q[groups == c]) for c in dict.fromkeys(groups) if (groups == c).sum() >= 5]
+            fig = FC.fig_anchor_spectra(m, entries, [c or 'Unassigned' for c in dict.fromkeys(groups)],
+                                        title=f'{name}: spectrum per condition (mean direction marked)')
+            return fig, {'groups': tab}
+        self._view('group table', _compute, 'groups')
+
+    def view_half_panel(self):
+        m = self._need_model(placed=True)
+        name = self._name()
+        k = self._training_mask()
+        X = self.X[k]
+
+        def _compute():
+            share = m.fisher_share(name)
+            order = sorted(share, key=lambda g: -share[g])
+            halves = {'half A': order[0::2], 'half B': order[1::2]}
+            th, st = FC.subpanel_agreement(m, name, X, halves)
+            fig = FC.fig_subpanel(th, 'half A', 'half B', title=f'{name} training cells: {halves["half A"]} vs {halves["half B"]}')
+            d = np.abs((th['half A'] - th['half B'] + 180) % 360 - 180)
+            s = X.sum(1)
+            edges = np.quantile(s, np.linspace(0, 1, 5))
+            b = np.clip(np.searchsorted(edges, s, side='right') - 1, 0, 3)
+            depth = pd.DataFrame([{'total_count_range': f'{edges[j]:.0f}-{edges[j + 1]:.0f}', 'n': int((b == j).sum()),
+                                   'median_abs_diff_deg': round(float(np.median(d[b == j])), 1) if (b == j).any() else np.nan,
+                                   'frac_within_45': round(float(np.mean(d[b == j] <= 45)), 2) if (b == j).any() else np.nan}
+                                  for j in range(4)])
+            return fig, {'agreement': st, 'by_depth': depth}
+        self._view('half-panel reproducibility', _compute, 'half_panel')
+
+    def view_cycle_time(self):
+        m = self._need_model(placed=True)
+        k = self._training_mask()
+        name, birth = self._name(), float(self.panel.BirthDegSpinBox.value())
+        spectra = {name: m.spectrum(self.q[k])}
+        self._view('cycle time', lambda: (FC.fig_cycle_time(m, spectra, birth_deg=birth,
+                                                             title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg)'), None),
+                   'cycle_time')
+
+    # -- 4. categories -----------------------------------------------------------------
+
+    def propose_arcs(self):
+        m = self._need_model()
+        roles = self.roles or {}
+        pk, _ = m.peak_phase()
+        late = [m.gi[g] for g in m.genes if roles.get(g) == 'G2/M']
+        if not late:
+            raise ValueError('No G2/M roles set, nothing to propose from.')
+        g2m = float(np.degrees(np.angle(np.mean(np.exp(1j * pk[late])))) % 360.0)
+        # non-overlapping by construction: S owns 330 -> 60, G2/M the
+        # 120-degree window around its genes' mean peak (never reaching
+        # back into S), G1 the rest
+        g_start = max(60.0, (g2m - 60.0) % 360.0)
+        g_end = (g2m + 60.0) % 360.0
+        arcs = [{'name': 'S', 'start_deg': 330.0, 'end_deg': 60.0},
+                {'name': 'G2/M', 'start_deg': g_start, 'end_deg': g_end},
+                {'name': 'G1', 'start_deg': g_end, 'end_deg': 330.0}]
+        self.panel.set_arcs(arcs)
+        self.panel.CategoryStatusLabel.setText(f'proposed from the roles: G2/M genes peak at {g2m:.0f} deg. Edit, then Apply.')
+
+    def apply_categories(self):
+        sp = self._storage()
+        spec = analysis_store.read_cellcycle_model(sp)
+        if not spec:
+            if self.spec is None:
+                raise ValueError('No stored model to attach categories to: fit or place first.')
+            spec = dict(self.spec)
+        arcs, gates = self.panel.arcs(), self.panel.gates()
+        if not arcs:
+            raise ValueError('No category arcs (add rows or Propose from roles).')
+        spec['categories'], spec['gates'], spec['birth_deg'] = arcs, gates, float(self.panel.BirthDegSpinBox.value())
+        analysis_store.write_cellcycle_model(sp, spec)
+        self.spec = spec
+        self._refresh_category_counts()
+        self._log('categories and gates stored: ' + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs)
+                  + ' | gates ' + ', '.join(f'{k}={v}' for k, v in gates.items() if v is not None))
+
+    def _refresh_category_counts(self):
+        p = self.panel
+        arcs = p.arcs()
+        if self.placed is None or not arcs:
+            p.CategoryStatusLabel.setText('' if self.placed is None else 'no arcs yet')
+            return
+        cat = CC.assign(self.placed, arcs, p.gates())
+        counts = pd.Series(cat).replace('', 'Unassigned').value_counts()
+        p.CategoryStatusLabel.setText('cells per category: ' + ', '.join(f'{k} {v}' for k, v in counts.items()))

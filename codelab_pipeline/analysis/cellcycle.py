@@ -75,6 +75,57 @@ DEFAULT_K = 2
 DEFAULT_T = 72
 DEFAULT_ALPHA = 100.0
 HOUSEKEEPING = ('GAPDH', 'ACTB', 'TUBB', 'RPLP0', 'HPRT1')
+# Default gene roles for ORIENTATION only (0 = the S genes' mean peak,
+# the G2/M genes' mean peak in the forward half turn): the Seurat /
+# Tirosh 2016 cell-cycle lists, plus the G1/S and mitotic cyclins the
+# synchronised panels carry (CCNE1, CDT1; CCNB1). A panel gene absent
+# from both lists takes no part in orientation; the stage lets the user
+# change every role.
+S_GENES = ('MCM5', 'PCNA', 'TYMS', 'FEN1', 'MCM2', 'MCM4', 'RRM1', 'UNG', 'GINS2', 'MCM6',
+           'CDCA7', 'DTL', 'PRIM1', 'UHRF1', 'CENPU', 'MLF1IP', 'HELLS', 'RFC2', 'RPA2', 'NASP',
+           'RAD51AP1', 'GMNN', 'WDR76', 'SLBP', 'CCNE2', 'UBR7', 'POLD3', 'MSH2', 'ATAD2',
+           'RAD51', 'RRM2', 'CDC45', 'CDC6', 'EXO1', 'TIPIN', 'DSCC1', 'BLM', 'CASP8AP2',
+           'USP1', 'CLSPN', 'POLA1', 'CHAF1B', 'BRIP1', 'E2F8', 'CCNE1', 'CDT1')
+G2M_GENES = ('HMGB2', 'CDK1', 'NUSAP1', 'UBE2C', 'BIRC5', 'TPX2', 'TOP2A', 'NDC80', 'CKS2',
+             'NUF2', 'CKS1B', 'MKI67', 'TMPO', 'CENPF', 'TACC3', 'PIMREG', 'FAM64A', 'SMC4',
+             'CCNB2', 'CKAP2L', 'CKAP2', 'AURKB', 'BUB1', 'KIF11', 'ANP32E', 'TUBB4B', 'GTSE1',
+             'KIF20B', 'HJURP', 'CDCA3', 'JPT1', 'HN1', 'CDC20', 'TTK', 'CDC25C', 'KIF2C',
+             'RANGAP1', 'NCAPD2', 'DLGAP5', 'CDCA2', 'CDCA8', 'ECT2', 'KIF23', 'HMMR', 'AURKA',
+             'PSRC1', 'ANLN', 'LBR', 'CKAP5', 'CENPE', 'CTCF', 'NEK2', 'G2E3', 'GAS2L3', 'CBX5',
+             'CENPA', 'CCNB1')
+ROLES = ('-', 'S', 'G2/M', 'housekeeping')
+
+
+def default_role(gene):
+    """The role a gene name gets before the user touches it."""
+    g = str(gene).upper()
+    if g in HOUSEKEEPING:
+        return 'housekeeping'
+    if g in S_GENES:
+        return 'S'
+    if g in G2M_GENES:
+        return 'G2/M'
+    return '-'
+
+
+def gene_from_readout(name):
+    """'MCM2_mRNA' / 'CCNB1_exon' -> 'MCM2' / 'CCNB1'; a nascent, intron,
+    repeat or toe round keeps its full name so it never silently counts
+    as the gene (those rounds are not usable as counts -- design 3b)."""
+    name = str(name or '')
+    if name.startswith(('Rep_', 'Toe_')):
+        return name
+    for suffix in ('_mRNA', '_exon'):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def countable_round(name):
+    """Whether a readout name looks like an mRNA/exon round the stage
+    should count by default."""
+    name = str(name or '')
+    return name.endswith(('_mRNA', '_exon')) and not name.startswith(('Rep_', 'Toe_'))
 
 
 # -- small pieces -----------------------------------------------------------

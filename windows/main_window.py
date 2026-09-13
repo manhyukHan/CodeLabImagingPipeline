@@ -1917,6 +1917,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # headless toolbox, deliberately outside this class.
         from windows.analysis_wiring import AnalysisWiring
         self.analysis = AnalysisWiring(self)
+        # The Cell Cycle tab, the same shape: windows/cellcycle_wiring.py
+        # over codelab_pipeline/analysis/cellcycle.
+        from windows.cellcycle_wiring import CellCycleWiring
+        self.cellcycle = CellCycleWiring(self)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
         # The engine combo was connected to NOTHING, so selecting v2 left
         # every control it ignores enabled and labelled in pixels. Every
@@ -2618,6 +2622,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # the Analysis tab's source list follows the parsed layouts
         if hasattr(self, 'analysis'):
             self.analysis.populate_sources()
+            self.cellcycle.populate_sources()
 
         if root:
             dp = os.path.abspath(root)
@@ -14144,6 +14149,16 @@ One PNG PER MODALITY: each modality has its own reference and its
             # a run could not say which engine produced its spots.
             'engine': ('localize_3d_displayer', 'EngineComboBox'),
         },
+        'cellcycle': {
+            'fov_list': ('CellCyclePanel', 'FovListLineEdit'),
+            'proxy': ('CellCyclePanel', 'ProxyComboBox'),
+            'min_total': ('CellCyclePanel', 'MinTotalSpinBox'),
+            'alpha': ('CellCyclePanel', 'AlphaSpinBox'),
+            'birth_deg': ('CellCyclePanel', 'BirthDegSpinBox'),
+            # 'genes' and 'training_celltypes' are dynamic (list-shaped),
+            # handled in the capture/apply pair like chromatin_tracing's
+            # checked hybes
+        },
         'celltype': {
             'barcode_hybe': ('CelltypeDeterminationPanel', 'BarcodeHybeComboBox'),
             'barcode_channel': ('CelltypeDeterminationPanel', 'BarcodeChannelComboBox'),
@@ -14326,6 +14341,10 @@ One PNG PER MODALITY: each modality has its own reference and its
             out['cross_modal_alignment'][f'reference_hybe_{name}'] = hybe
         out['chromatin_tracing']['hybes'] = ','.join(
             f'{folder}|{modality}' for folder, modality in self.ui.ChromatinTracingPanel.checked_hybes())
+        # the Cell Cycle panel's genes (source -> gene name -> role) and
+        # training celltypes: the experiment's panel design, list-shaped
+        out['cellcycle']['genes'] = self.ui.CellCyclePanel.gene_config()
+        out['cellcycle']['training_celltypes'] = ','.join(self.ui.CellCyclePanel.training_celltypes())
         # the ACTIVATED readout-channel choice, not the combo's transient
         out['chromatin_tracing']['readout_channel'] = \
             self.ui.ChromatinTracingPanel.active_readout_channel()
@@ -14416,6 +14435,14 @@ One PNG PER MODALITY: each modality has its own reference and its
                     continue
                 if section == 'chromatin_tracing' and param == 'readout_channel':
                     self.ui.ChromatinTracingPanel.set_active_readout_channel(value)
+                    continue
+                if section == 'cellcycle' and param == 'genes':
+                    self.ui.CellCyclePanel.set_gene_config(value)
+                    continue
+                if section == 'cellcycle' and param == 'training_celltypes':
+                    self.ui.CellCyclePanel.set_celltype_names(self.current_celltype_list)
+                    self.ui.CellCyclePanel.set_training_celltypes(
+                        [v.strip() for v in str(value).split(',') if v.strip()])
                     continue
                 if section == 'analysis_population' and param == 'sources':
                     wanted = {tuple(x.split('|', 2)) for x in value.split(',')
