@@ -330,7 +330,13 @@ class CellCycleWiring(QtCore.QObject):
             self._log('no S and G2/M roles set: the circle keeps an arbitrary orientation and the bridges choose the reflection')
         roles, names_map, metric, min_total = dict(self.roles), dict(self.names), p.proxy_metric(), p.MinTotalSpinBox.value()
         gates, birth = p.gates(), float(p.BirthDegSpinBox.value())
-        origin_division = p.OriginComboBox.currentIndex() == 0
+        origin_choice = int(p.OriginComboBox.currentIndex())        # 0 DAPI, 1 total drop, 2 S peak
+        origin_division = origin_choice in (0, 1)
+        dapi_src = p.dapi_source() if origin_choice == 0 else None
+        if origin_choice == 0 and dapi_src is None:
+            self._log('origin: no DAPI source in the layouts -- falling back to the panel-total drop')
+        fov_of = np.array([int(f) for f, _c in keys])
+        cell_of = np.array([int(c) for _f, c in keys])
         shares = p.phase_shares()
         p.FitPushButton.setEnabled(False)
         p.ModelStatusLabel.setText(f'fitting on {int(k.sum())} training cells' + (f' with {len(bridges)} bridge(s)' if bridges else '') + '...')
@@ -341,8 +347,33 @@ class CellCycleWiring(QtCore.QObject):
                 m.orient(early, late)
             origin = {'mode': 'S mean peak'}
             birth_used = birth
-            if origin_division:
-                # the origin at division: the roles have fixed the
+            dapi_tab = None
+            done = False
+            if dapi_src is not None:
+                # the origin at division, read directly: the DNA content of
+                # the training cells (DAPI inside the mask, per FOV) halves
+                # at division; the same step detector as the panel total's
+                th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
+                tr = pd.DataFrame({'fov': fov_of[k], 'cell': cell_of[k], 'theta_deg': th_tr})
+                dapi_tab, _fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
+                merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
+                dna = merged['sum_above_bg'].to_numpy(float).copy()
+                fv = merged['fov'].to_numpy()
+                for f_ in np.unique(fv):
+                    kk = (fv == f_) & np.isfinite(dna)
+                    med = np.median(dna[kk]) if kk.sum() >= 5 else np.nan
+                    dna[fv == f_] = dna[fv == f_] / med if np.isfinite(med) and med > 0 else np.nan
+                angle, factor = CC.total_drop_angle(merged['theta_deg'].to_numpy(), dna)
+                if angle is not None and factor >= 1.3:
+                    m.rotate_to_zero(angle)
+                    origin = {'mode': 'division (DAPI halving)', 'angle_before_deg': angle, 'drop_factor': factor,
+                              'dapi_source': list(dapi_src)}
+                    birth_used = 0.0
+                    done = True
+                else:
+                    origin = {'mode': 'DAPI showed no halving', 'drop_factor': factor}
+            if origin_division and not done:
+                # the panel total's drop stands in: the roles have fixed the
                 # direction, so the steepest drop of the training cells'
                 # panel total is the one event every panel shares
                 th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
@@ -354,7 +385,8 @@ class CellCycleWiring(QtCore.QObject):
                 # same 120-150 deg, so that gentler drop IS division too
                 if angle is not None and factor >= 1.8:
                     m.rotate_to_zero(angle)
-                    origin = {'mode': 'division (total drop)', 'angle_before_deg': angle, 'drop_factor': factor}
+                    origin = {'mode': 'division (total drop)' + (' after DAPI showed no halving' if dapi_src is not None else ''),
+                              'angle_before_deg': angle, 'drop_factor': factor}
                     birth_used = 0.0
                 else:
                     origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
@@ -366,11 +398,24 @@ class CellCycleWiring(QtCore.QObject):
             # division frame put half the cells in G2/M). The proposal
             # is the educated guess from cycle time; DAPI or the roles
             # can replace it, and Apply stores the final choice.
-            try:
-                w_train = m.spectrum(m.posterior(name, X[k]))
-                arcs = FC.propose_arcs_from_time(w_train, m.grid, birth_used, shares=shares)
-            except Exception:                                   # noqa: BLE001
-                arcs = []
+            arcs, arcs_from = [], ''
+            if dapi_tab is not None:
+                try:
+                    th_new = np.degrees(placed['theta'][k]) % 360.0
+                    tr2 = pd.DataFrame({'fov': fov_of[k], 'cell': cell_of[k], 'theta_deg': th_new})
+                    merged2 = tr2.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
+                    arcs, _info = FC.propose_arcs_from_dapi(merged2['theta_deg'].to_numpy(), merged2['sum_above_bg'].to_numpy(),
+                                                             birth_deg=birth_used, fov=merged2['fov'].to_numpy())
+                    arcs_from = 'DAPI'
+                except Exception as exc:                        # noqa: BLE001
+                    self.mw.log(f'{TAB_TITLE}: arcs from DAPI not proposed: {type(exc).__name__}: {exc}')
+            if not arcs:
+                try:
+                    w_train = m.spectrum(m.posterior(name, X[k]))
+                    arcs = FC.propose_arcs_from_time(w_train, m.grid, birth_used, shares=shares)
+                    arcs_from = 'cycle time'
+                except Exception:                               # noqa: BLE001
+                    arcs = []
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
                     'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
@@ -380,7 +425,7 @@ class CellCycleWiring(QtCore.QObject):
                     'align_report': {f'{a}->{b}': {kk: vv for kk, vv in r.items() if kk != 'residual_deg'}
                                      for (a, b), r in m.align_report.items()},
                     'fitted_at': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'origin': origin,
+                    'origin': origin, 'categories_from': arcs_from,
                     'categories': arcs, 'gates': gates, 'birth_deg': birth_used}
             self._persist(sp, spec, placed, keys, X)
             return m, placed, spec
@@ -399,6 +444,7 @@ class CellCycleWiring(QtCore.QObject):
             p.ModelStatusLabel.setText(
                 f'fitted {spec["fitted_at"]}: {spec["n_train"]} training cells, {spec["n_placed"]} placed over '
                 f'{len(fovs)} FOVs; alpha {alpha:g}; evidence {m.history[-1]:.3f}; origin {otxt}'
+                + (f'; categories proposed from {spec["categories_from"]}' if spec.get('categories_from') else '')
                 + (f'; bridges {rep}' if rep else ''))
             self._log(p.ModelStatusLabel.text())
 

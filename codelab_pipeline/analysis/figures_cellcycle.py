@@ -41,7 +41,7 @@ from matplotlib import cm, colors, transforms                    # noqa: E402
 
 from codelab_pipeline.analysis import cellcycle as CC            # noqa: E402
 
-PHASE_CMAP = 'rainbow'
+PHASE_CMAP = 'rainbow_r'      # 0 deg red -> 360 deg violet (user: the forward rainbow read backwards)
 PHASE_NORM = colors.Normalize(vmin=0.0, vmax=360.0)
 PHASE_TICKS = (0, 60, 120, 180, 240, 300, 360)
 # Okabe-Ito, then tab20 for panels beyond eight genes

@@ -132,10 +132,13 @@ class CellCyclePanelUI(object):
         alphaLayout.addWidget(self.AlphaHeldOutPushButton)
         mform.addRow('Dispersion alpha:', alphaRow)
         self.OriginComboBox = QtWidgets.QComboBox()
-        self.OriginComboBox.addItems(['division: the steepest drop of the panel total', 'the S genes\' mean peak'])
-        self.OriginComboBox.setToolTip('Where 0 deg sits. The roles fix the direction and the reflection either way; '
-                                       'division is measured on the training cells (mRNA halves, G2/M transcripts go), '
-                                       'so 0 deg = birth and the cycle-time clock starts there.')
+        self.OriginComboBox.addItems(['division: where the DAPI content halves (falls back to the panel-total drop)',
+                                      'division: the steepest drop of the panel total',
+                                      'the S genes\' mean peak'])
+        self.OriginComboBox.setToolTip('Where 0 deg sits. The roles fix the direction and the reflection either way. '
+                                       'Division is measured on the training cells: the DNA content halving (DAPI '
+                                       'source below, section 3) is the direct marker; the panel-total drop stands in '
+                                       'when there is no DAPI; 0 deg = birth and the cycle-time clock starts there.')
         mform.addRow('Origin (0 deg):', self.OriginComboBox)
         modelLayout.addLayout(mform)
         fitRow = QtWidgets.QWidget()
