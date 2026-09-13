@@ -950,21 +950,54 @@ def gene_table(expression, source_names, metric='n_spots'):
     return table, celltype
 
 
-def select_alpha(X, alphas=(10, 30, 100, 300, None), K=DEFAULT_K, folds=3, seed=0, **kw):
-    """Held-out mean evidence per alpha for one cycling population."""
+def _alpha_fold(item):
+    """One (alpha, fold) of select_alpha -- module-level for pmap."""
+    X, train, test, a, K, kw = item
+    m = CycleModel(K=K, **kw).fit([Dataset('cv', X[train], [str(i) for i in range(X.shape[1])], alpha=a)])
+    return float(m.evidence('cv', X[test], prior='uniform').mean())
+
+
+def select_alpha(X, alphas=(10, 30, 100, 300, None), K=DEFAULT_K, folds=3, seed=0, jobs=None,
+                 n_iter=20, **kw):
+    """Held-out mean evidence per alpha for one cycling population:
+    {alpha: score}, None = multinomial.
+
+    Every (alpha, fold) is an independent single fit, so they run
+    through ONE pool (codelab_pipeline.parallel.pmap, kind='cpu'); a
+    cross-validation fit stops at n_iter=20 with no DM polish -- the
+    ranking of alphas was the same at 20 and 40 iterations on JP_002
+    and the full budget made the chooser fifteen times slower than
+    the fit it serves. jobs=1 runs serially (tests).
+    """
+    from codelab_pipeline import parallel
     X = np.asarray(X, float)
     rng = np.random.default_rng(seed)
     parts = np.array_split(rng.permutation(len(X)), folds)
-    out = {}
+    kw = dict(kw)
+    kw.setdefault('polish', 0)
+    items, keys = [], []
     for a in alphas:
-        scores = []
         for f in range(folds):
             test = parts[f]
             train = np.concatenate([parts[j] for j in range(folds) if j != f])
-            m = CycleModel(K=K, **kw).fit([Dataset('cv', X[train], [str(i) for i in range(X.shape[1])], alpha=a)])
-            scores.append(float(m.evidence('cv', X[test], prior='uniform').mean()))
-        out[a] = float(np.mean(scores))
-    return out
+            items.append((X, train, test, a, K, kw))
+            keys.append(a)
+    # n_iter rides on the fit call, not the model: pass it through kw
+    # by wrapping fit's iteration budget
+    res = parallel.pmap(_alpha_fold_iter, [(it, n_iter) for it in items], kind='cpu', jobs=jobs)
+    out = {}
+    for a, r in zip(keys, res):
+        if isinstance(r, parallel.Failure):
+            raise RuntimeError(f'select_alpha: alpha {a}: {r}')
+        out.setdefault(a, []).append(r)
+    return {a: float(np.mean(v)) for a, v in out.items()}
+
+
+def _alpha_fold_iter(item):
+    (X, train, test, a, K, kw), n_iter = item
+    m = CycleModel(K=K, **kw)
+    m.fit([Dataset('cv', X[train], [str(i) for i in range(X.shape[1])], alpha=a)], n_iter=n_iter)
+    return float(m.evidence('cv', X[test], prior='uniform').mean())
 
 
 def backward_elimination(model, name, X, groups=None, train_group=None, anchors=('Hydroxyurea', 'Nocodazole')):
