@@ -776,7 +776,9 @@ def fig_gallery(rows, size=64, title=None, outline='#E69F00'):
             if mask is not None and mask.any():
                 ax.contour(mask.astype(float), levels=[0.5], colors=[outline], linewidths=0.6)
         axes[i][0].set_ylabel(label, fontsize=8, rotation=0, ha='right', va='center', labelpad=4)
-    fig.subplots_adjust(left=0.16, right=0.995, bottom=0.01, top=0.93 if title else 0.99, wspace=0.04, hspace=0.06)
     if title:
-        suptitle(fig, title)
+        fig.suptitle(wrap_title(title, 110), y=0.995, va='top', fontsize=10)
+    # a tall figure: the title band is a fixed few percent, not the
+    # generic suptitle band (which left a blank strip above the tiles)
+    fig.subplots_adjust(left=0.16, right=0.995, bottom=0.01, top=0.965 if title else 0.995, wspace=0.04, hspace=0.06)
     return fig
