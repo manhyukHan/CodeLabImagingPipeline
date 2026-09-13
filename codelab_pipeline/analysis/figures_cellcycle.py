@@ -110,26 +110,29 @@ def phase_axis(ax, which='x', marks=None):
     """Degree ticks on a 0..360 phase axis, and the role marks as a
     second row of labels under (or beside) the ticks."""
     ticks = list(PHASE_TICKS)
+    # the role marks go RIGHT UNDER the tick labels and the axis label
+    # under them (the first draft parked the marks below the label, in
+    # a band of their own -- user screenshot)
     if which == 'x':
         ax.set_xlim(0, 360)
         ax.set_xticks(ticks)
         ax.set_xticklabels([f'{t:d}' for t in ticks])
-        ax.set_xlabel('phase (deg)')
+        ax.set_xlabel('phase (deg)', labelpad=(14 if marks else 4))
         if marks:
             tr = transforms.blended_transform_factory(ax.transData, ax.transAxes)
             for name, deg in marks.items():
-                ax.text(float(deg) % 360.0, -0.30, name, transform=tr, ha='center', va='top',
-                        fontsize=8, color='0.35', clip_on=False)
+                ax.annotate(name, (float(deg) % 360.0, 0), xycoords=tr, xytext=(0, -17), textcoords='offset points',
+                            ha='center', va='top', fontsize=8, color='0.35', annotation_clip=False)
     else:
         ax.set_ylim(0, 360)
         ax.set_yticks(ticks)
         ax.set_yticklabels([f'{t:d}' for t in ticks])
-        ax.set_ylabel('phase (deg)')
+        ax.set_ylabel('phase (deg)', labelpad=(28 if marks else 4))
         if marks:
             tr = transforms.blended_transform_factory(ax.transAxes, ax.transData)
             for name, deg in marks.items():
-                ax.text(-0.16, float(deg) % 360.0, name, transform=tr, ha='right', va='center',
-                        fontsize=8, color='0.35', clip_on=False)
+                ax.annotate(name, (0, float(deg) % 360.0), xycoords=tr, xytext=(-36, 0), textcoords='offset points',
+                            ha='right', va='center', fontsize=8, color='0.35', annotation_clip=False)
 
 
 def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None, host=None):
@@ -151,8 +154,8 @@ def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None, host=N
     if marks:
         tr = transforms.blended_transform_factory(cax.transData, cax.transAxes)
         for name, deg in marks.items():
-            cax.text(float(deg) % 360.0, -1.9, name, transform=tr, ha='center', va='top',
-                     fontsize=8, color='0.35', clip_on=False)
+            cax.annotate(name, (float(deg) % 360.0, 0), xycoords=tr, xytext=(0, -17), textcoords='offset points',
+                         ha='center', va='top', fontsize=8, color='0.35', annotation_clip=False)
     return cb
 
 
@@ -267,8 +270,12 @@ def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=1500, tsne=True,
         ax.set_xticks([])
         ax.set_yticks([])
 
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.27, top=0.82, wspace=0.12)
     phase_colorbar(fig, list(axes), marks=marks)
-    return finish(fig, title or f'{name}: {len(idx)} cells, phase from the model'), notes
+    finish(fig)
+    if title:
+        fig.suptitle(wrap_title(title, max(30, int(fig.get_figwidth() * 11))), y=0.995, va='top', fontsize=11)
+    return fig, notes
 
 
 # -- gene profiles by biological role -----------------------------------------
@@ -396,7 +403,8 @@ def fig_anchor_spectra(model, entries, conditions, title=None, marks=None):
         w = model.spectrum(q)
         c = pal[conditions.index(cond)]
         ls = styles[exps.index(exp) % len(styles)]
-        ax.plot(deg[order], w[order] * len(w) / 360.0, color=c, ls=ls, lw=1.7, label=f'{exp} {cond} (n={len(q)})')
+        lab = f'{cond} (n={len(q)})' if len(exps) == 1 else f'{exp} {cond} (n={len(q)})'
+        ax.plot(deg[order], w[order] * len(w) / 360.0, color=c, ls=ls, lw=1.7, label=lab)
         mean = np.degrees(np.angle((q @ np.exp(1j * model.grid)).mean())) % 360.0
         ax.axvline(mean, color=c, ls=ls, lw=0.9, alpha=0.7)
     ax.set_ylabel('cell density (per degree x 360)')
@@ -552,7 +560,7 @@ def fig_cycle_time(model, spectra, birth_deg=0.0, training=None, groups_theta=No
         ax2.plot([dg], [tau_u(dg)], 'o', color='#D55E00', ms=6)
         ax2.annotate(lab, (dg, tau_u(dg)), textcoords='offset points', xytext=(5, -10), fontsize=8, color='#D55E00')
     ax2.set_ylabel('cycle time fraction tau')
-    ax2.set_title(wrap_title(f'angle -> time from the {training} spectrum (birth at {birth_deg:.0f} deg)', 44), fontsize=10)
+    ax2.set_title(f'angle -> time (birth at {birth_deg:.0f} deg)', fontsize=10)
     ax2.legend(fontsize=8, frameon=False)
     phase_axis(ax2, marks=marks)
 
@@ -573,8 +581,8 @@ def fig_cycle_time(model, spectra, birth_deg=0.0, training=None, groups_theta=No
         ax4.set_title('conditions over cycle time', fontsize=10)
         ax4.set_xlim(0, 1)
         ax4.legend(fontsize=8, frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.92 if title else 1))
-    return finish(fig, title)
+    fig.tight_layout(rect=(0, 0, 1, 0.9 if title else 1))
+    return finish(fig, (title + f' (clock: the {training} spectrum)') if title else None)
 
 
 # -- the FOV overlay ----------------------------------------------------------------
@@ -614,18 +622,22 @@ def fig_fov_overlay(mip, cells, values, mode='phase', categories=None, title=Non
             col = (r, g, b, 0.55) if v else (0.5, 0.5, 0.5, 0.3)
             n_drawn += bool(v)
         rgba[ys, xs] = col
-    fig, ax = plt.subplots(figsize=(8.5, 9.0))
+    fig, ax = plt.subplots(figsize=(8.5, 9.4))
     ax.imshow(mip, cmap='gray', vmin=lo, vmax=hi, interpolation='nearest')
     ax.imshow(rgba, interpolation='nearest')
     ax.set_xticks([])
     ax.set_yticks([])
+    fig.subplots_adjust(left=0.03, right=0.97, bottom=0.14 if mode == 'phase' else 0.03, top=0.93)
     if mode == 'phase':
         phase_colorbar(fig, [ax], marks=marks)
     else:
         from matplotlib.patches import Patch
         handles = [Patch(color=lut[c], label=c) for c in cats] + [Patch(color=(0.5, 0.5, 0.5), label='Unassigned')]
         ax.legend(handles=handles, loc='upper right', fontsize=8, frameon=True)
-    return finish(fig, title or f'{n_drawn} cells coloured by {mode}')
+    finish(fig)
+    t = title or f'{n_drawn} cells coloured by {mode}'
+    fig.suptitle(wrap_title(t, max(30, int(fig.get_figwidth() * 11))), y=0.995, va='top', fontsize=11)
+    return fig
 
 
 # -- the Analysis tab's views under a gate -------------------------------------------
@@ -792,3 +804,104 @@ def fig_gallery(rows, size=64, title=None, outline='#E69F00'):
     # generic suptitle band (which left a blank strip above the tiles)
     fig.subplots_adjust(left=0.16, right=0.995, bottom=0.01, top=0.965 if title else 0.995, wspace=0.04, hspace=0.06)
     return fig
+
+
+def propose_arcs_from_profiles(model, roles, birth_deg=0.0):
+    """Category arcs from the role profiles: a phase begins where the
+    mean fold-profile of its indicator genes rises through its cycle
+    mean (1.0) on the way to its peak -- S at the S genes' rise, G2/M at
+    the G2/M genes' rise -- and G1 begins at birth (the origin when it
+    is division). Returns [{'name', 'start_deg', 'end_deg'}] in the
+    order G1, S, G2/M around the circle from birth."""
+    deg = np.degrees(model.grid) % 360.0
+    order = np.argsort(deg)
+    d = deg[order]
+    fc = fold_profiles(model)[order]
+
+    def rise_before_peak(genes):
+        idx = [model.gi[g] for g in genes if g in model.gi]
+        if not idx:
+            return None
+        prof = fc[:, idx].mean(1)
+        k = int(np.argmax(prof))
+        # walk back from the peak to the last grid point at or below 1
+        j = k
+        for _ in range(len(d)):
+            jj = (j - 1) % len(d)
+            if prof[jj] <= 1.0:
+                return float(d[j])
+            j = jj
+        return float(d[k])
+    s_start = rise_before_peak([g for g, r in (roles or {}).items() if r == 'S'])
+    g_start = rise_before_peak([g for g, r in (roles or {}).items() if r == 'G2/M'])
+    if s_start is None or g_start is None:
+        raise ValueError('propose from roles needs at least one S and one G2/M gene in the model')
+    b = float(birth_deg) % 360.0
+    return [{'name': 'G1', 'start_deg': b, 'end_deg': s_start % 360.0},
+            {'name': 'S', 'start_deg': s_start % 360.0, 'end_deg': g_start % 360.0},
+            {'name': 'G2/M', 'start_deg': g_start % 360.0, 'end_deg': b}]
+
+
+def dna_curve(theta_deg, dna_norm, n_bins=36, smooth=1):
+    """(bin centres, circularly smoothed median DNA content per bin)."""
+    th = np.asarray(theta_deg, float) % 360.0
+    d = np.asarray(dna_norm, float)
+    ok = np.isfinite(th) & np.isfinite(d)
+    edges = np.linspace(0.0, 360.0, n_bins + 1)
+    b = np.clip(np.digitize(th[ok], edges) - 1, 0, n_bins - 1)
+    med = np.array([np.median(d[ok][b == k]) if (b == k).sum() >= 5 else np.nan for k in range(n_bins)])
+    if np.isnan(med).any():
+        good = np.where(np.isfinite(med))[0]
+        x = np.concatenate([good - n_bins, good, good + n_bins])
+        med = np.interp(np.arange(n_bins), x, np.tile(med[good], 3))
+    if smooth > 0:
+        k = np.ones(2 * smooth + 1) / (2 * smooth + 1)
+        med = np.convolve(np.concatenate([med[-smooth:], med, med[:smooth]]), k, mode='valid')
+    return 0.5 * (edges[:-1] + edges[1:]), med
+
+
+def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, plateau=0.85):
+    """Category arcs from the measured DNA content of the training cells:
+    from birth the content is flat (G1, 2N) until it starts to RISE
+    (S begins where the smoothed median first exceeds `rise` x the G1
+    level), S ends where it reaches `plateau` of the way from the G1
+    level to the maximum (G2/M), and G2/M ends at birth. dna: the DAPI
+    sum per cell, divided per FOV when fov is given. Returns (arcs,
+    info) with the levels used; raises ValueError when no rise is
+    found (a flat curve says nothing)."""
+    th = np.asarray(theta_deg, float) % 360.0
+    d = np.asarray(dna, float).copy()
+    if fov is not None:
+        f = np.asarray(fov)
+        for fv in np.unique(f):
+            k = (f == fv) & np.isfinite(d)
+            med = np.median(d[k]) if k.sum() >= 5 else np.nan
+            d[f == fv] = d[f == fv] / med if np.isfinite(med) and med > 0 else np.nan
+    # unsmoothed bins: a box across the division discontinuity smears the
+    # 4N plateau into the first 2N bins and reads as a rise
+    cen, med = dna_curve(th, d, smooth=0)
+    n = len(cen)
+    # walk from the first bin that lies wholly AFTER birth: the bin
+    # straddling birth mixes the plateau before division with the 2N
+    # level after it and read as a rise on the synthetic check
+    width = 360.0 / n
+    start = int(np.searchsorted(cen - width / 2, birth_deg % 360.0)) % n
+    order = [(start + i) % n for i in range(n)]
+    curve = med[order]
+    g1_level = float(np.median(curve[:max(3, n // 6)]))          # the first sixth of the cycle after birth
+    top = float(np.nanmax(curve))
+    if top < g1_level * rise:
+        raise ValueError(f'the DNA content never rises above {rise:.2f} x its post-birth level ({g1_level:.2f} -> {top:.2f}); '
+                         'no S boundary can be read from DAPI')
+    # a SUSTAINED rise: two consecutive bins above the threshold
+    i_s = next(i for i in range(n - 1) if curve[i] >= g1_level * rise and curve[i + 1] >= g1_level * rise)
+    target = g1_level + plateau * (top - g1_level)
+    i_g = next((i for i in range(i_s, n) if curve[i] >= target), n - 1)
+    half = 180.0 / n
+    s_start = (cen[order[i_s]] - half) % 360.0
+    g_start = (cen[order[i_g]] - half) % 360.0
+    b = float(birth_deg) % 360.0
+    arcs = [{'name': 'G1', 'start_deg': b, 'end_deg': s_start},
+            {'name': 'S', 'start_deg': s_start, 'end_deg': g_start},
+            {'name': 'G2/M', 'start_deg': g_start, 'end_deg': b}]
+    return arcs, {'g1_level': g1_level, 'top': top, 'ratio': top / g1_level if g1_level > 0 else float('nan')}

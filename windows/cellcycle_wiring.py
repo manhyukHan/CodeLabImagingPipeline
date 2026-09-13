@@ -75,6 +75,7 @@ class CellCycleWiring(QtCore.QObject):
         p.FovOverlayPushButton.clicked.connect(lambda: self._guard(self.view_fov_overlay))
         p.DapiPushButton.clicked.connect(lambda: self._guard(self.view_dapi))
         p.DapiGalleryPushButton.clicked.connect(lambda: self._guard(self.view_dapi_gallery))
+        p.ProposeFromDapiPushButton.clicked.connect(lambda: self._guard(self.propose_arcs_from_dapi))
         p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
         mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
 
@@ -328,9 +329,9 @@ class CellCycleWiring(QtCore.QObject):
         if orient_by is None:
             self._log('no S and G2/M roles set: the circle keeps an arbitrary orientation and the bridges choose the reflection')
         roles, names_map, metric, min_total = dict(self.roles), dict(self.names), p.proxy_metric(), p.MinTotalSpinBox.value()
-        previous = analysis_store.read_cellcycle_model(sp) or {}
-        arcs, gates, birth = p.arcs() or previous.get('categories', []), p.gates(), float(p.BirthDegSpinBox.value())
+        gates, birth = p.gates(), float(p.BirthDegSpinBox.value())
         origin_division = p.OriginComboBox.currentIndex() == 0
+        shares = p.phase_shares()
         p.FitPushButton.setEnabled(False)
         p.ModelStatusLabel.setText(f'fitting on {int(k.sum())} training cells' + (f' with {len(bridges)} bridge(s)' if bridges else '') + '...')
 
@@ -358,6 +359,18 @@ class CellCycleWiring(QtCore.QObject):
                 else:
                     origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
             placed = m.place(name, X)
+            # the arcs are RE-PROPOSED after every fit, never carried over:
+            # a fit can move the frame (the origin, a bridge), and arcs
+            # drawn in the old frame would silently name the wrong cells
+            # (seen: the time arcs of an S-peak frame applied to a
+            # division frame put half the cells in G2/M). The proposal
+            # is the educated guess from cycle time; DAPI or the roles
+            # can replace it, and Apply stores the final choice.
+            try:
+                w_train = m.spectrum(m.posterior(name, X[k]))
+                arcs = FC.propose_arcs_from_time(w_train, m.grid, birth_used, shares=shares)
+            except Exception:                                   # noqa: BLE001
+                arcs = []
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
                     'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
@@ -481,8 +494,8 @@ class CellCycleWiring(QtCore.QObject):
             return
         self._adopt_spec(spec)
         self.panel.ModelStatusLabel.setText(
-            f'model of {spec.get("fitted_at")} restored from the store ({spec.get("n_placed", "?")} cells placed); '
-            f'build counts and Place to refresh')
+            f'model of {spec.get("fitted_at")} restored from the store ({spec.get("n_placed", "?")} cells placed; '
+            f'origin {(spec.get("origin") or {}).get("mode", "S mean peak")}); build counts and Place to refresh')
 
     def _adopt_spec(self, spec):
         self.model = CC.CycleModel.from_dict(spec['model'])
@@ -514,7 +527,9 @@ class CellCycleWiring(QtCore.QObject):
         self._adopt_spec(spec)
         self.placed = self.q = self.X = None
         self.panel.ModelStatusLabel.setText(f'loaded {os.path.basename(path)} (fitted {spec.get("fitted_at")}, '
-                                            f'experiment {spec.get("experiment")}); Place to write placements')
+                                            f'experiment {spec.get("experiment")}, origin '
+                                            f'{(spec.get("origin") or {}).get("mode", "S mean peak")}); '
+                                            f'the frame travels with the model -- Place to write placements')
         self._log(self.panel.ModelStatusLabel.text())
 
     def save_model(self):
@@ -724,8 +739,44 @@ class CellCycleWiring(QtCore.QObject):
         marks = self._marks()
         self._view('cycle time', lambda: (FC.fig_cycle_time(
             m, spectra, birth_deg=birth, training=training, groups_theta=groups_theta, marks=marks,
-            title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg; clock = the training spectrum)'), None),
+            title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg)'), None),
             'cycle_time')
+
+    def propose_arcs_from_dapi(self):
+        """Arcs from the measured DNA content of the training cells."""
+        p = self.panel
+        self._need_model(placed=True)
+        src = p.dapi_source()
+        if src is None:
+            raise ValueError('No DAPI source: parse the layouts first, then pick the DAPI round.')
+        sp = self._storage()
+        k = self._training_mask()
+        placed = self.placed[k]
+        fovs = sorted(set(int(f) for f in placed['fov']))
+        birth = float(p.BirthDegSpinBox.value())
+        p.ProposeFromDapiPushButton.setEnabled(False)
+        p.CategoryStatusLabel.setText(f'DAPI over {len(fovs)} FOVs for the arcs...')
+
+        def _compute():
+            tab, _fails = CC.mask_intensity_table(sp, fovs, src)
+            merged = placed.merge(tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
+            return FC.propose_arcs_from_dapi(merged['theta_deg'].to_numpy(), merged['sum_above_bg'].to_numpy(),
+                                             birth_deg=birth, fov=merged['fov'].to_numpy())
+
+        def _done(res):
+            p.ProposeFromDapiPushButton.setEnabled(True)
+            arcs, info = res
+            p.set_arcs(arcs)
+            p.CategoryStatusLabel.setText(
+                f'proposed from DAPI (G1 level {info["g1_level"]:.2f}, plateau {info["top"]:.2f}, ratio {info["ratio"]:.2f}): '
+                + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs) + '. Edit, then Apply.')
+            self._refresh_category_counts()
+
+        def _fail(msg):
+            p.ProposeFromDapiPushButton.setEnabled(True)
+            p.CategoryStatusLabel.setText(f'DAPI proposal FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
 
     def propose_arcs_from_time(self):
         m = self._need_model(placed=True)
@@ -879,23 +930,17 @@ class CellCycleWiring(QtCore.QObject):
     # -- 4. categories -----------------------------------------------------------------
 
     def propose_arcs(self):
+        """A phase begins where its indicator genes' mean profile rises
+        through the cycle mean; G1 begins at birth."""
         m = self._need_model()
-        roles = self.roles or {}
-        pk, _ = m.peak_phase()
-        late = [m.gi[g] for g in m.genes if roles.get(g) == 'G2/M']
-        if not late:
-            raise ValueError('No G2/M roles set, nothing to propose from.')
-        g2m = float(np.degrees(np.angle(np.mean(np.exp(1j * pk[late])))) % 360.0)
-        # non-overlapping by construction: S owns 330 -> 60, G2/M the
-        # 120-degree window around its genes' mean peak (never reaching
-        # back into S), G1 the rest
-        g_start = max(60.0, (g2m - 60.0) % 360.0)
-        g_end = (g2m + 60.0) % 360.0
-        arcs = [{'name': 'S', 'start_deg': 330.0, 'end_deg': 60.0},
-                {'name': 'G2/M', 'start_deg': g_start, 'end_deg': g_end},
-                {'name': 'G1', 'start_deg': g_end, 'end_deg': 330.0}]
+        birth = float(self.panel.BirthDegSpinBox.value())
+        arcs = FC.propose_arcs_from_profiles(m, self.roles or {}, birth_deg=birth)
         self.panel.set_arcs(arcs)
-        self.panel.CategoryStatusLabel.setText(f'proposed from the roles: G2/M genes peak at {g2m:.0f} deg. Edit, then Apply.')
+        self.panel.CategoryStatusLabel.setText(
+            'proposed from the roles (a phase starts where its genes rise above their cycle mean; G1 at birth '
+            f'{birth:.0f} deg): ' + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs)
+            + '. Edit, then Apply.')
+        self._refresh_category_counts()
 
     def apply_categories(self):
         sp = self._storage()

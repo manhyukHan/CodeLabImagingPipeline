@@ -91,6 +91,13 @@ def main():
           and abs(arcs[0]['start_deg'] - 215.0) < 1e-6 and abs(arcs[-1]['end_deg'] - 215.0) < 1e-6)
     cover = CC.categorize(np.linspace(0, 359.9, 720), arcs)
     check('the arcs cover the whole circle without a gap', all(c != '' for c in cover) and set(cover) == {'G1', 'S', 'G2/M'})
+    arcs_r = FC.propose_arcs_from_profiles(m, roles, birth_deg=215.0)
+    check('arcs from the role profiles: G1 from birth, then S, then G2/M, covering the circle',
+          [a['name'] for a in arcs_r] == ['G1', 'S', 'G2/M'] and abs(arcs_r[0]['start_deg'] - 215.0) < 1e-6
+          and set(CC.categorize(np.linspace(0, 359.9, 720), arcs_r)) == {'G1', 'S', 'G2/M'}, str(arcs_r))
+    s_arc = arcs_r[1]
+    check('the S arc holds the S genes\' mean peak (0)', ((0.0 - s_arc['start_deg']) % 360) <= ((s_arc['end_deg'] - s_arc['start_deg']) % 360),
+          str(s_arc))
     fig = FC.fig_cycle_time(m, {'u': m.spectrum(q[:450]), 'h': m.spectrum(q[450:]), 'train': w}, birth_deg=215.0,
                             training='train', groups_theta={'u': th[:450], 'h': th[450:]}, title='cycle time', marks=marks)
     conventions(fig, 'cycle time')
@@ -126,6 +133,19 @@ def main():
     check('the gallery has one axes per tile slot and hides the empty ones',
           len(fig.axes) == 6 and sum(ax.get_visible() for ax in fig.axes) == 5)
     plt.close(fig)
+    # arcs from DAPI: flat 2N from birth (215), rising from 300 to a 2x plateau at 60, back at birth
+    th_d = np.linspace(0, 359.9, 1800)
+    rel = (th_d - 215.0) % 360.0
+    dna_d = np.where(rel < 85, 1.0, np.where(rel < 205, 1.0 + (rel - 85) / 120.0, 2.0)) * np.random.default_rng(5).lognormal(0, 0.05, 1800)
+    arcs_d, info = FC.propose_arcs_from_dapi(th_d, dna_d, birth_deg=215.0)
+    check('arcs from DAPI: S starts where the content rises, G2/M near the plateau',
+          [a['name'] for a in arcs_d] == ['G1', 'S', 'G2/M'] and abs(((arcs_d[1]['start_deg'] - 318.0) + 180) % 360 - 180) <= 12
+          and abs(((arcs_d[2]['start_deg'] - 50.0) + 180) % 360 - 180) <= 25 and 1.8 < info['ratio'] < 2.3, str((arcs_d, info)))
+    try:
+        FC.propose_arcs_from_dapi(th_d, np.ones(1800), birth_deg=215.0)
+        check('a flat DNA curve refuses to propose', False)
+    except ValueError:
+        check('a flat DNA curve refuses to propose', True)
     fig = FC.fig_phase_hist(th, groups=groups, marks=marks)
     conventions(fig, 'phase hist')
     check('phase histogram draws a line per group plus all', len(fig.axes[0].lines) == 3)

@@ -198,10 +198,14 @@ class CellCyclePanelUI(object):
         self.DapiPushButton.setToolTip('Routine verification: the DAPI sum inside each cell mask against the phase; '
                                        'G2/M cells should carry about twice the DAPI of G1 cells.')
         dapiLayout.addWidget(self.DapiPushButton, 1)
+        self.ProposeFromDapiPushButton = QtWidgets.QPushButton('Propose categories from DAPI')
+        self.ProposeFromDapiPushButton.setToolTip('The measured DNA content of the training cells: G1 while it stays at '
+                                                  'its post-birth level, S while it rises, G2/M once it is near its plateau.')
         self.DapiGalleryPushButton = QtWidgets.QPushButton('DAPI gallery by phase (images)')
         self.DapiGalleryPushButton.setToolTip('Example nuclei per 45-degree bin of the phase: confident training cells '
                                               'picked at random, the mask outlined; every tile on its own FOV scale.')
         dapiLayout.addWidget(self.DapiGalleryPushButton, 1)
+        dapiLayout.addWidget(self.ProposeFromDapiPushButton, 1)
         figLayout.addWidget(dapiRow, 5, 0, 1, 2)
         layout.addWidget(figGroup)
 
