@@ -51,6 +51,7 @@ class CellCycleWiring(QtCore.QObject):
         self.q = None             # (n, T) posteriors of the placed cells
         self.X = None             # (n, G) counts of the placed cells
         self.displayers = []
+        self.n_usable = 0        # cells reaching the minimum panel total, from the last count
         p = self.panel
         p.BuildCountsPushButton.clicked.connect(lambda: self._guard(self.build_counts))
         p.ExportCountsPushButton.clicked.connect(lambda: self._guard(self.export_counts))
@@ -163,9 +164,23 @@ class CellCycleWiring(QtCore.QObject):
             notes = []
             if fails:
                 notes.append(f'{len(fails)} FOV(s) FAILED: {fails[0][1]}')
-            empty = sorted({h for h, n in zip(tidy['hybe'], tidy['n_stored']) if n == 0}) if len(tidy) else []
-            if empty:
-                notes.append(f'no stored spots for {len(empty)} source(s) in some FOV: {empty[:6]}')
+            # COVERAGE, said plainly: a store with no RNA spots for the
+            # panel still yields a table (every count 0), and a fit on
+            # the handful of cells that happen to clear the minimum is
+            # numerically fine and scientifically nothing (seen: 86 of
+            # 2853 cells, evidence -0.000). Count the empty (FOV, source)
+            # slices and the cells that reach the minimum, and say so.
+            slices = tidy.groupby(['fov', 'hybe', 'channel'])['n_stored'].first() if len(tidy) else pd.Series(dtype=float)
+            n_empty, n_slices = int((slices == 0).sum()), int(len(slices))
+            self.n_usable = 0
+            if len(tidy):
+                table, _ct = CC.gene_table(tidy, names, metric=p.proxy_metric())
+                self.n_usable = int((table.sum(axis=1) >= p.MinTotalSpinBox.value()).sum())
+            if n_empty:
+                empty = sorted({h for h, n in zip(tidy['hybe'], tidy['n_stored']) if n == 0})
+                notes.append(f'{n_empty} of {n_slices} (FOV, source) slices hold NO stored spots ({empty[:6]}'
+                             f'{"..." if len(empty) > 6 else ""}) -- run Spot Localization for those hybes first')
+            notes.append(f'{self.n_usable} cells reach the minimum panel total of {p.MinTotalSpinBox.value()}')
             pmin = tidy.groupby('hybe')['p_min'].min() if len(tidy) else pd.Series(dtype=float)
             # a store gated AT 0.5 holds p_exist values from 0.500x up; only
             # a clear margin above the count gate means a stricter store gate
@@ -173,8 +188,10 @@ class CellCycleWiring(QtCore.QObject):
             if above:
                 notes.append(f'{len(above)} source(s) were stored with a p_exist gate above {CC.COUNT_GATE}: '
                              f'their count is the store\'s gate ({above[:6]})')
-            p.CountStatusLabel.setText(f'{n_cells} cells x {len(sources)} sources over {len(fovs)} FOVs'
-                                       + (' | ' + ' | '.join(notes) if notes else ''))
+            head = f'{n_cells} cells x {len(sources)} sources over {len(fovs)} FOVs'
+            if n_slices and n_empty > 0.5 * n_slices:
+                head = 'NOT USABLE FOR A FIT: ' + head
+            p.CountStatusLabel.setText(head + (' | ' + ' | '.join(notes) if notes else ''))
             self._log(p.CountStatusLabel.text())
 
         def _fail(msg):
@@ -287,8 +304,15 @@ class CellCycleWiring(QtCore.QObject):
         name = self._experiment_name()
         train = p.training_celltypes()
         k = np.isin(ct, train) if train else np.ones(len(X), bool)
-        if k.sum() < 50:
-            raise ValueError(f'Only {int(k.sum())} training cells -- check the training celltypes.')
+        slices = self.tidy.groupby(['fov', 'hybe', 'channel'])['n_stored'].first()
+        n_empty = int((slices == 0).sum())
+        if n_empty > 0.5 * len(slices):
+            raise ValueError(f'{n_empty} of {len(slices)} (FOV, source) slices hold no stored spots: the store has not '
+                             "been localized for this panel. Run Spot Localization for the panel hybes first.")
+        if k.sum() < 100:
+            raise ValueError(f'Only {int(k.sum())} training cells reach the minimum panel total -- too few for a 72-point '
+                             f'circle. Check the training celltypes, the minimum total, and that the store holds spots '
+                             f'for every panel hybe.')
         alpha = float(p.AlphaSpinBox.value())
         early, late, hk = self._role_lists(self.roles)
         bridges = []
