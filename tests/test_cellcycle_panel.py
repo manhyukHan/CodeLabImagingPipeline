@@ -89,7 +89,10 @@ def main():
     p.set_gates({'min_R': 0.6, 'min_bf_ring': None, 'max_radius': 1.5})
     g = p.gates()
     check('gates round-trip, None = off', g['min_R'] == 0.6 and g['min_bf_ring'] is None and g['max_radius'] == 1.5
-          and g['min_fit_z'] is None and g['min_total'] is None, str(g))
+          and g['min_fit_z'] is None and g['min_total'] is None and g['min_radius'] is None, str(g))
+    p.set_gates({'min_radius': 0.5})
+    cat_in = CC.assign(__import__('pandas').DataFrame({'theta_deg': [10.0, 10.0], 'radius': [0.3, 0.9]}), p.arcs(), p.gates())
+    check('the inside-the-ring gate (min centre ratio) drops the near-centre cell', list(cat_in) == ['', 'S'], str(list(cat_in)))
     cat = CC.assign(__import__('pandas').DataFrame({'theta_deg': [10.0, 100.0, 250.0], 'R': [0.9, 0.9, 0.9],
                                                      'radius': [1.0, 1.0, 1.0]}), p.arcs(), g)
     check('the panel\'s arcs and gates drive cellcycle.assign', list(cat) == ['S', 'G2/M', ''], str(list(cat)))

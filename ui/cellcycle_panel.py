@@ -259,11 +259,17 @@ class CellCyclePanelUI(object):
         self.MinFitZSpinBox = QtWidgets.QDoubleSpinBox(); self.MinFitZSpinBox.setRange(-100.0, 100.0); self.MinFitZSpinBox.setValue(-3.0)
         self.MaxRadiusCheckBox = QtWidgets.QCheckBox('max centre ratio (plane radius)')
         self.MaxRadiusSpinBox = QtWidgets.QDoubleSpinBox(); self.MaxRadiusSpinBox.setRange(0.0, 100.0); self.MaxRadiusSpinBox.setValue(2.0)
+        self.MinRadiusCheckBox = QtWidgets.QCheckBox('min centre ratio (inside the ring)')
+        self.MinRadiusCheckBox.setToolTip('The inside-the-ring gate the Bayes factor misses on deep cells: with ~1000 counts a cell '
+                                          'near the centre still beats the one centre point (JP_001 hydroxyurea: radius 0.28, '
+                                          'log BF_ring +0.8). 0.5 removes 96% of those and 31% of the cycling cells of that experiment.')
+        self.MinRadiusSpinBox = QtWidgets.QDoubleSpinBox(); self.MinRadiusSpinBox.setRange(0.0, 100.0); self.MinRadiusSpinBox.setSingleStep(0.05); self.MinRadiusSpinBox.setValue(0.5)
         self.MinTotalGateCheckBox = QtWidgets.QCheckBox('min panel total')
         self.MinTotalGateSpinBox = QtWidgets.QDoubleSpinBox(); self.MinTotalGateSpinBox.setRange(0.0, 1e6); self.MinTotalGateSpinBox.setDecimals(0); self.MinTotalGateSpinBox.setValue(10.0)
         self.MinBfCheckBox.setChecked(True)
         for i, (cb, sb) in enumerate(((self.MinRCheckBox, self.MinRSpinBox), (self.MinBfCheckBox, self.MinBfSpinBox),
                                       (self.MinFitZCheckBox, self.MinFitZSpinBox), (self.MaxRadiusCheckBox, self.MaxRadiusSpinBox),
+                                      (self.MinRadiusCheckBox, self.MinRadiusSpinBox),
                                       (self.MinTotalGateCheckBox, self.MinTotalGateSpinBox))):
             gates.addWidget(cb, i // 2, 2 * (i % 2))
             gates.addWidget(sb, i // 2, 2 * (i % 2) + 1)
@@ -556,6 +562,7 @@ class CellCyclePanelUI(object):
                 'min_bf_ring': self.MinBfSpinBox.value() if self.MinBfCheckBox.isChecked() else None,
                 'min_fit_z': self.MinFitZSpinBox.value() if self.MinFitZCheckBox.isChecked() else None,
                 'max_radius': self.MaxRadiusSpinBox.value() if self.MaxRadiusCheckBox.isChecked() else None,
+                'min_radius': self.MinRadiusSpinBox.value() if self.MinRadiusCheckBox.isChecked() else None,
                 'min_total': self.MinTotalGateSpinBox.value() if self.MinTotalGateCheckBox.isChecked() else None}
 
     def set_gates(self, gates):
@@ -564,6 +571,7 @@ class CellCyclePanelUI(object):
                             ('min_bf_ring', self.MinBfCheckBox, self.MinBfSpinBox),
                             ('min_fit_z', self.MinFitZCheckBox, self.MinFitZSpinBox),
                             ('max_radius', self.MaxRadiusCheckBox, self.MaxRadiusSpinBox),
+                            ('min_radius', self.MinRadiusCheckBox, self.MinRadiusSpinBox),
                             ('min_total', self.MinTotalGateCheckBox, self.MinTotalGateSpinBox)):
             v = gates.get(key)
             cb.setChecked(v is not None)
