@@ -121,9 +121,12 @@ def main():
     rng_d = np.random.default_rng(3)
     fov = np.repeat([1, 2, 3], 300)
     dna = np.where(((th - 60) % 360) < 120, 2.0, 1.0) * rng_d.lognormal(0, 0.1, 900) * np.where(fov == 2, 3.0, 1.0)
-    fig = FC.fig_dapi_vs_phase(th, dna, groups=groups, fov=fov, training=np.ones(900, bool), marks=marks)
+    area = np.where(((th - 60) % 360) < 120, 3000.0, 2000.0) * rng_d.lognormal(0, 0.1, 900)
+    fig = FC.fig_dapi_vs_phase(th, dna, groups=groups, fov=fov, training=np.ones(900, bool), marks=marks,
+                               area=area, area_unit='px')
     conventions(fig, 'dapi')
     ttl = fig._suptitle.get_text()
+    check('the DAPI figure carries the mask-area panel and its drop', len(fig.axes) == 2 and 'mask area falls' in ttl, ttl)
     check('the DAPI figure finds the halving angle near 180 despite a 3x FOV', 'halves at' in ttl
           and abs(float(ttl.split('halves at ')[1].split(' ')[0]) - 180) <= 15, ttl)
     plt.close(fig)

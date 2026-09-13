@@ -697,7 +697,7 @@ def fig_category_hist(categories, groups=None, mask=None, order=None, title=None
 # -- DAPI as the routine verification --------------------------------------------
 
 def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None, title=None, marks=None,
-                      fov=None, training=None):
+                      fov=None, training=None, area=None, area_unit='px'):
     """DNA content (a DAPI sum inside the mask) along the phase, per
     condition (binned median, quartiles), and per category as centre-
     connected lines. Each cell's DAPI is first divided by the median of
@@ -724,7 +724,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     ref = d[ok & (cat == names[0])] if (cat is not None and names) else d[ok]
     scale = float(np.median(ref)) if ref.size else 1.0
     dn = d / (scale if scale > 0 else 1.0)
-    ncol = 2 if cat is not None else 1
+    ncol = 1 + (cat is not None) + (area is not None)
     fig, axes = plt.subplots(1, ncol, figsize=(6.4 * ncol + 0.5, 4.4), squeeze=False)
     ax = axes[0][0]
     g = np.asarray(groups, dtype=object) if groups is not None else np.array(['all'] * len(th), dtype=object)
@@ -743,6 +743,30 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     ax.legend(fontsize=8, frameon=False)
     phase_axis(ax, marks=marks)
     ratio_txt = ''
+    if area is not None:
+        # the mask area beside the DNA content (user request): the cell
+        # grows through the cycle and halves at division -- a second,
+        # DAPI-free reading of the same event, from the segmentation
+        ar = np.asarray(area, float)
+        oka = np.isfinite(th) & np.isfinite(ar)
+        ax3 = axes[0][ncol - 1]
+        for cond, c in zip(conds, gene_palette(len(conds))):
+            k = oka & (g == cond)
+            if k.sum() < 10:
+                continue
+            cen, m_, lo_, hi_ = binned_stat(th[k], ar[k], n_bins=24)
+            ax3.plot(cen, m_, color=c, lw=1.6, label=f'{cond or "Unassigned"}')
+            ax3.fill_between(cen, lo_, hi_, color=c, alpha=0.12, linewidth=0)
+        ax3.set_ylabel(f'cell mask area ({area_unit})')
+        ax3.set_title('mask area along the cycle (median, quartiles)', fontsize=10)
+        ax3.legend(fontsize=8, frameon=False)
+        phase_axis(ax3, marks=marks)
+        tra = oka & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
+        if tra.sum() >= 200:
+            a_, fac_ = CC.total_drop_angle(th[tra], ar[tra], min_cells=200)
+            if a_ is not None and fac_ >= 1.2:
+                ratio_txt += f'; mask area falls x{fac_:.2f} at {a_:.0f} deg'
+                ax3.axvline(a_, color='k', lw=0.9, ls='--')
     if cat is not None:
         ax2 = axes[0][1]
         meds = {}
@@ -761,7 +785,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         ax2.legend(fontsize=8, frameon=False)
         g2m = next((n for n in names if 'G2' in n.upper() or n.upper() == 'M'), None)
         if g2m in meds and names[0] in meds and meds[names[0]] > 0:
-            ratio_txt = f' -- {g2m} / {names[0]} median ratio {meds[g2m] / meds[names[0]]:.2f} (about 2 expected)'
+            ratio_txt += f'; {g2m} / {names[0]} median ratio {meds[g2m] / meds[names[0]]:.2f} (about 2 expected)'
     drop_txt = ''
     tr = ok & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
     if tr.sum() >= 200:

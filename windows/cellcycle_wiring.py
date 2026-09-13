@@ -953,6 +953,10 @@ class CellCycleWiring(QtCore.QObject):
         fovs = sorted(set(int(f) for f in self.placed['fov']))
         placed = self.placed.copy()
         arcs, gates, marks, name = p.arcs(), p.gates(), self._marks(), self._name()
+        try:
+            voxel = self.mw._voxel_um()
+        except Exception:                                       # noqa: BLE001
+            voxel = None
         p.DapiPushButton.setEnabled(False)
         p.ModelStatusLabel.setText(f'DAPI over {len(fovs)} FOVs...')
 
@@ -965,9 +969,12 @@ class CellCycleWiring(QtCore.QObject):
             order = [a['name'] for a in arcs] if arcs else None
             train = (self.spec or {}).get('train_celltypes') or []
             tr = np.isin(merged['celltype'].to_numpy(), train) if train else None
+            area, unit = merged['area'].to_numpy(float), 'px'
+            if voxel is not None:
+                area, unit = area * float(voxel[0]) * float(voxel[1]), 'um^2'
             fig = FC.fig_dapi_vs_phase(merged['theta_deg'].to_numpy(), merged['sum_above_bg'].to_numpy(),
                                        groups=merged['celltype'].to_numpy(), categories=cat, order=order, marks=marks,
-                                       fov=merged['fov'].to_numpy(), training=tr,
+                                       fov=merged['fov'].to_numpy(), training=tr, area=area, area_unit=unit,
                                        title=f'{name}: DAPI ({src[1]} ch{src[2]}) as the routine verification')
             if cat is not None:
                 merged = merged.assign(category=cat)
