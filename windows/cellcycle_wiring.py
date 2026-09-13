@@ -73,6 +73,7 @@ class CellCycleWiring(QtCore.QObject):
         p.ProposeArcsPushButton.clicked.connect(lambda: self._guard(self.propose_arcs))
         p.ProposeFromTimePushButton.clicked.connect(lambda: self._guard(self.propose_arcs_from_time))
         p.FovOverlayPushButton.clicked.connect(lambda: self._guard(self.view_fov_overlay))
+        p.DapiPushButton.clicked.connect(lambda: self._guard(self.view_dapi))
         p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
         mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
 
@@ -328,6 +329,7 @@ class CellCycleWiring(QtCore.QObject):
         roles, names_map, metric, min_total = dict(self.roles), dict(self.names), p.proxy_metric(), p.MinTotalSpinBox.value()
         previous = analysis_store.read_cellcycle_model(sp) or {}
         arcs, gates, birth = p.arcs() or previous.get('categories', []), p.gates(), float(p.BirthDegSpinBox.value())
+        origin_division = p.OriginComboBox.currentIndex() == 0
         p.FitPushButton.setEnabled(False)
         p.ModelStatusLabel.setText(f'fitting on {int(k.sum())} training cells' + (f' with {len(bridges)} bridge(s)' if bridges else '') + '...')
 
@@ -335,6 +337,25 @@ class CellCycleWiring(QtCore.QObject):
             m = CC.CycleModel().fit(datasets, bridge_exclude=hk, orient_by=orient_by)
             if orient_by is not None:
                 m.orient(early, late)
+            origin = {'mode': 'S mean peak'}
+            birth_used = birth
+            if origin_division:
+                # the origin at division: the roles have fixed the
+                # direction, so the steepest drop of the training cells'
+                # panel total is the one event every panel shares
+                th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
+                angle, factor = CC.total_drop_angle(th_tr, X[k].sum(1))
+                # only a CLIFF is division: measured, the Tirosh-list panel
+                # (JP_001) drops x5.4 within 30 deg while the cyclin/CDK
+                # panel (JP_002) declines x2.1 over half a turn starting
+                # in G2, 100 deg earlier -- a gentle decline is the
+                # panel's own biology, not the event
+                if angle is not None and factor >= 3.0:
+                    m.rotate_to_zero(angle)
+                    origin = {'mode': 'division (total drop)', 'angle_before_deg': angle, 'drop_factor': factor}
+                    birth_used = 0.0
+                else:
+                    origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
             placed = m.place(name, X)
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
@@ -345,7 +366,8 @@ class CellCycleWiring(QtCore.QObject):
                     'align_report': {f'{a}->{b}': {kk: vv for kk, vv in r.items() if kk != 'residual_deg'}
                                      for (a, b), r in m.align_report.items()},
                     'fitted_at': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'categories': arcs, 'gates': gates, 'birth_deg': birth}
+                    'origin': origin,
+                    'categories': arcs, 'gates': gates, 'birth_deg': birth_used}
             self._persist(sp, spec, placed, keys, X)
             return m, placed, spec
 
@@ -356,9 +378,13 @@ class CellCycleWiring(QtCore.QObject):
             rep = '; '.join(f'{k_}: flip {v.get("flip")} shift {v.get("shift_deg", float("nan")):.0f} '
                             f'residual {v.get("err_deg", float("nan")):.0f} deg'
                             for k_, v in spec['align_report'].items() if 'flip' in v)
+            o = spec.get('origin') or {}
+            otxt = o.get('mode', '')
+            if 'drop_factor' in o and o.get('drop_factor') is not None:
+                otxt += f' (drop x{o["drop_factor"]:.1f}' + (f' at {o["angle_before_deg"]:.0f} deg before the rotation)' if 'angle_before_deg' in o else ')')
             p.ModelStatusLabel.setText(
                 f'fitted {spec["fitted_at"]}: {spec["n_train"]} training cells, {spec["n_placed"]} placed over '
-                f'{len(fovs)} FOVs; alpha {alpha:g}; evidence {m.history[-1]:.3f}'
+                f'{len(fovs)} FOVs; alpha {alpha:g}; evidence {m.history[-1]:.3f}; origin {otxt}'
                 + (f'; bridges {rep}' if rep else ''))
             self._log(p.ModelStatusLabel.text())
 
@@ -710,6 +736,47 @@ class CellCycleWiring(QtCore.QObject):
             'proposed from cycle time: ' + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs)
             + '. Edit, then Apply.')
         self._refresh_category_counts()
+
+    def view_dapi(self):
+        """The routine verification: DAPI inside each mask against the
+        phase and the categories."""
+        p = self.panel
+        self._need_model(placed=True)
+        src = p.dapi_source()
+        if src is None:
+            raise ValueError('No DAPI source: parse the layouts first, then pick the DAPI round.')
+        sp = self._storage()
+        fovs = sorted(set(int(f) for f in self.placed['fov']))
+        placed = self.placed.copy()
+        arcs, gates, marks, name = p.arcs(), p.gates(), self._marks(), self._name()
+        p.DapiPushButton.setEnabled(False)
+        p.ModelStatusLabel.setText(f'DAPI over {len(fovs)} FOVs...')
+
+        def _compute():
+            tab, fails = CC.mask_intensity_table(sp, fovs, src)
+            if fails:
+                self.mw.log(f'{TAB_TITLE}: DAPI: {len(fails)} FOV(s) failed: {fails[0][1]}')
+            merged = placed.merge(tab[['fov', 'cell', 'area', 'mask_mean', 'sum_above_bg']], on=['fov', 'cell'], how='left')
+            cat = CC.assign(merged, arcs, gates) if arcs else None
+            order = [a['name'] for a in arcs] if arcs else None
+            fig = FC.fig_dapi_vs_phase(merged['theta_deg'].to_numpy(), merged['sum_above_bg'].to_numpy(),
+                                       groups=merged['celltype'].to_numpy(), categories=cat, order=order, marks=marks,
+                                       title=f'{name}: DAPI ({src[1]} ch{src[2]}) as the routine verification')
+            if cat is not None:
+                merged = merged.assign(category=cat)
+            return fig, {'dapi': merged}
+
+        def _done(res):
+            p.DapiPushButton.setEnabled(True)
+            fig, tables = res
+            p.ModelStatusLabel.setText('DAPI: shown')
+            self._show(fig, 'dapi_vs_phase', tables=tables)
+
+        def _fail(msg):
+            p.DapiPushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'DAPI FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
 
     def view_fov_overlay(self):
         p = self.panel

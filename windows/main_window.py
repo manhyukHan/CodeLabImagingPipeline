@@ -14155,6 +14155,8 @@ One PNG PER MODALITY: each modality has its own reference and its
             'min_total': ('CellCyclePanel', 'MinTotalSpinBox'),
             'alpha': ('CellCyclePanel', 'AlphaSpinBox'),
             'birth_deg': ('CellCyclePanel', 'BirthDegSpinBox'),
+            'origin': ('CellCyclePanel', 'OriginComboBox'),
+            'phase_shares': ('CellCyclePanel', 'PhaseSharesLineEdit'),
             # 'genes' and 'training_celltypes' are dynamic (list-shaped),
             # handled in the capture/apply pair like chromatin_tracing's
             # checked hybes

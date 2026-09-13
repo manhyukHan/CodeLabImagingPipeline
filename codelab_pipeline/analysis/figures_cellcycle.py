@@ -670,3 +670,61 @@ def fig_category_hist(categories, groups=None, mask=None, order=None, title=None
     ax.set_ylabel('cells')
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     return finish(fig, title or 'cell-cycle category of the gated cells')
+
+
+# -- DAPI as the routine verification --------------------------------------------
+
+def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None, title=None, marks=None):
+    """DNA content (a DAPI sum inside the mask, normalised to the median
+    of the cells in the first category -- G1 when the arcs start at
+    birth) along the phase, per condition (binned median, quartiles),
+    and per category as centre-connected lines. The title carries the
+    G2/M-over-G1 ratio of medians: about 2 is the routine pass."""
+    th = np.asarray(theta_deg, float)
+    d = np.asarray(dapi, float)
+    ok = np.isfinite(th) & np.isfinite(d)
+    cat = None if categories is None else np.asarray(['Unassigned' if not c else str(c) for c in categories], dtype=object)
+    names = list(order) if order else ([x for x in dict.fromkeys(cat[ok]) if x != 'Unassigned'] if cat is not None else [])
+    ref = d[ok & (cat == names[0])] if (cat is not None and names) else d[ok]
+    scale = float(np.median(ref)) if ref.size else 1.0
+    dn = d / (scale if scale > 0 else 1.0)
+    ncol = 2 if cat is not None else 1
+    fig, axes = plt.subplots(1, ncol, figsize=(6.4 * ncol + 0.5, 4.4), squeeze=False)
+    ax = axes[0][0]
+    g = np.asarray(groups, dtype=object) if groups is not None else np.array(['all'] * len(th), dtype=object)
+    conds = [x for x in dict.fromkeys(g[ok])]
+    for cond, c in zip(conds, gene_palette(len(conds))):
+        k = ok & (g == cond)
+        if k.sum() < 10:
+            continue
+        cen, m, lo, hi = binned_stat(th[k], dn[k], n_bins=24)
+        ax.plot(cen, m, color=c, lw=1.6, label=f'{cond or "Unassigned"} (n={int(k.sum())})')
+        ax.fill_between(cen, lo, hi, color=c, alpha=0.12, linewidth=0)
+    ax.axhline(1.0, color='0.7', lw=0.8, ls=':')
+    ax.axhline(2.0, color='0.7', lw=0.8, ls=':')
+    ax.set_ylabel(f'DAPI sum above background / median of {names[0] if names else "all"}')
+    ax.set_title('DNA content along the cycle (median, quartiles)', fontsize=10)
+    ax.legend(fontsize=8, frameon=False)
+    phase_axis(ax, marks=marks)
+    ratio_txt = ''
+    if cat is not None:
+        ax2 = axes[0][1]
+        meds = {}
+        allnames = names + (['Unassigned'] if 'Unassigned' in set(cat[ok]) else [])
+        hi_x = float(np.nanpercentile(dn[ok], 99.5)) if ok.any() else 3.0
+        for name, c in zip(allnames, gene_palette(len(allnames))):
+            k = ok & (cat == name)
+            if k.sum() < 10:
+                continue
+            meds[name] = float(np.median(dn[k]))
+            line_hist(ax2, dn[k], bins=40, range=(0, max(hi_x, 1.0)), color=c, lw=1.6,
+                      label=f'{name} (n={int(k.sum())}, median {meds[name]:.2f})')
+        ax2.set_xlabel('DNA content (normalised)')
+        ax2.set_ylabel('density')
+        ax2.set_title('per category', fontsize=10)
+        ax2.legend(fontsize=8, frameon=False)
+        g2m = next((n for n in names if 'G2' in n.upper() or n.upper() == 'M'), None)
+        if g2m in meds and names[0] in meds and meds[names[0]] > 0:
+            ratio_txt = f' -- {g2m} / {names[0]} median ratio {meds[g2m] / meds[names[0]]:.2f} (about 2 expected)'
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    return finish(fig, (title or 'DAPI content as the routine verification') + ratio_txt)

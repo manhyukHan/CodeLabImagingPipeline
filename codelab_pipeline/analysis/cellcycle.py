@@ -604,6 +604,19 @@ class CycleModel:
         pl = np.angle(np.mean(np.exp(1j * peaks[l_])))
         flip = ((pl - pe) % TWO_PI) > np.pi
         shift = pe
+        self.rotate(shift, flip)
+        return shift, flip
+
+    def rotate_to_zero(self, deg):
+        """Rotate (no reflection) so the angle `deg` becomes 0 -- the
+        origin at a measured event, e.g. division (total_drop_angle)."""
+        self.rotate(np.radians(float(deg)), False)
+
+    def rotate(self, shift, flip=False):
+        """The frame change every readout shares: the profile at the new
+        angle t is the old profile at sgn*t + shift, so the point that
+        was at `shift` moves to 0 and a flip reverses the direction.
+        Profiles, spectra and stored posteriors move together."""
         sgn = -1.0 if flip else 1.0
         new = self.coef.copy()
         for k in range(1, self.K + 1):
@@ -619,7 +632,6 @@ class CycleModel:
         for name in list(self.q_):
             q = self.q_[name][:, idx]
             self.q_[name] = q / q.sum(1, keepdims=True)
-        return shift, flip
 
     # -- readouts --
 
@@ -856,6 +868,122 @@ def count_table(storage_path, fovs, sources, gate=COUNT_GATE, jobs=None, on_done
     cols = ['fov', 'cell', 'celltype', 'modality', 'hybe', 'channel',
             'n', 'soft', 'candidates', 'p_min', 'n_stored']
     return pd.DataFrame(rows, columns=cols), fails
+
+
+def _mask_intensity_fov(item):
+    """One FOV's per-cell mask statistics on one source's MIP -- module-
+    level for pmap. The mask is projected into the source hybe's own
+    frame through the store-built resolver (cell_crop's geometry); the
+    background is the MIP's own mode over the FOV."""
+    import os
+    import numpy.linalg as la
+    from codelab_pipeline.alignment import chain as alignment
+    from codelab_pipeline.analysis import resolvers as R
+    from codelab_pipeline.io import analysis_store, paths
+    from codelab_pipeline.models.cell import ACell
+    storage_path, fov, (modality, hybe, channel) = item
+    dicts, _ = analysis_store.read_cells(storage_path, fov)
+    if not dicts:
+        return []
+    mip_sp = os.path.join(paths.project_root(storage_path), modality)
+    mip = np.asarray(analysis_store.read_hybe_mip(mip_sp, fov, hybe, int(channel)), float)
+    finite = mip[np.isfinite(mip)]
+    lo, hi = np.percentile(finite, [0.5, 60])
+    if hi > lo:
+        h, e = np.histogram(finite, bins=128, range=(lo, hi))
+        k = int(np.argmax(h))
+        bg = float(0.5 * (e[k] + e[k + 1]))
+    else:
+        bg = float(np.median(finite))
+    try:
+        resolver = R.resolver_for(storage_path, fov)
+    except ValueError:
+        # a store with two declared modalities and no cross-modal bridge
+        # cannot name its hub; the cells' own modality is the frame here
+        resolver = R.resolver_for(storage_path, fov, shared=str(dicts[0].get('reference_modality') or modality))
+    rows = []
+    H, W = mip.shape
+    for d in dicts:
+        c = ACell()
+        c.set_metadata(**d)
+        Hc, _dz, _missing = resolver.transform((hybe, modality), (c.reference_hybe, c.reference_modality), c)
+        y_lit, x_lit = c.area
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(Hc), c.frame_shape)
+        if len(cy) == 0:
+            continue
+        ys = np.clip(cy.astype(int), 0, H - 1)
+        xs = np.clip(cx.astype(int), 0, W - 1)
+        v = mip[ys, xs]
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            continue
+        rows.append({'fov': int(fov), 'cell': int(c.id), 'celltype': str(c.celltype or ''),
+                     'area': int(v.size), 'mask_mean': float(v.mean()), 'mask_median': float(np.median(v)),
+                     'sum_above_bg': float(np.clip(v - bg, 0, None).sum()), 'background': bg})
+    return rows
+
+
+def mask_intensity_table(storage_path, fovs, source, jobs=None, on_done=None):
+    """Per cell: area, mask mean and median, and the sum above the FOV
+    background of one source's MIP inside the cell mask -- the DNA
+    content proxy when the source is DAPI (the routine verification:
+    G2/M cells should carry about twice the DAPI of G1 cells). FOV-major
+    through one pool. Returns (DataFrame, failures)."""
+    import pandas as pd
+    from codelab_pipeline import parallel
+    fovs = [int(f) for f in fovs]
+    items = [(storage_path, f, tuple(source)) for f in fovs]
+    results = parallel.pmap(_mask_intensity_fov, items, kind='io', jobs=jobs, on_done=on_done)
+    rows, fails = [], []
+    for f, r in zip(fovs, results):
+        if isinstance(r, parallel.Failure):
+            fails.append((f, str(r)))
+        else:
+            rows.extend(r)
+    cols = ['fov', 'cell', 'celltype', 'area', 'mask_mean', 'mask_median', 'sum_above_bg', 'background']
+    return pd.DataFrame(rows, columns=cols), fails
+
+
+def total_drop_angle(theta_deg, totals, n_bins=36, smooth=2, min_cells=200):
+    """The angle where the panel total per cell falls most steeply --
+    division, where the mRNA is halved and the G2/M transcripts go
+    (measured on JP_001: every condition's median total drops several-
+    fold within ~30 deg at the same angle). Returns (angle_deg,
+    drop_factor) with the factor = the smoothed log-median's peak
+    before the drop over its trough after it, or (None, None) when
+    there are too few cells. A factor near 1 means no drop was found."""
+    th = np.asarray(theta_deg, float) % 360.0
+    s = np.asarray(totals, float)
+    ok = np.isfinite(th) & np.isfinite(s) & (s > 0)
+    if ok.sum() < min_cells:
+        return None, None
+    th, s = th[ok], s[ok]
+    edges = np.linspace(0.0, 360.0, n_bins + 1)
+    b = np.clip(np.digitize(th, edges) - 1, 0, n_bins - 1)
+    med = np.array([np.median(s[b == k]) if (b == k).sum() >= 5 else np.nan for k in range(n_bins)])
+    if np.isnan(med).any():
+        good = np.where(np.isfinite(med))[0]
+        if len(good) < 6:
+            return None, None
+        x = np.concatenate([good - n_bins, good, good + n_bins])
+        y = np.tile(med[good], 3)
+        med = np.interp(np.arange(n_bins), x, y)
+    lm = np.log(med)
+    # a step detector, not a derivative: for every bin boundary, the mean
+    # log-median over the `smooth`+2 bins before it minus the mean over
+    # the same number after it; a symmetric window puts its maximum
+    # exactly at the edge of a step (a smoothed derivative slides it)
+    win = smooth + 2
+    contrast = np.empty(n_bins)
+    for j in range(n_bins):
+        before = lm[[(j - i) % n_bins for i in range(1, win + 1)]].mean()
+        after = lm[[(j + i) % n_bins for i in range(0, win)]].mean()
+        contrast[j] = before - after
+    j = int(np.argmax(contrast))
+    angle = float(edges[j] % 360.0)
+    before = lm[[(j - i) % n_bins for i in range(1, win + 1)]].max()
+    after = lm[[(j + i) % n_bins for i in range(0, win)]].min()
+    return angle, float(np.exp(before - after))
 
 
 def capsule_rows(placed, cell_ids, totals):

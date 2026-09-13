@@ -59,7 +59,9 @@ def main():
         sp = os.path.join(dp, 'RNA')
         os.makedirs(sp, exist_ok=True)
         # two FOVs, two cells each; FOV 2's second cell is Nocodazole
-        A.write_cell_dicts(sp, 1, [cell_dict(1, 1, 'Unsynchronized'), cell_dict(2, 1, 'Unsynchronized')])
+        c2 = cell_dict(2, 1, 'Unsynchronized')
+        c2['area'] = (np.array([50., 51.]), np.array([60., 61.]))       # away from the bright square below
+        A.write_cell_dicts(sp, 1, [cell_dict(1, 1, 'Unsynchronized'), c2])
         A.write_cell_dicts(sp, 2, [cell_dict(1, 2, 'Unsynchronized'), cell_dict(2, 2, 'Nocodazole')])
         # gene A (Hyb_001): cell 1 has 3 spots at p 0.9/0.6/0.2, cell 2 one
         # spot without p_exist (manual keep), one homeless spot
@@ -173,6 +175,17 @@ def main():
         a = CC.assign(pd.DataFrame({'theta_deg': [10.0, 10.0, np.nan], 'R': [0.9, 0.3, 0.9]}),
                       [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5})
         check('assign: gates and NaN phases', list(a) == ['G1', '', ''])
+        print('DAPI inside the mask')
+        # a MIP with a bright square where cell 1 sits and background elsewhere
+        mip = np.full((1024, 1024), 100.0)
+        mip[4:8, 6:10] = 400.0
+        A.write_hybe_mip(sp, 1, 'Hyb_500', {405: mip.astype(np.uint16)})
+        tab_d, fails_d = CC.mask_intensity_table(sp, [1], ('RNA', 'Hyb_500', 405), jobs=1)
+        c1 = tab_d[tab_d['cell'] == 1].iloc[0] if len(tab_d) else None
+        check('mask intensity rows for the FOV, no failure', fails_d == [] and len(tab_d) == 2, f'{fails_d} {len(tab_d)}')
+        check('the cell on the bright square sums above the background, the other does not',
+              c1 is not None and c1['sum_above_bg'] > 0 and float(tab_d[tab_d['cell'] == 2]['sum_above_bg'].iloc[0]) == 0.0,
+              str(tab_d[['cell', 'area', 'mask_mean', 'sum_above_bg', 'background']].to_dict('records')))
         empty = popmod.Population(sp, [1], (0.208, 0.208, 0.2), pop.cells, None, None, None, [])
         try:
             gate.PhaseRange(0, 90).mask(empty)

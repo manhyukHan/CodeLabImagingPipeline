@@ -131,6 +131,12 @@ class CellCyclePanelUI(object):
         alphaLayout.addWidget(self.AlphaSpinBox)
         alphaLayout.addWidget(self.AlphaHeldOutPushButton)
         mform.addRow('Dispersion alpha:', alphaRow)
+        self.OriginComboBox = QtWidgets.QComboBox()
+        self.OriginComboBox.addItems(['division: the steepest drop of the panel total', 'the S genes\' mean peak'])
+        self.OriginComboBox.setToolTip('Where 0 deg sits. The roles fix the direction and the reflection either way; '
+                                       'division is measured on the training cells (mRNA halves, G2/M transcripts go), '
+                                       'so 0 deg = birth and the cycle-time clock starts there.')
+        mform.addRow('Origin (0 deg):', self.OriginComboBox)
         modelLayout.addLayout(mform)
         fitRow = QtWidgets.QWidget()
         fitLayout = QtWidgets.QHBoxLayout(fitRow)
@@ -181,6 +187,18 @@ class CellCyclePanelUI(object):
         self.FovOverlayPushButton = QtWidgets.QPushButton('FOV overlay (cells on the reference MIP)')
         overlayLayout.addWidget(self.FovOverlayPushButton, 1)
         figLayout.addWidget(overlayRow, 4, 1)
+        dapiRow = QtWidgets.QWidget()
+        dapiLayout = QtWidgets.QHBoxLayout(dapiRow)
+        dapiLayout.setContentsMargins(0, 0, 0, 0)
+        dapiLayout.addWidget(QtWidgets.QLabel('DAPI source:'))
+        self.DapiSourceComboBox = QtWidgets.QComboBox()
+        self.DapiSourceComboBox.setToolTip('The (modality, hybe, channel) whose MIP is DAPI; rows named DAPI come first.')
+        dapiLayout.addWidget(self.DapiSourceComboBox, 1)
+        self.DapiPushButton = QtWidgets.QPushButton('DNA content (DAPI) vs phase and category')
+        self.DapiPushButton.setToolTip('Routine verification: the DAPI sum inside each cell mask against the phase; '
+                                       'G2/M cells should carry about twice the DAPI of G1 cells.')
+        dapiLayout.addWidget(self.DapiPushButton, 1)
+        figLayout.addWidget(dapiRow, 5, 0, 1, 2)
         layout.addWidget(figGroup)
 
         # -- 4. categories and gates ----------------------------------------
@@ -281,6 +299,21 @@ class CellCyclePanelUI(object):
                     use = bool(name) and CC.countable_round(name)
                     self._add_source_row((modality, r['folder'], int(ch)), gene, CC.default_role(gene), use)
         t.resizeColumnsToContents()
+        # every (modality, hybe, channel) for the DAPI picker, DAPI-named rounds first
+        self.DapiSourceComboBox.clear()
+        entries = []
+        for modality, records in (records_by_modality or {}).items():
+            for r in records:
+                name = str(r.get('readout_name') or '')
+                for ch in r.get('channels', []):
+                    entries.append(('DAPI' in name.upper(), modality, r['folder'], int(ch), name))
+        for is_dapi, modality, folder, ch, name in sorted(entries, key=lambda e: (not e[0], e[1], e[2], e[3])):
+            label = f'{modality} | {folder}' + (f' ({name})' if name else '') + f' | ch{ch}'
+            self.DapiSourceComboBox.addItem(label, [modality, folder, ch])
+
+    def dapi_source(self):
+        d = self.DapiSourceComboBox.currentData()
+        return tuple(d) if d else None
 
     def _add_source_row(self, src, gene, role, use):
         t = self.SourceTableWidget

@@ -168,6 +168,24 @@ check('fast path profile amplitudes match the exact DM fit within 15%', np.media
 rad_s = np.median(md.radius('shallow', Xd1)[0]); rad_d = np.median(md.radius('deep', Xd2)[0])
 check('cells of both experiments sit on the fitted ring (radius ~1)', 0.75 < rad_s < 1.3 and 0.75 < rad_d < 1.3, f'{rad_s:.2f} / {rad_d:.2f}')
 
+# -- 4c. the origin at division: the steepest drop of the panel total ----------
+print('origin')
+rng_o = np.random.default_rng(70)
+th_o = rng_o.uniform(0, 360, 3000)
+tot_o = np.where(((th_o - 200) % 360) < 180, 900.0, 300.0) * rng_o.lognormal(0, 0.15, 3000)   # high on 200..20, drops at 20
+ang, fac = CC.total_drop_angle(th_o, tot_o)
+check('the drop angle is found within a bin', min(abs(ang - 20), 360 - abs(ang - 20)) <= 12, f'{ang:.0f} deg, x{fac:.1f}')
+check('and the drop factor is about three', 2.0 < fac < 4.5, f'x{fac:.1f}')
+check('too few cells or no drop gives None / a factor near 1',
+      CC.total_drop_angle(th_o[:50], tot_o[:50]) == (None, None) and CC.total_drop_angle(th_o, np.full(3000, 500.0))[1] < 1.2)
+mo = CC.CycleModel().fit([CC.Dataset('A', X, genes, alpha=100.0)])
+pk_before, _ = mo.peak_phase()
+mo.rotate_to_zero(np.degrees(pk_before[0]))
+pk_after, _ = mo.peak_phase()
+check('rotate_to_zero moves the named angle to 0 and keeps every other gap',
+      abs(np.angle(np.exp(1j * pk_after[0]))) < 1e-6
+      and np.allclose(np.angle(np.exp(1j * ((pk_after - pk_after[0]) - (pk_before - pk_before[0])))), 0, atol=1e-6))
+
 # -- 5. persistence, gene table, helpers --------------------------------------
 print('helpers')
 m2 = CC.CycleModel.from_dict(mj.to_dict())
