@@ -72,17 +72,21 @@ def wrap_title(text, width=80):
     return '\n'.join(textwrap.wrap(str(text), width=width)) if text else ''
 
 
-def suptitle(fig, text, width=90):
-    """A figure title INSIDE the figure, with its own band on top."""
+def suptitle(fig, text, width=None):
+    """A figure title INSIDE the figure, with its own band on top,
+    wrapped to the figure's width (about 11 characters per inch at
+    11 pt -- a 6-inch figure takes 66 characters a line)."""
     if not text:
         return
+    if width is None:
+        width = max(30, int(fig.get_figwidth() * 11))
     t = wrap_title(text, width)
     n = t.count('\n') + 1
     fig.suptitle(t, y=0.995, va='top', fontsize=11)
     fig.subplots_adjust(top=1.0 - 0.05 * n - 0.06)
 
 
-def finish(fig, title=None, width=90):
+def finish(fig, title=None, width=None):
     for ax in fig.axes:
         style_ax(ax)
     if title:
@@ -128,21 +132,27 @@ def phase_axis(ax, which='x', marks=None):
                         fontsize=8, color='0.35', clip_on=False)
 
 
-def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None):
-    """ONE horizontal colour bar under the given axes, low enough to
-    clear their x labels; the role marks above its ticks."""
+def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None, host=None):
+    """ONE horizontal colour bar in its OWN axes under the host (the
+    first of `axes` unless given), placed by make_axes_locatable: 5% of
+    the host's height, 0.6 in below it, so it never rides over the
+    host's x label (it did, with fig.colorbar's pad on a one-panel
+    figure). The role marks sit under the tick labels, the bar's own
+    label under those."""
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+    host = host if host is not None else (axes[0] if isinstance(axes, (list, tuple)) else axes)
     sm = cm.ScalarMappable(norm=PHASE_NORM, cmap=PHASE_CMAP)
     sm.set_array([])
-    cb = fig.colorbar(sm, ax=axes, orientation='horizontal', fraction=0.05,
-                      pad=0.20, aspect=45)
+    cax = make_axes_locatable(host).append_axes('bottom', size='5%', pad=0.6)
+    cb = fig.colorbar(sm, cax=cax, orientation='horizontal')
     cb.set_ticks(list(PHASE_TICKS))
     cb.set_ticklabels([f'{t:d}' for t in PHASE_TICKS])
-    cb.set_label(label)
+    cb.set_label(label, labelpad=(22 if marks else 4))
     if marks:
-        tr = transforms.blended_transform_factory(cb.ax.transData, cb.ax.transAxes)
+        tr = transforms.blended_transform_factory(cax.transData, cax.transAxes)
         for name, deg in marks.items():
-            cb.ax.text(float(deg) % 360.0, 1.15, name, transform=tr, ha='center', va='bottom',
-                       fontsize=8, color='0.35', clip_on=False)
+            cax.text(float(deg) % 360.0, -1.9, name, transform=tr, ha='center', va='top',
+                     fontsize=8, color='0.35', clip_on=False)
     return cb
 
 
