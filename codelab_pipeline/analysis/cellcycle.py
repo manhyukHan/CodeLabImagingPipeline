@@ -346,10 +346,22 @@ class CycleModel:
             [self.evidence(d.name, d.X, d.groups) for d in datasets])))
 
     def stagewise_init(self, datasets, bridge_exclude=HOUSEKEEPING, weights='fisher_min',
-                       robust=True, verbose=False):
+                       robust=True, verbose=False, orient_by=None):
         """Initial angles that agree ACROSS experiments (see the module
-        docstring). Returns {name: theta0}."""
-        singles, peaks, info = {}, {}, {}
+        docstring). Returns {name: theta0}.
+
+        orient_by=(early, late): gene-role lists. When given, every
+        single fit that holds at least one gene of each list is FIRST
+        oriented by them (early mean peak at 0, late in the forward
+        half turn), and the bridge between two oriented experiments
+        then solves the rotation only -- the reflection is fixed by
+        the biology, never by the bridge. Measured need: with three
+        shared genes (chr19-JP_002: GMNN, CCNA2, CCNB1) the bridge's
+        reflection choice flipped between two fits of the same cells
+        whose counts differed at the 1% level (the hydroxyurea anchor
+        landed at 45 deg in one and 268 deg in the other).
+        """
+        singles, peaks, info, oriented = {}, {}, {}, set()
         for d in datasets:
             # the dataset's OWN dispersion in these single fits, not the
             # multinomial: measured on a synthetic bridge experiment with
@@ -360,6 +372,12 @@ class CycleModel:
             m = CycleModel(K=self.K, T=self.T, prior_smooth=self.prior_smooth, l2=self.l2,
                            mstep=self.mstep, polish=self.polish, patience=self.patience)
             m._fit_single(Dataset(d.name, d.X, d.genes, d.groups, alpha=d.alpha))
+            if orient_by is not None:
+                early = [g for g in orient_by[0] if g in m.gi]
+                late = [g for g in orient_by[1] if g in m.gi]
+                if early and late:
+                    m.orient(early, late)
+                    oriented.add(d.name)
             singles[d.name] = m.phase(d.name, d.X, prior='uniform')[0]
             pk, _ = m.peak_phase()
             peaks[d.name] = dict(zip(m.genes, pk))
@@ -388,11 +406,15 @@ class CycleModel:
                     wg = np.ones(len(genes))
                 wg = wg / max(wg.sum(), 1e-12)
 
+                # both experiments oriented by their role genes: the
+                # reflection is settled, the bridge only rotates
+                signs = (1.0,) if (ref in oriented and n in oriented) else (1.0, -1.0)
+
                 def solve(gs, w):
                     pr = np.array([peaks[ref][g] for g in gs])
                     pn = np.array([peaks[n][g] for g in gs])
                     best = None
-                    for sgn in (1.0, -1.0):
+                    for sgn in signs:
                         dd = pr - sgn * pn
                         shift = np.angle(np.sum(w * np.exp(1j * dd)))
                         r = np.abs(np.angle(np.exp(1j * (dd - shift))))
@@ -414,6 +436,7 @@ class CycleModel:
                         dropped, genes = bad, [genes[i] for i in keep]
                 self.align_report[(ref, n)] = {
                     'genes': genes, 'dropped': dropped, 'flip': bool(sgn < 0),
+                    'reflection_fixed_by_roles': bool(len(signs) == 1),
                     'shift_deg': float(np.degrees(shift)), 'err_deg': float(np.degrees(err)),
                     'residual_deg': dict(zip(genes, np.round(np.degrees(r), 1)))}
                 theta0[n] = (sgn * singles[n] + shift) % TWO_PI
@@ -489,12 +512,14 @@ class CycleModel:
         return self
 
     def fit(self, datasets, n_iter=40, tol=1e-4, bridge_exclude=HOUSEKEEPING,
-            weights='fisher_min', robust=True, verbose=False, theta0=None):
-        """Fit on cycling populations. `datasets`: [Dataset, ...]."""
+            weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None):
+        """Fit on cycling populations. `datasets`: [Dataset, ...].
+        orient_by=(early, late) fixes every bridge's reflection by gene
+        roles (see stagewise_init)."""
         datasets = list(datasets)
         self._index(datasets)
         if theta0 is None:
-            theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose)
+            theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose, orient_by)
                       if len(datasets) > 1 else {datasets[0].name: pca_angle(datasets[0].X)[0]})
         self._em(datasets, theta0, n_iter, tol, verbose)
         # fit-quality reference: the training cells' per-count evidence

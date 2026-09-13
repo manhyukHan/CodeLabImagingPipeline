@@ -101,7 +101,20 @@ check('arrested groups concentrate, cycling groups spread',
 gap = abs(np.angle(np.exp(1j * np.radians(sA['arrested']['mean_deg'] - sB['arrested']['mean_deg']))))
 check('the two arrest points keep their true separation (3.0 rad) within 0.3 rad', abs(gap - 3.0) < 0.3, f'{gap:.2f} rad')
 
-# -- 4. the three verdicts: outside, inside, on the ring ------------------------
+# -- 3b. the reflection fixed by gene roles: the same bridge, no flip search ----
+print('roles')
+pk_true = np.degrees(np.arctan2(coef12[:, 1], coef12[:, 0])) % 360           # true peak of the first harmonic
+early_g = [allg[i] for i in np.argsort(pk_true)[:3]]
+late_g = [allg[i] for i in np.argsort(pk_true)[5:8]]
+mr = CC.CycleModel().fit([CC.Dataset('A', XA_c, genA, gA_c, alpha=100.0),
+                          CC.Dataset('B', XB_c, genB, gB_c, alpha=100.0),
+                          CC.Dataset('C', XC, genC, gC, alpha=100.0)], orient_by=(early_g, late_g))
+fixed = [r.get('reflection_fixed_by_roles') for r in mr.align_report.values() if 'flip' in r]
+th_r = np.concatenate([mr.phase(n, Xd)[0] for n, Xd in (('A', XA), ('B', XB), ('C', XC))])
+medr, _, _ = CC.circular_agreement(tr_all, th_r)
+check('with orient_by every bridge skips the reflection search', all(fixed) and len(fixed) == 2, str(fixed))
+check('and the three experiments still align within 10 deg', deg(medr) < 10, f'{deg(medr):.1f} deg')
+
 print('verdicts')
 # cells generated from the FITTED ring of A (its own profiles and intercepts),
 # cells at its centre, and cells pushed off it
