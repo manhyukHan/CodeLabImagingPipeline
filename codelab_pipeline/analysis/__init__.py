@@ -28,6 +28,7 @@ Everything downstream of the store is in MICROMETRES: extractors scale
 pre-existing distmap in the app pdists raw (px, px, planes) -- display-
 only there, wrong for science, and the trap this rule exists to bury.
 """
+from codelab_pipeline.analysis import cellcycle        # noqa: F401
 from codelab_pipeline.analysis import polymer          # noqa: F401
 from codelab_pipeline.analysis import detection        # noqa: F401
 from codelab_pipeline.analysis import distances        # noqa: F401
