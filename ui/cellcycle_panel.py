@@ -139,7 +139,15 @@ class CellCyclePanelUI(object):
                                        'Division is measured on the training cells: the DNA content halving (DAPI '
                                        'source below, section 3) is the direct marker; the panel-total drop stands in '
                                        'when there is no DAPI; 0 deg = birth and the cycle-time clock starts there.')
-        mform.addRow('Origin (0 deg):', self.OriginComboBox)
+        originRow = QtWidgets.QWidget()
+        originLayout = QtWidgets.QHBoxLayout(originRow)
+        originLayout.setContentsMargins(0, 0, 0, 0)
+        originLayout.addWidget(self.OriginComboBox, 1)
+        self.SetOriginPushButton = QtWidgets.QPushButton('Apply origin to the current model (no refit)')
+        self.SetOriginPushButton.setToolTip('The origin is a rotation of the frame, not a fit: the current model is '
+                                            'rotated, every cell re-placed (seconds) and the arcs re-proposed.')
+        originLayout.addWidget(self.SetOriginPushButton)
+        mform.addRow('Origin (0 deg):', originRow)
         modelLayout.addLayout(mform)
         fitRow = QtWidgets.QWidget()
         fitLayout = QtWidgets.QHBoxLayout(fitRow)

@@ -75,6 +75,7 @@ class CellCycleWiring(QtCore.QObject):
         p.FovOverlayPushButton.clicked.connect(lambda: self._guard(self.view_fov_overlay))
         p.DapiPushButton.clicked.connect(lambda: self._guard(self.view_dapi))
         p.DapiGalleryPushButton.clicked.connect(lambda: self._guard(self.view_dapi_gallery))
+        p.SetOriginPushButton.clicked.connect(lambda: self._guard(self.set_origin))
         p.ProposeFromDapiPushButton.clicked.connect(lambda: self._guard(self.propose_arcs_from_dapi))
         p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
         mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
@@ -345,77 +346,17 @@ class CellCycleWiring(QtCore.QObject):
             m = CC.CycleModel().fit(datasets, bridge_exclude=hk, orient_by=orient_by)
             if orient_by is not None:
                 m.orient(early, late)
-            origin = {'mode': 'S mean peak'}
-            birth_used = birth
-            dapi_tab = None
-            done = False
-            if dapi_src is not None:
-                # the origin at division, read directly: the DNA content of
-                # the training cells (DAPI inside the mask, per FOV) halves
-                # at division; the same step detector as the panel total's
-                th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
-                tr = pd.DataFrame({'fov': fov_of[k], 'cell': cell_of[k], 'theta_deg': th_tr})
-                dapi_tab, _fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
-                merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
-                dna = merged['sum_above_bg'].to_numpy(float).copy()
-                fv = merged['fov'].to_numpy()
-                for f_ in np.unique(fv):
-                    kk = (fv == f_) & np.isfinite(dna)
-                    med = np.median(dna[kk]) if kk.sum() >= 5 else np.nan
-                    dna[fv == f_] = dna[fv == f_] / med if np.isfinite(med) and med > 0 else np.nan
-                angle, factor = CC.total_drop_angle(merged['theta_deg'].to_numpy(), dna)
-                if angle is not None and factor >= 1.3:
-                    m.rotate_to_zero(angle)
-                    origin = {'mode': 'division (DAPI halving)', 'angle_before_deg': angle, 'drop_factor': factor,
-                              'dapi_source': list(dapi_src)}
-                    birth_used = 0.0
-                    done = True
-                else:
-                    origin = {'mode': 'DAPI showed no halving', 'drop_factor': factor}
-            if origin_division and not done:
-                # the panel total's drop stands in: the roles have fixed the
-                # direction, so the steepest drop of the training cells'
-                # panel total is the one event every panel shares
-                th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
-                angle, factor = CC.total_drop_angle(th_tr, X[k].sum(1))
-                # the drop must be real: measured, the Tirosh-list panel
-                # (JP_001) drops x5.4 within 30 deg at 240 deg of the joint
-                # frame, chr19 x1.9 at 220, and the cyclin/CDK panel
-                # (JP_002) x2.1 at 120 -- and JP_002's DAPI halves at the
-                # same 120-150 deg, so that gentler drop IS division too
-                if angle is not None and factor >= 1.8:
-                    m.rotate_to_zero(angle)
-                    origin = {'mode': 'division (total drop)' + (' after DAPI showed no halving' if dapi_src is not None else ''),
-                              'angle_before_deg': angle, 'drop_factor': factor}
-                    birth_used = 0.0
-                else:
-                    origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
+            origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
+                                                               origin_division, dapi_src, birth)
             placed = m.place(name, X)
             # the arcs are RE-PROPOSED after every fit, never carried over:
             # a fit can move the frame (the origin, a bridge), and arcs
             # drawn in the old frame would silently name the wrong cells
             # (seen: the time arcs of an S-peak frame applied to a
-            # division frame put half the cells in G2/M). The proposal
-            # is the educated guess from cycle time; DAPI or the roles
-            # can replace it, and Apply stores the final choice.
-            arcs, arcs_from = [], ''
-            if dapi_tab is not None:
-                try:
-                    th_new = np.degrees(placed['theta'][k]) % 360.0
-                    tr2 = pd.DataFrame({'fov': fov_of[k], 'cell': cell_of[k], 'theta_deg': th_new})
-                    merged2 = tr2.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
-                    arcs, _info = FC.propose_arcs_from_dapi(merged2['theta_deg'].to_numpy(), merged2['sum_above_bg'].to_numpy(),
-                                                             birth_deg=birth_used, fov=merged2['fov'].to_numpy())
-                    arcs_from = 'DAPI'
-                except Exception as exc:                        # noqa: BLE001
-                    self.mw.log(f'{TAB_TITLE}: arcs from DAPI not proposed: {type(exc).__name__}: {exc}')
-            if not arcs:
-                try:
-                    w_train = m.spectrum(m.posterior(name, X[k]))
-                    arcs = FC.propose_arcs_from_time(w_train, m.grid, birth_used, shares=shares)
-                    arcs_from = 'cycle time'
-                except Exception:                               # noqa: BLE001
-                    arcs = []
+            # division frame put half the cells in G2/M). DAPI when it was
+            # measured, else the educated guess from cycle time; the roles
+            # can replace either, and Apply stores the final choice.
+            arcs, arcs_from = self._propose_after(m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares)
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
                     'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
@@ -524,6 +465,151 @@ class CellCycleWiring(QtCore.QObject):
 
         self._start(_compute, _done, _fail)
 
+    # -- the origin and the arcs, shared by fit and by the origin door ---------------
+
+    def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth):
+        """Rotate `m` so 0 deg is division, measured on the training cells:
+        the DAPI halving when a DAPI source is given, else the panel-
+        total drop, else nothing (0 stays the S genes' mean peak).
+        Returns (origin dict, birth angle to use, the DAPI table or None).
+        Runs in the worker: no widgets."""
+        origin = {'mode': 'S mean peak'}
+        birth_used = birth
+        dapi_tab = None
+        done = False
+        if dapi_src is not None:
+            th_tr = np.degrees(m.phase(name, X_tr)[0]) % 360.0
+            tr = pd.DataFrame({'fov': fov_tr, 'cell': cell_tr, 'theta_deg': th_tr})
+            dapi_tab, _fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
+            merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
+            dna = merged['sum_above_bg'].to_numpy(float).copy()
+            fv = merged['fov'].to_numpy()
+            for f_ in np.unique(fv):
+                kk = (fv == f_) & np.isfinite(dna)
+                med = np.median(dna[kk]) if kk.sum() >= 5 else np.nan
+                dna[fv == f_] = dna[fv == f_] / med if np.isfinite(med) and med > 0 else np.nan
+            angle, factor = CC.total_drop_angle(merged['theta_deg'].to_numpy(), dna)
+            if angle is not None and factor >= 1.3:
+                m.rotate_to_zero(angle)
+                origin = {'mode': 'division (DAPI halving)', 'angle_before_deg': angle, 'drop_factor': factor,
+                          'dapi_source': list(dapi_src)}
+                birth_used = 0.0
+                done = True
+            else:
+                origin = {'mode': 'DAPI showed no halving', 'drop_factor': factor}
+        if origin_division and not done:
+            th_tr = np.degrees(m.phase(name, X_tr)[0]) % 360.0
+            angle, factor = CC.total_drop_angle(th_tr, X_tr.sum(1))
+            # the drop must be real: measured, the Tirosh-list panel
+            # (JP_001) drops x5.4 within 30 deg, chr19 x1.9, the cyclin/CDK
+            # panel (JP_002) x2.1 -- and JP_002's DAPI halves at the same
+            # place, so that gentler drop IS division too
+            if angle is not None and factor >= 1.8:
+                m.rotate_to_zero(angle)
+                origin = {'mode': 'division (total drop)' + (' after DAPI showed no halving' if dapi_src is not None else ''),
+                          'angle_before_deg': angle, 'drop_factor': factor}
+                birth_used = 0.0
+            else:
+                origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
+        return origin, birth_used, dapi_tab
+
+    def _propose_after(self, m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares):
+        """The arcs to store with a (re)placed model: from DAPI when it was
+        measured, else from cycle time. Returns (arcs, source label)."""
+        arcs, arcs_from = [], ''
+        if dapi_tab is not None:
+            try:
+                th_new = np.degrees(placed['theta'][k]) % 360.0
+                tr2 = pd.DataFrame({'fov': fov_of[k], 'cell': cell_of[k], 'theta_deg': th_new})
+                merged2 = tr2.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
+                arcs, _info = FC.propose_arcs_from_dapi(merged2['theta_deg'].to_numpy(), merged2['sum_above_bg'].to_numpy(),
+                                                         birth_deg=birth_used, fov=merged2['fov'].to_numpy())
+                arcs_from = 'DAPI'
+            except Exception as exc:                            # noqa: BLE001
+                self.mw.log(f'{TAB_TITLE}: arcs from DAPI not proposed: {type(exc).__name__}: {exc}')
+        if not arcs:
+            try:
+                w_train = m.spectrum(placed['posterior'][k])
+                arcs = FC.propose_arcs_from_time(w_train, m.grid, birth_used, shares=shares)
+                arcs_from = 'cycle time'
+            except Exception:                                   # noqa: BLE001
+                arcs = []
+        return arcs, arcs_from
+
+    def set_origin(self):
+        """The origin door: rotate the CURRENT model to the chosen origin,
+        re-place every cell, re-propose the arcs -- no EM."""
+        p = self.panel
+        m = self._need_model()
+        sp = self._storage()
+        names = self._names_from_spec() if self.spec is not None else self.names
+        X, genes, ct, keys = self._dataset(names)
+        name = (self.spec or {}).get('experiment', self._experiment_name())
+        if name not in m.panels:
+            raise ValueError(f'the model carries no panel named {name!r}')
+        want = m.panels[name]
+        if list(genes) != list(want):
+            missing = [g for g in want if g not in genes]
+            if missing:
+                raise ValueError(f'the built counts lack the model\'s genes {missing}')
+            X = X[:, [genes.index(g) for g in want]]
+        train = (self.spec or {}).get('train_celltypes') or p.training_celltypes()
+        k = np.isin(ct, train) if train else np.ones(len(X), bool)
+        if k.sum() < 100:
+            raise ValueError(f'Only {int(k.sum())} training cells to measure the origin on.')
+        fov_of = np.array([int(f) for f, _c in keys])
+        cell_of = np.array([int(c) for _f, c in keys])
+        origin_choice = int(p.OriginComboBox.currentIndex())
+        origin_division = origin_choice in (0, 1)
+        dapi_src = p.dapi_source() if origin_choice == 0 else None
+        if origin_choice == 0 and dapi_src is None:
+            self._log('origin: no DAPI source in the layouts -- falling back to the panel-total drop')
+        birth = float(p.BirthDegSpinBox.value())
+        shares = p.phase_shares()
+        spec = dict(self.spec or {})
+        if origin_choice == 2:
+            early = [g for g, r in (self.roles or {}).items() if r == 'S']
+            late = [g for g, r in (self.roles or {}).items() if r == 'G2/M']
+            if not (early and late):
+                raise ValueError('the S-peak origin needs S and G2/M roles')
+        p.SetOriginPushButton.setEnabled(False)
+        p.ModelStatusLabel.setText('setting the origin on the current model...')
+
+        def _compute():
+            if origin_choice == 2:
+                m.orient(early, late)
+                origin, birth_used, dapi_tab = {'mode': 'S mean peak'}, birth, None
+            else:
+                origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
+                                                                   origin_division, dapi_src, birth)
+            placed = m.place(name, X)
+            arcs, arcs_from = self._propose_after(m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares)
+            spec['model'] = m.to_dict()
+            spec['origin'] = origin
+            spec['origin_set_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+            spec.setdefault('fitted_at', spec['origin_set_at'])
+            spec['categories'], spec['categories_from'], spec['birth_deg'] = arcs, arcs_from, birth_used
+            self._persist(sp, spec, placed, keys, X)
+            return placed, spec
+
+        def _done(res):
+            placed, spec_ = res
+            p.SetOriginPushButton.setEnabled(True)
+            self._adopt(m, spec_, placed, keys, ct, X)
+            o = spec_.get('origin') or {}
+            otxt = o.get('mode', '')
+            if o.get('drop_factor') is not None:
+                otxt += f' (x{o["drop_factor"]:.1f}' + (f' at {o["angle_before_deg"]:.0f} deg before the rotation)' if 'angle_before_deg' in o else ')')
+            p.ModelStatusLabel.setText(f'origin set on the model of {spec_.get("fitted_at")}: {otxt}; {len(X)} cells re-placed'
+                                       + (f'; categories proposed from {spec_["categories_from"]}' if spec_.get('categories_from') else ''))
+            self._log(p.ModelStatusLabel.text())
+
+        def _fail(msg):
+            p.SetOriginPushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'origin FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
     def _names_from_spec(self):
         out = {}
         for key, gene in (self.spec.get('sources') or {}).items():
@@ -540,8 +626,9 @@ class CellCycleWiring(QtCore.QObject):
             return
         self._adopt_spec(spec)
         self.panel.ModelStatusLabel.setText(
-            f'model of {spec.get("fitted_at")} restored from the store ({spec.get("n_placed", "?")} cells placed; '
-            f'origin {(spec.get("origin") or {}).get("mode", "S mean peak")}); build counts and Place to refresh')
+            f'model of {spec.get("fitted_at")} restored from analysis/cellcycle_model.json '
+            f'({spec.get("n_placed", "?")} cells placed; origin {(spec.get("origin") or {}).get("mode", "S mean peak")}); '
+            f'build counts and Place to refresh')
 
     def _adopt_spec(self, spec):
         self.model = CC.CycleModel.from_dict(spec['model'])
@@ -562,8 +649,16 @@ class CellCycleWiring(QtCore.QObject):
         if spec.get('min_total') is not None:
             p.MinTotalSpinBox.setValue(int(spec['min_total']))
 
+    def _model_dir(self):
+        """Where model copies go by default: the project root (the user's
+        own choice), beside the store's analysis/ directory."""
+        try:
+            return paths.project_root(self._storage())
+        except Exception:                                       # noqa: BLE001
+            return ''
+
     def load_model(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self.mw, 'Load cell-cycle model', self._default_dir(), 'JSON (*.json)')
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self.mw, 'Load cell-cycle model', self._model_dir(), 'JSON (*.json)')
         if not path:
             return
         with open(path) as f:
@@ -583,8 +678,9 @@ class CellCycleWiring(QtCore.QObject):
             raise ValueError('No model to save.')
         spec = dict(self.spec)
         spec['categories'], spec['gates'], spec['birth_deg'] = self.panel.arcs(), self.panel.gates(), float(self.panel.BirthDegSpinBox.value())
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self.mw, 'Save cell-cycle model', os.path.join(self._default_dir(), f'{spec.get("experiment", "model")}_cellcycle_model.json'), 'JSON (*.json)')
+        stamp = str(spec.get('fitted_at') or '').replace(':', '').replace('-', '').replace('T', '-')
+        default = os.path.join(self._model_dir(), f'{spec.get("experiment", "model")}_cellcycle_model_{stamp or "unfitted"}.json')
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self.mw, 'Save cell-cycle model', default, 'JSON (*.json)')
         if not path:
             return
         with open(path, 'w') as f:
