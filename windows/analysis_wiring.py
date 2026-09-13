@@ -58,6 +58,8 @@ class AnalysisWiring(QtCore.QObject):
         p.BrightnessVsCountPushButton.clicked.connect(self.view_brightness_vs_count)
         p.DistanceHistPushButton.clicked.connect(self.view_distance_hist)
         p.RepeatToeQcPushButton.clicked.connect(self.view_repeat_toe_qc)
+        p.PhaseHistPushButton.clicked.connect(self.view_phase_hist)
+        p.CategoryHistPushButton.clicked.connect(self.view_category_hist)
 
     # -- population --------------------------------------------------------
     def _hybe_name(self, modality, hybe):
@@ -706,6 +708,104 @@ class AnalysisWiring(QtCore.QObject):
                                'normalize': normalize,
                                'allele_mode':
                                self.panel.AlleleModeComboBox.currentText()})
+        self._guard(go)
+
+    def _cellcycle_columns(self, pop):
+        """(theta_deg, category) per cell of pop.cells (NaN / '' where the
+        Cell Cycle stage never placed the cell), plus the role marks
+        from the stored model for the phase axis."""
+        from codelab_pipeline.analysis import cellcycle as CC
+        from codelab_pipeline.analysis import figures_cellcycle as FC
+        from codelab_pipeline.io import analysis_store
+        t = getattr(pop, 'cellcycle', None)
+        if t is None or len(t) == 0:
+            raise ValueError('the population carries no cell-cycle placements -- '
+                             'run the Cell Cycle stage, then rebuild the population')
+        idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
+        by = t.set_index(['fov', 'cell'])
+        theta = by['theta_deg'].reindex(idx).to_numpy(dtype=float)
+        cat = by['category'].reindex(idx).fillna('').to_numpy() if 'category' in by.columns \
+            else np.array([''] * len(idx), dtype=object)
+        marks, order = None, None
+        try:
+            spec = analysis_store.read_cellcycle_model(pop.storage_path) or {}
+            if spec.get('model'):
+                m = CC.CycleModel.from_dict(spec['model'])
+                marks = FC.role_marks(m, spec.get('roles') or {})
+            order = [a['name'] for a in (spec.get('categories') or [])]
+        except Exception:                                       # noqa: BLE001
+            pass
+        return theta, cat, marks, order
+
+    def view_phase_hist(self):
+        def go():
+            pop = self._need_pop()
+            from codelab_pipeline.analysis import figures_cellcycle as FC
+            theta, _cat, marks, _order = self._cellcycle_columns(pop)
+            groups = self._allele_cell_groups()
+            per_ct = self.panel.CelltypeDecomposeCheckBox.isChecked()
+            import matplotlib.pyplot as plt
+
+            def _render(bins=None):
+                n = len(groups)
+                f, axes = plt.subplots(1, n, figsize=(7.0 * n, 4.4), squeeze=False)
+                for ax, (gname, cells_df) in zip(axes[0], groups.items()):
+                    keep = pop.cells.index.isin(cells_df.index)
+                    th = theta[keep]
+                    ct = pop.cells['celltype'].to_numpy()[keep]
+                    ok = np.isfinite(th)
+                    FC.line_hist(ax, th[ok], bins=bins or 36, range=(0, 360), color='k', lw=1.8,
+                                 label=f'all (n={int(ok.sum())})')
+                    if per_ct:
+                        names = [x for x in dict.fromkeys(ct[ok])]
+                        for name, c in zip(names, FC.gene_palette(len(names))):
+                            k = ok & (ct == name)
+                            if k.sum() >= 5:
+                                FC.line_hist(ax, th[k], bins=bins or 36, range=(0, 360), color=c, lw=1.4,
+                                             label=f'{name or "Unassigned"} (n={int(k.sum())})')
+                    ax.set_ylabel('density')
+                    ax.set_title(f'{gname} ({len(cells_df)} cells, {int(ok.sum())} placed)', fontsize=10)
+                    ax.legend(fontsize=8, frameon=False)
+                    FC.phase_axis(ax, marks=marks)
+                f.tight_layout(rect=(0, 0, 1, 0.92))
+                return FC.finish(f, 'cell-cycle phase of the gated cells')
+            fig = _render()
+            self._show(fig, 'cellcycle_phase_hist', {'cells': pop.cells.assign(theta_deg=theta)},
+                       rebuild=_render, params={'allele_mode': self.panel.AlleleModeComboBox.currentText()})
+        self._guard(go)
+
+    def view_category_hist(self):
+        def go():
+            pop = self._need_pop()
+            from codelab_pipeline.analysis import figures_cellcycle as FC
+            _theta, cat, _marks, order = self._cellcycle_columns(pop)
+            groups = self._allele_cell_groups()
+            per_ct = self.panel.CelltypeDecomposeCheckBox.isChecked()
+            import matplotlib.pyplot as plt
+            n = len(groups)
+            fig, axes = plt.subplots(1, n, figsize=(7.0 * n, 4.4), squeeze=False)
+            for ax, (gname, cells_df) in zip(axes[0], groups.items()):
+                keep = pop.cells.index.isin(cells_df.index)
+                sub = FC.fig_category_hist(cat[keep], groups=pop.cells['celltype'].to_numpy()[keep] if per_ct else None,
+                                           order=order)
+                # draw into this axes: re-plot the bars from the sub figure's data
+                src_ax = sub.axes[0]
+                for bar in src_ax.patches:
+                    ax.bar(bar.get_x() + bar.get_width() / 2, bar.get_height(), width=bar.get_width(),
+                           color=bar.get_facecolor())
+                ax.set_xticks(src_ax.get_xticks())
+                ax.set_xticklabels([t.get_text() for t in src_ax.get_xticklabels()])
+                if per_ct:
+                    handles, labels = src_ax.get_legend_handles_labels()
+                    if handles:
+                        ax.legend(handles, labels, fontsize=8, frameon=False)
+                plt.close(sub)
+                ax.set_ylabel('cells')
+                ax.set_title(f'{gname} ({len(cells_df)} cells)', fontsize=10)
+            fig.tight_layout(rect=(0, 0, 1, 0.92))
+            FC.finish(fig, 'cell-cycle category of the gated cells')
+            self._show(fig, 'cellcycle_category_hist', {'cells': pop.cells.assign(category=cat)},
+                       params={'allele_mode': self.panel.AlleleModeComboBox.currentText()})
         self._guard(go)
 
     def view_brightness_vs_count(self):

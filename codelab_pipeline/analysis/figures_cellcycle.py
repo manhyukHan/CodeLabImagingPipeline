@@ -1,38 +1,57 @@
 """
-Figures for the Cell Cycle stage: the ring seen three ways, the gene
-profiles by biological role, the spectrum and the panel's total count
-along the cycle, the anchors, and the agreement of disjoint sub-panels.
+Figures for the Cell Cycle stage: the ring in its CLR plane (and tSNE),
+the gene profiles by biological role, the spectrum and the panel's
+total count along the cycle, the anchors, the agreement of disjoint
+sub-panels, the angle as cycle time, category arcs proposed from cycle
+time, the FOV overlay, and the phase / category histograms the
+Analysis tab shows under a gate.
 
 Conventions fixed with the user (2026-09-13):
-  - phase runs 0..360 deg with 0 = S-phase, 180 = G2/M, 360 = G1/S;
-    every phase axis and the one horizontal colour bar carry those
-    three labels; the phase colour map is a rainbow;
-  - the ring in the CLR plane is drawn as contours of the centre ratio
-    rho (cell radius / ring radius): solid at the expected rho = 1, the
-    others dashed;
-  - gene profiles are lines only (no binned dots), one figure per role
-    (S indicators, G2/M indicators, unassigned), gene colours from a
-    categorical palette, never the phase rainbow.
+  - phase axes carry DEGREE ticks (0..360 by 60) with the roles as a
+    second row under the axis ('S' at the S genes' mean peak, 'G2/M'
+    at the G2/M genes' mean peak -- role_marks); the one horizontal
+    rainbow colour bar sits under the figure, clear of the axis labels;
+  - the ring in the CLR plane is the fitted 72-gon (solid) with the
+    same polygon scaled per vertex to centre ratio 0.5 and 1.5
+    (dashed); the plane axes carry no ticks, only labels with the
+    variance each direction explains; UMAP was dropped (slow, and the
+    PCA plane already shows the gradient); tSNE stays as an option on
+    at most 1500 cells;
+  - histograms are centre-connected lines, never step outlines;
+  - gene profiles are lines only, one figure per role, categorical
+    gene colours, never the phase rainbow;
+  - every axes loses its top and right spines (style_ax), and every
+    title stays INSIDE the figure: the displayer shows a figure at its
+    own pixel size, so a suptitle placed above y = 1 or a title wider
+    than the figure is simply cut off (seen on the sub-panel and the
+    embeddings figures). Long titles wrap (wrap_title) and suptitles
+    get their own band (suptitle).
 
-matplotlib only at import; scikit-learn and umap-learn are imported
-inside the functions that need them and reported as missing rather
-than crashing the stage.
+matplotlib only at import; scikit-learn is imported inside the function
+that needs it and reported as missing rather than crashing the stage.
 """
+import textwrap
+
 import numpy as np
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt                                  # noqa: E402
-from matplotlib import cm, colors                                # noqa: E402
+from matplotlib import cm, colors, transforms                    # noqa: E402
 
 from codelab_pipeline.analysis import cellcycle as CC            # noqa: E402
 
-PHASE_TICKS = ((0, 'S-phase'), (180, 'G2/M'), (360, 'G1/S'))
 PHASE_CMAP = 'rainbow'
 PHASE_NORM = colors.Normalize(vmin=0.0, vmax=360.0)
+PHASE_TICKS = (0, 60, 120, 180, 240, 300, 360)
 # Okabe-Ito, then tab20 for panels beyond eight genes
 OKABE_ITO = ('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2',
              '#D55E00', '#CC79A7', '#000000')
+# The educated guess for cultured mammalian cells (~24 h cycle: G1 ~11 h,
+# S ~8 h, G2+M ~5 h), as fractions of the cycle from birth. A starting
+# point for the category arcs when no arrested population anchors them;
+# the panel lets the user edit the shares.
+DEFAULT_PHASE_SHARES = (('G1', 0.45), ('S', 0.33), ('G2/M', 0.22))
 
 
 def gene_palette(n):
@@ -41,33 +60,105 @@ def gene_palette(n):
     return [plt.get_cmap('tab20')(i % 20) for i in range(n)]
 
 
-def phase_axis(ax, which='x'):
-    """Ticks and labels of a 0..360 phase axis."""
-    pos = [p for p, _ in PHASE_TICKS]
-    lab = [l for _, l in PHASE_TICKS]
+def style_ax(ax):
+    """The universal convention: no top or right spine."""
+    for side in ('top', 'right'):
+        ax.spines[side].set_visible(False)
+    return ax
+
+
+def wrap_title(text, width=80):
+    """A title that fits the figure: wrapped at `width` characters."""
+    return '\n'.join(textwrap.wrap(str(text), width=width)) if text else ''
+
+
+def suptitle(fig, text, width=90):
+    """A figure title INSIDE the figure, with its own band on top."""
+    if not text:
+        return
+    t = wrap_title(text, width)
+    n = t.count('\n') + 1
+    fig.suptitle(t, y=0.995, va='top', fontsize=11)
+    fig.subplots_adjust(top=1.0 - 0.05 * n - 0.06)
+
+
+def finish(fig, title=None, width=90):
+    for ax in fig.axes:
+        style_ax(ax)
+    if title:
+        suptitle(fig, title, width)
+    return fig
+
+
+def role_marks(model, roles):
+    """{'S': deg, 'G2/M': deg}: the mean peak of each role's genes in the
+    fitted model -- the second row of a phase axis. Roles: {gene: role}."""
+    pk, _ = model.peak_phase()
+    out = {}
+    for role in ('S', 'G2/M'):
+        idx = [model.gi[g] for g in model.genes if (roles or {}).get(g) == role]
+        if idx:
+            out[role] = float(np.degrees(np.angle(np.mean(np.exp(1j * pk[idx])))) % 360.0)
+    return out
+
+
+def phase_axis(ax, which='x', marks=None):
+    """Degree ticks on a 0..360 phase axis, and the role marks as a
+    second row of labels under (or beside) the ticks."""
+    ticks = list(PHASE_TICKS)
     if which == 'x':
         ax.set_xlim(0, 360)
-        ax.set_xticks(pos)
-        ax.set_xticklabels(lab)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f'{t:d}' for t in ticks])
+        ax.set_xlabel('phase (deg)')
+        if marks:
+            tr = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+            for name, deg in marks.items():
+                ax.text(float(deg) % 360.0, -0.30, name, transform=tr, ha='center', va='top',
+                        fontsize=8, color='0.35', clip_on=False)
     else:
         ax.set_ylim(0, 360)
-        ax.set_yticks(pos)
-        ax.set_yticklabels(lab)
+        ax.set_yticks(ticks)
+        ax.set_yticklabels([f'{t:d}' for t in ticks])
+        ax.set_ylabel('phase (deg)')
+        if marks:
+            tr = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+            for name, deg in marks.items():
+                ax.text(-0.16, float(deg) % 360.0, name, transform=tr, ha='right', va='center',
+                        fontsize=8, color='0.35', clip_on=False)
 
 
-def phase_colorbar(fig, axes, label='cell-cycle phase'):
-    """ONE horizontal colour bar under the given axes."""
+def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None):
+    """ONE horizontal colour bar under the given axes, low enough to
+    clear their x labels; the role marks above its ticks."""
     sm = cm.ScalarMappable(norm=PHASE_NORM, cmap=PHASE_CMAP)
     sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, orientation='horizontal', fraction=0.05,
-                      pad=0.10, aspect=45)
-    cb.set_ticks([p for p, _ in PHASE_TICKS])
-    cb.set_ticklabels([l for _, l in PHASE_TICKS])
+                      pad=0.20, aspect=45)
+    cb.set_ticks(list(PHASE_TICKS))
+    cb.set_ticklabels([f'{t:d}' for t in PHASE_TICKS])
     cb.set_label(label)
+    if marks:
+        tr = transforms.blended_transform_factory(cb.ax.transData, cb.ax.transAxes)
+        for name, deg in marks.items():
+            cb.ax.text(float(deg) % 360.0, 1.15, name, transform=tr, ha='center', va='bottom',
+                       fontsize=8, color='0.35', clip_on=False)
     return cb
 
 
-# -- the ring in the CLR plane and three other embeddings ----------------------
+def line_hist(ax, values, bins=40, range=None, density=True, **kw):
+    """A histogram drawn as a line through the bin centres (the user's
+    convention: no step outlines). Returns the line or None."""
+    v = np.asarray(values, float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return None
+    h, edges = np.histogram(v, bins=bins, range=range, density=density)
+    c = 0.5 * (edges[:-1] + edges[1:])
+    return ax.plot(c, h, '-', **kw)
+
+
+# -- the ring in the CLR plane ---------------------------------------------------
 
 def ring_plane(model, name):
     """(plane (2, G), centre (G,), ring2d (T, 2)): the ring's PCA plane in
@@ -80,15 +171,20 @@ def ring_plane(model, name):
 
 
 def embed_pca(model, name, X, pseudo=0.5):
-    """Cells in the ring's plane: (n, 2), plus the ring's own curve."""
+    """Cells in the ring's plane: (n, 2), the ring's own curve, and the
+    fraction of the cells' CLR variance each plane axis explains."""
     plane, cen, ring2d = ring_plane(model, name)
     F = (X + pseudo) / (X + pseudo).sum(1, keepdims=True)
-    return (CC.clr(F) - cen) @ plane.T, ring2d
+    c = CC.clr(F) - cen
+    c2 = c @ plane.T
+    total = float(c.var(0).sum()) + 1e-12
+    frac = c2.var(0) / total
+    return c2, ring2d, frac
 
 
 def clr_z(X, pseudo=0.5):
     """CLR then per-gene z-score: the input the notebook-style
-    embeddings (tSNE, UMAP) and the Mapper see."""
+    embedding (tSNE) sees."""
     F = (X + pseudo) / (X + pseudo).sum(1, keepdims=True)
     Z = CC.clr(F)
     return (Z - Z.mean(0)) / (Z.std(0) + 1e-9)
@@ -113,21 +209,17 @@ def _circ_mean_deg(theta_deg):
     return float(np.degrees(np.angle(z)) % 360.0)
 
 
-def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=3000, title=None):
-    """The same cells in three pictures, coloured by the model's phase:
-    the ring's CLR plane (PCA) with the rho contours, tSNE and UMAP.
-    Returns (fig, notes) -- notes names any embedding that could not be
-    drawn (missing library) instead of failing. (A TDA Mapper panel was
-    tried and dropped with the user, 2026-09-13: on this data the CLR
-    cloud is a filled disc with a phase gradient, and the Mapper on a
-    PCA lens returned the cover grid, not a loop.)"""
+def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=1500, tsne=True, title=None, marks=None):
+    """The cells in the ring's CLR plane (and tSNE when asked), coloured
+    by the model's phase. Returns (fig, notes)."""
     rng = np.random.default_rng(seed)
     n = len(X)
     idx = np.arange(n) if n <= max_cells else rng.choice(n, max_cells, replace=False)
     Xs, th = np.asarray(X, float)[idx], np.asarray(theta_deg, float)[idx]
-    Z = clr_z(Xs)
-    P, ring2d = embed_pca(model, name, Xs)
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6))
+    P, ring2d, frac = embed_pca(model, name, Xs)
+    ncol = 2 if tsne else 1
+    fig, axes = plt.subplots(1, ncol, figsize=(5.4 * ncol + 0.6, 5.6), squeeze=False)
+    axes = axes[0]
     notes = []
     kw = dict(c=th, cmap=PHASE_CMAP, norm=PHASE_NORM, s=6, alpha=0.75, linewidths=0)
 
@@ -135,48 +227,38 @@ def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=3000, title=None
     ax.scatter(P[:, 0], P[:, 1], **kw)
     # the fitted ring as the 72-gon of its grid points (solid), and the
     # same polygon with every vertex's distance from the centre scaled
-    # by 0.5 and 1.5 (dashed) -- the user's construction (2026-09-13):
-    # the ring's radius differs per grid theta and the contours keep
-    # that. The scaled copies nest only when the centre lies inside the
-    # polygon; when it does not (JP_001's crescent-shaped ring), they
-    # cross, and the title says so: there the scalar centre ratio is a
-    # coarse picture and bf_ring is the inside/outside criterion.
+    # by 0.5 and 1.5 (dashed) -- the user's construction: the ring's
+    # radius differs per grid theta and the contours keep that. The
+    # scaled copies nest only when the centre lies inside the polygon.
     closed = np.vstack([ring2d, ring2d[:1]])
     for rho, style, lw in ((0.5, '--', 0.8), (1.0, '-', 1.6), (1.5, '--', 0.8)):
         ax.plot(rho * closed[:, 0], rho * closed[:, 1], style, color='k', lw=lw, alpha=0.9)
     ax.plot(0, 0, 'k+', ms=8)
     inside = _point_in_polygon(0.0, 0.0, ring2d)
-    ax.set_title('CLR plane of the ring (PCA)\nsolid: fitted ring; dashed: centre ratio 0.5 and 1.5'
-                 + ('' if inside else '\n(centre outside the ring polygon: contours cross)'))
-    ax.set_xlabel('PC1 (CLR)')
-    ax.set_ylabel('PC2 (CLR)')
+    ax.set_title('CLR plane of the ring\nsolid: fitted ring; dashed: centre ratio 0.5 and 1.5'
+                 + ('' if inside else '\n(centre outside the ring polygon: contours cross)'), fontsize=9)
+    ax.set_xlabel(f'PC1 (CLR, {100 * frac[0]:.0f}%)')
+    ax.set_ylabel(f'PC2 (CLR, {100 * frac[1]:.0f}%)')
+    ax.set_xticks([])
+    ax.set_yticks([])
     ax.set_aspect('equal', adjustable='datalim')
 
-    ax = axes[1]
-    try:
-        from sklearn.manifold import TSNE
-        E = TSNE(n_components=2, perplexity=30, init='pca', random_state=seed).fit_transform(Z)
-        ax.scatter(E[:, 0], E[:, 1], **kw)
-        ax.set_title('tSNE (CLR, z-scored genes)')
-    except Exception as exc:                                    # noqa: BLE001
-        notes.append(f'tSNE: {type(exc).__name__}: {exc}')
-        ax.set_title('tSNE unavailable')
-    ax.set_xticks([]); ax.set_yticks([])
+    if tsne:
+        ax = axes[1]
+        try:
+            from sklearn.manifold import TSNE
+            Z = clr_z(Xs)
+            E = TSNE(n_components=2, perplexity=30, init='pca', random_state=seed).fit_transform(Z)
+            ax.scatter(E[:, 0], E[:, 1], **kw)
+            ax.set_title(f'tSNE (CLR, z-scored genes; {len(idx)} cells)', fontsize=9)
+        except Exception as exc:                                # noqa: BLE001
+            notes.append(f'tSNE: {type(exc).__name__}: {exc}')
+            ax.set_title('tSNE unavailable', fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-    ax = axes[2]
-    try:
-        import umap
-        E = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.3, random_state=seed).fit_transform(Z)
-        ax.scatter(E[:, 0], E[:, 1], **kw)
-        ax.set_title('UMAP (CLR, z-scored genes)')
-    except Exception as exc:                                    # noqa: BLE001
-        notes.append(f'UMAP: {type(exc).__name__}: {exc}')
-        ax.set_title('UMAP unavailable')
-    ax.set_xticks([]); ax.set_yticks([])
-
-    fig.suptitle(title or f'{name}: {len(idx)} cells, phase from the model', y=1.02)
-    phase_colorbar(fig, list(axes))
-    return fig, notes
+    phase_colorbar(fig, list(axes), marks=marks)
+    return finish(fig, title or f'{name}: {len(idx)} cells, phase from the model'), notes
 
 
 # -- gene profiles by biological role -----------------------------------------
@@ -188,7 +270,7 @@ def fold_profiles(model):
     return np.exp(f - f.mean(0, keepdims=True))
 
 
-def fig_profiles_by_role(model, roles, ncols=1, title=None):
+def fig_profiles_by_role(model, roles, ncols=1, title=None, marks=None):
     """roles: ordered {role: [gene, ...]} -- one axes per role, one line
     per gene, categorical colours, the shared phase axis."""
     deg = np.degrees(model.grid)
@@ -196,8 +278,8 @@ def fig_profiles_by_role(model, roles, ncols=1, title=None):
     fc = fold_profiles(model)
     roles = {r: [g for g in gs if g in model.gi] for r, gs in roles.items()}
     roles = {r: gs for r, gs in roles.items() if gs}
-    nrow = int(np.ceil(len(roles) / ncols))
-    fig, axes = plt.subplots(nrow, ncols, figsize=(6.4 * ncols, 3.2 * nrow), squeeze=False)
+    nrow = max(1, int(np.ceil(len(roles) / ncols)))
+    fig, axes = plt.subplots(nrow, ncols, figsize=(6.4 * ncols, 3.6 * nrow), squeeze=False)
     axes = axes.ravel()
     for ax, (role, genes) in zip(axes, roles.items()):
         pal = gene_palette(len(genes))
@@ -205,15 +287,13 @@ def fig_profiles_by_role(model, roles, ncols=1, title=None):
             ax.plot(deg[order], fc[order, model.gi[g]], color=c, lw=1.6, label=g)
         ax.axhline(1.0, color='0.7', lw=0.8, ls=':')
         ax.set_ylabel('fraction / cycle mean')
-        ax.set_title(f'{role} ({len(genes)} genes)')
-        phase_axis(ax)
+        ax.set_title(f'{role} ({len(genes)} genes)', fontsize=10)
+        phase_axis(ax, marks=marks)
         ax.legend(fontsize=8, ncol=2 if len(genes) > 6 else 1, frameon=False)
     for ax in axes[len(roles):]:
         ax.set_visible(False)
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    fig.tight_layout(rect=(0, 0, 1, 0.95 if title else 1))
+    return finish(fig, title)
 
 
 # -- spectrum and total count along the cycle ---------------------------------
@@ -232,7 +312,7 @@ def binned_stat(theta_deg, values, n_bins=24, stat='median'):
     return c, m, lo, hi
 
 
-def fig_spectrum_and_totals(model, groups, q, totals, title=None):
+def fig_spectrum_and_totals(model, groups, q, totals, title=None, marks=None):
     """Two axes: the spectrum per condition (posterior-mean density,
     smoothed as the model's prior is) and the panel's total count per
     cell along the cycle (median line, quartile band) per condition."""
@@ -241,27 +321,25 @@ def fig_spectrum_and_totals(model, groups, q, totals, title=None):
     theta = np.degrees(np.angle(q @ np.exp(1j * model.grid))) % 360.0
     names = [g for g in dict.fromkeys(groups)]
     pal = gene_palette(len(names))
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 3.8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 4.4))
     for g, c in zip(names, pal):
         k = np.asarray(groups) == g
         if k.sum() < 5:
             continue
         w = model.spectrum(q[k])
-        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.6, label=f'{g} (n={int(k.sum())})')
+        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.6, label=f'{g or "Unassigned"} (n={int(k.sum())})')
         cen, m, lo, hi = binned_stat(theta[k], np.asarray(totals)[k])
-        ax2.plot(cen, m, color=c, lw=1.6, label=g)
+        ax2.plot(cen, m, color=c, lw=1.6, label=g or 'Unassigned')
         ax2.fill_between(cen, lo, hi, color=c, alpha=0.12, linewidth=0)
     ax1.set_ylabel('cell density (per degree x 360)')
-    ax1.set_title('spectrum per condition')
+    ax1.set_title('spectrum per condition', fontsize=10)
     ax1.legend(fontsize=8, frameon=False)
     ax2.set_ylabel('panel total count per cell')
-    ax2.set_title('total count along the cycle (median, quartiles)')
+    ax2.set_title('total count along the cycle (median, quartiles)', fontsize=10)
     for ax in (ax1, ax2):
-        phase_axis(ax)
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+        phase_axis(ax, marks=marks)
+    fig.tight_layout(rect=(0, 0, 1, 0.93 if title else 1))
+    return finish(fig, title)
 
 
 # -- anchors across experiments ------------------------------------------------
@@ -292,18 +370,18 @@ def anchor_table(entries, n_boot=500, seed=0):
     return pd.DataFrame(rows)
 
 
-def fig_anchor_spectra(model, entries, conditions, title=None):
-    """The arrested conditions of every experiment on ONE phase axis:
+def fig_anchor_spectra(model, entries, conditions, title=None, marks=None):
+    """The named conditions of every experiment on ONE phase axis:
     entries [(experiment, condition, q)], one line per (experiment,
-    condition) for the named conditions, mean direction marked."""
+    condition), mean direction marked."""
     deg = np.degrees(model.grid)
     order = np.argsort(deg)
-    fig, ax = plt.subplots(figsize=(8, 3.6))
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
     styles = ['-', '--', ':', '-.']
     exps = list(dict.fromkeys(e for e, _c, _q in entries))
     pal = gene_palette(len(conditions))
     for (exp, cond, q) in entries:
-        if cond not in conditions:
+        if cond not in conditions or len(q) < 5:
             continue
         w = model.spectrum(q)
         c = pal[conditions.index(cond)]
@@ -312,11 +390,10 @@ def fig_anchor_spectra(model, entries, conditions, title=None):
         mean = np.degrees(np.angle((q @ np.exp(1j * model.grid)).mean())) % 360.0
         ax.axvline(mean, color=c, ls=ls, lw=0.9, alpha=0.7)
     ax.set_ylabel('cell density (per degree x 360)')
-    ax.set_title(title or 'anchors: arrested conditions across experiments')
     ax.legend(fontsize=8, frameon=False)
-    phase_axis(ax)
-    fig.tight_layout()
-    return fig
+    phase_axis(ax, marks=marks)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return finish(fig, title or 'conditions: spectrum and mean direction')
 
 
 # -- disjoint sub-panels ---------------------------------------------------------
@@ -344,26 +421,25 @@ def subpanel_agreement(model, name, X, subsets, prior='uniform'):
     return thetas, pd.DataFrame(rows)
 
 
-def fig_subpanel(thetas, a, b, title=None):
+def fig_subpanel(thetas, a, b, title=None, marks=None):
     """theta_a vs theta_b as a 2-D histogram (both 0..360) and the
-    histogram of their circular difference."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4.2), gridspec_kw={'width_ratios': [1.15, 1]})
+    distribution of their circular difference as a line."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5.0), gridspec_kw={'width_ratios': [1.15, 1]})
     ax1.hist2d(thetas[a], thetas[b], bins=36, range=[[0, 360], [0, 360]], cmap='Greys')
     ax1.plot([0, 360], [0, 360], 'r-', lw=0.8, alpha=0.6)
-    ax1.set_xlabel(f'phase from {a}')
-    ax1.set_ylabel(f'phase from {b}')
-    phase_axis(ax1, 'x'); phase_axis(ax1, 'y')
+    phase_axis(ax1, 'x', marks=marks)
+    phase_axis(ax1, 'y', marks=marks)
+    ax1.set_xlabel(f'phase from {a} (deg)')
+    ax1.set_ylabel(f'phase from {b} (deg)')
     ax1.set_aspect('equal')
     d = (thetas[a] - thetas[b] + 180.0) % 360.0 - 180.0
-    ax2.hist(d, bins=36, range=(-180, 180), color='0.4')
+    line_hist(ax2, d, bins=36, range=(-180, 180), color='0.3', lw=1.6)
     ax2.axvline(0, color='r', lw=0.8)
     ax2.set_xlabel(f'phase difference {a} - {b} (deg)')
-    ax2.set_ylabel('cells')
-    ax2.set_title(f'median |diff| {np.median(np.abs(d)):.0f} deg, {np.mean(np.abs(d) <= 45) * 100:.0f}% within 45')
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    ax2.set_ylabel('density')
+    ax2.set_title(f'median |diff| {np.median(np.abs(d)):.0f} deg, {np.mean(np.abs(d) <= 45) * 100:.0f}% within 45', fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.90 if title else 1))
+    return finish(fig, title)
 
 
 # -- the angle as cycle time -------------------------------------------------
@@ -378,24 +454,22 @@ def cycle_time_map(w, grid, birth_deg=0.0, growth='uniform'):
     cells on each part of the cycle in proportion to the time spent
     there -- the spectrum of the unsynchronized cells IS the clock.
 
-    w: the training population's spectrum on `grid` (T,), summing to 1.
-    birth_deg: where the cycle starts (age 0) -- cell division. With
-    growth='uniform' the returned tau is the plain cumulative fraction
-    of cycling cells from birth_deg forward; with growth='exponential'
-    the age distribution of an exponentially growing population,
-    p(age) = 2 ln2 / T * 2^(-age/T), is inverted (age/T = -log2(1 -
-    F/2)), which stretches the late cycle: young cells are twice as
-    numerous as cells about to divide, so equal cell counts late in
-    the cycle stand for more time.
-
-    Returns a function deg -> tau in [0, 1) (vectorised), and the
-    per-grid tau.
+    Both readings of the clock come from the SAME measured spectrum;
+    they differ in what they assume about the population:
+      'uniform'      every cell counts once: tau is the plain
+                     cumulative fraction of cycling cells from birth --
+                     a steady-state population that is not growing
+                     exponentially;
+      'exponential'  an exponentially growing population holds twice
+                     as many newborn cells as cells about to divide
+                     (age density 2 ln2 / T * 2^(-age/T)); inverting it
+                     (age/T = -log2(1 - F/2)) stretches the late cycle.
+    Returns (tau(deg) -> [0, 1), tau per grid point, theta(tau) -> deg).
     """
     deg = np.degrees(np.asarray(grid)) % 360.0
     order = np.argsort(deg)
     d, ww = deg[order], np.asarray(w, float)[order]
     ww = ww / ww.sum()
-    # rotate so the cycle starts at birth_deg
     start = np.searchsorted(d, birth_deg % 360.0)
     d2 = np.concatenate([d[start:], d[:start] + 360.0])
     w2 = np.concatenate([ww[start:], ww[:start]])
@@ -408,54 +482,191 @@ def cycle_time_map(w, grid, birth_deg=0.0, growth='uniform'):
     def tau(theta_deg):
         x = (np.asarray(theta_deg, float) - birth_deg) % 360.0 + d2[0]
         return np.interp(x, edges, F_edges)
-    return tau, tau(deg)
+
+    def theta(tau_val):
+        x = np.interp(np.asarray(tau_val, float), F_edges, edges)
+        return (x - d2[0] + birth_deg) % 360.0
+    return tau, tau(deg), theta
 
 
-def fig_cycle_time(model, spectra, birth_deg=0.0, anchors=None, title=None):
-    """spectra: {experiment: training spectrum (T,)}. Left: the spectra
-    over the angle; middle: tau(angle) for each experiment, uniform and
-    exponential-growth versions; right: the same spectra over tau (flat
-    by construction for the training population). anchors:
-    [(label, experiment, deg)] marked on the middle axes."""
+def propose_arcs_from_time(w, grid, birth_deg, shares=DEFAULT_PHASE_SHARES, growth='uniform'):
+    """Category arcs from cycle-time shares: the phases in order from
+    birth with their fractions of the cycle (default G1 45%, S 33%,
+    G2/M 22%), mapped back to angles through the clock. Returns
+    [{'name', 'start_deg', 'end_deg'}] covering the whole circle."""
+    _tau, _tg, theta = cycle_time_map(w, grid, birth_deg, growth)
+    names = [n for n, _s in shares]
+    vals = np.array([float(s) for _n, s in shares], float)
+    vals = vals / vals.sum()
+    bounds = np.concatenate([[0.0], np.cumsum(vals)])
+    arcs = []
+    for i, n in enumerate(names):
+        a = float(birth_deg % 360.0) if i == 0 else float(theta(bounds[i]))
+        b = float(birth_deg % 360.0) if i + 1 == len(names) else float(theta(bounds[i + 1]))
+        arcs.append({'name': n, 'start_deg': a % 360.0, 'end_deg': b % 360.0})
+    return arcs
+
+
+def fig_cycle_time(model, spectra, birth_deg=0.0, training=None, groups_theta=None,
+                   anchors=None, title=None, marks=None):
+    """spectra: {label: spectrum (T,)} for every condition; training:
+    the label whose spectrum is the clock (the cycling population).
+    Left: the spectra over the angle; second: tau(angle) for the clock,
+    uniform and exponential-growth; third: the ring's speed; right:
+    the conditions over tau (groups_theta: {label: theta_deg})."""
     deg = np.degrees(model.grid)
     order = np.argsort(deg)
     names = list(spectra)
+    training = training if training in spectra else names[0]
     pal = gene_palette(len(names))
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4))
+    ncol = 4 if groups_theta else 3
+    fig, axes = plt.subplots(1, ncol, figsize=(5.0 * ncol, 4.4))
+    ax1, ax2, ax3 = axes[0], axes[1], axes[2]
     for name, c in zip(names, pal):
         w = np.asarray(spectra[name], float)
-        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.6, label=name)
-        tau_u, tu = cycle_time_map(w, model.grid, birth_deg, 'uniform')
-        tau_e, te = cycle_time_map(w, model.grid, birth_deg, 'exponential')
-        xs = np.linspace(0, 360, 361)
-        ax2.plot(xs, tau_u(xs), color=c, lw=1.6, label=f'{name} uniform')
-        ax2.plot(xs, tau_e(xs), color=c, lw=1.0, ls='--', label=f'{name} exponential growth')
-        # the ring's speed in time: degrees of angle per 1% of cycle time
-        # -- high where the composition changes a lot in little time
-        # (few cycling cells per degree), low on a plateau. This is
-        # 1 / (dtau/dtheta) per grid bin; the bin width is 360/T.
-        speed = (360.0 / len(w)) / np.maximum(w[order] / w.sum(), 1e-9) / 100.0
-        ax3.plot(deg[order], speed, color=c, lw=1.6, label=name)
+        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.8 if name == training else 1.3,
+                 label=f'{name}{" (clock)" if name == training else ""}')
     ax1.set_ylabel('cell density (per degree x 360)')
-    ax1.set_title('training spectrum over the angle')
+    ax1.set_title('spectrum per condition over the angle', fontsize=10)
     ax1.legend(fontsize=8, frameon=False)
-    phase_axis(ax1)
-    ax2.set_ylabel('cycle time fraction tau')
-    ax2.set_title(f'angle -> time (birth at {birth_deg:.0f} deg)')
+    phase_axis(ax1, marks=marks)
+
+    w = np.asarray(spectra[training], float)
+    xs = np.linspace(0, 360, 361)
+    tau_u, _tu, _ = cycle_time_map(w, model.grid, birth_deg, 'uniform')
+    tau_e, _te, _ = cycle_time_map(w, model.grid, birth_deg, 'exponential')
+    ax2.plot(xs, tau_u(xs), color='k', lw=1.6, label='uniform (every cell counts once)')
+    ax2.plot(xs, tau_e(xs), color='k', lw=1.0, ls='--', label='exponential growth (age-corrected)')
     ax2.axhline(0.5, color='0.8', lw=0.8, ls=':')
-    for lab, exp_, dg in (anchors or []):
-        c = pal[names.index(exp_)] if exp_ in names else 'k'
-        tau_u, _ = cycle_time_map(spectra[exp_], model.grid, birth_deg, 'uniform')
-        ax2.plot([dg], [tau_u(dg)], 'o', color=c, ms=6)
-        ax2.annotate(lab, (dg, tau_u(dg)), textcoords='offset points', xytext=(5, -10), fontsize=8, color=c)
-    ax2.legend(fontsize=7, frameon=False)
-    phase_axis(ax2)
+    for lab, dg in (anchors or []):
+        ax2.plot([dg], [tau_u(dg)], 'o', color='#D55E00', ms=6)
+        ax2.annotate(lab, (dg, tau_u(dg)), textcoords='offset points', xytext=(5, -10), fontsize=8, color='#D55E00')
+    ax2.set_ylabel('cycle time fraction tau')
+    ax2.set_title(wrap_title(f'angle -> time from the {training} spectrum (birth at {birth_deg:.0f} deg)', 44), fontsize=10)
+    ax2.legend(fontsize=8, frameon=False)
+    phase_axis(ax2, marks=marks)
+
+    speed = (360.0 / len(w)) / np.maximum(w[order] / w.sum(), 1e-9) / 100.0
+    ax3.plot(deg[order], speed, color='k', lw=1.6)
     ax3.set_ylabel('degrees of angle per 1% of cycle time')
-    ax3.set_title('how fast the composition moves along the cycle')
+    ax3.set_title('how fast the composition moves along the cycle', fontsize=10)
     ax3.set_yscale('log')
-    ax3.legend(fontsize=8, frameon=False)
-    phase_axis(ax3)
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    return fig
+    phase_axis(ax3, marks=marks)
+
+    if groups_theta:
+        ax4 = axes[3]
+        for (name, th), c in zip(groups_theta.items(), gene_palette(len(groups_theta))):
+            line_hist(ax4, tau_u(np.asarray(th, float)), bins=40, range=(0, 1), color=c, lw=1.6,
+                      label=f'{name} (n={len(th)})')
+        ax4.set_xlabel(f'cycle time fraction tau ({training} clock)')
+        ax4.set_ylabel('density')
+        ax4.set_title('conditions over cycle time', fontsize=10)
+        ax4.set_xlim(0, 1)
+        ax4.legend(fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.92 if title else 1))
+    return finish(fig, title)
+
+
+# -- the FOV overlay ----------------------------------------------------------------
+
+def fig_fov_overlay(mip, cells, values, mode='phase', categories=None, title=None, marks=None):
+    """Cells painted on the FOV's reference MIP: mode 'phase' colours
+    each cell by its angle (rainbow), 'category' by its category
+    (categorical palette; '' = unassigned in grey). cells: [{'id',
+    'area': (ys, xs)}]; values: {cell id: angle or category}; a cell
+    with no value is shown in a faint grey."""
+    mip = np.asarray(mip, float)
+    finite = mip[np.isfinite(mip)]
+    lo, hi = (np.percentile(finite, [1, 99.5]) if finite.size else (0.0, 1.0))
+    H, W = mip.shape
+    rgba = np.zeros((H, W, 4), float)
+    cats = list(categories or [])
+    lut = {}
+    if mode == 'category':
+        cats = cats or sorted({v for v in values.values() if v})
+        lut = {c: colors.to_rgba(p) for c, p in zip(cats, gene_palette(len(cats)))}
+    cmap = plt.get_cmap(PHASE_CMAP)
+    n_drawn = 0
+    for c in cells:
+        cid = int(c['id'])
+        ys, xs = c['area']
+        ys = np.clip(np.asarray(ys).astype(int), 0, H - 1)
+        xs = np.clip(np.asarray(xs).astype(int), 0, W - 1)
+        v = values.get(cid)
+        if v is None or (mode == 'phase' and not np.isfinite(float(v))):
+            col = (0.6, 0.6, 0.6, 0.25)
+        elif mode == 'phase':
+            r, g, b, _a = cmap(PHASE_NORM(float(v)))
+            col = (r, g, b, 0.55)
+            n_drawn += 1
+        else:
+            r, g, b, _a = lut.get(v, (0.5, 0.5, 0.5, 1.0))
+            col = (r, g, b, 0.55) if v else (0.5, 0.5, 0.5, 0.3)
+            n_drawn += bool(v)
+        rgba[ys, xs] = col
+    fig, ax = plt.subplots(figsize=(8.5, 9.0))
+    ax.imshow(mip, cmap='gray', vmin=lo, vmax=hi, interpolation='nearest')
+    ax.imshow(rgba, interpolation='nearest')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if mode == 'phase':
+        phase_colorbar(fig, [ax], marks=marks)
+    else:
+        from matplotlib.patches import Patch
+        handles = [Patch(color=lut[c], label=c) for c in cats] + [Patch(color=(0.5, 0.5, 0.5), label='Unassigned')]
+        ax.legend(handles=handles, loc='upper right', fontsize=8, frameon=True)
+    return finish(fig, title or f'{n_drawn} cells coloured by {mode}')
+
+
+# -- the Analysis tab's views under a gate -------------------------------------------
+
+def fig_phase_hist(theta_deg, groups=None, mask=None, title=None, marks=None, bins=36):
+    """The angle distribution of the gated cells as centre-connected
+    lines, one per group (celltype) plus all together; cells outside
+    the mask or without a phase are left out."""
+    th = np.asarray(theta_deg, float)
+    keep = np.isfinite(th) & (np.ones(len(th), bool) if mask is None else np.asarray(mask, bool))
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    line_hist(ax, th[keep], bins=bins, range=(0, 360), color='k', lw=1.8, label=f'all gated (n={int(keep.sum())})')
+    if groups is not None:
+        g = np.asarray(groups, dtype=object)
+        names = [x for x in dict.fromkeys(g[keep])]
+        for name, c in zip(names, gene_palette(len(names))):
+            k = keep & (g == name)
+            if k.sum() >= 5:
+                line_hist(ax, th[k], bins=bins, range=(0, 360), color=c, lw=1.4, label=f'{name or "Unassigned"} (n={int(k.sum())})')
+    ax.set_ylabel('density')
+    ax.legend(fontsize=8, frameon=False)
+    phase_axis(ax, marks=marks)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return finish(fig, title or 'cell-cycle phase of the gated cells')
+
+
+def fig_category_hist(categories, groups=None, mask=None, order=None, title=None):
+    """Cells per category (bars) for the gated cells, side by side per
+    group (celltype) when groups are given; '' reads Unassigned."""
+    cat = np.asarray(['Unassigned' if not c else str(c) for c in categories], dtype=object)
+    keep = np.ones(len(cat), bool) if mask is None else np.asarray(mask, bool)
+    names = list(order) if order else [x for x in dict.fromkeys(cat[keep]) if x != 'Unassigned']
+    if 'Unassigned' in set(cat[keep]) and 'Unassigned' not in names:
+        names.append('Unassigned')
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    x = np.arange(len(names))
+    if groups is None:
+        counts = [int(((cat == n) & keep).sum()) for n in names]
+        ax.bar(x, counts, color='0.4')
+        for xi, n in zip(x, counts):
+            ax.text(xi, n, str(n), ha='center', va='bottom', fontsize=8)
+    else:
+        g = np.asarray(groups, dtype=object)
+        gnames = [v for v in dict.fromkeys(g[keep])]
+        width = 0.8 / max(1, len(gnames))
+        for j, (gn, c) in enumerate(zip(gnames, gene_palette(len(gnames)))):
+            counts = [int(((cat == n) & keep & (g == gn)).sum()) for n in names]
+            ax.bar(x + (j - (len(gnames) - 1) / 2) * width, counts, width=width, color=c, label=f'{gn or "Unassigned"}')
+        ax.legend(fontsize=8, frameon=False)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names)
+    ax.set_ylabel('cells')
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    return finish(fig, title or 'cell-cycle category of the gated cells')

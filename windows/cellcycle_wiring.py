@@ -71,6 +71,8 @@ class CellCycleWiring(QtCore.QObject):
         p.HalfPanelPushButton.clicked.connect(lambda: self._guard(self.view_half_panel))
         p.CycleTimePushButton.clicked.connect(lambda: self._guard(self.view_cycle_time))
         p.ProposeArcsPushButton.clicked.connect(lambda: self._guard(self.propose_arcs))
+        p.ProposeFromTimePushButton.clicked.connect(lambda: self._guard(self.propose_arcs_from_time))
+        p.FovOverlayPushButton.clicked.connect(lambda: self._guard(self.view_fov_overlay))
         p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
         mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
 
@@ -513,6 +515,13 @@ class CellCycleWiring(QtCore.QObject):
     def _name(self):
         return (self.spec or {}).get('experiment', self._experiment_name())
 
+    def _marks(self):
+        """The role marks for the phase axes, from the current model."""
+        try:
+            return FC.role_marks(self.model, self.roles or {}) if self.model is not None else None
+        except Exception:                                       # noqa: BLE001
+            return None
+
     def _default_dir(self):
         try:
             return paths.figure_dir(self._storage(), 'cellcycle', 0)
@@ -550,7 +559,9 @@ class CellCycleWiring(QtCore.QObject):
     def view_spectrum(self):
         m = self._need_model(placed=True)
         groups, q, totals, name = self.placed['celltype'].to_numpy(), self.q, self.placed['total'].to_numpy(), self._name()
-        self._view('spectrum', lambda: FC.fig_spectrum_and_totals(m, groups, q, totals, title=name), 'spectrum_and_totals')
+        marks = self._marks()
+        self._view('spectrum', lambda: FC.fig_spectrum_and_totals(m, groups, q, totals, title=name, marks=marks),
+                   'spectrum_and_totals')
 
     def view_profiles(self):
         m = self._need_model()
@@ -558,19 +569,25 @@ class CellCycleWiring(QtCore.QObject):
         rd = {'S indicators': [g for g in m.genes if roles.get(g) == 'S'],
               'G2/M indicators': [g for g in m.genes if roles.get(g) == 'G2/M'],
               'unassigned': [g for g in m.genes if roles.get(g) not in ('S', 'G2/M')]}
-        self._view('gene profiles', lambda: FC.fig_profiles_by_role(m, rd, title=f'{self._name()}: fitted gene profiles'), 'profiles_by_role')
+        marks = self._marks()
+        self._view('gene profiles', lambda: FC.fig_profiles_by_role(m, rd, title=f'{self._name()}: fitted gene profiles',
+                                                                     marks=marks), 'profiles_by_role')
 
     def view_embeddings(self):
         m = self._need_model(placed=True)
         k = self._training_mask()
         X, th, name = self.X[k], self.placed['theta_deg'].to_numpy()[k], self._name()
 
+        marks = self._marks()
+        tsne = self.panel.TsneCheckBox.isChecked()
+
         def _compute():
-            fig, notes = FC.fig_embeddings(m, name, X, th, title=f'{name}: {int(k.sum())} training cells, coloured by phase')
+            fig, notes = FC.fig_embeddings(m, name, X, th, tsne=tsne, marks=marks,
+                                           title=f'{name}: {int(k.sum())} training cells, coloured by phase')
             if notes:
                 self.mw.log(f'{TAB_TITLE}: embeddings: ' + '; '.join(notes))
             return fig, None
-        self._view('embeddings (tSNE/UMAP take a minute)', _compute, 'embeddings')
+        self._view('the ring' + (' (tSNE takes a while)' if tsne else ''), _compute, 'embeddings')
 
     def view_verdicts(self):
         self._need_model(placed=True)
@@ -588,13 +605,13 @@ class CellCycleWiring(QtCore.QObject):
                     v = placed.loc[placed['celltype'] == cond, col].to_numpy(float)
                     v = v[np.isfinite(v)]
                     if len(v):
-                        ax.hist(np.clip(v, *rng), bins=40, range=rng, histtype='step', color=c, lw=1.5, density=True,
-                                label=f'{cond or "Unassigned"} (n={len(v)})')
+                        FC.line_hist(ax, np.clip(v, *rng), bins=40, range=rng, color=c, lw=1.5,
+                                     label=f'{cond or "Unassigned"} (n={len(v)})')
                 ax.set_xlabel(lab)
                 ax.set_yticks([])
             axes[0].legend(fontsize=7, frameon=False)
-            fig.suptitle(f'{self._name()}: per-cell verdicts by condition')
-            fig.tight_layout()
+            fig.tight_layout(rect=(0, 0, 1, 0.9))
+            FC.finish(fig, f'{self._name()}: per-cell verdicts by condition')
             return fig, {'placements': placed}
         self._view('verdicts', _compute, 'verdicts')
 
@@ -615,9 +632,9 @@ class CellCycleWiring(QtCore.QObject):
             cols = ['#0072B2' if r == 'S' else '#D55E00' if r == 'G2/M' else '#999999' for r in tab['role']]
             ax.bar(tab['gene'], tab['fisher_share_%'], color=cols)
             ax.set_ylabel('Fisher information share (%)')
-            ax.set_title(f'{name}: what each gene contributes to the phase (blue S, orange G2/M, grey other)')
             ax.tick_params(axis='x', rotation=60)
-            fig.tight_layout()
+            fig.tight_layout(rect=(0, 0, 1, 0.9))
+            FC.finish(fig, f'{name}: what each gene contributes to the phase (blue S, orange G2/M, grey other)')
             return fig, {'contribution': tab}
         self._view('contribution', _compute, 'contribution')
 
@@ -633,7 +650,8 @@ class CellCycleWiring(QtCore.QObject):
             tab = pd.DataFrame(rows)
             entries = [(name, c or 'Unassigned', q[groups == c]) for c in dict.fromkeys(groups) if (groups == c).sum() >= 5]
             fig = FC.fig_anchor_spectra(m, entries, [c or 'Unassigned' for c in dict.fromkeys(groups)],
-                                        title=f'{name}: spectrum per condition (mean direction marked)')
+                                        title=f'{name}: spectrum per condition (mean direction marked)',
+                                        marks=self._marks())
             return fig, {'groups': tab}
         self._view('group table', _compute, 'groups')
 
@@ -648,7 +666,8 @@ class CellCycleWiring(QtCore.QObject):
             order = sorted(share, key=lambda g: -share[g])
             halves = {'half A': order[0::2], 'half B': order[1::2]}
             th, st = FC.subpanel_agreement(m, name, X, halves)
-            fig = FC.fig_subpanel(th, 'half A', 'half B', title=f'{name} training cells: {halves["half A"]} vs {halves["half B"]}')
+            fig = FC.fig_subpanel(th, 'half A', 'half B', marks=self._marks(),
+                                  title=f'{name} training cells: half A {halves["half A"]} vs half B {halves["half B"]}')
             d = np.abs((th['half A'] - th['half B'] + 180) % 360 - 180)
             s = X.sum(1)
             edges = np.quantile(s, np.linspace(0, 1, 5))
@@ -660,14 +679,83 @@ class CellCycleWiring(QtCore.QObject):
             return fig, {'agreement': st, 'by_depth': depth}
         self._view('half-panel reproducibility', _compute, 'half_panel')
 
+    def _training_spectrum(self):
+        m = self._need_model(placed=True)
+        return m.spectrum(self.q[self._training_mask()])
+
     def view_cycle_time(self):
         m = self._need_model(placed=True)
         k = self._training_mask()
         name, birth = self._name(), float(self.panel.BirthDegSpinBox.value())
-        spectra = {name: m.spectrum(self.q[k])}
-        self._view('cycle time', lambda: (FC.fig_cycle_time(m, spectra, birth_deg=birth,
-                                                             title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg)'), None),
-                   'cycle_time')
+        groups = self.placed['celltype'].to_numpy()
+        theta = self.placed['theta_deg'].to_numpy()
+        conds = [c for c in dict.fromkeys(groups) if (groups == c).sum() >= 5]
+        spectra = {(c or 'Unassigned'): m.spectrum(self.q[groups == c]) for c in conds}
+        training = 'training (' + ', '.join(self.spec.get('train_celltypes') or ['all']) + ')'
+        spectra[training] = m.spectrum(self.q[k])
+        groups_theta = {(c or 'Unassigned'): theta[groups == c] for c in conds}
+        marks = self._marks()
+        self._view('cycle time', lambda: (FC.fig_cycle_time(
+            m, spectra, birth_deg=birth, training=training, groups_theta=groups_theta, marks=marks,
+            title=f'{name}: the angle as cycle time (birth at {birth:.0f} deg; clock = the training spectrum)'), None),
+            'cycle_time')
+
+    def propose_arcs_from_time(self):
+        m = self._need_model(placed=True)
+        shares = self.panel.phase_shares()
+        birth = float(self.panel.BirthDegSpinBox.value())
+        arcs = FC.propose_arcs_from_time(self._training_spectrum(), m.grid, birth, shares=shares)
+        self.panel.set_arcs(arcs)
+        self.panel.CategoryStatusLabel.setText(
+            'proposed from cycle time: ' + ', '.join(f'{a["name"]} {a["start_deg"]:.0f}-{a["end_deg"]:.0f}' for a in arcs)
+            + '. Edit, then Apply.')
+        self._refresh_category_counts()
+
+    def view_fov_overlay(self):
+        p = self.panel
+        sp = self._storage()
+        fov = int(p.OverlayFovSpinBox.value())
+        mode = p.OverlayModeComboBox.currentText()
+        cells, _ = analysis_store.read_cells(sp, fov)
+        if not cells:
+            raise ValueError(f'FOV {fov} has no cells in the store.')
+        if self.placed is not None and (self.placed['fov'] == fov).any():
+            sub = self.placed[self.placed['fov'] == fov]
+            theta = dict(zip(sub['cell'].astype(int), sub['theta_deg'].astype(float)))
+            table = sub
+        else:
+            cap = analysis_store.read_fov_cellcycle(sp, fov)
+            if not cap or not cap.get('rows'):
+                raise ValueError(f'FOV {fov} has no placements: Fit or Place first.')
+            table = pd.DataFrame(cap['rows'])
+            theta = dict(zip(table['cell'].astype(int), table['theta_deg'].astype(float)))
+        if mode == 'category':
+            arcs = p.arcs()
+            if not arcs:
+                raise ValueError('No category arcs: propose or add them (section 4) first.')
+            cat = CC.assign(table, arcs, p.gates())
+            values = dict(zip(table['cell'].astype(int), cat))
+            order = [a['name'] for a in arcs]
+        else:
+            values, order = theta, None
+        # the reference MIP: the cells' own reference hybe in its modality,
+        # the segmentation channel when the panel names one
+        ref_hybe = str(cells[0].get('reference_hybe') or '')
+        ref_mod = str(cells[0].get('reference_modality') or '')
+        sp_ref = self.mw._storage_path_for_modality(ref_mod) or sp
+        channel = None
+        try:
+            channel = int(self.mw.ui.CellSegmentPanel.ChannelComboBox.currentText())
+        except Exception:                                       # noqa: BLE001
+            pass
+        if channel is not None:
+            mip = analysis_store.read_hybe_mip(sp_ref, fov, ref_hybe, channel)
+        else:
+            mip = analysis_store.fiducial_channel_mip(sp_ref, fov, ref_hybe)
+        marks = self._marks()
+        title = f'{self._name()} FOV {fov}: cells by {mode} on {ref_hybe}' + (f' ch{channel}' if channel else '')
+        self._view('FOV overlay', lambda: (FC.fig_fov_overlay(mip, cells, values, mode=mode, categories=order,
+                                                              title=title, marks=marks), None), f'fov{fov:03d}_overlay')
 
     # -- 4. categories -----------------------------------------------------------------
 

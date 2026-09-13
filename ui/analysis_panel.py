@@ -292,8 +292,17 @@ class AnalysisPanelUI(object):
         self.PredicateKindComboBox = QtWidgets.QComboBox()
         self.PredicateKindComboBox.addItems(
             ['ExpressionRange', 'PairDistanceRange', 'BarcodePresence',
-             'CompletenessRange', 'CelltypeIn', 'FovIn', 'AlleleCount'])
+             'CompletenessRange', 'CelltypeIn', 'FovIn', 'AlleleCount',
+             'PhaseRange', 'CycleRange', 'CycleCategoryIn'])
+        self.PredicateKindComboBox.setToolTip(
+            'PhaseRange: cell-cycle angle inside the arc Range lo -> hi (deg, forward, may cross 0);\n'
+            'Values = optional minimum R. CycleRange: one verdict (Cycle metric) within Range.\n'
+            'CycleCategoryIn: Values = category names (Unassigned for the placed-but-unassigned).\n'
+            'All three need the Cell Cycle stage to have placed the cells.')
         form.addRow('Kind:', self.PredicateKindComboBox)
+        self.CycleMetricComboBox = QtWidgets.QComboBox()
+        self.CycleMetricComboBox.addItems(['R', 'fit_z', 'bf_ring', 'radius', 'total'])
+        form.addRow('Cycle metric:', self.CycleMetricComboBox)
         self.SourceAPicker = SourcePicker(allow_traced=True)
         form.addRow('Source (A):', self.SourceAPicker)
         self.SourceBPicker = SourcePicker(allow_traced=True)
@@ -424,12 +433,16 @@ class AnalysisPanelUI(object):
         self.ExpressionHistPushButton = QtWidgets.QPushButton('Expression Histogram (source A)')
         self.BrightnessVsCountPushButton = QtWidgets.QPushButton('Brightness vs Count (source A)')
         self.DistanceHistPushButton = QtWidgets.QPushButton('Distance Histogram (A vs B)')
+        self.PhaseHistPushButton = QtWidgets.QPushButton('Cell-Cycle Phase Histogram')
+        self.CategoryHistPushButton = QtWidgets.QPushButton('Cell-Cycle Category Histogram')
         for i, b in enumerate((self.EnsembleMapPushButton,
                                self.FovConsistencyPushButton,
                                self.AlleleDifferencePushButton,
                                self.ExpressionHistPushButton,
                                self.BrightnessVsCountPushButton,
-                               self.DistanceHistPushButton)):
+                               self.DistanceHistPushButton,
+                               self.PhaseHistPushButton,
+                               self.CategoryHistPushButton)):
             grid.addWidget(b, i // 2, i % 2)
         viewLayout.addLayout(grid)
         layout.addWidget(viewGroup)
@@ -446,15 +459,19 @@ class AnalysisPanelUI(object):
         is_list = kind in ('CelltypeIn', 'FovIn')
         is_pres = kind == 'BarcodePresence'
         is_allele = kind in ('AlleleCount', 'CompletenessRange')
+        is_phase = kind == 'PhaseRange'
+        is_cycle = kind == 'CycleRange'
+        is_cat = kind == 'CycleCategoryIn'
+        self.CycleMetricComboBox.setEnabled(is_cycle)
         self.SourceAPicker.setEnabled(is_expr or is_pair)
         # expr needs B too: it is by_source normalization's reference
         self.SourceBPicker.setEnabled(is_pair or is_expr)
         self.MetricComboBox.setEnabled(is_expr)
         self.NormalizeComboBox.setEnabled(is_expr)
         self.CollapseComboBox.setEnabled(is_pair)
-        self.LoLineEdit.setEnabled(is_expr or is_pair or is_allele)
-        self.HiLineEdit.setEnabled(is_expr or is_pair or is_allele)
-        self.ValuesLineEdit.setEnabled(is_list or is_pres)
+        self.LoLineEdit.setEnabled(is_expr or is_pair or is_allele or is_phase or is_cycle)
+        self.HiLineEdit.setEnabled(is_expr or is_pair or is_allele or is_phase or is_cycle)
+        self.ValuesLineEdit.setEnabled(is_list or is_pres or is_phase or is_cat)
         self.AbsentCheckBox.setEnabled(is_pres)
         self.PreviewHistogramPushButton.setEnabled(is_expr or is_pair)
 
@@ -561,6 +578,27 @@ class AnalysisPanelUI(object):
             if not fovs:
                 raise ValueError('list the FOVs')
             return {'kind': 'fov_in', 'fovs': fovs}
+        if kind == 'PhaseRange':
+            if lo is None or hi is None:
+                raise ValueError('PhaseRange needs both bounds: the arc runs '
+                                 'forward from lo to hi in degrees')
+            txt = self.ValuesLineEdit.text().strip()
+            min_r = None
+            if txt:
+                try:
+                    min_r = float(txt)
+                except ValueError:
+                    raise ValueError('Values for PhaseRange is the optional minimum R (a number)')
+            return {'kind': 'phase_range', 'lo_deg': float(lo), 'hi_deg': float(hi), 'min_r': min_r}
+        if kind == 'CycleRange':
+            return {'kind': 'cycle_range', 'metric': self.CycleMetricComboBox.currentText(),
+                    'lo': lo, 'hi': hi}
+        if kind == 'CycleCategoryIn':
+            names = [v.strip() for v in self.ValuesLineEdit.text().split(',') if v.strip()]
+            if not names:
+                raise ValueError('list the cell-cycle categories, comma-separated '
+                                 '(Unassigned for the placed-but-unassigned cells)')
+            return {'kind': 'cycle_category_in', 'names': names}
         if kind == 'CompletenessRange':
             return {'kind': 'completeness_range',
                     'lo': int(lo) if lo is not None else None,

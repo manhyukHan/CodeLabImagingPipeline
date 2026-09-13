@@ -165,6 +165,22 @@ class CellCyclePanelUI(object):
                                self.VerdictsPushButton, self.ContributionPushButton, self.GroupTablePushButton,
                                self.HalfPanelPushButton, self.CycleTimePushButton)):
             figLayout.addWidget(b, i // 2, i % 2)
+        self.TsneCheckBox = QtWidgets.QCheckBox('add tSNE to the ring figure (slower)')
+        figLayout.addWidget(self.TsneCheckBox, 4, 0)
+        overlayRow = QtWidgets.QWidget()
+        overlayLayout = QtWidgets.QHBoxLayout(overlayRow)
+        overlayLayout.setContentsMargins(0, 0, 0, 0)
+        overlayLayout.addWidget(QtWidgets.QLabel('FOV:'))
+        self.OverlayFovSpinBox = QtWidgets.QSpinBox()
+        self.OverlayFovSpinBox.setRange(0, 9999)
+        self.OverlayFovSpinBox.setValue(1)
+        overlayLayout.addWidget(self.OverlayFovSpinBox)
+        self.OverlayModeComboBox = QtWidgets.QComboBox()
+        self.OverlayModeComboBox.addItems(['phase', 'category'])
+        overlayLayout.addWidget(self.OverlayModeComboBox)
+        self.FovOverlayPushButton = QtWidgets.QPushButton('FOV overlay (cells on the reference MIP)')
+        overlayLayout.addWidget(self.FovOverlayPushButton, 1)
+        figLayout.addWidget(overlayRow, 4, 1)
         layout.addWidget(figGroup)
 
         # -- 4. categories and gates ----------------------------------------
@@ -187,7 +203,12 @@ class CellCyclePanelUI(object):
         self.ProposeArcsPushButton = QtWidgets.QPushButton('Propose from roles')
         self.ProposeArcsPushButton.setToolTip('S around the S genes\' mean peak (0), G2/M around the G2/M genes\' mean peak, '
                                               'G1 between them: a starting point to edit, not a verdict.')
-        for b in (self.AddArcPushButton, self.RemoveArcPushButton, self.ProposeArcsPushButton):
+        self.ProposeFromTimePushButton = QtWidgets.QPushButton('Propose from cycle time')
+        self.ProposeFromTimePushButton.setToolTip('The educated guess: phases as shares of cycle time from birth, '
+                                                  'mapped to angles through the training spectrum (the clock). '
+                                                  'Edit the shares below, then propose, then Apply.')
+        for b in (self.AddArcPushButton, self.RemoveArcPushButton, self.ProposeArcsPushButton,
+                  self.ProposeFromTimePushButton):
             arcBtns.addWidget(b)
         arcBtns.addStretch(1)
         arcLayout.addLayout(arcBtns)
@@ -217,6 +238,10 @@ class CellCyclePanelUI(object):
         self.BirthDegSpinBox.setToolTip('Where the cycle-time clock starts (cell birth, M exit). Proposed from the G2/M '
                                         'profiles\' descent to their mean; the clock itself is the training spectrum.')
         bform.addRow('Birth angle for cycle time (deg):', self.BirthDegSpinBox)
+        self.PhaseSharesLineEdit = QtWidgets.QLineEdit('G1 45, S 33, G2/M 22')
+        self.PhaseSharesLineEdit.setToolTip('Phases in order from birth with their share of the cycle (%). '
+                                            'Default: cultured mammalian cells, ~24 h cycle.')
+        bform.addRow('Phase time shares (%):', self.PhaseSharesLineEdit)
         catLayout.addLayout(bform)
         self.ApplyCategoriesPushButton = QtWidgets.QPushButton('Apply categories and gates to the stored model')
         catLayout.addWidget(self.ApplyCategoriesPushButton)
@@ -441,6 +466,25 @@ class CellCyclePanelUI(object):
         t.setRowCount(0)
         for a in arcs or []:
             self._add_arc_row(a['name'], a['start_deg'], a['end_deg'])
+
+    def phase_shares(self):
+        """[(name, fraction)] from the shares line, in order; raises
+        ValueError on a malformed entry."""
+        out = []
+        for part in self.PhaseSharesLineEdit.text().split(','):
+            part = part.strip()
+            if not part:
+                continue
+            bits = part.rsplit(None, 1)
+            if len(bits) != 2:
+                raise ValueError(f'phase shares: "{part}" is not "name percent"')
+            try:
+                out.append((bits[0].strip(), float(bits[1]) / 100.0))
+            except ValueError:
+                raise ValueError(f'phase shares: "{bits[1]}" is not a number')
+        if len(out) < 2:
+            raise ValueError('phase shares need at least two phases, e.g. "G1 45, S 33, G2/M 22"')
+        return out
 
     def gates(self):
         """{gate key: value or None} over cellcycle.GATE_KEYS' keys the
