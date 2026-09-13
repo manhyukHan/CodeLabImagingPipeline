@@ -430,11 +430,12 @@ def fig_cycle_time(model, spectra, birth_deg=0.0, anchors=None, title=None):
         xs = np.linspace(0, 360, 361)
         ax2.plot(xs, tau_u(xs), color=c, lw=1.6, label=f'{name} uniform')
         ax2.plot(xs, tau_e(xs), color=c, lw=1.0, ls='--', label=f'{name} exponential growth')
-        # density over tau: cells per unit tau = w / dtau
-        dt = np.gradient(tu[order], deg[order])
-        with np.errstate(divide='ignore', invalid='ignore'):
-            dens = w[order] * len(w) / 360.0 / np.maximum(dt, 1e-9)
-        ax3.plot(tu[order], dens / np.nanmedian(dens), color=c, lw=1.6, label=name)
+        # the ring's speed in time: degrees of angle per 1% of cycle time
+        # -- high where the composition changes a lot in little time
+        # (few cycling cells per degree), low on a plateau. This is
+        # 1 / (dtau/dtheta) per grid bin; the bin width is 360/T.
+        speed = (360.0 / len(w)) / np.maximum(w[order] / w.sum(), 1e-9) / 100.0
+        ax3.plot(deg[order], speed, color=c, lw=1.6, label=name)
     ax1.set_ylabel('cell density (per degree x 360)')
     ax1.set_title('training spectrum over the angle')
     ax1.legend(fontsize=8, frameon=False)
@@ -449,10 +450,11 @@ def fig_cycle_time(model, spectra, birth_deg=0.0, anchors=None, title=None):
         ax2.annotate(lab, (dg, tau_u(dg)), textcoords='offset points', xytext=(5, -10), fontsize=8, color=c)
     ax2.legend(fontsize=7, frameon=False)
     phase_axis(ax2)
-    ax3.set_xlabel('cycle time fraction tau')
-    ax3.set_ylabel('density over tau / median')
-    ax3.set_title('the same spectra over tau (flat by construction)')
-    ax3.set_xlim(0, 1)
+    ax3.set_ylabel('degrees of angle per 1% of cycle time')
+    ax3.set_title('how fast the composition moves along the cycle')
+    ax3.set_yscale('log')
+    ax3.legend(fontsize=8, frameon=False)
+    phase_axis(ax3)
     if title:
         fig.suptitle(title)
     fig.tight_layout()
