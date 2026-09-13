@@ -1,5 +1,5 @@
 """
-Figures for the Cell Cycle stage: the ring seen four ways, the gene
+Figures for the Cell Cycle stage: the ring seen three ways, the gene
 profiles by biological role, the spectrum and the panel's total count
 along the cycle, the anchors, and the agreement of disjoint sub-panels.
 
@@ -94,45 +94,18 @@ def clr_z(X, pseudo=0.5):
     return (Z - Z.mean(0)) / (Z.std(0) + 1e-9)
 
 
-def mapper_graph(Z, lens, n_intervals=8, overlap=0.3, eps=None, min_samples=3):
-    """A minimal Mapper (Singh, Memoli, Carlsson 2007): cover the 2-D
-    lens with an overlapping grid, cluster the rows of Z inside each
-    cover cell (DBSCAN), one node per cluster, an edge where two nodes
-    share a cell. A loop in the graph is the ring seen topologically,
-    with no dimension reduction of the data itself.
-
-    Returns (nodes: [index arrays], edges: [(i, j)])."""
-    from sklearn.cluster import DBSCAN
-    from sklearn.neighbors import NearestNeighbors
-    if eps is None:
-        nn = NearestNeighbors(n_neighbors=6).fit(Z)
-        d, _ = nn.kneighbors(Z)
-        eps = 1.5 * float(np.median(d[:, -1]))
-    nodes = []
-    lo, hi = lens.min(0), lens.max(0)
-    width = (hi - lo) / n_intervals
-    step = width * (1.0 - overlap)
-    for i in range(n_intervals):
-        for j in range(n_intervals):
-            a = lo + np.array([i, j]) * step
-            b = a + width
-            if i == n_intervals - 1:
-                b[0] = hi[0] + 1e-9
-            if j == n_intervals - 1:
-                b[1] = hi[1] + 1e-9
-            inside = np.where((lens[:, 0] >= a[0]) & (lens[:, 0] < b[0])
-                              & (lens[:, 1] >= a[1]) & (lens[:, 1] < b[1]))[0]
-            if len(inside) < min_samples:
-                continue
-            labels = DBSCAN(eps=eps, min_samples=min_samples).fit(Z[inside]).labels_
-            for k in np.unique(labels):
-                if k < 0:
-                    continue
-                nodes.append(inside[labels == k])
-    sets = [set(n.tolist()) for n in nodes]
-    edges = [(i, j) for i in range(len(nodes)) for j in range(i + 1, len(nodes))
-             if sets[i] & sets[j]]
-    return nodes, edges
+def _point_in_polygon(x, y, poly):
+    """Even-odd test: is (x, y) inside the closed polygon `poly` (n, 2)?"""
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xc = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < xc:
+                inside = not inside
+    return inside
 
 
 def _circ_mean_deg(theta_deg):
@@ -141,28 +114,40 @@ def _circ_mean_deg(theta_deg):
 
 
 def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=3000, title=None):
-    """The same cells in four pictures, coloured by the model's phase:
-    the ring's CLR plane (PCA) with the rho contours, tSNE, UMAP, and the
-    Mapper graph. Returns (fig, notes) -- notes names any embedding that
-    could not be drawn (missing library) instead of failing."""
-    from matplotlib.collections import LineCollection
+    """The same cells in three pictures, coloured by the model's phase:
+    the ring's CLR plane (PCA) with the rho contours, tSNE and UMAP.
+    Returns (fig, notes) -- notes names any embedding that could not be
+    drawn (missing library) instead of failing. (A TDA Mapper panel was
+    tried and dropped with the user, 2026-09-13: on this data the CLR
+    cloud is a filled disc with a phase gradient, and the Mapper on a
+    PCA lens returned the cover grid, not a loop.)"""
     rng = np.random.default_rng(seed)
     n = len(X)
     idx = np.arange(n) if n <= max_cells else rng.choice(n, max_cells, replace=False)
     Xs, th = np.asarray(X, float)[idx], np.asarray(theta_deg, float)[idx]
     Z = clr_z(Xs)
     P, ring2d = embed_pca(model, name, Xs)
-    fig, axes = plt.subplots(1, 4, figsize=(17, 4.6))
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.6))
     notes = []
     kw = dict(c=th, cmap=PHASE_CMAP, norm=PHASE_NORM, s=6, alpha=0.75, linewidths=0)
 
     ax = axes[0]
     ax.scatter(P[:, 0], P[:, 1], **kw)
+    # the fitted ring as the 72-gon of its grid points (solid), and the
+    # same polygon with every vertex's distance from the centre scaled
+    # by 0.5 and 1.5 (dashed) -- the user's construction (2026-09-13):
+    # the ring's radius differs per grid theta and the contours keep
+    # that. The scaled copies nest only when the centre lies inside the
+    # polygon; when it does not (JP_001's crescent-shaped ring), they
+    # cross, and the title says so: there the scalar centre ratio is a
+    # coarse picture and bf_ring is the inside/outside criterion.
     closed = np.vstack([ring2d, ring2d[:1]])
     for rho, style, lw in ((0.5, '--', 0.8), (1.0, '-', 1.6), (1.5, '--', 0.8)):
         ax.plot(rho * closed[:, 0], rho * closed[:, 1], style, color='k', lw=lw, alpha=0.9)
     ax.plot(0, 0, 'k+', ms=8)
-    ax.set_title('CLR plane of the ring (PCA)\ncontours: centre ratio 0.5, 1 (solid), 1.5')
+    inside = _point_in_polygon(0.0, 0.0, ring2d)
+    ax.set_title('CLR plane of the ring (PCA)\nsolid: fitted ring; dashed: centre ratio 0.5 and 1.5'
+                 + ('' if inside else '\n(centre outside the ring polygon: contours cross)'))
     ax.set_xlabel('PC1 (CLR)')
     ax.set_ylabel('PC2 (CLR)')
     ax.set_aspect('equal', adjustable='datalim')
@@ -187,26 +172,6 @@ def fig_embeddings(model, name, X, theta_deg, seed=0, max_cells=3000, title=None
     except Exception as exc:                                    # noqa: BLE001
         notes.append(f'UMAP: {type(exc).__name__}: {exc}')
         ax.set_title('UMAP unavailable')
-    ax.set_xticks([]); ax.set_yticks([])
-
-    ax = axes[3]
-    try:
-        nodes, edges = mapper_graph(Z, P)
-        pos = np.array([P[m].mean(0) for m in nodes])
-        col = np.array([_circ_mean_deg(th[m]) for m in nodes])
-        size = np.array([len(m) for m in nodes], float)
-        if edges:
-            segs = [(pos[i], pos[j]) for i, j in edges]
-            ax.add_collection(LineCollection(segs, colors='0.6', linewidths=0.7, zorder=1))
-        ax.scatter(pos[:, 0], pos[:, 1], c=col, cmap=PHASE_CMAP, norm=PHASE_NORM,
-                   s=12 + 3.0 * np.sqrt(size), edgecolors='k', linewidths=0.4, zorder=2)
-        ax.set_title(f'TDA Mapper graph ({len(nodes)} nodes, {len(edges)} edges)\n'
-                     'lens: the two PCs; clusters: DBSCAN in CLR')
-        ax.set_aspect('equal', adjustable='datalim')
-        ax.autoscale_view()
-    except Exception as exc:                                    # noqa: BLE001
-        notes.append(f'Mapper: {type(exc).__name__}: {exc}')
-        ax.set_title('Mapper unavailable')
     ax.set_xticks([]); ax.set_yticks([])
 
     fig.suptitle(title or f'{name}: {len(idx)} cells, phase from the model', y=1.02)
