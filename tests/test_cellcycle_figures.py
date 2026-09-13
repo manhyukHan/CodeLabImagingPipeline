@@ -111,6 +111,21 @@ def main():
     fig = FC.fig_fov_overlay(mip, cells, {1: 'S', 2: '', 3: 'G1'}, mode='category', categories=['G1', 'S'])
     conventions(fig, 'overlay category')
     plt.close(fig)
+    rng_d = np.random.default_rng(3)
+    fov = np.repeat([1, 2, 3], 300)
+    dna = np.where(((th - 60) % 360) < 120, 2.0, 1.0) * rng_d.lognormal(0, 0.1, 900) * np.where(fov == 2, 3.0, 1.0)
+    fig = FC.fig_dapi_vs_phase(th, dna, groups=groups, fov=fov, training=np.ones(900, bool), marks=marks)
+    conventions(fig, 'dapi')
+    ttl = fig._suptitle.get_text()
+    check('the DAPI figure finds the halving angle near 180 despite a 3x FOV', 'halves at' in ttl
+          and abs(float(ttl.split('halves at ')[1].split(' ')[0]) - 180) <= 15, ttl)
+    plt.close(fig)
+    tiles = [(np.random.default_rng(i).normal(100, 10, (16, 16)), np.zeros((16, 16), bool), 80.0, 130.0) for i in range(5)]
+    tiles[0][1][4:10, 4:10] = True
+    fig = FC.fig_gallery([('0-45', tiles[:3]), ('45-90', tiles[3:])], size=16, title='gallery')
+    check('the gallery has one axes per tile slot and hides the empty ones',
+          len(fig.axes) == 6 and sum(ax.get_visible() for ax in fig.axes) == 5)
+    plt.close(fig)
     fig = FC.fig_phase_hist(th, groups=groups, marks=marks)
     conventions(fig, 'phase hist')
     check('phase histogram draws a line per group plus all', len(fig.axes[0].lines) == 3)

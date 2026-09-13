@@ -674,14 +674,28 @@ def fig_category_hist(categories, groups=None, mask=None, order=None, title=None
 
 # -- DAPI as the routine verification --------------------------------------------
 
-def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None, title=None, marks=None):
-    """DNA content (a DAPI sum inside the mask, normalised to the median
-    of the cells in the first category -- G1 when the arcs start at
-    birth) along the phase, per condition (binned median, quartiles),
-    and per category as centre-connected lines. The title carries the
-    G2/M-over-G1 ratio of medians: about 2 is the routine pass."""
+def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None, title=None, marks=None,
+                      fov=None, training=None):
+    """DNA content (a DAPI sum inside the mask) along the phase, per
+    condition (binned median, quartiles), and per category as centre-
+    connected lines. Each cell's DAPI is first divided by the median of
+    its own FOV (fov given): staining and illumination differ per FOV,
+    and in an FOV-mode experiment that difference IS the condition
+    difference (measured on JP_002: FOV medians span 1.6e7..3.1e7). Then
+    the scale is the median of the first category (G1 when the arcs
+    start at birth). The title carries the G2/M-over-G1 ratio (about 2
+    is the routine pass) and the angle where the DNA content halves --
+    division, found by the same step detector as the panel total's drop,
+    on the training cells when given."""
     th = np.asarray(theta_deg, float)
     d = np.asarray(dapi, float)
+    if fov is not None:
+        f = np.asarray(fov)
+        d = d.copy()
+        for fv in np.unique(f):
+            k = (f == fv) & np.isfinite(d)
+            med = np.median(d[k]) if k.sum() >= 5 else np.nan
+            d[f == fv] = d[f == fv] / med if np.isfinite(med) and med > 0 else np.nan
     ok = np.isfinite(th) & np.isfinite(d)
     cat = None if categories is None else np.asarray(['Unassigned' if not c else str(c) for c in categories], dtype=object)
     names = list(order) if order else ([x for x in dict.fromkeys(cat[ok]) if x != 'Unassigned'] if cat is not None else [])
@@ -726,5 +740,43 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         g2m = next((n for n in names if 'G2' in n.upper() or n.upper() == 'M'), None)
         if g2m in meds and names[0] in meds and meds[names[0]] > 0:
             ratio_txt = f' -- {g2m} / {names[0]} median ratio {meds[g2m] / meds[names[0]]:.2f} (about 2 expected)'
+    drop_txt = ''
+    tr = ok & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
+    if tr.sum() >= 200:
+        # the DNA content halves at division: the panel total's step
+        # detector on the DAPI curve (the inverse of the content, so the
+        # 'drop' is the halving)
+        a, fac = CC.total_drop_angle(th[tr], dn[tr], min_cells=200)
+        if a is not None and fac >= 1.3:
+            drop_txt = f'; DNA halves at {a:.0f} deg (x{fac:.2f}) = division'
+            ax.axvline(a, color='k', lw=0.9, ls='--')
     fig.tight_layout(rect=(0, 0, 1, 0.9))
-    return finish(fig, (title or 'DAPI content as the routine verification') + ratio_txt)
+    return finish(fig, (title or 'DAPI content as the routine verification') + ratio_txt + drop_txt)
+
+
+def fig_gallery(rows, size=64, title=None, outline='#E69F00'):
+    """Example images per phase bin: rows = [(label, [(crop, mask, lo,
+    hi), ...])], one tile per example, each on its own FOV scale, the
+    cell mask outlined. The user's routine verification by eye -- a
+    G2/M row should show larger, brighter nuclei and mitotic figures."""
+    ncol = max(len(ex) for _l, ex in rows) if rows else 1
+    fig, axes = plt.subplots(len(rows), ncol, figsize=(1.35 * ncol + 1.2, 1.35 * len(rows) + 0.8), squeeze=False)
+    for i, (label, examples) in enumerate(rows):
+        for j in range(ncol):
+            ax = axes[i][j]
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for side in ('top', 'right', 'bottom', 'left'):
+                ax.spines[side].set_visible(False)
+            if j >= len(examples):
+                ax.set_visible(False)
+                continue
+            crop, mask, lo, hi = examples[j]
+            ax.imshow(crop, cmap='gray', vmin=lo, vmax=hi, interpolation='nearest')
+            if mask is not None and mask.any():
+                ax.contour(mask.astype(float), levels=[0.5], colors=[outline], linewidths=0.6)
+        axes[i][0].set_ylabel(label, fontsize=8, rotation=0, ha='right', va='center', labelpad=4)
+    fig.subplots_adjust(left=0.16, right=0.995, bottom=0.01, top=0.93 if title else 0.99, wspace=0.04, hspace=0.06)
+    if title:
+        suptitle(fig, title)
+    return fig

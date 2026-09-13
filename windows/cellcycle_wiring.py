@@ -74,6 +74,7 @@ class CellCycleWiring(QtCore.QObject):
         p.ProposeFromTimePushButton.clicked.connect(lambda: self._guard(self.propose_arcs_from_time))
         p.FovOverlayPushButton.clicked.connect(lambda: self._guard(self.view_fov_overlay))
         p.DapiPushButton.clicked.connect(lambda: self._guard(self.view_dapi))
+        p.DapiGalleryPushButton.clicked.connect(lambda: self._guard(self.view_dapi_gallery))
         p.ApplyCategoriesPushButton.clicked.connect(lambda: self._guard(self.apply_categories))
         mw.ui.tabWidget.currentChanged.connect(self._on_tab_changed)
 
@@ -345,12 +346,12 @@ class CellCycleWiring(QtCore.QObject):
                 # panel total is the one event every panel shares
                 th_tr = np.degrees(m.phase(name, X[k])[0]) % 360.0
                 angle, factor = CC.total_drop_angle(th_tr, X[k].sum(1))
-                # only a CLIFF is division: measured, the Tirosh-list panel
-                # (JP_001) drops x5.4 within 30 deg while the cyclin/CDK
-                # panel (JP_002) declines x2.1 over half a turn starting
-                # in G2, 100 deg earlier -- a gentle decline is the
-                # panel's own biology, not the event
-                if angle is not None and factor >= 3.0:
+                # the drop must be real: measured, the Tirosh-list panel
+                # (JP_001) drops x5.4 within 30 deg at 240 deg of the joint
+                # frame, chr19 x1.9 at 220, and the cyclin/CDK panel
+                # (JP_002) x2.1 at 120 -- and JP_002's DAPI halves at the
+                # same 120-150 deg, so that gentler drop IS division too
+                if angle is not None and factor >= 1.8:
                     m.rotate_to_zero(angle)
                     origin = {'mode': 'division (total drop)', 'angle_before_deg': angle, 'drop_factor': factor}
                     birth_used = 0.0
@@ -759,8 +760,11 @@ class CellCycleWiring(QtCore.QObject):
             merged = placed.merge(tab[['fov', 'cell', 'area', 'mask_mean', 'sum_above_bg']], on=['fov', 'cell'], how='left')
             cat = CC.assign(merged, arcs, gates) if arcs else None
             order = [a['name'] for a in arcs] if arcs else None
+            train = (self.spec or {}).get('train_celltypes') or []
+            tr = np.isin(merged['celltype'].to_numpy(), train) if train else None
             fig = FC.fig_dapi_vs_phase(merged['theta_deg'].to_numpy(), merged['sum_above_bg'].to_numpy(),
                                        groups=merged['celltype'].to_numpy(), categories=cat, order=order, marks=marks,
+                                       fov=merged['fov'].to_numpy(), training=tr,
                                        title=f'{name}: DAPI ({src[1]} ch{src[2]}) as the routine verification')
             if cat is not None:
                 merged = merged.assign(category=cat)
@@ -775,6 +779,54 @@ class CellCycleWiring(QtCore.QObject):
         def _fail(msg):
             p.DapiPushButton.setEnabled(True)
             p.ModelStatusLabel.setText(f'DAPI FAILED: {msg}')
+
+        self._start(_compute, _done, _fail)
+
+    def view_dapi_gallery(self, n_bins=8, per_row=10, size=72, seed=0):
+        """Example DAPI images per phase bin: the routine verification by
+        eye."""
+        p = self.panel
+        self._need_model(placed=True)
+        src = p.dapi_source()
+        if src is None:
+            raise ValueError('No DAPI source: parse the layouts first, then pick the DAPI round.')
+        sp = self._storage()
+        placed = self.placed
+        k = self._training_mask() & (placed['R'].to_numpy() >= 0.5)
+        pool = placed[k]
+        if len(pool) < n_bins:
+            raise ValueError('Too few confident training cells for a gallery.')
+        rng = np.random.default_rng(seed)
+        edges = np.linspace(0, 360, n_bins + 1)
+        picks, labels = [], []
+        for i in range(n_bins):
+            sub = pool[(pool['theta_deg'] >= edges[i]) & (pool['theta_deg'] < edges[i + 1])]
+            take = sub.iloc[rng.choice(len(sub), min(per_row, len(sub)), replace=False)] if len(sub) else sub
+            picks.append([(int(f), int(c)) for f, c in zip(take['fov'], take['cell'])])
+            labels.append(f'{edges[i]:.0f}-{edges[i + 1]:.0f} deg (n={len(sub)})')
+        wanted = {}
+        for row in picks:
+            for f, c in row:
+                wanted.setdefault(f, []).append(c)
+        name = self._name()
+        p.DapiGalleryPushButton.setEnabled(False)
+        p.ModelStatusLabel.setText(f'DAPI gallery: {sum(len(r) for r in picks)} crops over {len(wanted)} FOVs...')
+
+        def _compute():
+            crops = CC.gallery_crops(sp, src, wanted, size=size)
+            rows = [(lab, [crops[key] for key in row if key in crops]) for lab, row in zip(labels, picks)]
+            fig = FC.fig_gallery(rows, size=size, title=f'{name}: DAPI ({src[1]} ch{src[2]}) examples per phase bin, training cells with R >= 0.5')
+            return fig, None
+
+        def _done(res):
+            p.DapiGalleryPushButton.setEnabled(True)
+            fig, _t = res
+            p.ModelStatusLabel.setText('DAPI gallery: shown')
+            self._show(fig, 'dapi_gallery')
+
+        def _fail(msg):
+            p.DapiGalleryPushButton.setEnabled(True)
+            p.ModelStatusLabel.setText(f'DAPI gallery FAILED: {msg}')
 
         self._start(_compute, _done, _fail)
 

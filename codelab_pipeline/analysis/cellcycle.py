@@ -887,22 +887,21 @@ def _mask_intensity_fov(item):
         return []
     mip_sp = os.path.join(paths.project_root(storage_path), modality)
     mip = np.asarray(analysis_store.read_hybe_mip(mip_sp, fov, hybe, int(channel)), float)
-    finite = mip[np.isfinite(mip)]
-    lo, hi = np.percentile(finite, [0.5, 60])
-    if hi > lo:
-        h, e = np.histogram(finite, bins=128, range=(lo, hi))
-        k = int(np.argmax(h))
-        bg = float(0.5 * (e[k] + e[k + 1]))
-    else:
-        bg = float(np.median(finite))
     try:
         resolver = R.resolver_for(storage_path, fov)
     except ValueError:
         # a store with two declared modalities and no cross-modal bridge
         # cannot name its hub; the cells' own modality is the frame here
         resolver = R.resolver_for(storage_path, fov, shared=str(dicts[0].get('reference_modality') or modality))
-    rows = []
     H, W = mip.shape
+    # THE BACKGROUND IS WHAT LIES OUTSIDE EVERY CELL. The MIP's histogram
+    # mode is not it on a confluent field: measured on JP_002's DAPI, the
+    # mode (665) sat above a third of the nuclei's own means and zeroed
+    # their sums. Project every mask first, then take the median of the
+    # uncovered pixels (the 5th percentile when almost nothing is
+    # uncovered).
+    projected = []
+    covered = np.zeros((H, W), bool)
     for d in dicts:
         c = ACell()
         c.set_metadata(**d)
@@ -913,6 +912,13 @@ def _mask_intensity_fov(item):
             continue
         ys = np.clip(cy.astype(int), 0, H - 1)
         xs = np.clip(cx.astype(int), 0, W - 1)
+        covered[ys, xs] = True
+        projected.append((c, ys, xs))
+    outside = mip[~covered & np.isfinite(mip)]
+    finite = mip[np.isfinite(mip)]
+    bg = float(np.median(outside)) if outside.size >= 0.01 * mip.size else float(np.percentile(finite, 5))
+    rows = []
+    for c, ys, xs in projected:
         v = mip[ys, xs]
         v = v[np.isfinite(v)]
         if v.size == 0:
@@ -984,6 +990,74 @@ def total_drop_angle(theta_deg, totals, n_bins=36, smooth=2, min_cells=200):
     before = lm[[(j - i) % n_bins for i in range(1, win + 1)]].max()
     after = lm[[(j + i) % n_bins for i in range(0, win)]].min()
     return angle, float(np.exp(before - after))
+
+
+def _crops_fov(item):
+    """One FOV's crops of one source's MIP around the wanted cells --
+    module-level for pmap. Each crop is `size` x `size`, centred on the
+    cell mask's centroid in the SOURCE hybe's own frame (the mask
+    projected through the store-built resolver), NaN beyond the frame,
+    with the mask as a boolean of the same shape. Also the FOV's 1st
+    and 99.5th percentiles, so every tile of a FOV shares one scale."""
+    import os
+    import numpy.linalg as la
+    from codelab_pipeline.alignment import chain as alignment
+    from codelab_pipeline.analysis import resolvers as R
+    from codelab_pipeline.io import analysis_store, paths
+    from codelab_pipeline.models.cell import ACell
+    storage_path, fov, (modality, hybe, channel), cell_ids, size = item
+    dicts, _ = analysis_store.read_cells(storage_path, fov)
+    if not dicts:
+        return {}
+    want = {int(c) for c in cell_ids}
+    mip_sp = os.path.join(paths.project_root(storage_path), modality)
+    mip = np.asarray(analysis_store.read_hybe_mip(mip_sp, fov, hybe, int(channel)), float)
+    finite = mip[np.isfinite(mip)]
+    lo, hi = (np.percentile(finite, [1, 99.5]) if finite.size else (0.0, 1.0))
+    try:
+        resolver = R.resolver_for(storage_path, fov)
+    except ValueError:
+        resolver = R.resolver_for(storage_path, fov, shared=str(dicts[0].get('reference_modality') or modality))
+    H, W = mip.shape
+    half = size // 2
+    out = {}
+    for d in dicts:
+        if int(d['id']) not in want:
+            continue
+        c = ACell()
+        c.set_metadata(**d)
+        Hc, _dz, _missing = resolver.transform((hybe, modality), (c.reference_hybe, c.reference_modality), c)
+        y_lit, x_lit = c.area
+        cy, cx = alignment.align_cell((y_lit, x_lit), la.inv(Hc), c.frame_shape)
+        if len(cy) == 0:
+            continue
+        y0, x0 = int(round(float(np.mean(cy)))), int(round(float(np.mean(cx))))
+        crop = np.full((size, size), np.nan)
+        mask = np.zeros((size, size), bool)
+        ya, yb = y0 - half, y0 - half + size
+        xa, xb = x0 - half, x0 - half + size
+        sy, sx = slice(max(ya, 0), min(yb, H)), slice(max(xa, 0), min(xb, W))
+        crop[sy.start - ya:sy.stop - ya, sx.start - xa:sx.stop - xa] = mip[sy, sx]
+        my, mx = cy.astype(int) - ya, cx.astype(int) - xa
+        k = (my >= 0) & (my < size) & (mx >= 0) & (mx < size)
+        mask[my[k], mx[k]] = True
+        out[int(c.id)] = (crop, mask, float(lo), float(hi))
+    return out
+
+
+def gallery_crops(storage_path, source, wanted, size=64, jobs=None):
+    """{(fov, cell): (crop, mask, lo, hi)} for wanted = {fov: [cell ids]},
+    one MIP read per FOV through one pool."""
+    from codelab_pipeline import parallel
+    items = [(storage_path, int(f), tuple(source), list(ids), int(size)) for f, ids in wanted.items() if ids]
+    results = parallel.pmap(_crops_fov, items, kind='io', jobs=jobs)
+    out = {}
+    for (f, _ids), r in zip(((int(f), ids) for f, ids in wanted.items() if ids), results):
+        if isinstance(r, parallel.Failure):
+            continue
+        for cid, v in r.items():
+            out[(f, cid)] = v
+    return out
 
 
 def capsule_rows(placed, cell_ids, totals):

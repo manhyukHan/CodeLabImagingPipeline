@@ -186,6 +186,10 @@ def main():
         check('the cell on the bright square sums above the background, the other does not',
               c1 is not None and c1['sum_above_bg'] > 0 and float(tab_d[tab_d['cell'] == 2]['sum_above_bg'].iloc[0]) == 0.0,
               str(tab_d[['cell', 'area', 'mask_mean', 'sum_above_bg', 'background']].to_dict('records')))
+        crops = CC.gallery_crops(sp, ('RNA', 'Hyb_500', 405), {1: [1, 2]}, size=16, jobs=1)
+        check('gallery crops: one tile per wanted cell, the mask inside, on the FOV scale',
+              set(crops) == {(1, 1), (1, 2)} and crops[(1, 1)][0].shape == (16, 16) and crops[(1, 1)][1].sum() == 2
+              and crops[(1, 1)][2] <= crops[(1, 1)][3], str({k: (v[0].shape, int(v[1].sum())) for k, v in crops.items()}))
         empty = popmod.Population(sp, [1], (0.208, 0.208, 0.2), pop.cells, None, None, None, [])
         try:
             gate.PhaseRange(0, 90).mask(empty)

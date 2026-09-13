@@ -198,6 +198,10 @@ class CellCyclePanelUI(object):
         self.DapiPushButton.setToolTip('Routine verification: the DAPI sum inside each cell mask against the phase; '
                                        'G2/M cells should carry about twice the DAPI of G1 cells.')
         dapiLayout.addWidget(self.DapiPushButton, 1)
+        self.DapiGalleryPushButton = QtWidgets.QPushButton('DAPI gallery by phase (images)')
+        self.DapiGalleryPushButton.setToolTip('Example nuclei per 45-degree bin of the phase: confident training cells '
+                                              'picked at random, the mask outlined; every tile on its own FOV scale.')
+        dapiLayout.addWidget(self.DapiGalleryPushButton, 1)
         figLayout.addWidget(dapiRow, 5, 0, 1, 2)
         layout.addWidget(figGroup)
 
@@ -305,7 +309,12 @@ class CellCyclePanelUI(object):
         for modality, records in (records_by_modality or {}).items():
             for r in records:
                 name = str(r.get('readout_name') or '')
+                fid = r.get('fiducial_channel')
                 for ch in r.get('channels', []):
+                    # never the fiducial channel: a DAPI round images DAPI on
+                    # its other channel (JP_002: Hyb_400 ch635, 555 = beads)
+                    if fid is not None and ch == fid:
+                        continue
                     entries.append(('DAPI' in name.upper(), modality, r['folder'], int(ch), name))
         for is_dapi, modality, folder, ch, name in sorted(entries, key=lambda e: (not e[0], e[1], e[2], e[3])):
             label = f'{modality} | {folder}' + (f' ({name})' if name else '') + f' | ch{ch}'
