@@ -743,6 +743,56 @@ def write_fov_expression(storage_path, fov, payload):
     _poke_cache(path, 'expression', json.loads(json.dumps(payload)))
 
 
+# -- cell cycle (per-FOV placements, one experiment-level model) ---------
+
+def _cellcycle_path(storage_path, fov):
+    return os.path.join(_fov_dir(storage_path, fov), 'cellcycle.json')
+
+
+def read_fov_cellcycle(storage_path, fov):
+    """The FOV's persisted cell-cycle placements, or None.
+
+    Shape (analysis/cellcycle.py owns it):
+      {'version': 1,
+       'model': <the model id the rows were placed with>,
+       'stamp': fov_input_stamp(...)   what the counts were read from,
+       'rows': [{cell, theta_deg, R, fit_z, bf_ring, radius, total}]}
+
+    A per-FOV capsule beside expression.json rather than new columns in
+    cells.h5: the placement is a DERIVED per-cell attribute that a refit
+    rewrites wholesale, and the cells capsule's compound dtype is
+    written per file (see columnar.pack_spots on why a field added to
+    it makes every older store unreadable by this same reader).
+    """
+    path = _cellcycle_path(storage_path, fov)
+    return _cached(path, 'cellcycle', lambda: _read_json(path))
+
+
+def write_fov_cellcycle(storage_path, fov, payload):
+    """Full-replace the FOV's placements (atomic door)."""
+    path = _cellcycle_path(storage_path, fov)
+    _atomic_json(path, payload)
+    _poke_cache(path, 'cellcycle', json.loads(json.dumps(payload)))
+
+
+def _cellcycle_model_path(storage_path):
+    return os.path.join(_analysis_root(storage_path), 'cellcycle_model.json')
+
+
+def read_cellcycle_model(storage_path):
+    """The experiment's fitted cell-cycle model with its provenance and
+    the user's category arcs, or None. Project-level (analysis/), like
+    params.json: the circle is one per experiment, not per modality."""
+    path = _cellcycle_model_path(storage_path)
+    return _cached(path, 'cellcycle_model', lambda: _read_json(path))
+
+
+def write_cellcycle_model(storage_path, payload):
+    path = _cellcycle_model_path(storage_path)
+    _atomic_json(path, payload)
+    _poke_cache(path, 'cellcycle_model', json.loads(json.dumps(payload)))
+
+
 # -- counts (status panels) ----------------------------------------------
 
 def fov_counts(storage_path, fovs):

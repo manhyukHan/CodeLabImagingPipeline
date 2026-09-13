@@ -695,6 +695,131 @@ class CycleModel:
 
 # -- helpers around the model ------------------------------------------------
 
+# -- the store: counts in, placements out --------------------------------------
+
+COUNT_GATE = 0.5        # the classifier's own operating point (design doc 4.2)
+CAPSULE_VERSION = 1
+CAPSULE_COLUMNS = ('cell', 'theta_deg', 'R', 'fit_z', 'bf_ring', 'radius', 'total')
+
+
+def source_key(src):
+    """'MOD|HYBE|CH' -- the same string key population.py uses."""
+    return f'{src[0]}|{src[1]}|{int(src[2])}'
+
+
+def _count_fov(item):
+    """One FOV's per-cell counts over the STORED spots of each source --
+    module-level for pmap. Three numbers per (cell, source): n (spots at
+    p_exist >= gate), soft (sum of p_exist) and candidates (every stored
+    spot of that cell). A stored spot with no p_exist -- an older store,
+    or a manual keep -- counts as one accepted spot with soft weight 1:
+    somebody kept it, and nothing here can second-guess that."""
+    storage_path, fov, sources, gate = item
+    from codelab_pipeline.io import analysis_store
+    cells, _ = analysis_store.read_cells(storage_path, fov)
+    ids = [int(c['id']) for c in (cells or [])]
+    celltype = {int(c['id']): str(c.get('celltype') or '') for c in (cells or [])}
+    rows = []
+    for src in sources:
+        modality, hybe, channel = src
+        spots = analysis_store.read_spots(storage_path, fov, modality=modality,
+                                          hybe=hybe, channel=int(channel))
+        n = {cid: 0 for cid in ids}
+        soft = {cid: 0.0 for cid in ids}
+        cand = {cid: 0 for cid in ids}
+        p_min = float('inf')
+        for sp in spots:
+            cid = int(sp.get('cell', -1))
+            if cid not in n:
+                continue
+            cand[cid] += 1
+            p = float(sp.get('p_exist', float('nan')))
+            if not np.isfinite(p):
+                n[cid] += 1
+                soft[cid] += 1.0
+            else:
+                p_min = min(p_min, p)
+                soft[cid] += p
+                if p >= gate:
+                    n[cid] += 1
+        for cid in ids:
+            rows.append({'fov': int(fov), 'cell': cid, 'celltype': celltype[cid],
+                         'modality': modality, 'hybe': hybe, 'channel': int(channel),
+                         'n': n[cid], 'soft': soft[cid], 'candidates': cand[cid],
+                         'p_min': (p_min if np.isfinite(p_min) else float('nan')),
+                         'n_stored': len(spots)})
+    return rows
+
+
+def count_table(storage_path, fovs, sources, gate=COUNT_GATE, jobs=None, on_done=None):
+    """Tidy per-(cell, source) counts for many FOVs, read FOV-major
+    through one pool: fov, cell, celltype, modality, hybe, channel, n,
+    soft, candidates, p_min, n_stored.
+
+    sources: [(modality, hybe, channel)]. The counts are over what the
+    spot store HOLDS: if the store was gated above `gate` when the
+    spots were saved, n is the store's gate, not this one -- p_min per
+    source says which (a p_min at or above `gate` means the store was
+    gated there). Pivot with gene_table(table, source_names, metric='n')
+    or metric='soft'.
+
+    Returns (table, failures) -- failures [(fov, message)], never
+    raised, so one unreadable FOV does not lose the other 33.
+    """
+    import pandas as pd
+    from codelab_pipeline import parallel
+    fovs = [int(f) for f in fovs]
+    items = [(storage_path, f, [tuple(s) for s in sources], float(gate)) for f in fovs]
+    results = parallel.pmap(_count_fov, items, kind='io', jobs=jobs, on_done=on_done)
+    rows, fails = [], []
+    for f, r in zip(fovs, results):
+        if isinstance(r, parallel.Failure):
+            fails.append((f, str(r)))
+        else:
+            rows.extend(r)
+    cols = ['fov', 'cell', 'celltype', 'modality', 'hybe', 'channel',
+            'n', 'soft', 'candidates', 'p_min', 'n_stored']
+    return pd.DataFrame(rows, columns=cols), fails
+
+
+def capsule_rows(placed, cell_ids, totals):
+    """The per-FOV capsule's rows from place()'s dict, in the order the
+    cells were placed."""
+    out = []
+    for i, cid in enumerate(cell_ids):
+        out.append({'cell': int(cid),
+                    'theta_deg': float(np.degrees(placed['theta'][i]) % 360.0),
+                    'R': float(placed['R'][i]),
+                    'fit_z': float(placed['fit_z'][i]),
+                    'bf_ring': float(placed['bf_ring'][i]),
+                    'radius': float(placed['radius'][i]),
+                    'total': float(totals[i])})
+    return out
+
+
+def categorize(theta_deg, arcs):
+    """Category name per cell from the user's arcs on the circle:
+    arcs = [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}, ...], each
+    running FORWARD from start to end (so an arc may cross 0). A phase
+    inside no arc reads ''; overlapping arcs resolve to the first
+    listed. Categories are derived at read time, never stored: the
+    boundaries are the user's choice and re-cutting them must not need
+    a refit."""
+    th = np.asarray(theta_deg, float) % 360.0
+    out = np.array([''] * len(th), dtype=object)
+    done = np.zeros(len(th), bool)
+    for arc in arcs:
+        lo, hi = float(arc['start_deg']) % 360.0, float(arc['end_deg']) % 360.0
+        width = (hi - lo) % 360.0
+        if width == 0:
+            width = 360.0
+        inside = ((th - lo) % 360.0) <= width
+        take = inside & ~done & np.isfinite(th)
+        out[take] = str(arc['name'])
+        done |= take
+    return out
+
+
 def gene_table(expression, source_names, metric='n_spots'):
     """(table, celltype): a cells x genes count table from a Population's
     tidy expression rows.

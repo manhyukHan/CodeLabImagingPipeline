@@ -15,6 +15,9 @@ plain tables:
   spots       DataFrame [fov, cell, celltype,      None unless
               modality, hybe, channel, z_status,    spot_sources
               y_um, x_um, z_um, brightness]
+  cellcycle   DataFrame [fov, cell, theta_deg, R,   None until the Cell
+              fit_z, bf_ring, radius, total]        Cycle stage placed
+                                                   the FOV's cells
 
 Keys are ALWAYS (fov, cell) pairs. The SG scripts carry a measured scar
 here: cells keyed by basename collided across FOVs and silently merged
@@ -48,6 +51,12 @@ def _fov_bundle(item):
     out['cells'] = [{'fov': int(fov), 'cell': int(c['id']),
                      'celltype': str(c.get('celltype') or '')}
                     for c in (cells or [])]
+    # the Cell Cycle stage's placements, when the FOV has them: one
+    # small JSON, read on every build so the phase gates and the
+    # category flag see the latest fit without a rebuild flag
+    cc = analysis_store.read_fov_cellcycle(storage_path, fov)
+    if cc and cc.get('rows'):
+        out['cellcycle'] = [dict(r, fov=int(fov)) for r in cc['rows']]
     if hybes:
         out['alleles'] = P.fov_polymer_table(storage_path, fov, hybes,
                                              voxel_um=voxel_um)
@@ -238,7 +247,7 @@ def _fov_bundle(item):
 
 class Population:
     def __init__(self, storage_path, fovs, voxel_um, cells, alleles,
-                 expression, spots, failures):
+                 expression, spots, failures, cellcycle=None):
         self.storage_path = storage_path
         self.fovs = list(fovs)
         self.voxel_um = tuple(voxel_um)
@@ -247,6 +256,7 @@ class Population:
         self.expression = expression
         self.spots = spots
         self.failures = failures
+        self.cellcycle = cellcycle
         self.cache_stats = None
         self._dmaps = None
 
@@ -349,8 +359,10 @@ class Population:
                                   'channel': 'int64', 'y_um': 'float64',
                                   'x_um': 'float64', 'z_um': 'float64',
                                   'brightness': 'float64'})
+        cc_rows = [r for b in bundles for r in b.get('cellcycle', [])]
+        cellcycle = pd.DataFrame(cc_rows) if cc_rows else None
         pop = cls(storage_path, fovs, voxel_um, cells, alleles,
-                  expression, spots, fails)
+                  expression, spots, fails, cellcycle=cellcycle)
         pop.cache_stats = cache_stats
         return pop
 
@@ -401,6 +413,8 @@ class Population:
             parts.append(f'{len(self.expression)} expression rows{note}')
         if self.spots is not None:
             parts.append(f'{len(self.spots)} spots')
+        if self.cellcycle is not None:
+            parts.append(f'{len(self.cellcycle)} cells placed on the cell cycle')
         if self.failures:
             # readable, not exhaustive: 37 stacked tracebacks once made
             # the status label a wall -- name the FOVs, show one message

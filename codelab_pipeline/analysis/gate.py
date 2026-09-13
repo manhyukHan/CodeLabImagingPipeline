@@ -137,6 +137,87 @@ class ExpressionRange(Predicate):
         return ok
 
 
+def _cellcycle_values(pop, column):
+    """(n_cells,) float of one placement column, NaN where the cell was
+    never placed -- shared by the phase predicates and the panel's
+    pickers so there is ONE definition."""
+    t = getattr(pop, 'cellcycle', None)
+    if t is None or len(t) == 0:
+        raise ValueError('population carries no cell-cycle placements; run '
+                         'the Cell Cycle stage first')
+    if column not in t.columns:
+        raise ValueError(f'cell-cycle placements carry no {column!r} '
+                         f'(have {list(t.columns)})')
+    by_cell = t.set_index(['fov', 'cell'])[column]
+    idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
+    return by_cell.reindex(idx).to_numpy(dtype=float)
+
+
+@_register
+class PhaseRange(Predicate):
+    """cell-cycle phase inside the arc from lo_deg FORWARD to hi_deg on
+    the fitted circle -- so PhaseRange(300, 60) is the arc through 0.
+    lo == hi means the whole circle. Cells never placed fail. min_r
+    optionally demands a posterior concentration R at least that
+    high, so a gate can ask for "in this arc, and sure of it"."""
+    kind = 'phase_range'
+
+    def __init__(self, lo_deg, hi_deg, min_r=None):
+        self.lo_deg, self.hi_deg = float(lo_deg), float(hi_deg)
+        self.min_r = None if min_r is None else float(min_r)
+
+    def _params(self):
+        return {'lo_deg': self.lo_deg, 'hi_deg': self.hi_deg, 'min_r': self.min_r}
+
+    def values(self, pop):
+        return _cellcycle_values(pop, 'theta_deg')
+
+    def mask(self, pop):
+        v = self.values(pop)
+        ok = np.isfinite(v)
+        width = (self.hi_deg - self.lo_deg) % 360.0
+        if width == 0:
+            width = 360.0
+        with np.errstate(invalid='ignore'):
+            ok &= ((v - self.lo_deg) % 360.0) <= width
+        if self.min_r is not None:
+            r = _cellcycle_values(pop, 'R')
+            ok &= np.isfinite(r) & (r >= self.min_r)
+        return ok
+
+
+@_register
+class CycleRange(Predicate):
+    """One per-cell cell-cycle verdict within [lo, hi]: metric is 'R'
+    (posterior concentration), 'fit_z' (evidence against the training
+    cells of the same depth; negative = worse than them), 'bf_ring'
+    (log Bayes factor ring vs centre), 'radius' (plane radius, 1 = on
+    the ring) or 'total' (panel counts). Open bounds via None."""
+    kind = 'cycle_range'
+    METRICS = ('R', 'fit_z', 'bf_ring', 'radius', 'total')
+
+    def __init__(self, metric, lo=None, hi=None):
+        if metric not in self.METRICS:
+            raise ValueError(f'metric must be one of {self.METRICS}, not {metric!r}')
+        self.metric = str(metric)
+        self.lo, self.hi = lo, hi
+
+    def _params(self):
+        return {'metric': self.metric, 'lo': self.lo, 'hi': self.hi}
+
+    def values(self, pop):
+        return _cellcycle_values(pop, self.metric)
+
+    def mask(self, pop):
+        v = self.values(pop)
+        ok = np.isfinite(v)
+        if self.lo is not None:
+            ok &= v >= float(self.lo)
+        if self.hi is not None:
+            ok &= v <= float(self.hi)
+        return ok
+
+
 @_register
 class PairDistanceRange(Predicate):
     """Per-cell collapsed distance between two spot sets within [lo, hi] um.
