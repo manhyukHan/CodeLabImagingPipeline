@@ -41,12 +41,11 @@ def main():
     print('sources -> genes')
     p.populate_sources(records)
     rows = p.gene_rows()
-    check('one row per (hybe, channel)', len(rows) == 11, str(len(rows)))
+    check('one row per (hybe, readout channel), none for the fiducial channel', len(rows) == 6, str(len(rows)))
     got = {(r['source'], r['gene'], r['role'], r['use']) for r in rows}
     check('an mRNA round on the readout channel is a checked S gene',
           (('RNA', 'Hyb_101', 635), 'MCM2', 'S', True) in got)
-    check('the same round on the fiducial channel is unchecked',
-          (('RNA', 'Hyb_101', 555), 'MCM2', 'S', False) in got)
+    check('the fiducial channel has no row', not any(s[2] == 555 for s, _g, _r, _u in got))
     check('exon rounds get their gene and role', (('RNA', 'Hyb_103', 635), 'CCNB1', 'G2/M', True) in got)
     check('GAPDH is housekeeping', (('RNA', 'Hyb_104', 635), 'GAPDH', 'housekeeping', True) in got)
     check('a nascent round keeps its name and starts unchecked',
@@ -95,6 +94,11 @@ def main():
                                                      'radius': [1.0, 1.0, 1.0]}), p.arcs(), g)
     check('the panel\'s arcs and gates drive cellcycle.assign', list(cat) == ['S', 'G2/M', ''], str(list(cat)))
     check('proxy metric', p.proxy_metric() == 'n' and (p.ProxyComboBox.setCurrentIndex(1) or p.proxy_metric() == 'soft'))
+    dlg = p.show_known_lists(w)
+    tbl = dlg.findChild(QtWidgets.QTableWidget)
+    check('the known-lists pop-up tabulates every S, G2/M and housekeeping gene',
+          tbl is not None and tbl.rowCount() == len(CC.S_GENES) + len(CC.G2M_GENES) + len(CC.HOUSEKEEPING))
+    dlg.close()
 
     print('the wiring module')
     from windows import cellcycle_wiring as W

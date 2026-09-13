@@ -286,12 +286,12 @@ class CellCyclePanelUI(object):
         dlg.setWindowTitle('Known gene roles')
         dlg.resize(520, 620)
         layout = QtWidgets.QVBoxLayout(dlg)
-        layout.addWidget(QtWidgets.QLabel(
-            'Roles only ORIENT the circle (S mean peak -> 0, G2/M mean peak forward).
-'
-            'S and G2/M: the Seurat / Tirosh 2016 lists, plus CCNE1 and CDT1 (S) and CCNB1 (G2/M).
-'
-            'Housekeeping genes never bridge experiments. Edit any role in the table.'))
+        note = QtWidgets.QLabel(
+            'Roles only ORIENT the circle (S mean peak -> 0, G2/M mean peak forward). '
+            'S and G2/M: the Seurat / Tirosh 2016 lists, plus CCNE1 and CDT1 (S) and CCNB1 (G2/M). '
+            'Housekeeping genes never bridge experiments. Edit any role in the panel table.')
+        note.setWordWrap(True)
+        layout.addWidget(note)
         rows = ([(g, 'S') for g in CC.S_GENES] + [(g, 'G2/M') for g in CC.G2M_GENES]
                 + [(g, 'housekeeping') for g in CC.HOUSEKEEPING])
         table = QtWidgets.QTableWidget(len(rows), 2)
