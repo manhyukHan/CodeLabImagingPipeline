@@ -364,3 +364,96 @@ def fig_subpanel(thetas, a, b, title=None):
         fig.suptitle(title)
     fig.tight_layout()
     return fig
+
+
+# -- the angle as cycle time -------------------------------------------------
+
+def cycle_time_map(w, grid, birth_deg=0.0, growth='uniform'):
+    """The phase axis re-scaled by where the CYCLING cells are.
+
+    The fitted angle is a distance in composition, not time: the ring
+    covers a stretch of the cycle where composition barely changes
+    (G1) with the same number of degrees as one where it changes fast.
+    Under the ergodic assumption -- an asynchronous population spends
+    cells on each part of the cycle in proportion to the time spent
+    there -- the spectrum of the unsynchronized cells IS the clock.
+
+    w: the training population's spectrum on `grid` (T,), summing to 1.
+    birth_deg: where the cycle starts (age 0) -- cell division. With
+    growth='uniform' the returned tau is the plain cumulative fraction
+    of cycling cells from birth_deg forward; with growth='exponential'
+    the age distribution of an exponentially growing population,
+    p(age) = 2 ln2 / T * 2^(-age/T), is inverted (age/T = -log2(1 -
+    F/2)), which stretches the late cycle: young cells are twice as
+    numerous as cells about to divide, so equal cell counts late in
+    the cycle stand for more time.
+
+    Returns a function deg -> tau in [0, 1) (vectorised), and the
+    per-grid tau.
+    """
+    deg = np.degrees(np.asarray(grid)) % 360.0
+    order = np.argsort(deg)
+    d, ww = deg[order], np.asarray(w, float)[order]
+    ww = ww / ww.sum()
+    # rotate so the cycle starts at birth_deg
+    start = np.searchsorted(d, birth_deg % 360.0)
+    d2 = np.concatenate([d[start:], d[:start] + 360.0])
+    w2 = np.concatenate([ww[start:], ww[:start]])
+    edges = np.concatenate([[d2[0]], 0.5 * (d2[1:] + d2[:-1]), [d2[0] + 360.0]])
+    F_edges = np.concatenate([[0.0], np.cumsum(w2)])
+    if growth == 'exponential':
+        F_edges = -np.log2(1.0 - np.clip(F_edges, 0, 1) / 2.0)
+    F_edges = F_edges / F_edges[-1]
+
+    def tau(theta_deg):
+        x = (np.asarray(theta_deg, float) - birth_deg) % 360.0 + d2[0]
+        return np.interp(x, edges, F_edges)
+    return tau, tau(deg)
+
+
+def fig_cycle_time(model, spectra, birth_deg=0.0, anchors=None, title=None):
+    """spectra: {experiment: training spectrum (T,)}. Left: the spectra
+    over the angle; middle: tau(angle) for each experiment, uniform and
+    exponential-growth versions; right: the same spectra over tau (flat
+    by construction for the training population). anchors:
+    [(label, experiment, deg)] marked on the middle axes."""
+    deg = np.degrees(model.grid)
+    order = np.argsort(deg)
+    names = list(spectra)
+    pal = gene_palette(len(names))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 4))
+    for name, c in zip(names, pal):
+        w = np.asarray(spectra[name], float)
+        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.6, label=name)
+        tau_u, tu = cycle_time_map(w, model.grid, birth_deg, 'uniform')
+        tau_e, te = cycle_time_map(w, model.grid, birth_deg, 'exponential')
+        xs = np.linspace(0, 360, 361)
+        ax2.plot(xs, tau_u(xs), color=c, lw=1.6, label=f'{name} uniform')
+        ax2.plot(xs, tau_e(xs), color=c, lw=1.0, ls='--', label=f'{name} exponential growth')
+        # density over tau: cells per unit tau = w / dtau
+        dt = np.gradient(tu[order], deg[order])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dens = w[order] * len(w) / 360.0 / np.maximum(dt, 1e-9)
+        ax3.plot(tu[order], dens / np.nanmedian(dens), color=c, lw=1.6, label=name)
+    ax1.set_ylabel('cell density (per degree x 360)')
+    ax1.set_title('training spectrum over the angle')
+    ax1.legend(fontsize=8, frameon=False)
+    phase_axis(ax1)
+    ax2.set_ylabel('cycle time fraction tau')
+    ax2.set_title(f'angle -> time (birth at {birth_deg:.0f} deg)')
+    ax2.axhline(0.5, color='0.8', lw=0.8, ls=':')
+    for lab, exp_, dg in (anchors or []):
+        c = pal[names.index(exp_)] if exp_ in names else 'k'
+        tau_u, _ = cycle_time_map(spectra[exp_], model.grid, birth_deg, 'uniform')
+        ax2.plot([dg], [tau_u(dg)], 'o', color=c, ms=6)
+        ax2.annotate(lab, (dg, tau_u(dg)), textcoords='offset points', xytext=(5, -10), fontsize=8, color=c)
+    ax2.legend(fontsize=7, frameon=False)
+    phase_axis(ax2)
+    ax3.set_xlabel('cycle time fraction tau')
+    ax3.set_ylabel('density over tau / median')
+    ax3.set_title('the same spectra over tau (flat by construction)')
+    ax3.set_xlim(0, 1)
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig
