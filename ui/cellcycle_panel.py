@@ -279,6 +279,12 @@ class CellCyclePanelUI(object):
         self.PhaseSharesLineEdit.setToolTip('Phases in order from birth with their share of the cycle (%). '
                                             'Default: cultured mammalian cells, ~24 h cycle.')
         bform.addRow('Phase time shares (%):', self.PhaseSharesLineEdit)
+        self.PostMCheckBox = QtWidgets.QCheckBox('split a post-M arc off the first arc (birth to where the cell density recovers)')
+        self.PostMCheckBox.setChecked(True)
+        self.PostMCheckBox.setToolTip('Right after division the cells are 2N but their composition still carries the '
+                                      'mitotic transcripts and changes fast: few cells, a few percent of the cycle. '
+                                      'On by default so G1 starts where the density recovers (JP_002: ~30 deg).')
+        bform.addRow('', self.PostMCheckBox)
         catLayout.addLayout(bform)
         self.ApplyCategoriesPushButton = QtWidgets.QPushButton('Apply categories and gates to the stored model')
         catLayout.addWidget(self.ApplyCategoriesPushButton)

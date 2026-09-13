@@ -146,6 +146,20 @@ def main():
         check('a flat DNA curve refuses to propose', False)
     except ValueError:
         check('a flat DNA curve refuses to propose', True)
+    # post-M: a density with a hole right after birth (215) that recovers by ~250
+    w_h = np.ones(72)
+    for i in range(72):
+        dd = (i * 5 + 2.5 - 215.0) % 360.0
+        if dd < 35:
+            w_h[i] = 0.1
+    w_h /= w_h.sum()
+    end = FC.post_division_end(w_h, m.grid, 215.0)
+    check('post_division_end finds where the density recovers after birth', end is not None and 240 <= end <= 262, str(end))
+    check('and reports None when nothing is sparse after birth', FC.post_division_end(np.ones(72) / 72, m.grid, 215.0) is None)
+    split = FC.with_post_m([{'name': 'G1', 'start_deg': 215.0, 'end_deg': 320.0}, {'name': 'S', 'start_deg': 320.0, 'end_deg': 215.0}],
+                           w_h, m.grid, 215.0)
+    check('with_post_m splits the first arc and keeps the rest', [a['name'] for a in split] == ['post-M', 'G1', 'S']
+          and split[0]['start_deg'] == 215.0 and split[1]['start_deg'] == split[0]['end_deg'] and split[1]['end_deg'] == 320.0)
     fig = FC.fig_phase_hist(th, groups=groups, marks=marks)
     conventions(fig, 'phase hist')
     check('phase histogram draws a line per group plus all', len(fig.axes[0].lines) == 3)

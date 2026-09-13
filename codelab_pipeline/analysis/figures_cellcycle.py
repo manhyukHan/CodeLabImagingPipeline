@@ -905,3 +905,43 @@ def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, p
             {'name': 'S', 'start_deg': s_start, 'end_deg': g_start},
             {'name': 'G2/M', 'start_deg': g_start, 'end_deg': b}]
     return arcs, {'g1_level': g1_level, 'top': top, 'ratio': top / g1_level if g1_level > 0 else float('nan')}
+
+
+def post_division_end(w, grid, birth_deg=0.0, level=0.5, smooth=5):
+    """The angle after birth where the cycling cells' density first
+    recovers to `level` x its median: the end of the sparse, fast
+    stretch right after division (measured on JP_002: 2% of the cells
+    in the first 30 deg, density back to half the median at 30 deg and
+    to the median at 40). Returns the angle, or None when the density
+    never falls below the level after birth (no such stretch)."""
+    deg = np.degrees(np.asarray(grid)) % 360.0
+    order = np.argsort(deg)
+    d, ww = deg[order], np.asarray(w, float)[order]
+    ww = CC._circ_smooth(ww / ww.sum(), smooth)
+    med = float(np.median(ww))
+    start = int(np.searchsorted(d, birth_deg % 360.0)) % len(d)
+    if ww[start] >= level * med:
+        return None
+    for i in range(1, len(d)):
+        j = (start + i) % len(d)
+        if ww[j] >= level * med:
+            width = 360.0 / len(d)
+            return float((d[j] - width / 2) % 360.0)
+    return None
+
+
+def with_post_m(arcs, w, grid, birth_deg=0.0, level=0.5, name='post-M'):
+    """Split the arc that starts at birth into 'post-M' (birth -> the
+    density recovery) and the rest; the arcs come back unchanged when
+    no sparse stretch follows birth or the recovery lies beyond the
+    first arc's end."""
+    end = post_division_end(w, grid, birth_deg, level)
+    if end is None or not arcs:
+        return arcs
+    first = arcs[0]
+    span = (first['end_deg'] - first['start_deg']) % 360.0
+    cut = (end - first['start_deg']) % 360.0
+    if cut <= 0 or cut >= span:
+        return arcs
+    return ([{'name': name, 'start_deg': first['start_deg'], 'end_deg': end},
+             {'name': first['name'], 'start_deg': end, 'end_deg': first['end_deg']}] + list(arcs[1:]))
