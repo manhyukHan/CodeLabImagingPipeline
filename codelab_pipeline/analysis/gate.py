@@ -219,6 +219,36 @@ class CycleRange(Predicate):
 
 
 @_register
+class CycleCategoryIn(Predicate):
+    """The cell's cell-cycle category -- the Cell Cycle stage's arcs and
+    verdict gates applied to its placement -- is one of `names`. Like
+    CelltypeIn, but over a derived attribute: '' (in the list as
+    'Unassigned' too) names the cells the stage placed but did not
+    assign, and a cell never placed matches nothing."""
+    kind = 'cycle_category_in'
+
+    def __init__(self, names):
+        self.names = list(names)
+
+    def _params(self):
+        return {'names': self.names}
+
+    def mask(self, pop):
+        t = getattr(pop, 'cellcycle', None)
+        if t is None or len(t) == 0:
+            raise ValueError('population carries no cell-cycle placements; run '
+                             'the Cell Cycle stage first')
+        if 'category' not in t.columns:
+            raise ValueError('cell-cycle placements carry no category: the Cell '
+                             'Cycle stage has not stored its arcs')
+        names = ['' if n == 'Unassigned' else n for n in self.names]
+        by_cell = t.set_index(['fov', 'cell'])['category']
+        idx = pd.MultiIndex.from_frame(pop.cells[['fov', 'cell']])
+        v = by_cell.reindex(idx)
+        return (v.notna() & v.isin(names)).to_numpy()
+
+
+@_register
 class PairDistanceRange(Predicate):
     """Per-cell collapsed distance between two spot sets within [lo, hi] um.
 

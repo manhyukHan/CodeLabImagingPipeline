@@ -16,8 +16,8 @@ plain tables:
               modality, hybe, channel, z_status,    spot_sources
               y_um, x_um, z_um, brightness]
   cellcycle   DataFrame [fov, cell, theta_deg, R,   None until the Cell
-              fit_z, bf_ring, radius, total]        Cycle stage placed
-                                                   the FOV's cells
+              fit_z, bf_ring, radius, total,        Cycle stage placed
+              category]                             the FOV's cells
 
 Keys are ALWAYS (fov, cell) pairs. The SG scripts carry a measured scar
 here: cells keyed by basename collided across FOVs and silently merged
@@ -361,6 +361,15 @@ class Population:
                                   'brightness': 'float64'})
         cc_rows = [r for b in bundles for r in b.get('cellcycle', [])]
         cellcycle = pd.DataFrame(cc_rows) if cc_rows else None
+        if cellcycle is not None:
+            # the category is DERIVED here from the stage's stored arcs
+            # and verdict gates (cellcycle_model.json), never persisted
+            # per cell: re-drawing a boundary is a re-read, not a refit
+            from codelab_pipeline.analysis import cellcycle as CCm
+            spec = analysis_store.read_cellcycle_model(storage_path) or {}
+            arcs = spec.get('categories') or []
+            cellcycle['category'] = (CCm.assign(cellcycle, arcs, spec.get('gates'))
+                                     if arcs else '')
         pop = cls(storage_path, fovs, voxel_um, cells, alleles,
                   expression, spots, fails, cellcycle=cellcycle)
         pop.cache_stats = cache_stats

@@ -149,6 +149,30 @@ def main():
         cats = CC.categorize(v, [{'name': 'G1', 'start_deg': 300, 'end_deg': 60},
                                  {'name': 'G2M', 'start_deg': 100, 'end_deg': 250}])
         check('categories from arcs; unplaced and uncovered read empty', list(cats) == ['G1', 'G1', '', 'G2M'])
+        print("the stage's arcs and gates become the category at read time")
+        cat0 = pop.cellcycle.set_index(['fov', 'cell'])['category']
+        check('with the stored arc and no gates the category follows the arc alone',
+              cat0[(1, 1)] == 'G1' and cat0[(1, 2)] == 'G1' and cat0[(2, 2)] == '', str(dict(cat0)))
+        A.write_cellcycle_model(sp, {'version': 1, 'model': {'K': 2},
+                                     'categories': [{'name': 'G1', 'start_deg': 300, 'end_deg': 60},
+                                                    {'name': 'G2M', 'start_deg': 100, 'end_deg': 250}],
+                                     'gates': {'min_R': 0.5, 'min_bf_ring': 0.0}})
+        pop = popmod.Population.build(sp, [1, 2], jobs=1, mask_intensity=False)
+        cat = pop.cellcycle.set_index(['fov', 'cell'])['category']
+        check('arcs name the cells that pass every gate; a failed gate reads unassigned',
+              cat[(1, 1)] == 'G1' and cat[(1, 2)] == '' and cat[(2, 2)] == 'G2M', str(dict(cat)))
+        check('CycleCategoryIn gates like CelltypeIn, never placed matches nothing',
+              list(gate.CycleCategoryIn(['G1']).mask(pop)) == [True, False, False, False]
+              and list(gate.CycleCategoryIn(['Unassigned']).mask(pop)) == [False, True, False, False]
+              and list(gate.CycleCategoryIn(['G1', 'G2M']).mask(pop)) == [True, False, False, True])
+        d = gate.Condition([gate.CycleCategoryIn(['G2M'])]).to_dict()
+        check('CycleCategoryIn round-trips', list(gate.Condition.from_dict(d).mask(pop)) == [False, False, False, True])
+        a = CC.assign(pd.DataFrame({'theta_deg': [10.0, 10.0, np.nan], 'R': [0.9, 0.3, 0.9], 'fit_z': [0.0, 0.0, 0.0]}),
+                      [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5, 'min_bf_ring': 0.0})
+        check('assign: a gated verdict the table lacks fails every cell', list(a) == ['', '', ''])
+        a = CC.assign(pd.DataFrame({'theta_deg': [10.0, 10.0, np.nan], 'R': [0.9, 0.3, 0.9]}),
+                      [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5})
+        check('assign: gates and NaN phases', list(a) == ['G1', '', ''])
         empty = popmod.Population(sp, [1], (0.208, 0.208, 0.2), pop.cells, None, None, None, [])
         try:
             gate.PhaseRange(0, 90).mask(empty)

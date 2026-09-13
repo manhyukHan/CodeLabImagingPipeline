@@ -820,6 +820,37 @@ def categorize(theta_deg, arcs):
     return out
 
 
+GATE_KEYS = (('min_R', 'R', 'ge'), ('min_bf_ring', 'bf_ring', 'ge'),
+             ('min_fit_z', 'fit_z', 'ge'), ('max_fit_z', 'fit_z', 'le'),
+             ('min_radius', 'radius', 'ge'), ('max_radius', 'radius', 'le'),
+             ('min_total', 'total', 'ge'))
+
+
+def assign(table, arcs, gates=None):
+    """The final call per placed cell: the arc's name when every verdict
+    gate passes, '' (unassigned) otherwise. table: rows with theta_deg
+    and the verdict columns; arcs as in categorize; gates: {gate key:
+    value or None} over GATE_KEYS (min_R, min_bf_ring, min_fit_z,
+    max_fit_z, min_radius, max_radius, min_total). A cell with no value
+    for a gated verdict fails that gate. The Cell Cycle stage decides
+    both the arcs and the gates and stores them with the model; the app
+    applies them here when it reads the placements, so changing either
+    never needs a refit."""
+    cat = categorize(np.asarray(table['theta_deg'], float), arcs)
+    ok = np.ones(len(cat), bool)
+    for key, col, op in GATE_KEYS:
+        v = (gates or {}).get(key)
+        if v is None:
+            continue
+        if col not in table:
+            ok &= False
+            continue
+        x = np.asarray(table[col], float)
+        ok &= np.isfinite(x) & ((x >= float(v)) if op == 'ge' else (x <= float(v)))
+    cat[~ok] = ''
+    return cat
+
+
 def gene_table(expression, source_names, metric='n_spots'):
     """(table, celltype): a cells x genes count table from a Population's
     tidy expression rows.
