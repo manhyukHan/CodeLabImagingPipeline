@@ -44,7 +44,8 @@ class CellCyclePanelUI(object):
             'without its _mRNA/_exon suffix); "role" only orients the circle: the S genes\'\n'
             'mean peak becomes 0 and the G2/M genes\' mean peak lies in the forward half turn.\n'
             'Housekeeping genes never bridge experiments. Nascent/intron, repeat and toe\n'
-            'rounds are not counts (design 3b) and start unchecked.')
+            'rounds are not counts (design 3b) and start unchecked. The fiducial channel is '
+            'never a gene and is not listed; every other channel of a hybe is.')
         panelLayout.addWidget(self.SourceTableWidget)
         row = QtWidgets.QWidget()
         rowLayout = QtWidgets.QHBoxLayout(row)
@@ -54,7 +55,9 @@ class CellCyclePanelUI(object):
         self.RolesFromListsPushButton = QtWidgets.QPushButton('Roles from known lists')
         self.RolesFromListsPushButton.setToolTip('Seurat/Tirosh S and G2/M lists plus CCNE1, CDT1 (S) and CCNB1 (G2/M); '
                                                  'GAPDH/ACTB/TUBB/RPLP0/HPRT1 housekeeping.')
-        for b in (self.CheckMrnaRoundsPushButton, self.UncheckAllSourcesPushButton, self.RolesFromListsPushButton):
+        self.ShowKnownListsPushButton = QtWidgets.QPushButton('Show known lists')
+        for b in (self.CheckMrnaRoundsPushButton, self.UncheckAllSourcesPushButton, self.RolesFromListsPushButton,
+                  self.ShowKnownListsPushButton):
             rowLayout.addWidget(b)
         panelLayout.addWidget(row)
         form = QtWidgets.QFormLayout()
@@ -226,6 +229,7 @@ class CellCyclePanelUI(object):
         self.CheckMrnaRoundsPushButton.clicked.connect(self._check_mrna_rounds)
         self.UncheckAllSourcesPushButton.clicked.connect(lambda: self._set_all_use(False))
         self.RolesFromListsPushButton.clicked.connect(self._roles_from_lists)
+        self.ShowKnownListsPushButton.clicked.connect(lambda: self.show_known_lists(Widget))
         self.AddArcPushButton.clicked.connect(lambda: self._add_arc_row('', 0.0, 0.0))
         self.RemoveArcPushButton.clicked.connect(self._remove_arc_row)
 
@@ -243,8 +247,13 @@ class CellCyclePanelUI(object):
                 fid = r.get('fiducial_channel')
                 name = str(r.get('readout_name') or '')
                 for ch in r.get('channels', []):
+                    # the fiducial channel is never a gene: no row (user
+                    # request 2026-09-13); every other channel of a
+                    # multichannel readout gets one
+                    if fid is not None and ch == fid:
+                        continue
                     gene = CC.gene_from_readout(name) if name else ''
-                    use = bool(name) and CC.countable_round(name) and ch != fid
+                    use = bool(name) and CC.countable_round(name)
                     self._add_source_row((modality, r['folder'], int(ch)), gene, CC.default_role(gene), use)
         t.resizeColumnsToContents()
 
@@ -270,6 +279,37 @@ class CellCyclePanelUI(object):
         combo.addItems(list(CC.ROLES))
         combo.setCurrentIndex(max(0, list(CC.ROLES).index(role) if role in CC.ROLES else 0))
         t.setCellWidget(i, self.ROLE_COLUMN, combo)
+
+    def show_known_lists(self, parent=None):
+        """A pop-up table of the role lists the defaults come from."""
+        dlg = QtWidgets.QDialog(parent)
+        dlg.setWindowTitle('Known gene roles')
+        dlg.resize(520, 620)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.addWidget(QtWidgets.QLabel(
+            'Roles only ORIENT the circle (S mean peak -> 0, G2/M mean peak forward).
+'
+            'S and G2/M: the Seurat / Tirosh 2016 lists, plus CCNE1 and CDT1 (S) and CCNB1 (G2/M).
+'
+            'Housekeeping genes never bridge experiments. Edit any role in the table.'))
+        rows = ([(g, 'S') for g in CC.S_GENES] + [(g, 'G2/M') for g in CC.G2M_GENES]
+                + [(g, 'housekeeping') for g in CC.HOUSEKEEPING])
+        table = QtWidgets.QTableWidget(len(rows), 2)
+        table.setHorizontalHeaderLabels(['gene', 'role'])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        for i, (g, role) in enumerate(rows):
+            table.setItem(i, 0, QtWidgets.QTableWidgetItem(g))
+            table.setItem(i, 1, QtWidgets.QTableWidgetItem(role))
+        table.resizeColumnsToContents()
+        layout.addWidget(table)
+        close = QtWidgets.QPushButton('Close')
+        close.clicked.connect(dlg.accept)
+        layout.addWidget(close)
+        self._known_lists_dialog = dlg
+        dlg.show()
+        return dlg
 
     def gene_rows(self):
         """[{'source': (modality, hybe, channel), 'gene': str, 'role': str,
