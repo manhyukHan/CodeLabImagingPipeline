@@ -381,6 +381,8 @@ class PipelineRunner(QtCore.QObject):
 
     def _run_tracing(self, fovs, mode):
         mw = self.mw
+        if self.project is not None and not S.tracing_configured(self.project):
+            raise ValueError('chromatin tracing is not configured (no tracing hybes checked): not building alleles')
         mw._build_chromatin_alleles_all_fovs()
         mw._run_chromatin_tracing_fit_all()
         return (lambda: _running(getattr(mw, '_chromatin_worker', None))), (lambda: 'chromatin tracing batch ended')

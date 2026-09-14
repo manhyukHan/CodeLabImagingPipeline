@@ -133,6 +133,30 @@ def localization_targets(project):
     return out
 
 
+def tracing_configured(project):
+    """Chromatin tracing applies when the config names tracing hybes
+    ('HYBE|MOD,...' in chromatin_tracing/hybes). Without them the step is
+    n/a: building alleles would turn every spot of whatever round the
+    tracing tab shows into an allele."""
+    sec = (project.get('params', {}) or {}).get('chromatin_tracing', {}) or {}
+    return bool(str(sec.get('hybes', '') or '').strip())
+
+
+def cellcycle_configured(project):
+    """The cell-cycle stage applies when the config names genes, the
+    store holds a model, or a modality has countable readout rounds."""
+    from codelab_pipeline.analysis import cellcycle as CC
+    sec = (project.get('params', {}) or {}).get('cellcycle', {}) or {}
+    if str(sec.get('genes', '') or '').strip():
+        return True
+    try:
+        if project['modalities'] and analysis_store.read_cellcycle_model(_first_storage(project)):
+            return True
+    except Exception:                                           # noqa: BLE001
+        pass
+    return any(CC.countable_round(r.get('readout_name')) for m in project['modalities'].values() for r in m['records'])
+
+
 def reference_hybe(project, section, modality):
     """The reference hybe a config section names for a modality
     (fov_alignment / cell_alignment / cross_modal_alignment), or ''."""
@@ -292,6 +316,11 @@ def fov_status(project, fov, deep=True, targets=None):
     else:
         for s in DEEP_STEPS:
             out[s] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'shallow'}
+    # a step the project is not configured for is n/a everywhere, done or not
+    if not tracing_configured(project):
+        out['tracing'] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'no tracing hybes configured'}
+    if not cellcycle_configured(project):
+        out['cellcycle'] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'no cell-cycle genes, model or countable rounds'}
     return {s: out[s] for s in STEPS}
 
 

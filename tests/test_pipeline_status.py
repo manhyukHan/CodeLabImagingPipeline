@@ -70,7 +70,8 @@ def main():
                    'modalities': {'RNA': {'storage_path': rna, 'layout_path': '', 'records': records_rna, 'fields': {}},
                                   'DNA': {'storage_path': dna, 'layout_path': '', 'records': records_dna, 'fields': {}}},
                    'params': {'fov_alignment': {'reference_hybe_RNA': 'Hyb_001', 'reference_hybe_DNA': 'Hyb_001'},
-                              'spot_localization': {'hybe': 'Hyb_001 (DNA)', 'channel': '555'}},
+                              'spot_localization': {'hybe': 'Hyb_001 (DNA)', 'channel': '555'},
+                              'chromatin_tracing': {'hybes': 'Hyb_001|DNA,Hyb_002|DNA'}},
                    'celltype_names': ['A', 'B']}
         # FOV 1: everything; FOV 2: ingested + cells only; FOV 3: nothing
         for h in ('Hyb_001', 'Hyb_002', 'Hyb_003'):
@@ -139,6 +140,12 @@ def main():
         check('parse_fovs', S.parse_fovs('1-3, 7, 9-10') == [1, 2, 3, 7, 9, 10])
         lvl = S.project_level(project)
         check('project level: no model, no celltype config yet', lvl == {'cellcycle_model': False, 'celltype_config': False}, str(lvl))
+        check('tracing and cell cycle count as configured here', S.tracing_configured(project) and S.cellcycle_configured(project))
+        bare = dict(project, params={}, modalities={'DNA': project['modalities']['DNA']})
+        stb = S.fov_status(bare, 1)
+        check('without tracing hybes or countable rounds both steps are n/a', stb['tracing']['state'] == 'n/a' and stb['cellcycle']['state'] == 'n/a',
+              str((stb['tracing'], stb['cellcycle'])))
+        check('and the plan never runs them', S.plan([dict(fov=1, **stb)])['tracing'] == [] and S.plan([dict(fov=1, **stb)])['cellcycle'] == [])
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
