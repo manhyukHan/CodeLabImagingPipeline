@@ -16,15 +16,23 @@ judged here by quantities the model never sees:
     area_r2       the same for the cell-mask area
     arrested      where an arrested population lands and how tight it is
 
-and two hard requirements: the panel must keep at least one S and one
-G2/M gene (nothing orients the circle otherwise) and the DAPI step must
-be findable at all (no step, no division origin).
+and three hard requirements: the panel must keep at least one S and one
+G2/M gene (nothing orients the circle otherwise), the DAPI step must be
+findable at all (no step, no division origin), and the DNA must actually
+double over the cycle it draws (before/after ratio >= MIN_DNA_RATIO --
+without this a search happily reached the best DNA R2 on a cycle whose
+DNA content was flat).
 
 Two searches, both reporting the same metrics:
 
-    backward()  drop the weakest Fisher share first -- an order fixed
-                BEFORE the external scoring, so the curve is not tuned
-                on the criterion that judges it
+    backward()  drop in a pre-registered order (orders() offers three:
+                Fisher share, cycle amplitude, counts per cell), fixed
+                BEFORE the external scoring so the curve is not tuned on
+                the criterion that judges it -- but one order is one
+                path, and a path can miss the best panel
+    backward_greedy()  drop whichever gene leaves the highest rank; the
+                mirror of forward(), to be read beside a fixed-order
+                curve rather than instead of one
     forward()   start from every (S, G2/M) pair, keep the best, then add
                 whichever remaining gene ranks highest: origin found
                 first, arrested populations still in place second, the
@@ -157,6 +165,7 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
     g2g1 = (float(np.nanmedian(dna[before]) / np.nanmedian(dna[after]))
             if found and before.sum() >= 20 and after.sum() >= 20 else np.nan)
     share = m.fisher_share(data.name)
+    _pk, f_pk = m.peak_phase()
     s = np.array([share[g] for g in genes], float)
     s = s / max(s.sum(), 1e-12)
     row.update({'fitted': True, 'ok': bool(found), 'cells': int(keep.sum()), 'origin_found': bool(found),
@@ -168,7 +177,8 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
                 'on_ring': float(on[k].mean()), 'R_med': float(np.median(placed['R'][k])),
                 'effective_genes': float(np.exp(-(s * np.log(s + 1e-12)).sum())),
                 'inv_simpson': float(1.0 / (s ** 2).sum()), 'top_share': float(s.max()),
-                'fisher_share': {g: float(share[g]) for g in genes}})
+                'fisher_share': {g: float(share[g]) for g in genes},
+                'amplitude': {g: float(np.exp(f_pk[:, m.gi[g]].max() - f_pk[:, m.gi[g]].min())) for g in genes}})
     for cond in sorted({str(c) for c in data.groups if c and c != data.train}):
         sel = on & (groups == cond)
         if sel.sum() >= 20:
@@ -257,16 +267,31 @@ def arrested_shift(row, reference, tol_deg=45.0):
     return worst <= float(tol_deg), worst
 
 
-def rank(row, reference=None, key='dna_r2', tol_deg=45.0):
-    """The lexicographic score a forward search maximises: first a panel
-    that finds its division origin, then one whose arrested populations
-    have not moved, then the objective. Ranking this way (instead of the
-    objective alone) is what keeps the search from trading the division
-    step and the arrested anchors for a better DNA R2."""
+MIN_DNA_RATIO = 1.2
+"""The smallest before/after DNA ratio a panel may report and still be
+considered. The physical value is 2; the three stores read 1.45-1.83
+with their full panels, and a panel that reads near 1 is saying the DNA
+does not double over its own cycle -- its origin is a fitted angle with
+no biology behind it. Measured: chr19's greedy elimination reached four
+genes with the best DNA R2 on the board (0.263) and a ratio of 0.93."""
+
+
+def rank(row, reference=None, key='dna_r2', tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+    """The lexicographic score the searches maximise: a panel that finds
+    its division origin, then one whose DNA actually doubles over the
+    cycle (before/after ratio >= min_ratio), then one whose arrested
+    populations have not moved, and only then the objective.
+
+    Ranking this way (instead of the objective alone) is what keeps a
+    search from trading the division step, the DNA doubling and the
+    arrested anchors for a better DNA R2 -- each of those trades was
+    observed on the real stores before the condition was added."""
     if not row.get('fitted'):
-        return (-1, -1, -np.inf)
+        return (-1, -1, -1, -np.inf)
     ok, _worst = arrested_shift(row, reference, tol_deg)
-    return (1 if row.get('origin_found') else 0, 1 if ok else 0, objective(row, key))
+    ratio = row.get('dna_g2_over_g1', np.nan)
+    doubles = 1 if (np.isfinite(ratio) and ratio >= float(min_ratio)) else 0
+    return (1 if row.get('origin_found') else 0, doubles, 1 if ok else 0, objective(row, key))
 
 
 def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2', runner=None,
@@ -314,7 +339,7 @@ def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2',
         cand = max(tried, key=_rank)
         cand_score = _rank(cand)
         must_grow = len(current) < int(min_size) or score[0] < 1
-        if not must_grow and cand_score <= (score[0], score[1], score[2] + tol):
+        if not must_grow and cand_score <= score[:-1] + (score[-1] + tol,):
             break
         if not np.isfinite(cand_score[2]):
             break
@@ -343,20 +368,30 @@ def band(entry, key):
     return first, float(min(vals)), float(max(vals))
 
 
-def best_entry(curve, key='dna_r2'):
-    """The entry a curve should be judged against: the one that finds its
-    origin and scores highest on `key`.
+def entry_rank(entry, reference=None, key='dna_r2', tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+    """rank() of an entry's seed-0 row."""
+    row = next((r for r in entry['rows'] if r.get('seed') == 0), (entry['rows'] or [{}])[0])
+    return rank(row, reference, key, tol_deg, min_ratio)
 
-    NOT the full panel. Anchoring the stop rule to the full panel asks
-    only 'is this no worse than everything together', and when the full
-    panel is itself poor the rule passes anything: chr19's eleven genes
-    read a before/after DNA ratio of 1.09 (a cycle in which the DNA does
-    not double), so every smaller panel cleared that bar while two of
-    them -- nine genes at 1.54 and five at 1.45 -- were plainly better."""
+
+def best_entry(curve, key='dna_r2', reference=None, tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+    """The entry a curve should be judged against: the highest-ranking
+    one -- origin found, DNA doubling, arrested populations in place,
+    then the objective.
+
+    NOT the full panel: anchoring the stop rule there asks only 'is this
+    no worse than everything together', and when the full panel is poor
+    the rule passes anything (chr19's eleven genes read a before/after
+    DNA ratio of 1.09, so every smaller panel cleared that bar while
+    better ones existed). And not the objective alone: on the same store
+    a four-gene panel had the best DNA R2 with a ratio of 0.93."""
+    if not curve:
+        return None
+    ref = reference if reference is not None else next((r for r in curve[0]['rows'] if r.get('seed') == 0), None)
     ok = [e for e in curve if any(r.get('origin_found') for r in e['rows'])]
     if not ok:
         return None
-    return max(ok, key=lambda e: (band(e, key)[0] if np.isfinite(band(e, key)[0]) else -np.inf))
+    return max(ok, key=lambda e: entry_rank(e, ref, key, tol_deg, min_ratio))
 
 
 def stop_size(curve, keys=EXTERNAL, reference=None, key='dna_r2'):
@@ -388,3 +423,79 @@ def stop_size(curve, keys=EXTERNAL, reference=None, key='dna_r2'):
         if ok:
             best = entry
     return best
+
+def orders(data, genes=None, seeds=(0,), runner=None):
+    """Pre-registered elimination orders, weakest first, each computed
+    from ONE fit of the full panel and fixed before any external
+    scoring:
+
+        fisher     the share of the phase information a gene carries
+        amplitude  the gene's own cycle signal, log(max pi / min pi)
+        counts     the median counts per cell (a weak round first)
+
+    A single order explores a single path; running all three and taking
+    the best entry across them costs three curves and covers the panels
+    one order alone would miss."""
+    genes = list(genes or data.genes)
+    row = _run(data, [(genes, int(seeds[0]))], runner, False)[0]
+    share = row.get('fisher_share') or {g: 0.0 for g in genes}
+    X = data.columns(genes)
+    counts = {g: float(np.median(X[:, i])) for i, g in enumerate(genes)}
+    amp = row.get('amplitude') or {}
+    out = {'fisher': sorted(genes, key=lambda g: share.get(g, 0.0)),
+           'counts': sorted(genes, key=lambda g: counts.get(g, 0.0))}
+    if amp:
+        out['amplitude'] = sorted(genes, key=lambda g: amp.get(g, 0.0))
+    return out
+
+
+def backward_greedy(data, genes=None, seeds=DEFAULT_SEEDS, min_genes=3, runner=None, key='dna_r2',
+                    reference=None, tol_deg=45.0, with_half_panel=True):
+    """Elimination that chooses what to drop at every step: the gene
+    whose removal leaves the highest rank (origin found, arrested
+    populations within tol_deg of the reference, then the objective).
+
+    This is the mirror of forward() and carries the same warning: it
+    optimises the criterion it is scored by, so read it next to a
+    fixed-order curve rather than instead of one.
+
+    Returns the same shape as backward()."""
+    genes = list(genes or data.genes)
+    if reference is None:
+        reference = _run(data, [(list(genes), int(seeds[0]))], runner, False)[0]
+
+    def _rank(r):
+        return rank(r, reference, key, tol_deg)
+    current = list(genes)
+    out = [{'size': len(current), 'genes': list(current), 'dropped': [],
+            'rows': _run(data, [(list(current), int(s)) for s in seeds], runner, with_half_panel)}]
+    while len(current) > min_genes:
+        tried = _run(data, [([g for g in current if g != drop], int(seeds[0])) for drop in current], runner, False)
+        tried = [r for r in tried if r.get('fitted')]
+        if not tried:
+            break
+        best = max(tried, key=_rank)
+        current = list(best['genes'])
+        out.append({'size': len(current), 'genes': list(current), 'dropped': [g for g in genes if g not in current],
+                    'rows': _run(data, [(list(current), int(s)) for s in seeds], runner, with_half_panel)})
+    return out
+
+
+def best_of(curves, key='dna_r2', reference=None, tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+    """The highest-ranking entry across several curves (a dict of name ->
+    curve, or a list of curves), by the same rank the searches use --
+    not by the objective alone. Returns (name, entry)."""
+    items = list(curves.items()) if isinstance(curves, dict) else list(enumerate(curves))
+    ref = reference
+    if ref is None and items:
+        first = items[0][1]
+        ref = next((r for r in first[0]['rows'] if r.get('seed') == 0), None) if first else None
+    best = (None, None, None)
+    for name, curve in items:
+        e = best_entry(curve, key, ref, tol_deg, min_ratio)
+        if e is None:
+            continue
+        sc = entry_rank(e, ref, key, tol_deg, min_ratio)
+        if best[2] is None or sc > best[2]:
+            best = (name, e, sc)
+    return best[0], best[1]

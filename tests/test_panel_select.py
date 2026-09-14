@@ -90,6 +90,20 @@ def main():
     check('arrested_shift flags a population that moved', (not ok) or worst == 0.0, f'ok={ok} worst={worst:.0f}')
     r_bad = dict(ref, origin_found=False)
     check('a panel without an origin ranks below one with it', PS.rank(r_bad, ref) < PS.rank(ref, ref))
+    r_good = dict(ref, dna_g2_over_g1=1.8, dna_r2=0.50)
+    r_flat = dict(ref, dna_g2_over_g1=0.95, dna_r2=0.70)
+    check('a panel whose DNA does not double ranks below one whose does, even with a better objective',
+          PS.rank(r_flat, ref) < PS.rank(r_good, ref), f"{PS.rank(r_flat, ref)} vs {PS.rank(r_good, ref)}")
+    fake = [{'size': 6, 'genes': data.genes, 'rows': [dict(r_good, seed=0)]},
+            {'size': 4, 'genes': data.genes[:4], 'rows': [dict(r_flat, seed=0)]}]
+    check('best_entry refuses the flat-DNA panel however good its objective', PS.best_entry(fake)['size'] == 6,
+          str(PS.best_entry(fake)['size']))
+    # the ratio is compressed by the windows: the 'after' window spans
+    # 90-270 deg, and with cells spread evenly over the phase it already
+    # contains the 2N half. The real stores read 1.45-1.83 because their
+    # cells pile up in G1; this bench, sampling the phase uniformly,
+    # reads about 1.15 for the same underlying doubling.
+    check('the synthetic bench reports a DNA rise', ref['dna_g2_over_g1'] > 1.1, f"{ref['dna_g2_over_g1']:.2f}")
     # the objective may dip while the search is still below min_size or
     # still looking for an origin: the rank, not the objective, is what
     # the search climbs
@@ -118,6 +132,23 @@ def main():
     if small:
         check('a two-gene panel that lost a role is marked not ok', not any(r.get('ok') for r in small[0]['rows'])
               or {'S_true', 'G2M_true'} <= set(small[0]['genes']), str(small[0]['genes']))
+    print('top-down: several orders and the greedy variant')
+    o = PS.orders(data)
+    check('three pre-registered orders, each a permutation of the panel',
+          set(o) == {'fisher', 'counts', 'amplitude'} and all(sorted(v) == sorted(data.genes) for v in o.values()), str(list(o)))
+    check('the amplitude order puts a flat gene first', o['amplitude'][0].startswith('FLAT'), str(o['amplitude']))
+    bad_order = ['S_true', 'G2M_true', 'FREE_true', 'FLAT_A', 'FLAT_B', 'FLAT_C']   # carriers first: the worst possible path
+    bad = PS.backward(data, seeds=(0,), min_genes=3, order=bad_order, with_half_panel=False)
+    greedy = PS.backward_greedy(data, seeds=(0,), min_genes=3, with_half_panel=False)
+    carriers = {'S_true', 'G2M_true', 'FREE_true'}
+    check('greedy keeps carriers where a bad fixed order loses them',
+          len(carriers & set(greedy[-1]['genes'])) >= 2 and not (carriers & set(bad[-1]['genes'])),
+          f"greedy {greedy[-1]['genes']} vs fixed {bad[-1]['genes']}")
+    check('greedy scores better than the bad fixed order at the same size',
+          PS.band(greedy[-1], 'dna_r2')[0] > PS.band(bad[-1], 'dna_r2')[0],
+          f"{PS.band(greedy[-1], 'dna_r2')[0]:.3f} vs {PS.band(bad[-1], 'dna_r2')[0]:.3f}")
+    name, entry = PS.best_of({'fisher': curve, 'greedy': greedy})
+    check('best_of picks an entry across curves', entry is not None and name in ('fisher', 'greedy'), str(name))
     v, lo, hi = PS.band(curve[0], 'dna_r2')
     check('band returns the seed-0 value inside its own range', lo - 1e-9 <= v <= hi + 1e-9, f'{v:.3f} [{lo:.3f}-{hi:.3f}]')
 
