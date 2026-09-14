@@ -26,7 +26,10 @@ Two searches, both reporting the same metrics:
                 BEFORE the external scoring, so the curve is not tuned
                 on the criterion that judges it
     forward()   start from every (S, G2/M) pair, keep the best, then add
-                whichever remaining gene improves the score most
+                whichever remaining gene ranks highest: origin found
+                first, arrested populations still in place second, the
+                objective third (a single-metric greedy search traded
+                both away -- see forward's docstring)
 
 A pair is a ratio, so the winner of the seeding round is often a cyclic
 gene against a FLAT one rather than two cyclic genes: in a composition
@@ -237,15 +240,50 @@ def seeds_for_forward(data, genes=None):
     return [[a, b] for a in early for b in late]
 
 
-def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2', runner=None,
-            tol=0.0, with_half_panel=True):
-    """Greedy addition: score every (S, G2/M) pair, keep the best, then
-    add whichever remaining gene raises the objective most, until
-    max_genes or no addition improves it by more than `tol`.
+def arrested_shift(row, reference, tol_deg=45.0):
+    """(ok, worst shift in deg) of the arrested populations against a
+    reference panel: an addition that moves an arrested population by
+    more than tol_deg has changed what the circle means, whatever it did
+    to the objective."""
+    if not reference:
+        return True, 0.0
+    worst = 0.0
+    for key in [k for k in reference if k.endswith('_deg') and k != 'origin_deg']:
+        a, b = row.get(key), reference.get(key)
+        if a is None or b is None or not (np.isfinite(a) and np.isfinite(b)):
+            continue
+        worst = max(worst, abs((float(a) - float(b) + 180.0) % 360.0 - 180.0))
+    return worst <= float(tol_deg), worst
 
-    Returns [{'size', 'genes', 'added', 'rows'}], the first entry being
-    the winning pair and each later one a single addition; the search
-    itself runs on seeds[0] and every kept panel is re-scored on all
+
+def rank(row, reference=None, key='dna_r2', tol_deg=45.0):
+    """The lexicographic score a forward search maximises: first a panel
+    that finds its division origin, then one whose arrested populations
+    have not moved, then the objective. Ranking this way (instead of the
+    objective alone) is what keeps the search from trading the division
+    step and the arrested anchors for a better DNA R2."""
+    if not row.get('fitted'):
+        return (-1, -1, -np.inf)
+    ok, _worst = arrested_shift(row, reference, tol_deg)
+    return (1 if row.get('origin_found') else 0, 1 if ok else 0, objective(row, key))
+
+
+def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2', runner=None,
+            tol=0.0, with_half_panel=True, min_size=4, reference=None, tol_deg=45.0):
+    """Greedy addition under hard conditions: score every (S, G2/M)
+    pair, keep the best, then add whichever remaining gene ranks highest
+    -- origin found first, arrested populations still in place second,
+    the objective third.
+
+    The search keeps going while the panel is smaller than `min_size` or
+    has no division origin, whatever the objective does; after that it
+    stops when no addition improves the rank by more than `tol`.
+    `reference` is a row (usually the full panel) the arrested check is
+    made against; without it that check passes.
+
+    Returns [{'size', 'genes', 'added', 'rows', 'candidates'}], the first
+    entry being the winning pair and each later one a single addition;
+    the search runs on seeds[0] and every kept panel is re-scored on all
     seeds."""
     genes = list(genes or data.genes)
     max_genes = int(max_genes or len(genes))
@@ -253,29 +291,38 @@ def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2',
     if not pairs:
         raise ValueError('the panel has no (S, G2/M) pair: nothing can orient the circle')
     search_seed = int(seeds[0])
+    if reference is None:
+        reference = _run(data, [(list(genes), search_seed)], runner, False)[0]
+
+    def _rank(r):
+        return rank(r, reference, key, tol_deg)
     rows = _run(data, [(p, search_seed) for p in pairs], runner, False)
-    best = max(rows, key=lambda r: objective(r, key))
-    if not np.isfinite(objective(best, key)):
-        raise ValueError('no (S, G2/M) pair could be fitted and oriented')
+    best = max(rows, key=_rank)
+    if not np.isfinite(_rank(best)[2]):
+        raise ValueError('no (S, G2/M) pair could be fitted')
     current = list(best['genes'])
+    score = _rank(best)
     path = [{'size': len(current), 'genes': list(current), 'added': list(current),
              'rows': _run(data, [(list(current), int(s)) for s in seeds], runner, with_half_panel),
-             'candidates': [{'genes': r['genes'], 'score': objective(r, key)} for r in rows]}]
-    score = objective(best, key)
+             'candidates': [{'genes': r['genes'], 'rank': _rank(r)} for r in rows]}]
     while len(current) < max_genes:
         rest = [g for g in genes if g not in current]
         if not rest:
             break
         tried = _run(data, [(current + [g], search_seed) for g in rest], runner, False)
-        cand = max(tried, key=lambda r: objective(r, key))
-        if objective(cand, key) <= score + tol:
+        cand = max(tried, key=_rank)
+        cand_score = _rank(cand)
+        must_grow = len(current) < int(min_size) or score[0] < 1
+        if not must_grow and cand_score <= (score[0], score[1], score[2] + tol):
+            break
+        if not np.isfinite(cand_score[2]):
             break
         added = [g for g in cand['genes'] if g not in current]
         current = list(cand['genes'])
-        score = objective(cand, key)
+        score = cand_score
         path.append({'size': len(current), 'genes': list(current), 'added': added,
                      'rows': _run(data, [(list(current), int(s)) for s in seeds], runner, with_half_panel),
-                     'candidates': [{'genes': r['genes'], 'score': objective(r, key)} for r in tried]})
+                     'candidates': [{'genes': r['genes'], 'rank': _rank(r)} for r in tried]})
     return path
 
 

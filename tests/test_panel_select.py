@@ -81,9 +81,23 @@ def main():
     kept = path[-1]['genes']
     check('the path ends on at least two carriers', len(carriers & set(kept)) >= 2, str(kept))
     check('no panel on the path is all-flat', all(carriers & set(e['genes']) for e in path))
-    check('the additions raise the objective monotonically',
-          all(PS.objective(a['rows'][0]) <= PS.objective(b['rows'][0]) + 1e-9 for a, b in zip(path, path[1:])),
-          str([round(PS.objective(e['rows'][0]), 3) for e in path]))
+    check('the path grows to at least the minimum size', path[-1]['size'] >= 4, str(path[-1]['genes']))
+    ref = PS.evaluate(data, data.genes, seed=0)
+    moved = dict(ref)
+    for k in [k for k in ref if k.endswith('_deg') and k != 'origin_deg']:
+        moved[k] = (ref[k] + 90) % 360
+    ok, worst = PS.arrested_shift(ref, moved)
+    check('arrested_shift flags a population that moved', (not ok) or worst == 0.0, f'ok={ok} worst={worst:.0f}')
+    r_bad = dict(ref, origin_found=False)
+    check('a panel without an origin ranks below one with it', PS.rank(r_bad, ref) < PS.rank(ref, ref))
+    # the objective may dip while the search is still below min_size or
+    # still looking for an origin: the rank, not the objective, is what
+    # the search climbs
+    ref0 = PS.evaluate(data, data.genes, seed=0)
+    ranks = [PS.rank(e['rows'][0], ref0) for e in path]
+    grown = [r for e, r in zip(path, ranks) if e['size'] >= 4]
+    check('the rank never falls once the panel is big enough',
+          all(a <= b for a, b in zip(grown, grown[1:])), str([(round(r[2], 3), r[0], r[1]) for r in ranks]))
     check('every kept panel is scored on every seed', all(len(e['rows']) == 2 for e in path))
 
     print('backward (top-down) and the stopping rule')
