@@ -378,11 +378,12 @@ class ChromatinTracingPanelUI(object):
         psfRow.addWidget(self.FitReadoutPsfPushButton)
         engineForm.addRow('Readout PSF (v2):', psfRow)
 
-        # -- cross-mode: shared by BOTH engines, so it sits OUTSIDE the
-        # stack. v2 really does read all four: spad reaches
-        # crop_for_localization, and both drift gates are applied in
-        # tracing_v2.build_chromatin_trace_allele. z_window and
-        # z_boundary_trim are v1-only and move onto the v1 page below.
+        # -- cross-mode: shared by EVERY engine, so it sits OUTSIDE the
+        # stack. v2 and v3 really do read all of them: spad reaches
+        # crop_for_localization, both drift gates are applied in
+        # tracing_v2.build_chromatin_trace_allele, and the two z controls
+        # (z_window, z_boundary_trim) ride on V2Params since c4881db --
+        # they used to be v1-only and are added to this form further down.
         crossForm = QtWidgets.QFormLayout()
         paramsOuter.addLayout(crossForm)
 
