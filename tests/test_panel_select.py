@@ -108,6 +108,12 @@ def main():
     stop = PS.stop_size(curve)
     check('the stop keeps the three carriers', stop is not None and {'S_true', 'G2M_true', 'FREE_true'} <= set(stop['genes']),
           str(stop['genes']) if stop else 'none')
+    best = PS.best_entry(curve)
+    check('the reference is the best panel on the curve, not the biggest',
+          best is not None and PS.band(best, 'dna_r2')[0] >= PS.band(curve[0], 'dna_r2')[0] - 1e-9,
+          f"best {best['size']} r2 {PS.band(best, 'dna_r2')[0]:.3f} vs full {PS.band(curve[0], 'dna_r2')[0]:.3f}" if best else 'none')
+    check('the stop is no bigger than the best entry', stop is not None and best is not None and stop['size'] <= best['size'],
+          f"stop {stop['size']} best {best['size']}" if stop and best else '')
     small = [e for e in curve if e['size'] == 2]
     if small:
         check('a two-gene panel that lost a role is marked not ok', not any(r.get('ok') for r in small[0]['rows'])

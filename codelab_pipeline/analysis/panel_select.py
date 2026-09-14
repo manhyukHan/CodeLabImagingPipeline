@@ -38,7 +38,8 @@ just as well. Seeds are therefore a starting point, not a verdict on a
 gene's worth -- read the path, not its first step.
 
 `stop_size` reads a backward curve: the smallest panel whose external
-numbers still sit inside the full panel's bootstrap band.
+numbers still sit inside the bootstrap band of the BEST panel on the
+curve (not of the full panel -- a poor full panel would pass anything).
 """
 import numpy as np
 
@@ -342,14 +343,32 @@ def band(entry, key):
     return first, float(min(vals)), float(max(vals))
 
 
-def stop_size(curve, keys=EXTERNAL, reference=None):
+def best_entry(curve, key='dna_r2'):
+    """The entry a curve should be judged against: the one that finds its
+    origin and scores highest on `key`.
+
+    NOT the full panel. Anchoring the stop rule to the full panel asks
+    only 'is this no worse than everything together', and when the full
+    panel is itself poor the rule passes anything: chr19's eleven genes
+    read a before/after DNA ratio of 1.09 (a cycle in which the DNA does
+    not double), so every smaller panel cleared that bar while two of
+    them -- nine genes at 1.54 and five at 1.45 -- were plainly better."""
+    ok = [e for e in curve if any(r.get('origin_found') for r in e['rows'])]
+    if not ok:
+        return None
+    return max(ok, key=lambda e: (band(e, key)[0] if np.isfinite(band(e, key)[0]) else -np.inf))
+
+
+def stop_size(curve, keys=EXTERNAL, reference=None, key='dna_r2'):
     """The smallest panel of a backward curve whose external metrics all
-    stay inside the reference panel's bootstrap band (the full panel by
-    default). A panel that cannot be oriented, or whose origin is not
-    found, never qualifies."""
+    stay inside the reference panel's bootstrap band. The reference is
+    the best panel on the curve (best_entry) unless one is given: a panel
+    is kept because it matches the best result, not because it matches
+    the biggest panel. A panel that cannot be oriented, or whose origin
+    is not found, never qualifies."""
     if not curve:
         return None
-    ref = reference if reference is not None else curve[0]
+    ref = reference if reference is not None else (best_entry(curve, key) or curve[0])
     bands = {k: band(ref, k)[1:] for k in keys}
     best = None
     for entry in curve:
