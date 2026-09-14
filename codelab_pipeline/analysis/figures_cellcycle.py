@@ -704,8 +704,8 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     its own FOV (fov given): staining and illumination differ per FOV,
     and in an FOV-mode experiment that difference IS the condition
     difference (measured on JP_002: FOV medians span 1.6e7..3.1e7). Then
-    the scale is the median of the first category (G1 when the arcs
-    start at birth). The title carries the G2/M-over-G1 ratio (about 2
+    the scale is the median of the G1 category (the first category when
+    there is no G1). The title carries the G2/M-over-G1 ratio (about 2
     is the routine pass) and the angle where the DNA content halves --
     division, found by the same step detector as the panel total's drop,
     on the training cells when given."""
@@ -721,7 +721,16 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     ok = np.isfinite(th) & np.isfinite(d)
     cat = None if categories is None else np.asarray(['Unassigned' if not c else str(c) for c in categories], dtype=object)
     names = list(order) if order else ([x for x in dict.fromkeys(cat[ok]) if x != 'Unassigned'] if cat is not None else [])
-    ref = d[ok & (cat == names[0])] if (cat is not None and names) else d[ok]
+    # THE REFERENCE IS G1 when the arcs have one: with a post-M arc first,
+    # 'the first category' would be the few newborn cells, and the routine
+    # G2/M ratio would be read against them (seen: 1.15 'expected 2')
+    refname = 'G1' if 'G1' in names else (names[0] if names else None)
+    # the scale and the per-category panel come from the TRAINING cells
+    # when they are given: an arrested condition's per-FOV-normalised DNA
+    # is not on the cycling cells' scale, and mixing it in diluted the
+    # G2/M-over-G1 check (JP_002: 1.30 with all cells, 1.9 cycling only)
+    trn = ok & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
+    ref = d[trn & (cat == refname)] if (cat is not None and refname) else d[trn]
     scale = float(np.median(ref)) if ref.size else 1.0
     dn = d / (scale if scale > 0 else 1.0)
     ncol = 1 + (cat is not None) + (area is not None)
@@ -738,7 +747,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         ax.fill_between(cen, lo, hi, color=c, alpha=0.12, linewidth=0)
     ax.axhline(1.0, color='0.7', lw=0.8, ls=':')
     ax.axhline(2.0, color='0.7', lw=0.8, ls=':')
-    ax.set_ylabel(f'DAPI sum above background / median of {names[0] if names else "all"}')
+    ax.set_ylabel(f'DAPI sum above background / median of {refname or "all"}')
     ax.set_title('DNA content along the cycle (median, quartiles)', fontsize=10)
     ax.legend(fontsize=8, frameon=False)
     phase_axis(ax, marks=marks)
@@ -773,7 +782,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         allnames = names + (['Unassigned'] if 'Unassigned' in set(cat[ok]) else [])
         hi_x = float(np.nanpercentile(dn[ok], 99.5)) if ok.any() else 3.0
         for name, c in zip(allnames, gene_palette(len(allnames))):
-            k = ok & (cat == name)
+            k = trn & (cat == name)
             if k.sum() < 10:
                 continue
             meds[name] = float(np.median(dn[k]))
@@ -781,11 +790,11 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
                       label=f'{name} (n={int(k.sum())}, median {meds[name]:.2f})')
         ax2.set_xlabel('DNA content (normalised)')
         ax2.set_ylabel('density')
-        ax2.set_title('per category', fontsize=10)
+        ax2.set_title('per category' + (' (training cells)' if training is not None else ''), fontsize=10)
         ax2.legend(fontsize=8, frameon=False)
         g2m = next((n for n in names if 'G2' in n.upper() or n.upper() == 'M'), None)
-        if g2m in meds and names[0] in meds and meds[names[0]] > 0:
-            ratio_txt += f'; {g2m} / {names[0]} median ratio {meds[g2m] / meds[names[0]]:.2f} (about 2 expected)'
+        if g2m in meds and refname in meds and meds[refname] > 0:
+            ratio_txt += f'; {g2m} / {refname} median ratio {meds[g2m] / meds[refname]:.2f} (about 2 expected)'
     drop_txt = ''
     tr = ok & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
     if tr.sum() >= 200:

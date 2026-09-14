@@ -130,6 +130,14 @@ def main():
     check('the DAPI figure finds the halving angle near 180 despite a 3x FOV', 'halves at' in ttl
           and abs(float(ttl.split('halves at ')[1].split(' ')[0]) - 180) <= 15, ttl)
     plt.close(fig)
+    # with a post-M arc FIRST the reference is still G1 (not the newborn cells)
+    cats = np.where(((th - 180) % 360) < 20, 'post-M', np.where(((th - 200) % 360) < 220, 'G1', 'G2/M')).astype(object)
+    fig = FC.fig_dapi_vs_phase(th, dna, groups=groups, categories=cats, order=['post-M', 'G1', 'G2/M'], fov=fov,
+                               training=np.ones(900, bool), marks=marks)
+    ttl = fig._suptitle.get_text()
+    check('the DAPI reference category is G1 even when post-M comes first', 'G2/M / G1 median ratio' in ttl
+          and 'median of G1' in fig.axes[0].get_ylabel(), ttl + ' | ' + fig.axes[0].get_ylabel())
+    plt.close(fig)
     tiles = [(np.random.default_rng(i).normal(100, 10, (16, 16)), np.zeros((16, 16), bool), 80.0, 130.0) for i in range(5)]
     tiles[0][1][4:10, 4:10] = True
     fig = FC.fig_gallery([('0-45', tiles[:3]), ('45-90', tiles[3:])], size=16, title='gallery')
