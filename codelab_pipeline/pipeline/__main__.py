@@ -70,10 +70,39 @@ def cmd_plan(args):
         print(f'{s:15s} {eff[s]:8s} -> {len(fovs):3d} FOVs' + (f': {fovs}' if fovs and len(fovs) <= 40 else '') + note)
 
 
+def cmd_run(args):
+    """The plan, then the run through an offscreen MainWindow (the app's
+    own batch actions), unless --dry-run."""
+    project = _project(args)
+    pol = S.parse_policy(args.policy)
+    rows = _rows(project, args)
+    p = S.plan(rows, pol)
+    eff = dict(S.DEFAULT_POLICY)
+    eff.update(pol)
+    todo = [(s, p[s]) for s in S.STEPS if p[s] and eff[s] != 'skip' and (s not in S.NEVER_AUTO or s in pol)]
+    for s in S.STEPS:
+        print(f'{s:15s} {eff[s]:8s} -> {len(p[s]):3d} FOVs' + ('' if (s not in S.NEVER_AUTO or s in pol or not p[s]) else '   (not run: choose segmentation explicitly)'))
+    if not todo:
+        print('nothing to run')
+        return
+    if args.dry_run:
+        print('dry run: would run ' + ', '.join(f'{s} ({len(f)} FOVs, {"overwrite" if eff[s] == "redo" else "append"})' for s, f in todo))
+        return
+    from windows.pipeline_wiring import run_headless
+    report = run_headless(args.config, fovs=project['fovs'], policies=pol, explicit=tuple(pol), log=lambda m: print(m, flush=True),
+                          timeout_s=args.timeout)
+    print()
+    for e in report['steps']:
+        print(f'{e["step"]:15s} {e.get("seconds", 0):7.1f}s  {e.get("summary") or e.get("error", "")}' + (f'  [{e["after"]}]' if e.get('after') else ''))
+    if report['failed']:
+        print('failed:', report['failed'])
+        sys.exit(1)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m codelab_pipeline.pipeline')
     sub = ap.add_subparsers(dest='cmd', required=True)
-    for name, fn in (('status', cmd_status), ('plan', cmd_plan)):
+    for name, fn in (('status', cmd_status), ('plan', cmd_plan), ('run', cmd_run)):
         sp = sub.add_parser(name)
         sp.add_argument('config')
         sp.add_argument('--fovs', default='')
@@ -83,6 +112,9 @@ def main(argv=None):
             sp.add_argument('--detail', action='store_true')
         else:
             sp.add_argument('--policy', default='', help='step=existing|redo|skip, comma separated')
+        if name == 'run':
+            sp.add_argument('--dry-run', action='store_true', help='print what would run and exit')
+            sp.add_argument('--timeout', type=float, default=None, help='seconds before the run stops after its current step')
         sp.set_defaults(fn=fn)
     args = ap.parse_args(argv)
     args.fn(args)
