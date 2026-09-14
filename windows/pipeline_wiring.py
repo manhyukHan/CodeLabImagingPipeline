@@ -386,6 +386,127 @@ class PipelineRunner(QtCore.QObject):
         return (lambda: _running(getattr(mw, '_chromatin_worker', None))), (lambda: 'chromatin tracing batch ended')
 
 
+def project_from_app(mw):
+    """The status module's project dict from the live app: storage paths
+    and layouts from the Ingestion tab, the parsed hybe records, every
+    tab's current parameters (the config the app would save), the
+    Ingestion FOV list."""
+    from codelab_pipeline.io import paths
+    ip = mw.ui.IngestionPanel
+    modalities = {}
+    root = ''
+    for name, data in (getattr(ip, 'modality_data', {}) or {}).items():
+        sp = str((data or {}).get('storage_path', '') or '')
+        if not sp:
+            continue
+        root = root or paths.project_root(sp)
+        modalities[name] = {'storage_path': sp, 'layout_path': str((data or {}).get('layout_path', '') or ''),
+                            'records': list((getattr(mw, 'hybe_records_by_modality', {}) or {}).get(name, [])),
+                            'fields': dict(data or {})}
+    try:
+        params = mw._capture_config_params()
+    except Exception:                                           # noqa: BLE001
+        params = {}
+    return {'config': 'app', 'project_root': root, 'fovs': mw._parse_fov_list(ip.FovListLineEdit.text()),
+            'modalities': modalities, 'params': params, 'celltype_names': list(getattr(mw, 'current_celltype_list', None) or [])}
+
+
+class PipelineTab:
+    """The Pipeline tab over PipelineRunner: Refresh reads the store's
+    status (a worker), Start runs the plan the policies imply, Stop ends
+    after the current step; the runner's log lands in the tab."""
+
+    def __init__(self, mw):
+        self.mw = mw
+        self.panel = mw.ui.PipelinePanel
+        self.runner = PipelineRunner(mw)
+        self.rows = None
+        self.project = None
+        self._worker = None
+        p = self.panel
+        p.RefreshPushButton.clicked.connect(lambda: self._guard(self.refresh))
+        p.StartPushButton.clicked.connect(lambda: self._guard(self.start))
+        p.StopPushButton.clicked.connect(lambda: self._guard(self.runner.stop))
+        for combo in p.policy_combos.values():
+            combo.currentTextChanged.connect(lambda _t: self._update_plan())
+        self.runner.logged.connect(p.append_log)
+        self.runner.step_started.connect(lambda s, f: p.ProgressLabel.setText(f'running {s} on {len(f)} FOV(s)...'))
+        self.runner.step_finished.connect(lambda s, t: p.ProgressLabel.setText(t))
+        self.runner.finished.connect(self._on_finished)
+
+    def _guard(self, fn):
+        try:
+            fn()
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self.mw, TAB_TITLE, str(e))
+        except Exception as e:                                  # noqa: BLE001
+            QtWidgets.QMessageBox.critical(self.mw, f'{TAB_TITLE} error', f'{type(e).__name__}: {e}')
+
+    def _project(self):
+        project = project_from_app(self.mw)
+        if not project['modalities']:
+            raise ValueError('No storage path set on the Ingestion tab.')
+        if not project['fovs']:
+            raise ValueError('The Ingestion tab has no FOV list.')
+        if not any(m['records'] for m in project['modalities'].values()):
+            raise ValueError('Parse the layouts on the Ingestion tab first.')
+        return project
+
+    def refresh(self, then=None):
+        from windows.main_window import FnWorker
+        p = self.panel
+        project = self._project()
+        deep = p.DeepCheckBox.isChecked()
+        p.FovListLabel.setText(f'FOVs: {len(project["fovs"])} ({project["fovs"][0]}..{project["fovs"][-1]})')
+        p.RefreshPushButton.setEnabled(False)
+        p.SummaryLabel.setText('reading the store...')
+
+        def _done(rows):
+            p.RefreshPushButton.setEnabled(True)
+            self.rows, self.project = rows, project
+            self._update_plan()
+            if then is not None:
+                self._guard(then)
+
+        def _fail(msg):
+            p.RefreshPushButton.setEnabled(True)
+            p.SummaryLabel.setText(f'status failed: {msg}')
+        self._worker = FnWorker(lambda: S.status_table(project, deep=deep))
+        self._worker.finished_ok.connect(lambda r: self._guard(lambda: _done(r)))
+        self._worker.failed.connect(_fail)
+        self._worker.start()
+
+    def _update_plan(self):
+        if self.rows is None:
+            return
+        plan = S.plan(self.rows, self.panel.policies())
+        self.panel.set_status_rows(self.rows, plan)
+
+    def start(self):
+        if self.runner.running:
+            raise ValueError('A run is already in progress.')
+        if self.rows is None or self.project is None:
+            self.refresh(then=self.start)
+            return
+        pol = self.panel.policies()
+        plan = S.plan(self.rows, pol)
+        if not any(plan[s] for s in S.STEPS if pol[s] != 'skip'):
+            raise ValueError('Nothing to run: every step is done for these FOVs, or skipped.')
+        self.panel.set_running(True)
+        self.panel.append_log('---- run started ----')
+        self.runner.start(self.project, plan, pol, explicit=self.panel.explicit_steps())
+
+    def _on_finished(self, report):
+        self.panel.set_running(False)
+        self.panel.ProgressLabel.setText(f'finished in {report.get("seconds", 0):.0f}s; {len(report.get("failed", []))} failed'
+                                         + (' (stopped early)' if report.get('stopped') else ''))
+        # the store changed: read it again
+        try:
+            self.refresh()
+        except Exception as exc:                                # noqa: BLE001
+            self.panel.append_log(f'refresh after the run failed: {type(exc).__name__}: {exc}')
+
+
 def run_headless(config_path, fovs=None, policies=None, explicit=(), log=print, timeout_s=None):
     """The CLI's door: an offscreen MainWindow, the runner, the event loop
     pumped until it finishes. Returns the report."""

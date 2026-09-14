@@ -1921,6 +1921,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # over codelab_pipeline/analysis/cellcycle.
         from windows.cellcycle_wiring import CellCycleWiring
         self.cellcycle = CellCycleWiring(self)
+        # The Pipeline tab: one run over the whole store through the batch
+        # actions above -- windows/pipeline_wiring.py over
+        # codelab_pipeline/pipeline (status, plan).
+        from windows.pipeline_wiring import PipelineTab
+        self.pipeline = PipelineTab(self)
         chp.FitReadoutPsfPushButton.clicked.connect(self._fit_readout_psf)
         # The engine combo was connected to NOTHING, so selecting v2 left
         # every control it ignores enabled and labelled in pixels. Every
@@ -14148,6 +14153,18 @@ One PNG PER MODALITY: each modality has its own reference and its
             # every app restart and never appeared in a config file --
             # a run could not say which engine produced its spots.
             'engine': ('localize_3d_displayer', 'EngineComboBox'),
+        },
+        'pipeline': {
+            'ingestion_policy': ('PipelinePanel', 'IngestionPolicyComboBox'),
+            'segmentation_policy': ('PipelinePanel', 'SegmentationPolicyComboBox'),
+            'fov_alignment_policy': ('PipelinePanel', 'FovAlignmentPolicyComboBox'),
+            'cross_modal_policy': ('PipelinePanel', 'CrossModalPolicyComboBox'),
+            'cell_alignment_policy': ('PipelinePanel', 'CellAlignmentPolicyComboBox'),
+            'localization_policy': ('PipelinePanel', 'LocalizationPolicyComboBox'),
+            'celltype_policy': ('PipelinePanel', 'CelltypePolicyComboBox'),
+            'cellcycle_policy': ('PipelinePanel', 'CellcyclePolicyComboBox'),
+            'tracing_policy': ('PipelinePanel', 'TracingPolicyComboBox'),
+            'deep_status': ('PipelinePanel', 'DeepCheckBox'),
         },
         'cellcycle': {
             'fov_list': ('CellCyclePanel', 'FovListLineEdit'),

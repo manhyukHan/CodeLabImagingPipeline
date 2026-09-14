@@ -75,6 +75,14 @@ class MainWindowUI(object):
         self.AnalysisPanel.setupUi(self.AnalysisPanelWidget)
         self.tabWidget.addTab(self._scrollable(self.AnalysisPanelWidget), 'Analysis')
 
+        # The Pipeline tab: one run over the whole store (ui/pipeline_panel.py,
+        # windows/pipeline_wiring.py over codelab_pipeline/pipeline).
+        from ui.pipeline_panel import PipelinePanelUI
+        self.PipelinePanelWidget = QtWidgets.QWidget()
+        self.PipelinePanel = PipelinePanelUI()
+        self.PipelinePanel.setupUi(self.PipelinePanelWidget)
+        self.tabWidget.addTab(self._scrollable(self.PipelinePanelWidget), 'Pipeline')
+
         # The combined log window replaced every panel's own log box -- this
         # corner button (visible from every tab) re-opens it after the user
         # closes it. MainWindow wires the click.
