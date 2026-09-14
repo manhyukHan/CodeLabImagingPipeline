@@ -131,6 +131,8 @@ def _fov_bundle(item):
             allspots = analysis_store.read_spots(storage_path, fov, modality=m)
             per = {}
             for s_ in allspots:
+                if not E.accepted(s_):
+                    continue
                 cid = int(s_.get('cell', -1))
                 if cid < 0:
                     continue
@@ -222,6 +224,8 @@ def _fov_bundle(item):
             m, h, ch = src
             for s in analysis_store.read_spots(storage_path, fov, modality=m,
                                                hybe=h, channel=ch):
+                if not E.accepted(s):
+                    continue
                 y, x, z = s['adj_coordinate']
                 rows.append({'fov': int(fov), 'cell': int(s.get('cell', -1)),
                              'celltype': str(s.get('celltype') or ''),

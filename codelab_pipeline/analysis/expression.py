@@ -37,16 +37,35 @@ from codelab_pipeline.models.cell import ACell
 DEFAULT_VOXEL_UM = (0.208, 0.208, 0.2)
 
 
+SPOT_GATE = 0.5
+"""The p_exist a stored spot needs to be counted. A store may hold every
+candidate the detector saw (batch.run with min_p_exist 0, so a rejection
+rate can be gated post hoc); without this gate every count here would
+silently jump 2-4x. A spot with no p_exist -- an older store, a manual
+keep -- counts: somebody kept it, and nothing here can second-guess
+that. Same rule and same default as cellcycle.COUNT_GATE."""
+
+
+def accepted(spot, gate=SPOT_GATE):
+    p = spot.get('p_exist')
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return True
+    return not np.isfinite(p) or p >= gate
+
+
 def fov_expression_table(storage_path, fov, sources, mask_intensity=False,
-                         resolver=None):
+                         resolver=None, gate=SPOT_GATE):
     """Tidy long expression rows for one FOV.
 
     sources: [(modality, hybe, channel), ...]. One row per (cell x
     source): fov, cell, celltype, modality, hybe, channel, n_spots,
     brightness_median, brightness_total, and -- when mask_intensity --
-    mask_median, mask_frame. Homeless spots (cell == -1) are excluded
-    from per-cell rows; their count is returned per source in the
-    companion dict so nothing disappears silently.
+    mask_median, mask_frame. Only spots at p_exist >= gate are counted
+    (see SPOT_GATE). Homeless spots (cell == -1) are excluded from
+    per-cell rows; their count is returned per source in the companion
+    dict so nothing disappears silently.
 
     Returns (DataFrame, {'homeless': {source: n}}).
     """
@@ -66,6 +85,8 @@ def fov_expression_table(storage_path, fov, sources, mask_intensity=False,
         by_cell = {}
         n_homeless = 0
         for s in spots:
+            if not accepted(s, gate):
+                continue
             cid = int(s.get('cell', -1))
             if cid < 0:
                 n_homeless += 1

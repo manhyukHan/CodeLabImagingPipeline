@@ -347,7 +347,7 @@ class CellCycleWiring(QtCore.QObject):
             if orient_by is not None:
                 m.orient(early, late)
             origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
-                                                               origin_division, dapi_src, birth)
+                                                               origin_division, dapi_src, birth, gates)
             placed = m.place(name, X)
             # the arcs are RE-PROPOSED after every fit, never carried over:
             # a fit can move the frame (the origin, a bridge), and arcs
@@ -467,19 +467,43 @@ class CellCycleWiring(QtCore.QObject):
 
     # -- the origin and the arcs, shared by fit and by the origin door ---------------
 
-    def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth):
-        """Rotate `m` so 0 deg is division, measured on the training cells:
-        the DAPI halving when a DAPI source is given, else the panel-
-        total drop, else nothing (0 stays the S genes' mean peak).
+    def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth, gates=None):
+        """Rotate `m` so 0 deg is division, measured on the ON-RING
+        training cells: the DAPI halving when a DAPI source is given,
+        else the panel-total drop, else nothing (0 stays the S genes'
+        mean peak).
+
+        Cells the verdicts put off the ring do not divide on this circle,
+        and mixing them in dilutes the step. Measured on the three
+        stores: chr19 (42% of its training cells off the ring) reads
+        x1.39 at 0 deg over every training cell and x1.63 at 40 deg over
+        the on-ring ones; JP_001 and JP_002, which keep most cells on the
+        ring, are unchanged. Fewer than 200 on-ring cells falls back to
+        all of them (the step detector needs the cells more than it needs
+        the gate) and says so in the origin dict.
+
         Returns (origin dict, birth angle to use, the DAPI table or None).
         Runs in the worker: no widgets."""
         origin = {'mode': 'S mean peak'}
         birth_used = birth
         dapi_tab = None
         done = False
+        placed_tr = m.place(name, X_tr)
+        g = dict(gates or {})
+        min_bf = g.get('min_bf_ring', 0.0)
+        min_rad = g.get('min_radius', 0.5)
+        on = np.ones(len(X_tr), bool)
+        if min_bf is not None:
+            on &= placed_tr['bf_ring'] >= float(min_bf)
+        if min_rad is not None:
+            on &= placed_tr['radius'] >= float(min_rad)
+        measured_on = 'on-ring training cells'
+        if on.sum() < 200:
+            on = np.ones(len(X_tr), bool)
+            measured_on = 'every training cell (too few on the ring)'
         if dapi_src is not None:
-            th_tr = np.degrees(m.phase(name, X_tr)[0]) % 360.0
-            tr = pd.DataFrame({'fov': fov_tr, 'cell': cell_tr, 'theta_deg': th_tr})
+            th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
+            tr = pd.DataFrame({'fov': np.asarray(fov_tr)[on], 'cell': np.asarray(cell_tr)[on], 'theta_deg': th_tr})
             dapi_tab, _fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
             merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
             dna = merged['sum_above_bg'].to_numpy(float).copy()
@@ -492,14 +516,14 @@ class CellCycleWiring(QtCore.QObject):
             if angle is not None and factor >= 1.3:
                 m.rotate_to_zero(angle)
                 origin = {'mode': 'division (DAPI halving)', 'angle_before_deg': angle, 'drop_factor': factor,
-                          'dapi_source': list(dapi_src)}
+                          'dapi_source': list(dapi_src), 'measured_on': measured_on, 'n_cells': int(on.sum())}
                 birth_used = 0.0
                 done = True
             else:
                 origin = {'mode': 'DAPI showed no halving', 'drop_factor': factor}
         if origin_division and not done:
-            th_tr = np.degrees(m.phase(name, X_tr)[0]) % 360.0
-            angle, factor = CC.total_drop_angle(th_tr, X_tr.sum(1))
+            th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
+            angle, factor = CC.total_drop_angle(th_tr, X_tr[on].sum(1))
             # the drop must be real: measured, the Tirosh-list panel
             # (JP_001) drops x5.4 within 30 deg, chr19 x1.9, the cyclin/CDK
             # panel (JP_002) x2.1 -- and JP_002's DAPI halves at the same
@@ -507,7 +531,7 @@ class CellCycleWiring(QtCore.QObject):
             if angle is not None and factor >= 1.8:
                 m.rotate_to_zero(angle)
                 origin = {'mode': 'division (total drop)' + (' after DAPI showed no halving' if dapi_src is not None else ''),
-                          'angle_before_deg': angle, 'drop_factor': factor}
+                          'angle_before_deg': angle, 'drop_factor': factor, 'measured_on': measured_on, 'n_cells': int(on.sum())}
                 birth_used = 0.0
             else:
                 origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
@@ -572,6 +596,7 @@ class CellCycleWiring(QtCore.QObject):
             self._log('origin: no DAPI source in the layouts -- falling back to the panel-total drop')
         birth = float(p.BirthDegSpinBox.value())
         shares = p.phase_shares()
+        gates = p.gates()
         spec = dict(self.spec or {})
         if origin_choice == 2:
             early = [g for g, r in (self.roles or {}).items() if r == 'S']
@@ -587,7 +612,7 @@ class CellCycleWiring(QtCore.QObject):
                 origin, birth_used, dapi_tab = {'mode': 'S mean peak'}, birth, None
             else:
                 origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
-                                                                   origin_division, dapi_src, birth)
+                                                                   origin_division, dapi_src, birth, gates)
             placed = m.place(name, X)
             arcs, arcs_from = self._propose_after(m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares)
             spec['model'] = m.to_dict()
