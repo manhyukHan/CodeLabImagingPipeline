@@ -168,6 +168,10 @@ def main():
     check('a FLAT gene is not refused: it is a denominator, not an artefact', not rows['flat']['refused'], str(rows['flat']))
     check('a WEAK gene is not refused either: that is the panel search to decide', not rows['weak']['refused'], str(rows['weak']))
     check('a gene that cycles only after the gate is refused', rows['fake']['refused'], str(rows['fake']))
+    same = PS.screen_genes({'accepted_only': (real_acc, real_acc)})['accepted_only']
+    check('a round with no candidate profile is reported unjudged, not passed',
+          not same['judged'] and not same['refused'], str(same))
+    check('a round with both profiles is judged', rows['real']['judged'], str(rows['real']))
     rho, cs, acs = PS.profile_agreement(real_cand, real_acc)
     check('profile_agreement reports the correlation and both swings', rho > 0.9 and cs > 3 and acs > 3,
           f'rho {rho:.2f} cand {cs:.1f} acc {acs:.1f}')

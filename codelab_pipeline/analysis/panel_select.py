@@ -515,8 +515,13 @@ MIN_PROFILE_RHO = 0.3
 """How much the accepted profile must follow the candidate profile. A
 real gene's counts rise because there are more transcripts to find:
 its candidates and its accepted counts move together (measured: 0.46 to
-0.99 over 33 of 34 rounds in three stores). A cycle the gate invented
-does not (chr19's GMNN: -0.02)."""
+1.00 over 34 of the 37 rounds in three stores). A cycle the gate
+invented does not: chr19's GMNN (-0.02), GINS2 (-0.73) and GAPDH
+(-0.68) are the three refusals, and they are that store's three
+lowest-acceptance rounds (6-11% of candidates kept, against 17-48% for
+the eight it keeps). The verdict is about a ROUND, not about a gene --
+JP_002's GAPDH passes at +0.69, and dropping the three restores chr19's
+before/after DNA ratio from 1.09 to 1.55."""
 
 
 def profile_agreement(cand_profile, acc_profile):
@@ -556,12 +561,28 @@ def gate_made_cycle(cand_profile, acc_profile, min_acc_swing=MIN_ACC_SWING, min_
     return bool(acc_swing >= float(min_acc_swing) and rho < float(min_rho))
 
 
+def judgeable(cand_profile, acc_profile):
+    """False when the two profiles cannot be compared because they are
+    the same measurement: a store that kept only the spots it accepted
+    has no candidate profile, and the screen would read a perfect
+    correlation and pass the gene without testing anything. chr19's
+    GAPDH round was exactly this (acceptance rate 1.00) until it was
+    re-detected with every candidate."""
+    c = np.asarray(cand_profile, float)
+    a = np.asarray(acc_profile, float)
+    ok = np.isfinite(c) & np.isfinite(a)
+    return bool(ok.sum() >= 6 and not np.allclose(c[ok], a[ok]))
+
+
 def screen_genes(profiles, min_acc_swing=MIN_ACC_SWING, min_rho=MIN_PROFILE_RHO):
     """profiles: {gene: (cand_profile, acc_profile)} -> {gene: row} with
-    rho, the two swings and 'refused'."""
+    rho, the two swings, 'judged' and 'refused'. A round that is not
+    judgeable is neither refused nor cleared -- re-detect it keeping
+    every candidate, then screen it."""
     out = {}
     for gene, (c, a) in profiles.items():
         rho, cs, as_ = profile_agreement(c, a)
-        out[gene] = {'gene': gene, 'rho': rho, 'cand_swing': cs, 'acc_swing': as_,
-                     'refused': gate_made_cycle(c, a, min_acc_swing, min_rho)}
+        ok = judgeable(c, a)
+        out[gene] = {'gene': gene, 'rho': rho, 'cand_swing': cs, 'acc_swing': as_, 'judged': ok,
+                     'refused': bool(ok and gate_made_cycle(c, a, min_acc_swing, min_rho))}
     return out
