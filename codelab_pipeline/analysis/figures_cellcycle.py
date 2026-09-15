@@ -106,33 +106,149 @@ def role_marks(model, roles):
     return out
 
 
-def phase_axis(ax, which='x', marks=None):
-    """Degree ticks on a 0..360 phase axis, and the role marks as a
-    second row of labels under (or beside) the ticks."""
-    ticks = list(PHASE_TICKS)
+TAU_TICKS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
+class PhaseScale:
+    """How a phase axis is drawn, and what is marked on it.
+
+    'deg'   the fitted angle, 0-360. It is a distance in COMPOSITION:
+            equal degrees are not equal time.
+    'tau'   cycle time, 0-1: the same angle re-scaled by where the
+            cycling cells sit (cycle_time_map). Equal distances are then
+            equal time, under the ergodic assumption that an
+            asynchronous population spends cells on a stretch of the
+            cycle in proportion to the time spent there.
+
+    The category arcs travel with the scale, so every phase axis can
+    draw its own phase boundaries and no figure has to know them.
+    """
+
+    def __init__(self, mode='deg', tau=None, arcs=None, birth_deg=0.0):
+        self.mode = 'tau' if str(mode).lower().startswith('t') else 'deg'
+        self._tau = tau
+        self.arcs = [a for a in (arcs or []) if a and a.get('name')]
+        self.birth_deg = float(birth_deg)
+        if self.mode == 'tau' and tau is None:
+            raise ValueError('a cycle-time scale needs the clock: PhaseScale.of(model=..., w=...)')
+
+    @classmethod
+    def of(cls, model=None, w=None, grid=None, arcs=None, birth_deg=0.0, mode='deg', growth='uniform'):
+        """The scale for a model. 'deg' needs nothing; 'tau' needs the
+        spectrum w of the CYCLING cells on the model's grid -- the
+        clock is that spectrum, so an arrested population must not be
+        mixed into it."""
+        tau = None
+        if str(mode).lower().startswith('t'):
+            g = model.grid if grid is None else grid
+            if w is None or g is None:
+                raise ValueError('cycle time needs the spectrum of the cycling cells and the grid')
+            tau, _tg, _theta = cycle_time_map(w, g, birth_deg, growth)
+        return cls(mode, tau, arcs, birth_deg)
+
+    def x(self, theta_deg):
+        """Degrees -> the coordinate this axis is drawn in."""
+        t = np.asarray(theta_deg, float) % 360.0
+        if self.mode == 'deg':
+            return t
+        return np.asarray(self._tau(t), float)
+
+    @property
+    def span(self):
+        return (0.0, 1.0) if self.mode == 'tau' else (0.0, 360.0)
+
+    @property
+    def label(self):
+        return 'cycle time (tau, 0 = birth)' if self.mode == 'tau' else 'phase (deg)'
+
+    @property
+    def ticks(self):
+        return list(TAU_TICKS if self.mode == 'tau' else PHASE_TICKS)
+
+    @property
+    def ticklabels(self):
+        return [f'{t:g}' if self.mode == 'tau' else f'{int(t):d}' for t in self.ticks]
+
+    def density(self, w, deg):
+        """(x sorted, density in x) of a spectrum w on the angles deg --
+        w per unit of the DISPLAYED coordinate, so a spectrum that is
+        uniform in time reads flat on a cycle-time axis and peaked on a
+        degree axis. On a uniform degree grid this is the w * T / 360
+        the degree figures already drew."""
+        x = self.x(deg)
+        o = np.argsort(x)
+        xs, ws = x[o], np.asarray(w, float)[o]
+        dx = np.gradient(xs) if len(xs) > 1 else np.ones_like(xs)
+        return xs, ws / np.where(dx > 0, dx, np.nan)
+
+    def boundaries(self):
+        """[(name, x of the start, x of the middle)] for the arcs."""
+        out = []
+        for a in self.arcs:
+            s = float(a.get('start_deg', 0.0)) % 360.0
+            e = float(a.get('end_deg', 0.0)) % 360.0
+            width = (e - s) % 360.0 or 360.0
+            out.append((str(a.get('name')), float(self.x(s)), float(self.x((s + width / 2.0) % 360.0))))
+        return out
+
+
+def phase_bands(ax, which='x', scale=None):
+    """A dashed line at every phase boundary the scale carries, with the
+    phase named inside the axes between its own boundaries."""
+    sc = scale if scale is not None else PhaseScale()
+    marks = sc.boundaries()
+    if not marks:
+        return
+    if which == 'x':
+        tr = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+    else:
+        tr = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for name, start, mid in marks:
+        (ax.axvline if which == 'x' else ax.axhline)(start, color='0.6', lw=0.8, ls=(0, (4, 3)),
+                                                     alpha=0.85, zorder=0.4)
+        if which == 'x':
+            ax.annotate(name, (mid, 0.985), xycoords=tr, ha='center', va='top',
+                        fontsize=7.5, color='0.35', annotation_clip=False)
+        else:
+            ax.annotate(name, (0.985, mid), xycoords=tr, ha='right', va='center',
+                        fontsize=7.5, color='0.35', annotation_clip=False)
+
+
+def phase_axis(ax, which='x', marks=None, scale=None):
+    """Ticks on a phase axis, the role marks as a second row of labels
+    under (or beside) them, and -- when the scale carries category arcs
+    -- a dashed line at every phase boundary.
+
+    The scale decides what the axis IS: degrees by default, cycle time
+    when one is given. Marks are always in degrees; they are mapped
+    through the scale here, so a caller never converts."""
+    sc = scale if scale is not None else PhaseScale()
+    lo, hi = sc.span
+    ticks, labels = sc.ticks, sc.ticklabels
     # the role marks go RIGHT UNDER the tick labels and the axis label
     # under them (the first draft parked the marks below the label, in
     # a band of their own -- user screenshot)
     if which == 'x':
-        ax.set_xlim(0, 360)
+        ax.set_xlim(lo, hi)
         ax.set_xticks(ticks)
-        ax.set_xticklabels([f'{t:d}' for t in ticks])
-        ax.set_xlabel('phase (deg)', labelpad=(14 if marks else 4))
+        ax.set_xticklabels(labels)
+        ax.set_xlabel(sc.label, labelpad=(14 if marks else 4))
         if marks:
             tr = transforms.blended_transform_factory(ax.transData, ax.transAxes)
             for name, deg in marks.items():
-                ax.annotate(name, (float(deg) % 360.0, 0), xycoords=tr, xytext=(0, -17), textcoords='offset points',
+                ax.annotate(name, (float(sc.x(deg)), 0), xycoords=tr, xytext=(0, -17), textcoords='offset points',
                             ha='center', va='top', fontsize=8, color='0.35', annotation_clip=False)
     else:
-        ax.set_ylim(0, 360)
+        ax.set_ylim(lo, hi)
         ax.set_yticks(ticks)
-        ax.set_yticklabels([f'{t:d}' for t in ticks])
-        ax.set_ylabel('phase (deg)', labelpad=(28 if marks else 4))
+        ax.set_yticklabels(labels)
+        ax.set_ylabel(sc.label, labelpad=(28 if marks else 4))
         if marks:
             tr = transforms.blended_transform_factory(ax.transAxes, ax.transData)
             for name, deg in marks.items():
-                ax.annotate(name, (0, float(deg) % 360.0), xycoords=tr, xytext=(-36, 0), textcoords='offset points',
+                ax.annotate(name, (0, float(sc.x(deg))), xycoords=tr, xytext=(-36, 0), textcoords='offset points',
                             ha='right', va='center', fontsize=8, color='0.35', annotation_clip=False)
+    phase_bands(ax, which, sc)
 
 
 def phase_colorbar(fig, axes, label='cell-cycle phase (deg)', marks=None, host=None):
@@ -287,11 +403,13 @@ def fold_profiles(model):
     return np.exp(f - f.mean(0, keepdims=True))
 
 
-def fig_profiles_by_role(model, roles, ncols=1, title=None, marks=None):
+def fig_profiles_by_role(model, roles, ncols=1, title=None, marks=None, scale=None):
     """roles: ordered {role: [gene, ...]} -- one axes per role, one line
     per gene, categorical colours, the shared phase axis."""
+    sc = scale if scale is not None else PhaseScale()
     deg = np.degrees(model.grid)
-    order = np.argsort(deg)
+    x = sc.x(deg)
+    order = np.argsort(x)
     fc = fold_profiles(model)
     roles = {r: [g for g in gs if g in model.gi] for r, gs in roles.items()}
     roles = {r: gs for r, gs in roles.items() if gs}
@@ -301,11 +419,11 @@ def fig_profiles_by_role(model, roles, ncols=1, title=None, marks=None):
     for ax, (role, genes) in zip(axes, roles.items()):
         pal = gene_palette(len(genes))
         for g, c in zip(genes, pal):
-            ax.plot(deg[order], fc[order, model.gi[g]], color=c, lw=1.6, label=g)
+            ax.plot(x[order], fc[order, model.gi[g]], color=c, lw=1.6, label=g)
         ax.axhline(1.0, color='0.7', lw=0.8, ls=':')
         ax.set_ylabel('fraction / cycle mean')
         ax.set_title(f'{role} ({len(genes)} genes)', fontsize=10)
-        phase_axis(ax, marks=marks)
+        phase_axis(ax, marks=marks, scale=sc)
         ax.legend(fontsize=8, ncol=2 if len(genes) > 6 else 1, frameon=False)
     for ax in axes[len(roles):]:
         ax.set_visible(False)
@@ -315,10 +433,14 @@ def fig_profiles_by_role(model, roles, ncols=1, title=None, marks=None):
 
 # -- spectrum and total count along the cycle ---------------------------------
 
-def binned_stat(theta_deg, values, n_bins=24, stat='median'):
-    """(centres, stat per bin, q25, q75) over phase bins."""
-    edges = np.linspace(0, 360, n_bins + 1)
-    b = np.clip(np.digitize(theta_deg % 360.0, edges) - 1, 0, n_bins - 1)
+def binned_stat(theta_deg, values, n_bins=24, stat='median', span=(0.0, 360.0)):
+    """(centres, stat per bin, q25, q75) over bins of the phase axis.
+    `span` is the axis the values are already on: degrees by default,
+    (0, 1) when the caller has mapped them through a cycle-time scale,
+    so the bins are even on the axis the reader sees."""
+    lo, hi = float(span[0]), float(span[1])
+    edges = np.linspace(lo, hi, n_bins + 1)
+    b = np.clip(np.digitize(lo + np.mod(np.asarray(theta_deg, float) - lo, hi - lo), edges) - 1, 0, n_bins - 1)
     c = 0.5 * (edges[:-1] + edges[1:])
     m = np.full(n_bins, np.nan); lo = np.full(n_bins, np.nan); hi = np.full(n_bins, np.nan)
     for k in range(n_bins):
@@ -329,13 +451,14 @@ def binned_stat(theta_deg, values, n_bins=24, stat='median'):
     return c, m, lo, hi
 
 
-def fig_spectrum_and_totals(model, groups, q, totals, title=None, marks=None):
+def fig_spectrum_and_totals(model, groups, q, totals, title=None, marks=None, scale=None):
     """Two axes: the spectrum per condition (posterior-mean density,
     smoothed as the model's prior is) and the panel's total count per
     cell along the cycle (median line, quartile band) per condition."""
+    sc = scale if scale is not None else PhaseScale()
     deg = np.degrees(model.grid)
-    order = np.argsort(deg)
     theta = np.degrees(np.angle(q @ np.exp(1j * model.grid))) % 360.0
+    xt = sc.x(theta)
     names = [g for g in dict.fromkeys(groups)]
     pal = gene_palette(len(names))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 4.4))
@@ -344,17 +467,18 @@ def fig_spectrum_and_totals(model, groups, q, totals, title=None, marks=None):
         if k.sum() < 5:
             continue
         w = model.spectrum(q[k])
-        ax1.plot(deg[order], w[order] * len(w) / 360.0, color=c, lw=1.6, label=f'{g or "Unassigned"} (n={int(k.sum())})')
-        cen, m, lo, hi = binned_stat(theta[k], np.asarray(totals)[k])
+        xs, dens = sc.density(w, deg)
+        ax1.plot(xs, dens, color=c, lw=1.6, label=f'{g or "Unassigned"} (n={int(k.sum())})')
+        cen, m, lo, hi = binned_stat(xt[k], np.asarray(totals)[k], span=sc.span)
         ax2.plot(cen, m, color=c, lw=1.6, label=g or 'Unassigned')
         ax2.fill_between(cen, lo, hi, color=c, alpha=0.12, linewidth=0)
-    ax1.set_ylabel('cell density (per degree x 360)')
+    ax1.set_ylabel('cell density (per %s)' % ('tau' if sc.mode == 'tau' else 'degree'))
     ax1.set_title('spectrum per condition', fontsize=10)
     ax1.legend(fontsize=8, frameon=False)
     ax2.set_ylabel('panel total count per cell')
     ax2.set_title('total count along the cycle (median, quartiles)', fontsize=10)
     for ax in (ax1, ax2):
-        phase_axis(ax, marks=marks)
+        phase_axis(ax, marks=marks, scale=sc)
     fig.tight_layout(rect=(0, 0, 1, 0.93 if title else 1))
     return finish(fig, title)
 
@@ -387,12 +511,12 @@ def anchor_table(entries, n_boot=500, seed=0):
     return pd.DataFrame(rows)
 
 
-def fig_anchor_spectra(model, entries, conditions, title=None, marks=None):
+def fig_anchor_spectra(model, entries, conditions, title=None, marks=None, scale=None):
     """The named conditions of every experiment on ONE phase axis:
     entries [(experiment, condition, q)], one line per (experiment,
     condition), mean direction marked."""
+    sc = scale if scale is not None else PhaseScale()
     deg = np.degrees(model.grid)
-    order = np.argsort(deg)
     fig, ax = plt.subplots(figsize=(8.5, 4.2))
     styles = ['-', '--', ':', '-.']
     exps = list(dict.fromkeys(e for e, _c, _q in entries))
@@ -404,12 +528,13 @@ def fig_anchor_spectra(model, entries, conditions, title=None, marks=None):
         c = pal[conditions.index(cond)]
         ls = styles[exps.index(exp) % len(styles)]
         lab = f'{cond} (n={len(q)})' if len(exps) == 1 else f'{exp} {cond} (n={len(q)})'
-        ax.plot(deg[order], w[order] * len(w) / 360.0, color=c, ls=ls, lw=1.7, label=lab)
+        xs, dens = sc.density(w, deg)
+        ax.plot(xs, dens, color=c, ls=ls, lw=1.7, label=lab)
         mean = np.degrees(np.angle((q @ np.exp(1j * model.grid)).mean())) % 360.0
-        ax.axvline(mean, color=c, ls=ls, lw=0.9, alpha=0.7)
-    ax.set_ylabel('cell density (per degree x 360)')
+        ax.axvline(float(sc.x(mean)), color=c, ls=ls, lw=0.9, alpha=0.7)
+    ax.set_ylabel('cell density (per %s)' % ('tau' if sc.mode == 'tau' else 'degree'))
     ax.legend(fontsize=8, frameon=False)
-    phase_axis(ax, marks=marks)
+    phase_axis(ax, marks=marks, scale=sc)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     return finish(fig, title or 'conditions: spectrum and mean direction')
 
@@ -439,16 +564,18 @@ def subpanel_agreement(model, name, X, subsets, prior='uniform'):
     return thetas, pd.DataFrame(rows)
 
 
-def fig_subpanel(thetas, a, b, title=None, marks=None):
+def fig_subpanel(thetas, a, b, title=None, marks=None, scale=None):
     """theta_a vs theta_b as a 2-D histogram (both 0..360) and the
     distribution of their circular difference as a line."""
+    sc = scale if scale is not None else PhaseScale()
+    span = list(sc.span)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5.0), gridspec_kw={'width_ratios': [1.15, 1]})
-    ax1.hist2d(thetas[a], thetas[b], bins=36, range=[[0, 360], [0, 360]], cmap='Greys')
-    ax1.plot([0, 360], [0, 360], 'r-', lw=0.8, alpha=0.6)
-    phase_axis(ax1, 'x', marks=marks)
-    phase_axis(ax1, 'y', marks=marks)
-    ax1.set_xlabel(f'phase from {a} (deg)')
-    ax1.set_ylabel(f'phase from {b} (deg)')
+    ax1.hist2d(sc.x(thetas[a]), sc.x(thetas[b]), bins=36, range=[span, span], cmap='Greys')
+    ax1.plot(span, span, 'r-', lw=0.8, alpha=0.6)
+    phase_axis(ax1, 'x', marks=marks, scale=sc)
+    phase_axis(ax1, 'y', marks=marks, scale=sc)
+    ax1.set_xlabel(f'{sc.label} from {a}')
+    ax1.set_ylabel(f'{sc.label} from {b}')
     ax1.set_aspect('equal')
     d = (thetas[a] - thetas[b] + 180.0) % 360.0 - 180.0
     line_hist(ax2, d, bins=36, range=(-180, 180), color='0.3', lw=1.6)
@@ -642,24 +769,26 @@ def fig_fov_overlay(mip, cells, values, mode='phase', categories=None, title=Non
 
 # -- the Analysis tab's views under a gate -------------------------------------------
 
-def fig_phase_hist(theta_deg, groups=None, mask=None, title=None, marks=None, bins=36):
+def fig_phase_hist(theta_deg, groups=None, mask=None, title=None, marks=None, bins=36, scale=None):
     """The angle distribution of the gated cells as centre-connected
     lines, one per group (celltype) plus all together; cells outside
     the mask or without a phase are left out."""
+    sc = scale if scale is not None else PhaseScale()
     th = np.asarray(theta_deg, float)
     keep = np.isfinite(th) & (np.ones(len(th), bool) if mask is None else np.asarray(mask, bool))
+    x = sc.x(np.where(np.isfinite(th), th, 0.0))
     fig, ax = plt.subplots(figsize=(8.5, 4.2))
-    line_hist(ax, th[keep], bins=bins, range=(0, 360), color='k', lw=1.8, label=f'all gated (n={int(keep.sum())})')
+    line_hist(ax, x[keep], bins=bins, range=sc.span, color='k', lw=1.8, label=f'all gated (n={int(keep.sum())})')
     if groups is not None:
         g = np.asarray(groups, dtype=object)
         names = [x for x in dict.fromkeys(g[keep])]
         for name, c in zip(names, gene_palette(len(names))):
             k = keep & (g == name)
             if k.sum() >= 5:
-                line_hist(ax, th[k], bins=bins, range=(0, 360), color=c, lw=1.4, label=f'{name or "Unassigned"} (n={int(k.sum())})')
+                line_hist(ax, x[k], bins=bins, range=sc.span, color=c, lw=1.4, label=f'{name or "Unassigned"} (n={int(k.sum())})')
     ax.set_ylabel('density')
     ax.legend(fontsize=8, frameon=False)
-    phase_axis(ax, marks=marks)
+    phase_axis(ax, marks=marks, scale=sc)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     return finish(fig, title or 'cell-cycle phase of the gated cells')
 
@@ -697,7 +826,7 @@ def fig_category_hist(categories, groups=None, mask=None, order=None, title=None
 # -- DAPI as the routine verification --------------------------------------------
 
 def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None, title=None, marks=None,
-                      fov=None, training=None, area=None, area_unit='px'):
+                      fov=None, training=None, area=None, area_unit='px', scale=None):
     """DNA content (a DAPI sum inside the mask) along the phase, per
     condition (binned median, quartiles), and per category as centre-
     connected lines. Each cell's DAPI is first divided by the median of
@@ -709,7 +838,9 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     is the routine pass) and the angle where the DNA content halves --
     division, found by the same step detector as the panel total's drop,
     on the training cells when given."""
+    sc = scale if scale is not None else PhaseScale()
     th = np.asarray(theta_deg, float)
+    xth = sc.x(np.where(np.isfinite(th), th, 0.0))
     d = np.asarray(dapi, float)
     if fov is not None:
         f = np.asarray(fov)
@@ -742,7 +873,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         k = ok & (g == cond)
         if k.sum() < 10:
             continue
-        cen, m, lo, hi = binned_stat(th[k], dn[k], n_bins=24)
+        cen, m, lo, hi = binned_stat(xth[k], dn[k], n_bins=24, span=sc.span)
         ax.plot(cen, m, color=c, lw=1.6, label=f'{cond or "Unassigned"} (n={int(k.sum())})')
         ax.fill_between(cen, lo, hi, color=c, alpha=0.12, linewidth=0)
     ax.axhline(1.0, color='0.7', lw=0.8, ls=':')
@@ -750,7 +881,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
     ax.set_ylabel(f'DAPI sum above background / median of {refname or "all"}')
     ax.set_title('DNA content along the cycle (median, quartiles)', fontsize=10)
     ax.legend(fontsize=8, frameon=False)
-    phase_axis(ax, marks=marks)
+    phase_axis(ax, marks=marks, scale=sc)
     ratio_txt = ''
     if area is not None:
         # the mask area beside the DNA content (user request): the cell
@@ -763,19 +894,19 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
             k = oka & (g == cond)
             if k.sum() < 10:
                 continue
-            cen, m_, lo_, hi_ = binned_stat(th[k], ar[k], n_bins=24)
+            cen, m_, lo_, hi_ = binned_stat(xth[k], ar[k], n_bins=24, span=sc.span)
             ax3.plot(cen, m_, color=c, lw=1.6, label=f'{cond or "Unassigned"}')
             ax3.fill_between(cen, lo_, hi_, color=c, alpha=0.12, linewidth=0)
         ax3.set_ylabel(f'cell mask area ({area_unit})')
         ax3.set_title('mask area along the cycle (median, quartiles)', fontsize=10)
         ax3.legend(fontsize=8, frameon=False)
-        phase_axis(ax3, marks=marks)
+        phase_axis(ax3, marks=marks, scale=sc)
         tra = oka & (np.asarray(training, bool) if training is not None else np.ones(len(th), bool))
         if tra.sum() >= 200:
             a_, fac_ = CC.total_drop_angle(th[tra], ar[tra], min_cells=200)
             if a_ is not None and fac_ >= 1.2:
                 ratio_txt += f'; mask area falls x{fac_:.2f} at {a_:.0f} deg'
-                ax3.axvline(a_, color='k', lw=0.9, ls='--')
+                ax3.axvline(float(sc.x(a_)), color='k', lw=0.9, ls='--')
     if cat is not None:
         ax2 = axes[0][1]
         meds = {}
@@ -804,7 +935,7 @@ def fig_dapi_vs_phase(theta_deg, dapi, groups=None, categories=None, order=None,
         a, fac = CC.total_drop_angle(th[tr], dn[tr], min_cells=200)
         if a is not None and fac >= 1.3:
             drop_txt = f'; DNA halves at {a:.0f} deg (x{fac:.2f}) = division'
-            ax.axvline(a, color='k', lw=0.9, ls='--')
+            ax.axvline(float(sc.x(a)), color='k', lw=0.9, ls='--')
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     return finish(fig, (title or 'DAPI content as the routine verification') + ratio_txt + drop_txt)
 

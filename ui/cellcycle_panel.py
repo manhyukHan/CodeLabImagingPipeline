@@ -184,6 +184,14 @@ class CellCyclePanelUI(object):
             figLayout.addWidget(b, i // 2, i % 2)
         self.TsneCheckBox = QtWidgets.QCheckBox('add tSNE to the ring figure (slower)')
         figLayout.addWidget(self.TsneCheckBox, 4, 0)
+        self.CycleTimeCheckBox = QtWidgets.QCheckBox('x axis in cycle time (tau) instead of degrees')
+        self.CycleTimeCheckBox.setToolTip(
+            'Degrees are a distance in COMPOSITION: the ring spends as many degrees on a stretch where the '
+            'composition barely moves (G1) as on one where it moves fast. Cycle time re-scales the axis by the '
+            'spectrum of the training cells -- an asynchronous population spends cells on a stretch in proportion '
+            'to the time spent there -- so 0 is birth, 1 is the next division, and equal distances are equal time. '
+            'Needs placements; the category arcs are marked on the axis either way.')
+        figLayout.addWidget(self.CycleTimeCheckBox, 6, 0, 1, 2)
         overlayRow = QtWidgets.QWidget()
         overlayLayout = QtWidgets.QHBoxLayout(overlayRow)
         overlayLayout.setContentsMargins(0, 0, 0, 0)

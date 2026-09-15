@@ -737,6 +737,30 @@ class CellCycleWiring(QtCore.QObject):
         except Exception:                                       # noqa: BLE001
             return None
 
+    def _scale(self):
+        """The phase axis for the figures: degrees, or cycle time when
+        the box is ticked. Either way it carries the stored arcs, so
+        every axis draws its own phase boundaries.
+
+        Cycle time is the cumulative spectrum of the CYCLING cells --
+        the ergodic clock -- so it needs placements and the training
+        mask; without them the axis stays in degrees rather than
+        inventing a clock from an arrested population."""
+        try:
+            arcs = self.panel.arcs() or []
+        except Exception:                                       # noqa: BLE001
+            arcs = []
+        box = getattr(self.panel, 'CycleTimeCheckBox', None)
+        if box is None or not box.isChecked():
+            return FC.PhaseScale(arcs=arcs)
+        try:
+            k = self._training_mask()
+            w = self.model.spectrum(self.q[k])
+            return FC.PhaseScale.of(model=self.model, w=w, arcs=arcs, mode='tau')
+        except Exception as e:                                  # noqa: BLE001
+            self.panel.ModelStatusLabel.setText(f'cycle time needs placed training cells; axis stays in degrees ({e})')
+            return FC.PhaseScale(arcs=arcs)
+
     def _default_dir(self):
         try:
             return paths.figure_dir(self._storage(), 'cellcycle', 0)
@@ -774,9 +798,9 @@ class CellCycleWiring(QtCore.QObject):
     def view_spectrum(self):
         m = self._need_model(placed=True)
         groups, q, totals, name = self.placed['celltype'].to_numpy(), self.q, self.placed['total'].to_numpy(), self._name()
-        marks = self._marks()
-        self._view('spectrum', lambda: FC.fig_spectrum_and_totals(m, groups, q, totals, title=name, marks=marks),
-                   'spectrum_and_totals')
+        marks, scale = self._marks(), self._scale()
+        self._view('spectrum', lambda: FC.fig_spectrum_and_totals(m, groups, q, totals, title=name, marks=marks,
+                                                                  scale=scale), 'spectrum_and_totals')
 
     def view_profiles(self):
         m = self._need_model()
@@ -784,9 +808,9 @@ class CellCycleWiring(QtCore.QObject):
         rd = {'S indicators': [g for g in m.genes if roles.get(g) == 'S'],
               'G2/M indicators': [g for g in m.genes if roles.get(g) == 'G2/M'],
               'unassigned': [g for g in m.genes if roles.get(g) not in ('S', 'G2/M')]}
-        marks = self._marks()
+        marks, scale = self._marks(), self._scale()
         self._view('gene profiles', lambda: FC.fig_profiles_by_role(m, rd, title=f'{self._name()}: fitted gene profiles',
-                                                                     marks=marks), 'profiles_by_role')
+                                                                     marks=marks, scale=scale), 'profiles_by_role')
 
     def view_embeddings(self):
         m = self._need_model(placed=True)
@@ -854,6 +878,7 @@ class CellCycleWiring(QtCore.QObject):
         self._view('contribution', _compute, 'contribution')
 
     def view_groups(self):
+        marks, scale = self._marks(), self._scale()
         m = self._need_model(placed=True)
         name, X, groups, q = self._name(), self.X, self.placed['celltype'].to_numpy(), self.q
 
@@ -866,11 +891,12 @@ class CellCycleWiring(QtCore.QObject):
             entries = [(name, c or 'Unassigned', q[groups == c]) for c in dict.fromkeys(groups) if (groups == c).sum() >= 5]
             fig = FC.fig_anchor_spectra(m, entries, [c or 'Unassigned' for c in dict.fromkeys(groups)],
                                         title=f'{name}: spectrum per condition (mean direction marked)',
-                                        marks=self._marks())
+                                        marks=marks, scale=scale)
             return fig, {'groups': tab}
         self._view('group table', _compute, 'groups')
 
     def view_half_panel(self):
+        marks, scale = self._marks(), self._scale()
         m = self._need_model(placed=True)
         name = self._name()
         k = self._training_mask()
@@ -881,7 +907,7 @@ class CellCycleWiring(QtCore.QObject):
             order = sorted(share, key=lambda g: -share[g])
             halves = {'half A': order[0::2], 'half B': order[1::2]}
             th, st = FC.subpanel_agreement(m, name, X, halves)
-            fig = FC.fig_subpanel(th, 'half A', 'half B', marks=self._marks(),
+            fig = FC.fig_subpanel(th, 'half A', 'half B', marks=marks, scale=scale,
                                   title=f'{name} training cells: half A {halves["half A"]} vs half B {halves["half B"]}')
             d = np.abs((th['half A'] - th['half B'] + 180) % 360 - 180)
             s = X.sum(1)
@@ -1004,7 +1030,7 @@ class CellCycleWiring(QtCore.QObject):
                 area, unit = area * float(voxel[0]) * float(voxel[1]), 'um^2'
             fig = FC.fig_dapi_vs_phase(merged['theta_deg'].to_numpy(), merged['sum_above_bg'].to_numpy(),
                                        groups=merged['celltype'].to_numpy(), categories=cat, order=order, marks=marks,
-                                       fov=merged['fov'].to_numpy(), training=tr, area=area, area_unit=unit,
+                                       scale=scale, fov=merged['fov'].to_numpy(), training=tr, area=area, area_unit=unit,
                                        title=f'{name}: DAPI ({src[1]} ch{src[2]}) as the routine verification')
             if cat is not None:
                 merged = merged.assign(category=cat)

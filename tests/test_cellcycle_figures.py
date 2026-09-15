@@ -191,6 +191,62 @@ def main():
     check('category histogram has one bar group per category', len(fig.axes[0].get_xticks()) == 3)
     plt.close(fig)
 
+    print('the phase axis in cycle time, with the phase boundaries')
+    arcs4 = [{'name': 'G1', 'start_deg': 0.0, 'end_deg': 160.0},
+             {'name': 'S', 'start_deg': 160.0, 'end_deg': 260.0},
+             {'name': 'G2/M', 'start_deg': 260.0, 'end_deg': 360.0}]
+    deg_scale = FC.PhaseScale(arcs=arcs4)
+    check('a degree scale leaves the angle alone', np.allclose(deg_scale.x([0, 90, 370]), [0, 90, 10]))
+    check('a degree scale spans the circle', deg_scale.span == (0.0, 360.0))
+    w_all = m.spectrum(q)
+    tau_scale = FC.PhaseScale.of(model=m, w=w_all, arcs=arcs4, mode='tau')
+    xs = tau_scale.x(np.linspace(0, 359, 60))
+    check('cycle time spans 0..1', tau_scale.span == (0.0, 1.0) and 0 <= xs.min() and xs.max() <= 1.0,
+          f'{xs.min():.3f}..{xs.max():.3f}')
+    check('cycle time rises with the angle from birth', np.all(np.diff(xs) >= -1e-9))
+    check('cycle time starts at birth', abs(float(tau_scale.x(0.0))) < 1e-6, str(float(tau_scale.x(0.0))))
+    check('cycle time is NOT the angle over 360 (the spectrum is not uniform)',
+          np.max(np.abs(xs - np.linspace(0, 359, 60) / 360.0)) > 0.02,
+          f'{np.max(np.abs(xs - np.linspace(0, 359, 60) / 360.0)):.3f}')
+    x_deg, dens = deg_scale.density(w_all, np.degrees(m.grid))
+    check('the degree density is the one the figures already drew',
+          np.allclose(np.sort(dens), np.sort(w_all * len(w_all) / 360.0), rtol=1e-6),
+          f'{dens[:3]} vs {(w_all * len(w_all) / 360.0)[:3]}')
+    # the simulated population is already near-uniform in angle, so the
+    # clock has nothing to undo there; a deliberately peaked spectrum
+    # shows what the scale is for.
+    w_peak = 1.0 + 0.9 * np.cos(m.grid)
+    w_peak = w_peak / w_peak.sum()
+    peak_scale = FC.PhaseScale.of(model=m, w=w_peak, mode='tau')
+    flat_d = float(np.nanmax(deg_scale.density(w_peak, np.degrees(m.grid))[1])
+                   / np.nanmin(deg_scale.density(w_peak, np.degrees(m.grid))[1]))
+    flat_t = float(np.nanmax(peak_scale.density(w_peak, np.degrees(m.grid))[1])
+                   / np.nanmin(peak_scale.density(w_peak, np.degrees(m.grid))[1]))
+    check('a peaked spectrum read in ITS OWN cycle time flattens out',
+          flat_d > 15.0 and flat_t < 2.0, f'deg {flat_d:.1f} -> tau {flat_t:.2f}')
+
+    fig = FC.fig_spectrum_and_totals(m, groups, q, X.sum(1), marks=marks, scale=tau_scale)
+    conventions(fig, 'spectrum in cycle time')
+    ax = fig.axes[0]
+    check('the axis is drawn in cycle time', ax.get_xlim() == (0.0, 1.0) and 'tau' in ax.get_xlabel(),
+          f'{ax.get_xlim()} {ax.get_xlabel()!r}')
+    dashed = [ln for ln in ax.lines if ln.get_linestyle() not in ('-', 'solid', 'None')]
+    check('every phase boundary is drawn as a dashed line', len(dashed) >= len(arcs4), str(len(dashed)))
+    named = {t.get_text() for t in ax.texts}
+    check('every phase is named on the axis', {'G1', 'S', 'G2/M'} <= named, str(sorted(named)))
+    plt.close(fig)
+
+    fig = FC.fig_dapi_vs_phase(th, dna, groups=groups, fov=fov, training=np.ones(900, bool),
+                               categories=CC.categorize(th, arcs4), order=['G1', 'S', 'G2/M'],
+                               marks=marks, scale=tau_scale)
+    check('DAPI against cycle time keeps the 0..1 axis', fig.axes[0].get_xlim() == (0.0, 1.0))
+    plt.close(fig)
+    fig = FC.fig_phase_hist(th, groups=groups, marks=marks, scale=deg_scale)
+    check('a degree histogram still spans the circle', fig.axes[0].get_xlim() == (0.0, 360.0))
+    check('the boundaries are drawn on a degree axis too',
+          len([ln for ln in fig.axes[0].lines if ln.get_linestyle() not in ('-', 'solid', 'None')]) >= 3)
+    plt.close(fig)
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         print('FAILED:', FAIL)
