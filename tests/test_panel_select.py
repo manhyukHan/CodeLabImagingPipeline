@@ -152,6 +152,24 @@ def main():
     v, lo, hi = PS.band(curve[0], 'dna_r2')
     check('band returns the seed-0 value inside its own range', lo - 1e-9 <= v <= hi + 1e-9, f'{v:.3f} [{lo:.3f}-{hi:.3f}]')
 
+    print('the recommendation is the smallest panel, not the best-scoring one')
+
+    def _entry(size, genes, dna_r2, ratio=1.6, drop=0.1):
+        rows = [dict(ref, seed=s, genes=list(genes), size=size, dna_r2=dna_r2, dna_g2_over_g1=ratio,
+                     abs_drop_minus_2=drop, area_r2=0.2, fitted=True, ok=True, origin_found=True)
+                for s in (0, 1)]
+        return {'size': size, 'genes': list(genes), 'dropped': [], 'rows': rows}
+
+    peak = data.genes[:6]
+    flat_curve = [_entry(8, data.genes[:8], 0.30), _entry(6, peak, 0.32), _entry(5, data.genes[:5], 0.32),
+                  _entry(4, data.genes[:4], 0.10)]
+    who, stop, best = PS.recommend({'greedy': flat_curve}, keys=('dna_r2',))
+    check('recommend returns the smallest panel inside the best entry band', stop['size'] == 5,
+          f"stop {stop['size']} best {best['size']}")
+    check('recommend also reports the peak it was judged against', best['size'] in (5, 6),
+          f"best {best['size']}")
+    check('recommend names the curve it came from', who == 'greedy', str(who))
+
     print('the gene validity screen')
     import numpy as _np
     ang = _np.linspace(0, 2 * _np.pi, 12, endpoint=False)

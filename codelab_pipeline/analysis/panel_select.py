@@ -505,6 +505,28 @@ def best_of(curves, key='dna_r2', reference=None, tol_deg=45.0, min_ratio=MIN_DN
             best = (name, e, sc)
     return best[0], best[1]
 
+def recommend(curves, keys=EXTERNAL, key='dna_r2', reference=None, tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+    """How few rounds the NEXT experiment needs: pick the curve carrying
+    the highest-ranked panel, then take the smallest panel on that curve
+    still inside its band. Returns (name, stop_entry, best_entry).
+
+    This is what the minimum-panel question asks, and it is not the same
+    as best_of(): that one returns the panel that scored highest, which
+    is the peak of the curve rather than the point where the curve stops
+    being distinguishable from the peak. On the three stores they agree
+    twice (chr19 and JP_002, 6 genes both ways) and part once -- JP_001
+    peaks at 12 genes and holds inside that band down to 9.
+
+    Report both. The smallest panel is the recommendation; the peak is
+    what it is being judged against."""
+    name, best = best_of(curves, key, reference, tol_deg, min_ratio)
+    if name is None:
+        return None, None, None
+    curve = curves[name]
+    stop = stop_size(curve, keys, reference, key)
+    return name, (stop if stop is not None else best), best
+
+
 # -- the gene-level validity screen ------------------------------------------
 
 MIN_ACC_SWING = 1.5
