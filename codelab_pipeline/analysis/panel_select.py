@@ -16,6 +16,11 @@ judged here by quantities the model never sees:
     area_r2       the same for the cell-mask area
     arrested      where an arrested population lands and how tight it is
 
+A gene can also be refused outright, before any panel is scored, and
+for one reason only: the cycle its accepted counts show has no
+counterpart in the candidates they were gated from (gate_made_cycle).
+Flatness and weakness are not validity failures -- see that function.
+
 and three hard requirements: the panel must keep at least one S and one
 G2/M gene (nothing orients the circle otherwise), the DAPI step must be
 findable at all (no step, no division origin), and the DNA must actually
@@ -499,3 +504,64 @@ def best_of(curves, key='dna_r2', reference=None, tol_deg=45.0, min_ratio=MIN_DN
         if best[2] is None or sc > best[2]:
             best = (name, e, sc)
     return best[0], best[1]
+
+# -- the gene-level validity screen ------------------------------------------
+
+MIN_ACC_SWING = 1.5
+"""An accepted profile flatter than this has no cycle to explain, so the
+screen has nothing to judge and passes the gene."""
+
+MIN_PROFILE_RHO = 0.3
+"""How much the accepted profile must follow the candidate profile. A
+real gene's counts rise because there are more transcripts to find:
+its candidates and its accepted counts move together (measured: 0.46 to
+0.99 over 33 of 34 rounds in three stores). A cycle the gate invented
+does not (chr19's GMNN: -0.02)."""
+
+
+def profile_agreement(cand_profile, acc_profile):
+    """(rho, candidate swing, accepted swing) of a gene's two profiles
+    along the cycle -- the medians per angle bin of the candidates the
+    detector proposed and of the spots the gate accepted."""
+    from scipy.stats import spearmanr
+    c = np.asarray(cand_profile, float)
+    a = np.asarray(acc_profile, float)
+    ok = np.isfinite(c) & np.isfinite(a)
+    if ok.sum() >= 6 and np.std(c[ok]) > 0 and np.std(a[ok]) > 0:
+        rho = float(spearmanr(c[ok], a[ok])[0])
+    elif ok.sum() >= 6:
+        # a constant profile predicts nothing: a candidate pool that does
+        # not move cannot account for accepted counts that do
+        rho = 0.0
+    else:
+        rho = np.nan
+    cs = float(np.nanmax(c) / max(np.nanmin(c), 1.0)) if ok.any() else np.nan
+    as_ = float(np.nanmax(a) / max(np.nanmin(a), 0.5)) if ok.any() else np.nan
+    return rho, cs, as_
+
+
+def gate_made_cycle(cand_profile, acc_profile, min_acc_swing=MIN_ACC_SWING, min_rho=MIN_PROFILE_RHO):
+    """True when a gene's accepted counts cycle (swing >= min_acc_swing)
+    while the candidates they were gated from do not follow that cycle
+    (rho < min_rho): the profile the model would read from this gene was
+    made by the classifier, not by the transcripts.
+
+    This is the ONLY validity reason to refuse a gene. Flatness is not
+    one (a flat gene is a composition's denominator) and neither is a
+    low contribution (the panel search decides that, on what the model
+    never saw)."""
+    rho, _cs, acc_swing = profile_agreement(cand_profile, acc_profile)
+    if not np.isfinite(rho) or not np.isfinite(acc_swing):
+        return False
+    return bool(acc_swing >= float(min_acc_swing) and rho < float(min_rho))
+
+
+def screen_genes(profiles, min_acc_swing=MIN_ACC_SWING, min_rho=MIN_PROFILE_RHO):
+    """profiles: {gene: (cand_profile, acc_profile)} -> {gene: row} with
+    rho, the two swings and 'refused'."""
+    out = {}
+    for gene, (c, a) in profiles.items():
+        rho, cs, as_ = profile_agreement(c, a)
+        out[gene] = {'gene': gene, 'rho': rho, 'cand_swing': cs, 'acc_swing': as_,
+                     'refused': gate_made_cycle(c, a, min_acc_swing, min_rho)}
+    return out

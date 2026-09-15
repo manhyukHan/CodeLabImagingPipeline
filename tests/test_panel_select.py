@@ -152,6 +152,26 @@ def main():
     v, lo, hi = PS.band(curve[0], 'dna_r2')
     check('band returns the seed-0 value inside its own range', lo - 1e-9 <= v <= hi + 1e-9, f'{v:.3f} [{lo:.3f}-{hi:.3f}]')
 
+    print('the gene validity screen')
+    import numpy as _np
+    ang = _np.linspace(0, 2 * _np.pi, 12, endpoint=False)
+    real_cand = 40 + 30 * _np.cos(ang)
+    real_acc = 20 + 18 * _np.cos(ang)                       # follows its candidates
+    flat_cand = _np.full(12, 100.0)
+    flat_acc = _np.full(12, 28.0)                           # flat and flat: nothing to judge
+    fake_acc = 20 + 15 * _np.cos(ang + _np.pi / 2)          # cycles where the candidates do not
+    weak_cand = 12 + 9 * _np.cos(ang)
+    weak_acc = 2 + 1.5 * _np.cos(ang)                       # few counts, but they follow
+    rows = PS.screen_genes({'real': (real_cand, real_acc), 'flat': (flat_cand, flat_acc),
+                            'fake': (flat_cand, fake_acc), 'weak': (weak_cand, weak_acc)})
+    check('a gene whose accepted counts follow its candidates passes', not rows['real']['refused'], str(rows['real']))
+    check('a FLAT gene is not refused: it is a denominator, not an artefact', not rows['flat']['refused'], str(rows['flat']))
+    check('a WEAK gene is not refused either: that is the panel search to decide', not rows['weak']['refused'], str(rows['weak']))
+    check('a gene that cycles only after the gate is refused', rows['fake']['refused'], str(rows['fake']))
+    rho, cs, acs = PS.profile_agreement(real_cand, real_acc)
+    check('profile_agreement reports the correlation and both swings', rho > 0.9 and cs > 3 and acs > 3,
+          f'rho {rho:.2f} cand {cs:.1f} acc {acs:.1f}')
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         print('FAILED:', FAIL)
