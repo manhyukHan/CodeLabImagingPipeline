@@ -254,7 +254,13 @@ check('a model written before gains existed reads back with every gain at 1',
 # evidence than the same fit without gains. The parameter is right in
 # principle (the five genes chr19 and JP_001 share do differ in depth
 # by up to 2.4x, measured on 20 bootstrap refits) but is not estimable
-# at this depth, and it destabilises the EM. Hence: opt-in, and off.
+# at this depth, and it destabilises the EM. Holding the gains at 1
+# until the angles settle (gain_warmup=10) repairs the EM: with 12
+# shared genes the correlation goes 0.41 -> 0.90 and the evidence is
+# then always above the fit without gains; with 8 it is 0.63 -> 0.67,
+# with 5 only -0.06 -> 0.35. On the real pair (5 shared) the warm-up
+# changes nothing: TPX2 still comes out at 0.2 against a measured 1.24.
+# Hence: opt-in, off, and not for panels sharing fewer than ~12 genes.
 
 
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))

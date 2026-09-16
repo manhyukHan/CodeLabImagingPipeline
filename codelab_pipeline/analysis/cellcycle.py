@@ -243,6 +243,7 @@ class CycleModel:
         self.s = {}                 # name -> (|S_d|,) gains on the harmonics
         self.free_s = {}            # name -> bool over the panel: gains that are free
         self._gene_gains = False    # fit(gene_gains=True) frees the shared genes' gains
+        self._gains_active = True   # _em holds this False through the warm-up
         self.w = {}                 # (name, group) -> (T,) spectrum
         self.alphas = {}            # name -> alpha
         self.panels = {}            # name -> [genes]
@@ -353,6 +354,14 @@ class CycleModel:
 
     # -- fitting --
 
+    def _free_of(self, name):
+        """The gains that are free in THIS M-step: none during the
+        warm-up, the shared ones after it."""
+        free = self.free_s.get(name)
+        if free is None or not self._gains_active:
+            return None
+        return free if free.any() else None
+
     def _unpack(self, v, names=None):
         """(coef, intercepts, gains) from the flat vector. The gains are
         carried as LOG gains, and only for the entries free_s marks; the
@@ -367,9 +376,9 @@ class CycleModel:
             off += n
         s = {}
         for name in names:
-            free = self.free_s.get(name)
+            free = self._free_of(name)
             sv = np.ones(len(self.cols[name]))
-            if free is not None and free.any():
+            if free is not None:
                 k = int(free.sum())
                 sv[free] = np.exp(v[off:off + k])
                 off += k
@@ -383,9 +392,8 @@ class CycleModel:
         G, P = len(self.genes), self.B.shape[1]
         names = [d.name for d in datasets]
         x0 = np.concatenate([self.coef.ravel()] + [self.a[d.name] for d in datasets]
-                            + [np.log(self.s[d.name][self.free_s[d.name]])
-                               for d in datasets if self.free_s.get(d.name) is not None
-                               and self.free_s[d.name].any()])
+                            + [np.log(self.s[d.name][self._free_of(d.name)])
+                               for d in datasets if self._free_of(d.name) is not None])
         pre = {}
         for d in datasets:
             q = qs[d.name]
@@ -423,8 +431,8 @@ class CycleModel:
                 sv = s[d.name]
                 gcoef[self.cols[d.name]] += (g_eta * sv[None, :]).T @ self.B
                 ga[d.name] = g_eta.sum(0)
-                free = self.free_s.get(d.name)
-                if free is not None and free.any():
+                free = self._free_of(d.name)
+                if free is not None:
                     # d eta / d log s = (B @ coef) * s
                     h = (self.B @ coef[self.cols[d.name]].T) * sv[None, :]
                     g = (g_eta * h).sum(0)[free]
@@ -444,8 +452,8 @@ class CycleModel:
         for name in a:
             a[name] = a[name] - a[name].mean()          # softmax gauge
         for name in s:
-            free = self.free_s.get(name)
-            if free is not None and free.any():         # the gauge on the gains
+            free = self._free_of(name)
+            if free is not None:                        # the gauge on the gains
                 s[name][free] = np.exp(np.log(s[name][free]) - np.log(s[name][free]).mean())
         return coef, a, s
 
@@ -575,7 +583,7 @@ class CycleModel:
         theta0 = {d.name: pca_angle(d.X)[0]}
         return self._em([d], theta0, n_iter, tol, verbose=False)
 
-    def _em(self, datasets, theta0, n_iter, tol, verbose):
+    def _em(self, datasets, theta0, n_iter, tol, verbose, gain_warmup=0):
         G, P = len(self.genes), self.B.shape[1]
         self.coef = np.zeros((G, P))
         self.a = {d.name: np.zeros(len(d.genes)) for d in datasets}
@@ -589,6 +597,7 @@ class CycleModel:
         self.history = []
         prev = -np.inf
         for it in range(int(n_iter)):
+            self._gains_active = it >= int(gain_warmup)
             self.coef, self.a, self.s = self._mstep(datasets, qs, exact)
             self._update_w(datasets, qs)
             qs = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
@@ -606,6 +615,7 @@ class CycleModel:
             if abs(ev - prev) < tol or since >= self.patience:
                 break
             prev = ev
+        self._gains_active = True
         if best is not None:
             self.coef, self.a, self.w, self.s = best
         # polish: exact DM M-steps from the best point (no-op if every
@@ -629,7 +639,7 @@ class CycleModel:
 
     def fit(self, datasets, n_iter=40, tol=1e-4, bridge_exclude=HOUSEKEEPING,
             weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None,
-            gene_gains=False):
+            gene_gains=False, gain_warmup=0):
         """Fit on cycling populations. `datasets`: [Dataset, ...].
         orient_by=(early, late) fixes every bridge's reflection by gene
         roles (see stagewise_init).
@@ -638,14 +648,17 @@ class CycleModel:
         by a different depth in each of them (see gains()). It is off by
         default because it changes what a joint fit can express, and so
         changes joint results; a single-dataset fit is unaffected either
-        way, since there a gain is redundant with the gene's own (b, c)."""
+        way, since there a gain is redundant with the gene's own (b, c).
+        gain_warmup=k holds the gains at 1 for the first k EM iterations,
+        so the angles settle before the fit is allowed to trade a
+        profile's shape against its gain."""
         datasets = list(datasets)
         self._gene_gains = bool(gene_gains)
         self._index(datasets)
         if theta0 is None:
             theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose, orient_by)
                       if len(datasets) > 1 else {datasets[0].name: pca_angle(datasets[0].X)[0]})
-        self._em(datasets, theta0, n_iter, tol, verbose)
+        self._em(datasets, theta0, n_iter, tol, verbose, gain_warmup=gain_warmup)
         # fit-quality reference: the training cells' per-count evidence
         # under a UNIFORM prior, by octile of the panel total
         for d in datasets:
