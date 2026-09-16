@@ -263,5 +263,34 @@ check('a model written before gains existed reads back with every gain at 1',
 # Hence: opt-in, off, and not for panels sharing fewer than ~12 genes.
 
 
+print('DAPI as an observation of the joint fit')
+rng_d = np.random.default_rng(5)
+Xd, thd, _cd, _ad, gd = CC.simulate(n=500, seed=21, total=(80, 300))
+Xe, the, _ce, _ae, _ge = CC.simulate(n=500, seed=22, total=(80, 300))
+gD, gE = list(gd)[:6], list(gd)[2:8]
+def _dapi(th):
+    return np.log1p((np.asarray(th) % (2 * np.pi)) / (2 * np.pi)) + rng_d.normal(0, 0.1, len(th))
+dD = CC.Dataset('D', Xd[:, [gd.index(g) for g in gD]], gD, alpha=100.0, dapi=_dapi(thd))
+dE = CC.Dataset('E', Xe[:, [gd.index(g) for g in gE]], gE, alpha=100.0, dapi=_dapi(the))
+m_nod = CC.CycleModel().fit([dD, dE])
+check('without dapi_weight the fit never looks at DAPI', m_nod.h is None and m_nod.dapi_weight == 0.0)
+m_d = CC.CycleModel().fit([dD, dE], dapi_weight=0.5)
+check('with dapi_weight the shared curve exists on the grid with mean 0',
+      m_d.h is not None and len(m_d.h) == m_d.T and abs(float(m_d.h.mean())) < 1e-9)
+# the q-weighted mean over broad posteriors, smoothed like the spectrum,
+# flattens a log-2 sawtooth to about 0.3 here; what matters is that a
+# cycle came out at all, not its full height
+check('the curve is a cycle, not flat (a log-2 sawtooth reads about 0.3 after the smoothing)',
+      0.15 < float(m_d.h.max() - m_d.h.min()) < 1.0, f'{m_d.h.max() - m_d.h.min():.2f}')
+check('every dataset gets an offset and a residual scale',
+      set(m_d.c) == {'D', 'E'} and all(v > 0 for v in m_d.sigma.values()))
+th_pl = np.degrees(m_d.place('D', dD.X)['theta']) % 360.0
+check('placement stays count-only: it runs without DAPI and returns an angle per cell',
+      len(th_pl) == len(dD.X) and np.all(np.isfinite(th_pl)))
+back_d = CC.CycleModel.from_dict(m_d.to_dict())
+check('the DAPI curve survives a round trip',
+      back_d.h is not None and np.allclose(back_d.h, m_d.h) and back_d.c == m_d.c and back_d.dapi_weight == 0.5)
+
+
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

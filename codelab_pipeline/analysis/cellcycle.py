@@ -209,9 +209,12 @@ class Dataset:
     a condition label per cell, and the dispersion alpha (None =
     multinomial)."""
 
-    def __init__(self, name, X, genes, groups=None, alpha=DEFAULT_ALPHA):
+    def __init__(self, name, X, genes, groups=None, alpha=DEFAULT_ALPHA, dapi=None):
         self.name = str(name)
         self.X = np.asarray(X, float)
+        # log DAPI per cell, already normalised within its FOV; NaN where
+        # a cell has none. Only fit(dapi_weight > 0) looks at it.
+        self.dapi = None if dapi is None else np.asarray(dapi, float)
         self.genes = [str(g) for g in genes]
         if self.X.ndim != 2 or self.X.shape[1] != len(self.genes):
             raise ValueError(f'{name}: X is {self.X.shape}, genes are {len(self.genes)}')
@@ -244,6 +247,10 @@ class CycleModel:
         self.free_s = {}            # name -> bool over the panel: gains that are free
         self._gene_gains = False    # fit(gene_gains=True) frees the shared genes' gains
         self._gains_active = True   # _em holds this False through the warm-up
+        self.dapi_weight = 0.0      # fit(dapi_weight=...) lets the E-step see DAPI
+        self.h = None               # (T,) shared log-DAPI curve on the grid, mean 0
+        self.c = {}                 # name -> DAPI offset
+        self.sigma = {}             # name -> DAPI residual sd
         self.w = {}                 # (name, group) -> (T,) spectrum
         self.alphas = {}            # name -> alpha
         self.panels = {}            # name -> [genes]
@@ -320,11 +327,15 @@ class CycleModel:
             return X @ lpi.T
         return _dm_loglik(X, alpha * np.exp(lpi))
 
-    def posterior(self, name, X, groups=None, prior='spectrum', subset=None):
+    def posterior(self, name, X, groups=None, prior='spectrum', subset=None, aux=None):
         """(n, T). prior='spectrum' uses the fitted group spectra (groups
         required); prior='uniform' asks the counts alone -- the PLACEMENT
-        prior for populations that were not fitted."""
+        prior for populations that were not fitted. `aux` (n, T) is an
+        extra log-likelihood per cell and angle: the fit passes the DAPI
+        term here; placement never does."""
         ll = self.loglik_grid(name, X, subset=subset)
+        if aux is not None:
+            ll = ll + aux
         if prior == 'uniform' or groups is None:
             lp = ll
         else:
@@ -456,6 +467,65 @@ class CycleModel:
             if free is not None:                        # the gauge on the gains
                 s[name][free] = np.exp(np.log(s[name][free]) - np.log(s[name][free]).mean())
         return coef, a, s
+
+    def _dapi_aux(self, d):
+        """(n, T) the weighted DAPI log-likelihood of dataset d on the
+        grid, or None when the fit is not using DAPI."""
+        if self.dapi_weight <= 0 or d.dapi is None or self.h is None or d.name not in self.c:
+            return None
+        y = d.dapi
+        ok = np.isfinite(y)
+        aux = np.zeros((len(y), self.T))
+        r = y[ok][:, None] - self.c[d.name] - self.h[None, :]
+        aux[ok] = -self.dapi_weight * 0.5 * r ** 2 / (self.sigma[d.name] ** 2)
+        return aux
+
+    def _update_dapi(self, datasets, qs, sweeps=2):
+        """Closed-form M-step for the DAPI curve: with q fixed, the shared
+        h(t) is the q-weighted mean of every cell's offset-corrected log
+        DAPI at t (smoothed like the spectrum, mean 0 -- the level lives
+        in c_d), then each dataset's offset and residual scale.
+
+        The shape is left free on purpose. A ramp fixed to the textbook
+        cycle (0 to log 2, drop at division) was tried on the real pair
+        and hurt: the count evidence fell with the weight, chr19's R
+        median went 0.80 -> 0.74 and its DAPI drop 2.09 -> 1.5x, because
+        the real curve is flat through G1, rises through S and plateaus,
+        and forcing a linear rise drags G1 cells early and G2/M cells
+        late. The free curve at weight 0.5-1 raised the count evidence
+        (-38.143 -> -38.128 per cell) and closed the two experiments'
+        DAPI halving to 0 deg while the DAPI-free checks stayed put.
+
+        What neither form can do is rescue a grossly mis-rotated start:
+        seeded 120 deg off, both leave the divisions 100-110 deg apart at
+        any weight, because h is estimated from the same mis-rotated q's
+        and simply grows one hump per dataset. Within about 60 deg the
+        counts alone already align; the term keeps and refines that."""
+        use = [d for d in datasets if d.dapi is not None and np.isfinite(d.dapi).any()]
+        if self.dapi_weight <= 0 or not use:
+            return
+        if self.h is None:
+            self.h = np.zeros(self.T)
+        for d in use:
+            self.c.setdefault(d.name, float(np.nanmean(d.dapi)))
+            self.sigma.setdefault(d.name, max(float(np.nanstd(d.dapi)), 1e-3))
+        for _ in range(sweeps):
+            num, den = np.zeros(self.T), np.zeros(self.T)
+            for d in use:
+                ok = np.isfinite(d.dapi)
+                q = qs[d.name][ok]
+                num += q.T @ (d.dapi[ok] - self.c[d.name])
+                den += q.sum(0)
+            h = num / np.maximum(den, 1e-9)
+            h = _circ_smooth(h, self.prior_smooth)
+            self.h = h - h.mean()
+            for d in use:
+                ok = np.isfinite(d.dapi)
+                q = qs[d.name][ok]
+                pred = q @ self.h
+                self.c[d.name] = float(np.mean(d.dapi[ok] - pred))
+                resid2 = (q * (d.dapi[ok][:, None] - self.c[d.name] - self.h[None, :]) ** 2).sum(1)
+                self.sigma[d.name] = max(float(np.sqrt(np.mean(resid2))), 1e-3)
 
     def _update_w(self, datasets, qs):
         for d in datasets:
@@ -600,7 +670,8 @@ class CycleModel:
             self._gains_active = it >= int(gain_warmup)
             self.coef, self.a, self.s = self._mstep(datasets, qs, exact)
             self._update_w(datasets, qs)
-            qs = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
+            self._update_dapi(datasets, qs)
+            qs = {d.name: self.posterior(d.name, d.X, d.groups, aux=self._dapi_aux(d)) for d in datasets}
             ev = self._mean_evidence(datasets)
             self.history.append(ev)
             if verbose:
@@ -622,7 +693,7 @@ class CycleModel:
         # alpha is None or polish == 0)
         if self.polish and not exact and any(d.alpha is not None for d in datasets):
             for _ in range(self.polish):
-                qs = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
+                qs = {d.name: self.posterior(d.name, d.X, d.groups, aux=self._dapi_aux(d)) for d in datasets}
                 coef, a, s = self._mstep(datasets, qs, True)
                 ev = None
                 old = (self.coef, self.a, self.s)
@@ -634,12 +705,12 @@ class CycleModel:
                     break
                 best_ev = ev
                 self.history.append(ev)
-        self.q_ = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
+        self.q_ = {d.name: self.posterior(d.name, d.X, d.groups, aux=self._dapi_aux(d)) for d in datasets}
         return self
 
     def fit(self, datasets, n_iter=40, tol=1e-4, bridge_exclude=HOUSEKEEPING,
             weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None,
-            gene_gains=False, gain_warmup=0):
+            gene_gains=False, gain_warmup=0, dapi_weight=0.0):
         """Fit on cycling populations. `datasets`: [Dataset, ...].
         orient_by=(early, late) fixes every bridge's reflection by gene
         roles (see stagewise_init).
@@ -651,9 +722,16 @@ class CycleModel:
         way, since there a gain is redundant with the gene's own (b, c).
         gain_warmup=k holds the gains at 1 for the first k EM iterations,
         so the angles settle before the fit is allowed to trade a
-        profile's shape against its gain."""
+        profile's shape against its gain.
+
+        dapi_weight > 0 lets the E-step see each dataset's log DAPI
+        (Dataset.dapi) through a shared curve on the angle grid, which is
+        what pins the relative rotation between experiments; the counts
+        alone do not. Placement stays count-only."""
         datasets = list(datasets)
         self._gene_gains = bool(gene_gains)
+        self.dapi_weight = float(dapi_weight)
+        self.h, self.c, self.sigma = None, {}, {}
         self._index(datasets)
         if theta0 is None:
             theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose, orient_by)
@@ -850,6 +928,8 @@ class CycleModel:
                 'panels': {n: list(p) for n, p in self.panels.items()},
                 'a': {n: v.tolist() for n, v in self.a.items()},
                 's': {n: v.tolist() for n, v in self.s.items()},
+                'dapi': {'weight': self.dapi_weight, 'h': None if self.h is None else self.h.tolist(),
+                         'c': dict(self.c), 'sigma': dict(self.sigma)},
                 'alphas': dict(self.alphas),
                 'w': [[n, str(c), v.tolist()] for (n, c), v in self.w.items()],
                 'ref': {n: {k: np.asarray(v).tolist() for k, v in r.items()} for n, r in self.ref.items()}}
@@ -867,6 +947,11 @@ class CycleModel:
         # a model written before the gains existed has none: every gain is 1
         m.s = {n: np.asarray(d.get('s', {}).get(n, np.ones(len(p))), float) for n, p in m.panels.items()}
         m.free_s = {n: np.zeros(len(p), bool) for n, p in m.panels.items()}
+        dp = d.get('dapi') or {}
+        m.dapi_weight = float(dp.get('weight', 0.0))
+        m.h = None if dp.get('h') is None else np.asarray(dp['h'], float)
+        m.c = {k: float(v) for k, v in (dp.get('c') or {}).items()}
+        m.sigma = {k: float(v) for k, v in (dp.get('sigma') or {}).items()}
         m.alphas = {n: (None if v is None else float(v)) for n, v in d['alphas'].items()}
         m.w = {(n, c): np.asarray(v, float) for n, c, v in d['w']}
         m.ref = {n: {k: np.asarray(v, float) for k, v in r.items()} for n, r in d.get('ref', {}).items()}
