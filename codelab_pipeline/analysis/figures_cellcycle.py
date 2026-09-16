@@ -54,6 +54,26 @@ OKABE_ITO = ('#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2',
 DEFAULT_PHASE_SHARES = (('G1', 0.45), ('S', 0.33), ('G2/M', 0.22))
 
 
+MANUSCRIPT_FONTS = {'title': {'fontname': 'arial', 'fontsize': 24, 'fontweight': 'bold'},
+                    'title_small': {'fontname': 'arial', 'fontsize': 16, 'fontweight': 'bold'},
+                    'label': {'fontname': 'arial', 'fontsize': 16},
+                    'ticks': {'fontname': 'arial', 'fontsize': 14}}
+
+
+def manuscript_style(font='arial', size=14):
+    """The manuscript's figure conventions, set on matplotlib's rcParams:
+    Arial throughout, and -- the part that matters for an exported PDF --
+    fonttype 42, which embeds text as TrueType so a PDF keeps its words
+    as words (the default, type 3, draws every glyph as an outline and
+    the text is gone). Returns the font dicts for titles, labels and
+    ticks so a figure can pass them explicitly."""
+    plt.rcParams['font.family'] = font
+    plt.rcParams['font.size'] = size
+    plt.rcParams['pdf.fonttype'] = 42
+    plt.rcParams['ps.fonttype'] = 42
+    return {k: dict(v) for k, v in MANUSCRIPT_FONTS.items()}
+
+
 def gene_palette(n):
     if n <= len(OKABE_ITO):
         return list(OKABE_ITO[:n])

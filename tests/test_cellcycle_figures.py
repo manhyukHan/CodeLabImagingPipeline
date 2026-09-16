@@ -247,6 +247,24 @@ def main():
           len([ln for ln in fig.axes[0].lines if ln.get_linestyle() not in ('-', 'solid', 'None')]) >= 3)
     plt.close(fig)
 
+    print('the manuscript style')
+    fonts = FC.manuscript_style()
+    check('manuscript_style embeds PDF text as TrueType (fonttype 42)',
+          plt.rcParams['pdf.fonttype'] == 42 and plt.rcParams['ps.fonttype'] == 42)
+    check('manuscript_style hands back the four font dicts',
+          set(fonts) == {'title', 'title_small', 'label', 'ticks'} and fonts['title']['fontsize'] == 24)
+    import io as _io
+    fig2, ax2 = plt.subplots(figsize=(3, 2))
+    ax2.set_title('probe', **fonts['title_small'])
+    ax2.set_xlabel('x', **fonts['label'])
+    buf = _io.BytesIO()
+    fig2.savefig(buf, format='pdf')
+    raw = buf.getvalue()
+    check('a PDF saved under the style carries a TrueType font, not Type 3 outlines',
+          b'/FontFile2' in raw and b'/Type3' not in raw)
+    plt.close(fig2)
+
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         print('FAILED:', FAIL)
