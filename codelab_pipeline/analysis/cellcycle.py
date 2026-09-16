@@ -504,6 +504,14 @@ class CycleModel:
         use = [d for d in datasets if d.dapi is not None and np.isfinite(d.dapi).any()]
         if self.dapi_weight <= 0 or not use:
             return
+        # Estimated from every dataset's q, h is a summary of the current
+        # placement and can only reinforce it. Shaping it from ONE
+        # dataset's q was tried (an 'anchor') and changed nothing: at a
+        # mis-rotated fixed point that dataset's own q is smeared too, and
+        # in any case a per-cell DAPI term cannot rotate a dataset -- the
+        # counts pin each cell by ~28 log-units against a DAPI gain of at
+        # most ~6. Rotation is a global move; see the rotation scan.
+        shape = use
         if self.h is None:
             self.h = np.zeros(self.T)
         for d in use:
@@ -511,7 +519,7 @@ class CycleModel:
             self.sigma.setdefault(d.name, max(float(np.nanstd(d.dapi)), 1e-3))
         for _ in range(sweeps):
             num, den = np.zeros(self.T), np.zeros(self.T)
-            for d in use:
+            for d in shape:
                 ok = np.isfinite(d.dapi)
                 q = qs[d.name][ok]
                 num += q.T @ (d.dapi[ok] - self.c[d.name])
@@ -727,7 +735,16 @@ class CycleModel:
         dapi_weight > 0 lets the E-step see each dataset's log DAPI
         (Dataset.dapi) through a shared curve on the angle grid, which is
         what pins the relative rotation between experiments; the counts
-        alone do not. Placement stays count-only."""
+        alone do not. Placement stays count-only.
+
+        What the term can and cannot do, measured: from a start within
+        about 60 deg it keeps and refines the alignment (weight 0.5-1;
+        at 2 the count evidence still rises but the arrested populations
+        lose their place -- the 3e rule's 'internal up, external down').
+        It cannot pull a dataset out of a wrongly rotated basin at any
+        weight, with any shape of curve, anchored or not: a cell's
+        counts hold it ~28 log-units against a DAPI gain of ~6 at most.
+        Choose the basin with the rotation scan; use this to hold it."""
         datasets = list(datasets)
         self._gene_gains = bool(gene_gains)
         self.dapi_weight = float(dapi_weight)
@@ -928,7 +945,8 @@ class CycleModel:
                 'panels': {n: list(p) for n, p in self.panels.items()},
                 'a': {n: v.tolist() for n, v in self.a.items()},
                 's': {n: v.tolist() for n, v in self.s.items()},
-                'dapi': {'weight': self.dapi_weight, 'h': None if self.h is None else self.h.tolist(),
+                'dapi': {'weight': self.dapi_weight,
+                         'h': None if self.h is None else self.h.tolist(),
                          'c': dict(self.c), 'sigma': dict(self.sigma)},
                 'alphas': dict(self.alphas),
                 'w': [[n, str(c), v.tolist()] for (n, c), v in self.w.items()],
