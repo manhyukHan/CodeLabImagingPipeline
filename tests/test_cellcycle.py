@@ -210,5 +210,52 @@ elim = CC.backward_elimination(mj, 'A', XA, gA, train_group='cycling')
 check('backward elimination walks the panel down to two genes with rising error',
       elim[-1]['n_genes'] == 2 and elim[-1]['err_deg'] >= elim[0]['err_deg'] and 'dropped' in elim[1])
 
+print('the per-(dataset, gene) gain')
+Xg, thg, _cg, _ag, genesg = CC.simulate(n=400, seed=11, total=(80, 300))
+gA = list(genesg)[:6]
+gB = list(genesg)[2:8]
+dA = CC.Dataset('A', Xg[:, [genesg.index(g) for g in gA]], gA, alpha=100.0)
+dB = CC.Dataset('B', Xg[:, [genesg.index(g) for g in gB]], gB, alpha=100.0)
+
+m_off = CC.CycleModel().fit([dA, dB])
+check('gains are 1 unless asked for',
+      all(abs(v - 1.0) < 1e-12 for d in m_off.gains().values() for v in d.values()))
+
+m_solo = CC.CycleModel().fit([dA], gene_gains=True)
+check('a single dataset gets no free gain: there a gain is redundant with (b, c)',
+      all(abs(v - 1.0) < 1e-12 for v in m_solo.gains('A').values()),
+      str(m_solo.gains('A')))
+
+m_on = CC.CycleModel().fit([dA, dB], gene_gains=True)
+shared = [g for g in gA if g in gB]
+only_a = [g for g in gA if g not in gB]
+check('only the SHARED genes get a free gain',
+      all(abs(m_on.gains('A')[g] - 1.0) < 1e-12 for g in only_a),
+      str({g: round(m_on.gains('A')[g], 3) for g in only_a}))
+check('a shared gene does move off 1',
+      any(abs(m_on.gains('A')[g] - 1.0) > 1e-6 for g in shared),
+      str({g: round(m_on.gains('A')[g], 3) for g in shared}))
+for name in ('A', 'B'):
+    lg = [np.log(m_on.gains(name)[g]) for g in shared]
+    check(f'{name}: the free log gains average to zero, so only RATIOS are claimed',
+          abs(float(np.mean(lg))) < 1e-6, f'{np.mean(lg):.2e}')
+
+spec = m_on.to_dict()
+back = CC.CycleModel.from_dict(spec)
+check('the gains survive a round trip',
+      all(abs(back.gains(n)[g] - m_on.gains(n)[g]) < 1e-12 for n in ('A', 'B') for g in back.panels[n]))
+old = {k: v for k, v in spec.items() if k != 's'}
+check('a model written before gains existed reads back with every gain at 1',
+      all(abs(v - 1.0) < 1e-12 for d in CC.CycleModel.from_dict(old).gains().values() for v in d.values()))
+# WHEN NOT TO USE IT. On synthetic pairs built WITH a known gain, the
+# fitted ratios track the truth at correlation 0.07 (3 shared genes),
+# 0.11 (5), 0.66 (8), 0.29 (12) over three repeats each at 1500 cells
+# per dataset -- and at 12 genes two of three repeats reached a LOWER
+# evidence than the same fit without gains. The parameter is right in
+# principle (the five genes chr19 and JP_001 share do differ in depth
+# by up to 2.4x, measured on 20 bootstrap refits) but is not estimable
+# at this depth, and it destabilises the EM. Hence: opt-in, and off.
+
+
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

@@ -224,12 +224,13 @@ class Dataset:
 
 class CycleModel:
     def __init__(self, K=DEFAULT_K, T=DEFAULT_T, prior_smooth=5, l2=1e-2,
-                 mstep='multinomial', patience=5, polish=2, m_iter=60):
+                 mstep='multinomial', patience=5, polish=2, m_iter=60, gain_l2=1.0):
         if mstep not in ('multinomial', 'dm'):
             raise ValueError("mstep must be 'multinomial' or 'dm'")
         self.K, self.T = int(K), int(T)
         self.prior_smooth = int(prior_smooth)
         self.l2 = float(l2)
+        self.gain_l2 = float(gain_l2)   # ridge on log s; 0 frees the gains, large pins them to 1
         self.mstep = mstep
         self.patience = int(patience)
         self.polish = int(polish)
@@ -239,6 +240,9 @@ class CycleModel:
         self.genes = []
         self.coef = None            # (G, 2K) shared harmonics
         self.a = {}                 # name -> (|S_d|,) intercepts
+        self.s = {}                 # name -> (|S_d|,) gains on the harmonics
+        self.free_s = {}            # name -> bool over the panel: gains that are free
+        self._gene_gains = False    # fit(gene_gains=True) frees the shared genes' gains
         self.w = {}                 # (name, group) -> (T,) spectrum
         self.alphas = {}            # name -> alpha
         self.panels = {}            # name -> [genes]
@@ -258,10 +262,33 @@ class CycleModel:
                     genes.append(g)
         self.genes = genes
         self.gi = {g: i for i, g in enumerate(genes)}
+        seen = {}
+        for d in datasets:
+            for g in d.genes:
+                seen[g] = seen.get(g, 0) + 1
+        gains = bool(getattr(self, '_gene_gains', False))
         for d in datasets:
             self.panels[d.name] = list(d.genes)
             self.cols[d.name] = np.array([self.gi[g] for g in d.genes])
             self.alphas[d.name] = d.alpha
+            self.s[d.name] = np.ones(len(d.genes))
+            # a gain is redundant with the gene's own (b, c) unless the
+            # gene is also fitted somewhere else: free it only then
+            self.free_s[d.name] = np.array([gains and seen[g] > 1 for g in d.genes], bool)
+
+    def gains(self, name=None):
+        """The per-gene gain on the harmonic part: how much deeper (or
+        shallower) each gene swings in this experiment than the shared
+        profile says. 1.0 everywhere unless a joint fit freed them.
+
+        Only genes shared by two or more datasets carry a free gain --
+        for a gene fitted in one place the gain is redundant with its own
+        (b, c) -- and each dataset's free log gains average to zero, so
+        what a gain reports is the RATIO against the other experiments,
+        never an absolute scale."""
+        if name is not None:
+            return {g: float(v) for g, v in zip(self.panels[name], self.s.get(name, np.ones(len(self.panels[name]))))}
+        return {n: self.gains(n) for n in self.panels}
 
     def bridge_report(self):
         names = list(self.panels)
@@ -270,17 +297,19 @@ class CycleModel:
 
     # -- composition and likelihood --
 
-    def log_pi(self, name, coef=None, a=None, subset=None):
+    def log_pi(self, name, coef=None, a=None, subset=None, s=None):
         """(T, |subset|) log composition of `name`'s panel (or a subset
         of it) on the grid."""
         coef = self.coef if coef is None else coef
         a = self.a[name] if a is None else a
+        sv = self.s.get(name) if s is None else s
         if subset is None:
             gidx, aidx = self.cols[name], np.arange(len(self.panels[name]))
         else:
             aidx = np.array([self.panels[name].index(g) for g in subset])
             gidx = np.array([self.gi[g] for g in subset])
-        eta = self.B @ coef[gidx].T + a[aidx][None, :]
+        sv = np.ones(len(self.panels[name])) if sv is None else np.asarray(sv, float)
+        eta = (self.B @ coef[gidx].T) * sv[aidx][None, :] + a[aidx][None, :]
         return eta - logsumexp(eta, axis=1, keepdims=True)
 
     def loglik_grid(self, name, X, coef=None, a=None, subset=None, alpha='own'):
@@ -324,22 +353,39 @@ class CycleModel:
 
     # -- fitting --
 
-    def _unpack(self, v):
+    def _unpack(self, v, names=None):
+        """(coef, intercepts, gains) from the flat vector. The gains are
+        carried as LOG gains, and only for the entries free_s marks; the
+        rest stay at 1."""
         G, P = len(self.genes), self.B.shape[1]
         coef = v[:G * P].reshape(G, P)
+        names = list(self.panels) if names is None else list(names)
         a, off = {}, G * P
-        for name in self.panels:
+        for name in names:
             n = len(self.cols[name])
             a[name] = v[off:off + n]
             off += n
-        return coef, a
+        s = {}
+        for name in names:
+            free = self.free_s.get(name)
+            sv = np.ones(len(self.cols[name]))
+            if free is not None and free.any():
+                k = int(free.sum())
+                sv[free] = np.exp(v[off:off + k])
+                off += k
+            s[name] = sv
+        return coef, a, s
 
     def _mstep(self, datasets, qs, exact):
         """One M-step over shared harmonics and every experiment's
         intercepts. exact=False folds each dataset to its multinomial
         sufficient statistics; exact=True uses the DM objective."""
         G, P = len(self.genes), self.B.shape[1]
-        x0 = np.concatenate([self.coef.ravel()] + [self.a[d.name] for d in datasets])
+        names = [d.name for d in datasets]
+        x0 = np.concatenate([self.coef.ravel()] + [self.a[d.name] for d in datasets]
+                            + [np.log(self.s[d.name][self.free_s[d.name]])
+                               for d in datasets if self.free_s.get(d.name) is not None
+                               and self.free_s[d.name].any()])
         pre = {}
         for d in datasets:
             q = qs[d.name]
@@ -357,13 +403,13 @@ class CycleModel:
             pre[d.name] = (q, q.T @ (d.X * w[:, None]), q.T @ (s * w))
 
         def f(v):
-            coef, a = self._unpack(v)
+            coef, a, s = self._unpack(v, names)
             val = 0.5 * self.l2 * (coef ** 2).sum()
             gcoef = self.l2 * coef
-            ga = {}
+            ga, gs = {}, {}
             for d in datasets:
                 q, Sx, Ss = pre[d.name]
-                lpi = self.log_pi(d.name, coef, a[d.name])
+                lpi = self.log_pi(d.name, coef, a[d.name], s=s[d.name])
                 pi = np.exp(lpi)
                 if not exact or d.alpha is None:
                     val -= (Sx * lpi).sum()
@@ -374,16 +420,34 @@ class CycleModel:
                     val -= (q[:, :, None] * (gammaln(Xb + api[None]) - gammaln(api)[None])).sum()
                     dpi = d.alpha * (q[:, :, None] * (digamma(Xb + api[None]) - digamma(api)[None])).sum(0)
                     g_eta = -(pi * (dpi - (pi * dpi).sum(1, keepdims=True)))
-                gcoef[self.cols[d.name]] += g_eta.T @ self.B
+                sv = s[d.name]
+                gcoef[self.cols[d.name]] += (g_eta * sv[None, :]).T @ self.B
                 ga[d.name] = g_eta.sum(0)
-            return val, np.concatenate([gcoef.ravel()] + [ga[d.name] for d in datasets])
+                free = self.free_s.get(d.name)
+                if free is not None and free.any():
+                    # d eta / d log s = (B @ coef) * s
+                    h = (self.B @ coef[self.cols[d.name]].T) * sv[None, :]
+                    g = (g_eta * h).sum(0)[free]
+                    ls = np.log(sv[free])
+                    val += 0.5 * self.gain_l2 * (ls ** 2).sum()
+                    g = g + self.gain_l2 * ls
+                    # the dataset's own scale is redundant with the shared
+                    # profile: keep the mean of its log gains at zero by
+                    # projecting it out of the gradient
+                    gs[d.name] = g - g.mean()
+            return val, np.concatenate([gcoef.ravel()] + [ga[d.name] for d in datasets]
+                                       + [gs[n] for n in names if n in gs])
 
         res = optimize.minimize(f, x0, jac=True, method='L-BFGS-B',
                                 options={'maxiter': self.m_iter})
-        coef, a = self._unpack(res.x)
+        coef, a, s = self._unpack(res.x, names)
         for name in a:
             a[name] = a[name] - a[name].mean()          # softmax gauge
-        return coef, a
+        for name in s:
+            free = self.free_s.get(name)
+            if free is not None and free.any():         # the gauge on the gains
+                s[name][free] = np.exp(np.log(s[name][free]) - np.log(s[name][free]).mean())
+        return coef, a, s
 
     def _update_w(self, datasets, qs):
         for d in datasets:
@@ -525,7 +589,7 @@ class CycleModel:
         self.history = []
         prev = -np.inf
         for it in range(int(n_iter)):
-            self.coef, self.a = self._mstep(datasets, qs, exact)
+            self.coef, self.a, self.s = self._mstep(datasets, qs, exact)
             self._update_w(datasets, qs)
             qs = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
             ev = self._mean_evidence(datasets)
@@ -535,27 +599,28 @@ class CycleModel:
             if ev > best_ev + 1e-12:
                 best_ev, since = ev, 0
                 best = (self.coef.copy(), {k: v.copy() for k, v in self.a.items()},
-                        {k: v.copy() for k, v in self.w.items()})
+                        {k: v.copy() for k, v in self.w.items()},
+                        {k: v.copy() for k, v in self.s.items()})
             else:
                 since += 1
             if abs(ev - prev) < tol or since >= self.patience:
                 break
             prev = ev
         if best is not None:
-            self.coef, self.a, self.w = best
+            self.coef, self.a, self.w, self.s = best
         # polish: exact DM M-steps from the best point (no-op if every
         # alpha is None or polish == 0)
         if self.polish and not exact and any(d.alpha is not None for d in datasets):
             for _ in range(self.polish):
                 qs = {d.name: self.posterior(d.name, d.X, d.groups) for d in datasets}
-                coef, a = self._mstep(datasets, qs, True)
+                coef, a, s = self._mstep(datasets, qs, True)
                 ev = None
-                old = (self.coef, self.a)
-                self.coef, self.a = coef, a
+                old = (self.coef, self.a, self.s)
+                self.coef, self.a, self.s = coef, a, s
                 self._update_w(datasets, qs)
                 ev = self._mean_evidence(datasets)
                 if ev < best_ev:                 # a polish that hurts is undone
-                    self.coef, self.a = old
+                    self.coef, self.a, self.s = old
                     break
                 best_ev = ev
                 self.history.append(ev)
@@ -563,11 +628,19 @@ class CycleModel:
         return self
 
     def fit(self, datasets, n_iter=40, tol=1e-4, bridge_exclude=HOUSEKEEPING,
-            weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None):
+            weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None,
+            gene_gains=False):
         """Fit on cycling populations. `datasets`: [Dataset, ...].
         orient_by=(early, late) fixes every bridge's reflection by gene
-        roles (see stagewise_init)."""
+        roles (see stagewise_init).
+
+        gene_gains=True lets a gene shared by two or more datasets swing
+        by a different depth in each of them (see gains()). It is off by
+        default because it changes what a joint fit can express, and so
+        changes joint results; a single-dataset fit is unaffected either
+        way, since there a gain is redundant with the gene's own (b, c)."""
         datasets = list(datasets)
+        self._gene_gains = bool(gene_gains)
         self._index(datasets)
         if theta0 is None:
             theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose, orient_by)
@@ -759,22 +832,28 @@ class CycleModel:
 
     def to_dict(self):
         return {'K': self.K, 'T': self.T, 'prior_smooth': self.prior_smooth, 'l2': self.l2,
+                'gain_l2': self.gain_l2,
                 'genes': list(self.genes), 'coef': self.coef.tolist(),
                 'panels': {n: list(p) for n, p in self.panels.items()},
                 'a': {n: v.tolist() for n, v in self.a.items()},
+                's': {n: v.tolist() for n, v in self.s.items()},
                 'alphas': dict(self.alphas),
                 'w': [[n, str(c), v.tolist()] for (n, c), v in self.w.items()],
                 'ref': {n: {k: np.asarray(v).tolist() for k, v in r.items()} for n, r in self.ref.items()}}
 
     @classmethod
     def from_dict(cls, d):
-        m = cls(K=d['K'], T=d['T'], prior_smooth=d.get('prior_smooth', 5), l2=d.get('l2', 1e-2))
+        m = cls(K=d['K'], T=d['T'], prior_smooth=d.get('prior_smooth', 5), l2=d.get('l2', 1e-2),
+                gain_l2=d.get('gain_l2', 1.0))
         m.genes = list(d['genes'])
         m.gi = {g: i for i, g in enumerate(m.genes)}
         m.coef = np.asarray(d['coef'], float)
         m.panels = {n: list(p) for n, p in d['panels'].items()}
         m.cols = {n: np.array([m.gi[g] for g in p]) for n, p in m.panels.items()}
         m.a = {n: np.asarray(v, float) for n, v in d['a'].items()}
+        # a model written before the gains existed has none: every gain is 1
+        m.s = {n: np.asarray(d.get('s', {}).get(n, np.ones(len(p))), float) for n, p in m.panels.items()}
+        m.free_s = {n: np.zeros(len(p), bool) for n, p in m.panels.items()}
         m.alphas = {n: (None if v is None else float(v)) for n, v in d['alphas'].items()}
         m.w = {(n, c): np.asarray(v, float) for n, c, v in d['w']}
         m.ref = {n: {k: np.asarray(v, float) for k, v in r.items()} for n, r in d.get('ref', {}).items()}
