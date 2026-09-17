@@ -248,6 +248,8 @@ class CycleModel:
         self._gene_gains = False    # fit(gene_gains=True) frees the shared genes' gains
         self._gains_active = True   # _em holds this False through the warm-up
         self.dapi_weight = 0.0      # fit(dapi_weight=...) lets the E-step see DAPI
+        self.balance_datasets = False   # fit(balance_datasets=True): equal say per experiment
+        self.dataset_scale = {}     # name -> the factor that equalised it (1 when off)
         self.h = None               # (T,) shared log-DAPI curve on the grid, mean 0
         self.c = {}                 # name -> DAPI offset
         self.sigma = {}             # name -> DAPI residual sd
@@ -406,8 +408,23 @@ class CycleModel:
                             + [np.log(self.s[d.name][self._free_of(d.name)])
                                for d in datasets if self._free_of(d.name) is not None])
         pre = {}
+        # Per cell the DM effective count already levels a deep cell with
+        # a shallow one, but nothing levels the EXPERIMENTS: the sum over
+        # cells still hands the shared profile to whichever experiment has
+        # more cells and a larger alpha (measured: JP_001 carries 2.7x
+        # chr19). balance_datasets scales each dataset's q so their
+        # effective masses match -- every experiment gets an equal say.
+        self.dataset_scale = {d.name: 1.0 for d in datasets}
+        if self.balance_datasets and len(datasets) > 1:
+            mass = {}
+            for d in datasets:
+                s = d.X.sum(1)
+                w = np.ones_like(s) if d.alpha is None else (1.0 + d.alpha) / (s + d.alpha)
+                mass[d.name] = float((s * w).sum())
+            target = float(np.mean(list(mass.values())))
+            self.dataset_scale = {n: target / max(m, 1e-9) for n, m in mass.items()}
         for d in datasets:
-            q = qs[d.name]
+            q = qs[d.name] * self.dataset_scale[d.name]
             s = d.X.sum(1)
             # THE DM'S OWN WEIGHTING, kept in the fast path. A Dirichlet-
             # multinomial cell carries s(1+alpha)/(s+alpha) effective counts,
@@ -718,7 +735,7 @@ class CycleModel:
 
     def fit(self, datasets, n_iter=40, tol=1e-4, bridge_exclude=HOUSEKEEPING,
             weights='fisher_min', robust=True, verbose=False, theta0=None, orient_by=None,
-            gene_gains=False, gain_warmup=0, dapi_weight=0.0):
+            gene_gains=False, gain_warmup=0, dapi_weight=0.0, balance_datasets=False):
         """Fit on cycling populations. `datasets`: [Dataset, ...].
         orient_by=(early, late) fixes every bridge's reflection by gene
         roles (see stagewise_init).
@@ -744,10 +761,20 @@ class CycleModel:
         It cannot pull a dataset out of a wrongly rotated basin at any
         weight, with any shape of curve, anchored or not: a cell's
         counts hold it ~28 log-units against a DAPI gain of ~6 at most.
-        Choose the basin with the rotation scan; use this to hold it."""
+        Choose the basin with the rotation scan; use this to hold it.
+
+        balance_datasets=True gives every experiment the same total
+        weight in the shared M-step (their effective masses are scaled
+        to a common value). Off, the shared profile belongs to the
+        experiment with more cells and a larger alpha, as a likelihood
+        does; on, it is an average of experiments. Measured on the real
+        pair: JP_001 carries 2.72x chr19 unbalanced, and balancing
+        brings the two experiments' role peaks from 16-21 deg apart to
+        1-6 deg, at the cost of an emptier stretch in JP_001's ring."""
         datasets = list(datasets)
         self._gene_gains = bool(gene_gains)
         self.dapi_weight = float(dapi_weight)
+        self.balance_datasets = bool(balance_datasets)
         self.h, self.c, self.sigma = None, {}, {}
         self._index(datasets)
         if theta0 is None:
