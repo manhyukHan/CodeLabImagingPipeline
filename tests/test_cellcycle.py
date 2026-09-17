@@ -292,5 +292,86 @@ check('the DAPI curve survives a round trip',
       back_d.h is not None and np.allclose(back_d.h, m_d.h) and back_d.c == m_d.c and back_d.dapi_weight == 0.5)
 
 
+# -- 12. the angle-aware gate where the ring folds through its centre ----------
+print('calibrated gate')
+# a ring that passes exactly through its centre at 90 deg: with K=2 the
+# composition there is c1 - b2 per gene, so b2 = c1 makes every gene sit
+# at its intercept at that angle -- the shape both real panels have right
+# after division, where the fixed gate (bf >= 0, radius >= 0.5) throws
+# away most of the cells that are truly on the ring.
+fold = np.zeros((6, 4))
+fold[:, 0] = np.random.default_rng(5).normal(0, 1.0, 6)
+fold[:, 1] = np.random.default_rng(6).normal(0, 1.0, 6)
+fold[:, 2] = fold[:, 1]
+Xf, thf, _, _, _ = CC.simulate(n=600, genes=genA, coef=fold, seed=7, alpha=100.0)
+mf = CC.CycleModel().fit([CC.Dataset('F', Xf, genA, alpha=100.0)])
+mf.coef[mf.cols['F']] = fold                       # the model as truth, fold included
+ringf = CC.clr(np.exp(mf.log_pi('F')))
+dist = np.linalg.norm(ringf - ringf.mean(0), axis=1)
+kf = int(np.argmin(dist))
+check('the ring folds through its centre', dist[kf] / np.median(dist) < 0.3, f'{dist[kf] / np.median(dist):.2f} of the radius at {deg(mf.grid[kf] / CC.TWO_PI):.0f} deg')
+mf.ring_reference('F', np.full(400, 150.0), n_sim=300, seed=1)
+rngf = np.random.default_rng(2)
+pis = np.exp(mf.log_pi('F'))
+keep_fixed, keep_cal, reject_centre = [], [], []
+for t in range(0, mf.T, 6):
+    Xs = CC._simulate_cells(rngf, pis[t], 100.0, 150, 150)
+    pl = mf.place('F', Xs)
+    keep_fixed.append(((pl['bf_ring'] >= 0) & (pl['radius'] >= 0.5)).mean())
+    keep_cal.append(mf.on_ring('F', Xs, level=0.1, placed=pl)[0].mean())
+Xc = CC._simulate_cells(rngf, mf.centre('F'), 100.0, 150, 300)
+plc = mf.place('F', Xc)
+far = np.abs(np.angle(np.exp(1j * (plc['theta'] - mf.grid[kf])))) > np.pi / 2
+onc = mf.on_ring('F', Xc, level=0.1, placed=plc)[0]
+check('the fixed gate loses most true on-ring cells at the fold', min(keep_fixed) < 0.5, f'worst angle keeps {min(keep_fixed):.2f}')
+# two tails at level 0.1: correlated away from the fold (miss ~0.1), near-independent at the fold (miss ~0.19)
+check('the calibrated gate keeps true on-ring cells at every angle, the fold included', min(keep_cal) >= 0.7, f'worst angle keeps {min(keep_cal):.2f}')
+check('the calibrated gate still rejects centre cells placed away from the fold', onc[far].mean() < 0.3 if far.sum() >= 20 else True,
+      f'{onc[far].mean():.2f} of {far.sum()} pass')
+mf2 = CC.CycleModel.from_dict(mf.to_dict())
+same = np.array_equal(mf2.on_ring('F', Xc, level=0.1)[0], onc)
+check('the reference survives to_dict / from_dict', same and 'F' in mf2.ring_ref)
+check('without a reference on_ring is the fixed gate',
+      np.array_equal(CC.CycleModel.from_dict({**mf.to_dict(), 'ring_ref': {}}).on_ring('F', Xc)[0], (plc['bf_ring'] >= 0) & (plc['radius'] >= 0.5)))
+
+# -- 13. a ring that does NOT fold: the gate must not change the answer -------
+print('calibrated gate on a circular ring')
+# an exact circle in CLR: log pi_t = a + u cos t + v sin t with u, v
+# mean-zero, orthogonal and of equal length, so every angle sits the same
+# distance from the centre and the fixed gate already misses almost
+# nothing. A sound panel must come through the new gate unchanged.
+rngc = np.random.default_rng(11)
+u = rngc.normal(0, 1, 6); u -= u.mean()
+v = rngc.normal(0, 1, 6); v -= v.mean()
+v -= (v @ u) / (u @ u) * u
+v *= np.linalg.norm(u) / np.linalg.norm(v)
+circ = np.zeros((6, 4)); circ[:, 0] = u; circ[:, 1] = v
+Xc0, _thc, _, _, _ = CC.simulate(n=600, genes=genA, coef=circ, seed=12, alpha=100.0)
+mc = CC.CycleModel().fit([CC.Dataset('C1', Xc0, genA, alpha=100.0)])
+mc.coef[mc.cols['C1']] = circ
+rc = CC.clr(np.exp(mc.log_pi('C1')))
+dc = np.linalg.norm(rc - rc.mean(0), axis=1)
+check('the ring is a circle: every angle the same distance from the centre',
+      (dc.max() - dc.min()) / np.median(dc) < 0.1, f'spread {(dc.max() - dc.min()) / np.median(dc):.3f} of the radius')
+mc.ring_reference('C1', np.full(400, 150.0), n_sim=300, seed=2)
+rngc2 = np.random.default_rng(13)
+pisc = np.exp(mc.log_pi('C1'))
+agree, keep_fx, keep_un = [], [], []
+for t in range(0, mc.T, 6):
+    Xs = CC._simulate_cells(rngc2, pisc[t], 100.0, 150, 200)
+    pl = mc.place('C1', Xs)
+    fx = (pl['bf_ring'] >= 0) & (pl['radius'] >= 0.5)
+    un = mc.on_ring('C1', Xs, level=0.1, placed=pl)[0]
+    agree.append((fx == un).mean()); keep_fx.append(fx.mean()); keep_un.append(un.mean())
+check('on a circular ring the gate keeps every cell the fixed gate kept', min(np.array(keep_un) - np.array(keep_fx)) >= 0.0)
+check('on a circular ring the two gates give nearly the same answer', np.mean(agree) >= 0.9, f'{np.mean(agree):.2f} of cells agree')
+check('and it still misses almost nothing there', 1 - np.mean(keep_un) <= 0.1, f'miss {1 - np.mean(keep_un):.2f}')
+Xcc = CC._simulate_cells(rngc2, mc.centre('C1'), 100.0, 150, 400)
+plcc = mc.place('C1', Xcc)
+fxc = ((plcc['bf_ring'] >= 0) & (plcc['radius'] >= 0.5)).mean()
+unc = mc.on_ring('C1', Xcc, level=0.1, placed=plcc)[0].mean()
+check('centre cells are still rejected on a circular ring', unc <= 0.35, f'fixed passes {fxc:.2f}, union passes {unc:.2f}')
+
+
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))
 sys.exit(1 if FAIL else 0)
