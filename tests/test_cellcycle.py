@@ -372,6 +372,27 @@ for labl, Xbad in (('a random composition', Xrand), ('the ring composition with 
     gt = mc.on_ring('C1', Xbad, miss=0.05, placed=plb)[0].mean()
     check(f'the gate rejects {labl}', gt <= 0.25, f'gate passes {gt:.2f}, the old fixed gate passed {fx:.2f}')
 
+# -- 14. orient_by must hold for a single dataset too -------------------------
+print('orientation of a single fit')
+# orient_by used to be applied only inside stagewise_init, which a
+# single-dataset fit never reaches, so the handedness came from the PCA
+# seed: two fits of the same cells could come out mirrored.
+pk_true = np.degrees(np.arctan2(coef12[:, 1], coef12[:, 0])) % 360
+early1 = [allg[i] for i in np.argsort(pk_true)[:3]]
+late1 = [allg[i] for i in np.argsort(pk_true)[5:8]]
+gens = [g for g in genA if g in early1 + late1] or genA
+m1 = CC.CycleModel().fit([CC.Dataset('S1', XA_c, genA, alpha=100.0)], orient_by=(early1, late1))
+pk1, _ = m1.peak_phase()
+e1 = [m1.gi[g] for g in early1 if g in m1.gi]
+l1 = [m1.gi[g] for g in late1 if g in m1.gi]
+sep = float(np.degrees(np.angle(np.mean(np.exp(1j * pk1[l1]))) - np.angle(np.mean(np.exp(1j * pk1[e1]))))) % 360
+check('a single fit honours orient_by: the early mean peak sits at 0', abs(deg(np.angle(np.mean(np.exp(1j * pk1[e1]))) / CC.TWO_PI)) < 6,
+      f'{deg(np.angle(np.mean(np.exp(1j * pk1[e1]))) / CC.TWO_PI):.1f} deg')
+check('and the late genes lie in the forward half turn', sep < 180, f'{sep:.0f} deg')
+m2 = CC.CycleModel().fit([CC.Dataset('S1', XA_c, genA, alpha=100.0)], orient_by=(early1, late1))
+med2, sgn2, _sh2 = CC.circular_agreement(m1.place('S1', XA_c)['theta'], m2.place('S1', XA_c)['theta'])
+check('two fits of the same cells keep the same handedness', sgn2 > 0, 'mirrored' if sgn2 < 0 else 'same')
+
 
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))
 sys.exit(1 if FAIL else 0)

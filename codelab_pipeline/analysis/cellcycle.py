@@ -796,6 +796,19 @@ class CycleModel:
             theta0 = (self.stagewise_init(datasets, bridge_exclude, weights, robust, verbose, orient_by)
                       if len(datasets) > 1 else {datasets[0].name: pca_angle(datasets[0].X)[0]})
         self._em(datasets, theta0, n_iter, tol, verbose, gain_warmup=gain_warmup)
+        # Orientation is a property of the ANSWER, not of the seed. It used
+        # to be applied only inside stagewise_init, which a single-dataset
+        # fit never calls (theta0 comes straight from the PCA angle there),
+        # so fit(orient_by=...) on one experiment silently did nothing and
+        # the handedness fell out of whichever way the PCA happened to
+        # point -- refits of the same cells came out mirrored from each
+        # other, and from the stored models. Re-applying it here makes the
+        # constraint hold whatever path produced theta0.
+        if orient_by is not None:
+            early = [g for g in orient_by[0] if g in self.gi]
+            late = [g for g in orient_by[1] if g in self.gi]
+            if early and late:
+                self.orient(early, late)
         # fit-quality reference: the training cells' per-count evidence
         # under a UNIFORM prior, by octile of the panel total
         for d in datasets:
