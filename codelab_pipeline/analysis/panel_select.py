@@ -169,6 +169,19 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
     after = cyc & (th >= 90.0) & (th < 270.0)
     g2g1 = (float(np.nanmedian(dna[before]) / np.nanmedian(dna[after]))
             if found and before.sum() >= 20 and after.sum() >= 20 else np.nan)
+    # How far the fitted ring stands from its own centre at its weakest
+    # angle, in units of the ring's radius. A panel whose ring returns to
+    # its centre has a stretch where 'on the ring' and 'no phase' are one
+    # composition: no gate can tell them apart and no angle can be
+    # trusted there. Measured on the stores: JP_002 0.63 at nine genes
+    # and 0.58 at six, but 0.31 at five whichever fifth gene is used --
+    # a size floor, not one missing gene. chr19 reads 0.20 at every size
+    # and JP_001 falls 0.22 -> 0.15 -> 0.09 -> 0.06 from 19 to 4 genes.
+    # Fisher share cannot see this: it ranks by information per gene,
+    # and the ring closes or folds on the arrangement of the peaks.
+    ring = CC.clr(np.exp(m.log_pi(data.name)))
+    rdist = np.linalg.norm(ring - ring.mean(0), axis=1)
+    ring_gap = float(rdist.min() / max(np.median(rdist), 1e-12))
     share = m.fisher_share(data.name)
     _pk, f_pk = m.peak_phase()
     s = np.array([share[g] for g in genes], float)
@@ -180,6 +193,7 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
                 'dna_g2_over_g1': g2g1,
                 'dna_r2': _binned_r2(th[cyc], dna[cyc]), 'area_r2': _binned_r2(th[cyc], area[cyc]),
                 'on_ring': float(on[k].mean()), 'R_med': float(np.median(placed['R'][k])),
+                'ring_gap': ring_gap, 'folds': bool(ring_gap < MIN_RING_GAP),
                 'effective_genes': float(np.exp(-(s * np.log(s + 1e-12)).sum())),
                 'inv_simpson': float(1.0 / (s ** 2).sum()), 'top_share': float(s.max()),
                 'fisher_share': {g: float(share[g]) for g in genes},
@@ -272,6 +286,17 @@ def arrested_shift(row, reference, tol_deg=45.0):
     return worst <= float(tol_deg), worst
 
 
+MIN_RING_GAP = 0.5
+"""How close the fitted ring may come to its own centre, as a fraction
+of its radius, before the panel is set aside. Below this the ring runs
+through the composition that has no phase, and at those angles nothing
+in the model separates a cell on the ring from a cell at the centre:
+simulated on the stores, the fixed gate kept 15% of true on-ring cells
+at chr19's fold and 9% at JP_001's, and the calibrated gate keeps them
+by refusing to decide. Panels are compared on this before the objective
+because the objective cannot see it -- a folded panel scores well on
+the cells it can still place."""
+
 MIN_DNA_RATIO = 1.2
 """The smallest before/after DNA ratio a panel may report and still be
 considered. The physical value is 2; the three stores read 1.45-1.83
@@ -281,10 +306,12 @@ no biology behind it. Measured: chr19's greedy elimination reached four
 genes with the best DNA R2 on the board (0.263) and a ratio of 0.93."""
 
 
-def rank(row, reference=None, key='dna_r2', tol_deg=45.0, min_ratio=MIN_DNA_RATIO):
+def rank(row, reference=None, key='dna_r2', tol_deg=45.0, min_ratio=MIN_DNA_RATIO,
+         min_ring_gap=MIN_RING_GAP):
     """The lexicographic score the searches maximise: a panel that finds
-    its division origin, then one whose DNA actually doubles over the
-    cycle (before/after ratio >= min_ratio), then one whose arrested
+    its division origin, then one whose ring stays clear of its own
+    centre, then one whose DNA actually doubles over the cycle
+    (before/after ratio >= min_ratio), then one whose arrested
     populations have not moved, and only then the objective.
 
     Ranking this way (instead of the objective alone) is what keeps a
@@ -292,11 +319,14 @@ def rank(row, reference=None, key='dna_r2', tol_deg=45.0, min_ratio=MIN_DNA_RATI
     arrested anchors for a better DNA R2 -- each of those trades was
     observed on the real stores before the condition was added."""
     if not row.get('fitted'):
-        return (-1, -1, -1, -np.inf)
+        return (-1, -1, -1, -1, -np.inf)
     ok, _worst = arrested_shift(row, reference, tol_deg)
     ratio = row.get('dna_g2_over_g1', np.nan)
     doubles = 1 if (np.isfinite(ratio) and ratio >= float(min_ratio)) else 0
-    return (1 if row.get('origin_found') else 0, doubles, 1 if ok else 0, objective(row, key))
+    gap = row.get('ring_gap', np.nan)
+    open_ring = 1 if (not np.isfinite(gap) or gap >= float(min_ring_gap)) else 0
+    return (1 if row.get('origin_found') else 0, open_ring, doubles, 1 if ok else 0,
+            objective(row, key))
 
 
 def forward(data, genes=None, max_genes=None, seeds=DEFAULT_SEEDS, key='dna_r2', runner=None,

@@ -194,6 +194,17 @@ def main():
     check('profile_agreement reports the correlation and both swings', rho > 0.9 and cs > 3 and acs > 3,
           f'rho {rho:.2f} cand {cs:.1f} acc {acs:.1f}')
 
+    # -- the fold: a ring that returns to its own centre is not usable --------
+    print('ring_gap')
+    folded = dict(fitted=True, origin_found=True, dna_g2_over_g1=1.6, dna_r2=0.30, ring_gap=0.20)
+    open_r = dict(fitted=True, origin_found=True, dna_g2_over_g1=1.6, dna_r2=0.10, ring_gap=0.70)
+    check('a folded panel loses to an open one even with a better objective',
+          PS.rank(open_r) > PS.rank(folded), f'open {PS.rank(open_r)} vs folded {PS.rank(folded)}')
+    check('among open panels the objective still decides',
+          PS.rank(dict(open_r, dna_r2=0.31)) > PS.rank(open_r))
+    check('a row from before ring_gap existed is treated as open',
+          PS.rank({kk: vv for kk, vv in open_r.items() if kk != 'ring_gap'}) == PS.rank(open_r))
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         print('FAILED:', FAIL)
