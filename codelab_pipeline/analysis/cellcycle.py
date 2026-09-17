@@ -213,20 +213,6 @@ def _simulate_cells(rng, pi, alpha, total, n):
     return rng.multinomial(int(total), p).astype(float)
 
 
-def _ring_tails(qbf, qrad, levels, bf, rad, Q):
-    """Posterior-averaged reference CDFs: for each cell, the probability
-    that a true on-ring cell placed where it is placed scores at or
-    below its bf_ring (and its radius). qbf/qrad are (T, L) quantile
-    tables at the cell's depth, Q the (n, T) posteriors."""
-    T = Q.shape[1]
-    tb = np.zeros(len(bf))
-    tr = np.zeros(len(rad))
-    for t in range(T):
-        tb += Q[:, t] * np.interp(bf, qbf[t], levels, left=0.0, right=1.0)
-        tr += Q[:, t] * np.interp(rad, qrad[t], levels, left=0.0, right=1.0)
-    return tb, tr
-
-
 def _dm_const(X, alpha):
     s = X.sum(1)
     c = gammaln(s + 1) - gammaln(X + 1).sum(1)
@@ -938,24 +924,53 @@ class CycleModel:
         resid = np.linalg.norm(c - c2 @ plane, axis=1)
         return rho, resid
 
+    def ring_level(self, name, X):
+        """Per count, how much better the ring explains this cell than a
+        composition free to be anything:
+
+            [ log P(X | ring, theta marginalised)
+              - log P(X | free composition) ] / total
+
+        A uniform prior over the simplex makes the free hypothesis
+        integrate to lgamma(G) - lgamma(N+G) + lgamma(N+1), a function
+        of the depth alone, so the statistic costs one evidence call.
+
+        This is what the on-ring gate asks. The older pair (bf_ring >= 0
+        and radius >= 0.5) compares the cell with the ring's CENTRE
+        instead, which is a different question and the wrong one: a
+        random composition lies far from the centre too and sails
+        through it (measured: 72-97% of random compositions and 88-100%
+        of gene-scrambled ones pass on the three panels), while cells
+        NEAR the centre are rejected -- and those are exactly the cells
+        a panel whose ring folds through its centre places on its ring.
+        Against ring_level a random composition scores -0.13 to -0.17
+        per count where a true on-ring cell scores about +0.03.
+        """
+        X = np.asarray(X, float)
+        G = X.shape[1]
+        N = X.sum(1)
+        free = gammaln(G) - gammaln(N + G) + gammaln(N + 1)
+        return (self.evidence(name, X, prior='uniform') - free) / np.maximum(N, 1.0)
+
     def ring_reference(self, name, totals, n_sim=200, seed=0, n_bins=6, levels=RING_LEVELS):
         """What a cell that truly sits ON the ring scores, at every grid
-        angle and at a few depths: cells are simulated from the fitted
+        angle and a few depths: cells are simulated from the fitted
         composition of each angle (Dirichlet-multinomial with the
-        panel's alpha, totals drawn from the depth bin) and the lower
-        quantiles of their bf_ring and radius are kept.
+        panel's alpha, totals drawn from the depth bin) and the
+        quantiles of their ring_level are kept.
 
-        Why: bf_ring compares a cell with the ring's CENTRE, and where
-        the fitted curve comes back to its centre -- both real panels
-        without an early-G1 signal do this right after division -- a
-        cell truly on the ring scores a NEGATIVE log Bayes factor by
-        construction (the ring's marginal spreads mass over angles that
-        do not fit) and radius() loses its unit. The fixed gate
-        (bf >= 0, radius >= 0.5) then removes 85-90% of the true
-        on-ring cells at those angles (chr19 45-75 deg, JP_001 345-0
-        deg) and 96-99% of the real cells placed there. A gate that
-        asks 'does this cell score like a true on-ring cell at ITS
-        angle and depth' has a fixed miss rate everywhere instead."""
+        Keyed by where the simulated cells are PLACED, not by the angle
+        they came from: on_ring judges a real cell through its
+        posterior, so the reference has to be built the same way, or a
+        cell whose posterior straddles two angles is held to a standard
+        neither of them sets.
+
+        Why calibrate at all: ring_level drifts along theta, because the
+        fitted composition is sharper at some angles than others, so one
+        flat threshold would cut hardest where the model is least
+        certain. Against this reference the gate keeps true on-ring
+        cells at the same rate everywhere -- measured 0.96-0.97 at both
+        a fold and the far side of the ring, on all three panels."""
         rng = np.random.default_rng(seed)
         totals = np.asarray(totals, float)
         totals = totals[np.isfinite(totals) & (totals > 0)]
@@ -966,118 +981,80 @@ class CycleModel:
         reps = np.array([max(int(round(np.median(totals[b_all == b]))), 1) if (b_all == b).any() else 1
                          for b in range(len(cuts) + 1)])
         levels = np.asarray(levels, float)
-        pis = np.exp(self.log_pi(name))                      # (T, G)
+        pis = np.exp(self.log_pi(name))
         alpha = self.alphas[name]
-        bf = np.empty((self.T, len(reps), len(levels)))
-        rad = np.empty_like(bf)
-        sq = np.empty_like(bf)
+        tab = np.empty((self.T, len(reps), len(levels)))
         for b, N in enumerate(reps):
             Xs = np.vstack([_simulate_cells(rng, pis[t], alpha, int(N), n_sim) for t in range(self.T)])
-            s_bf = self.bf_ring(name, Xs)
-            s_rad = self.radius(name, Xs)[0]
-            # The reference for angle t is what on-ring cells PLACED at t
-            # score -- every simulated cell weighted by its posterior mass
-            # at t -- not what cells simulated at t score. on_ring judges
-            # a real cell through its posterior, so the reference must be
-            # built the same way, or a cell whose posterior straddles a
-            # fold is held to the standard of the angles beside it.
+            lv = self.ring_level(name, Xs)
             Q = self.posterior(name, Xs, prior='uniform')
-            o_bf, o_rad = np.argsort(s_bf), np.argsort(s_rad)
+            o = np.argsort(lv)
             for t in range(self.T):
-                w = Q[:, t]
-                if w.sum() <= 0:
-                    w = np.ones(len(w))
-                cw = np.cumsum(w[o_bf]) / w.sum()
-                bf[t, b, :] = np.interp(levels, cw, s_bf[o_bf])
-                cw = np.cumsum(w[o_rad]) / w.sum()
-                rad[t, b, :] = np.interp(levels, cw, s_rad[o_rad])
-            # Second level: the two tails are correlated away from the
-            # fold and independent on it, so 'both tails >= level' misses
-            # anywhere between level and 2*level. The gate therefore uses
-            # the smaller tail, calibrated the same way once more: its
-            # own reference, per angle, from these same cells.
-            s = np.minimum(*_ring_tails(bf[:, b, :], rad[:, b, :], levels, s_bf, s_rad, Q))
-            o_s = np.argsort(s)
-            for t in range(self.T):
-                w = Q[:, t]
-                if w.sum() <= 0:
-                    w = np.ones(len(w))
-                cw = np.cumsum(w[o_s]) / w.sum()
-                sq[t, b, :] = np.interp(levels, cw, s[o_s])
-        self.ring_ref[name] = {'cuts': cuts, 'totals': reps.astype(float), 'levels': levels, 'bf': bf, 'rad': rad, 's': sq}
+                w = Q[o, t]
+                s = float(w.sum())
+                if s <= 0:
+                    w, s = np.ones(len(o)), float(len(o))
+                tab[t, b, :] = np.interp(levels, np.cumsum(w) / s, lv[o])
+        self.ring_ref[name] = {'cuts': cuts, 'totals': reps.astype(float), 'levels': levels, 'lvl': tab}
         return self.ring_ref[name]
 
-    def on_ring(self, name, X, level=0.1, placed=None):
-        """The angle-aware on-ring verdict: (mask, tail, parts).
+    def _level_tail(self, name, X, placed):
+        """Per cell, the probability that a cell truly on the ring,
+        placed where this one is placed and read as deeply, scores a
+        ring_level at or below its own. NaN without a reference."""
+        ref = self.ring_ref.get(name)
+        X = np.asarray(X, float)
+        if ref is None or 'lvl' not in ref:
+            return np.full(len(X), np.nan)
+        lv = self.ring_level(name, X)
+        q = placed['posterior']
+        levels = ref['levels']
+        b = np.clip(np.searchsorted(ref['cuts'], X.sum(1), side='right'), 0, ref['lvl'].shape[1] - 1)
+        out = np.zeros(len(lv))
+        for bi in np.unique(b):
+            k = b == bi
+            for t in range(self.T):
+                out[k] += q[k, t] * np.interp(lv[k], ref['lvl'][t, bi], levels, left=0.0, right=1.0)
+        return out
 
-        For each cell, parts[:, 0] is the probability that a TRUE
-        on-ring cell placed where this cell is placed (its posterior on
-        the angle grid, its depth) scores a bf_ring at or below the
-        cell's own, parts[:, 1] the same for the radius, and `tail` the
-        smaller of the two calibrated once more against the same
-        reference.
+    def on_ring(self, name, X, miss=0.05, placed=None):
+        """(mask, tail). The cell is on the ring when its tail (see
+        _level_tail) is at least `miss`, so true on-ring cells are lost
+        at a rate of about `miss` at EVERY angle -- by construction, not
+        by threshold, and a fold is no longer a hole.
 
-        The verdict is the UNION of the old fixed gate and this one:
+        What this does NOT ask is whether the cell sits inside the ring
+        rather than on it. That question needs the centre as its
+        reference, it has no answer wherever the ring passes through its
+        own centre, and asking it anyway is what made the old gate empty
+        those angles. Cells halfway in pass here (0.93-0.97); R is what
+        says whether a cell may carry an angle.
 
-            bf >= 0 and radius >= 0.5    or    tail >= level
-
-        so a cell the fixed gate accepted is never rejected, and true
-        on-ring cells are missed at a rate of AT MOST `level` at every
-        angle, fold included -- by construction, not by threshold.
-
-        The union matters because a flat quantile cuts both ways: at
-        angles where the ring stands well away from its centre the
-        fixed gate misses almost nothing, and applying `level` there
-        would make a sound panel stricter for no reason (measured on
-        JP_002, whose ring never folds: its 0-30 deg bin fell from 1.00
-        to 0.78 under the quantile alone and returns to 1.00 under the
-        union, while the fold-shaped bins stay rescued, 0.54 -> 0.90).
-        The fixed gate's failure is false negatives at a fold, not
-        false positives away from one: it passes 1-12% of true centre
-        cells. So the first clause decides wherever it can and the
-        calibrated one only ever adds cells back.
-
-        The posterior average matters: a cell whose composition is the
-        centre's has its posterior on the fold angles, and where a
-        panel folds twice (chr19: 45-75 and 225-240 deg) the posterior
-        MEAN lands between the folds, at an angle whose reference would
-        reject it. Without a reference for this panel the fixed gate
-        (bf >= 0, radius >= 0.5) is applied and the tails are reported
-        as 1 (pass) or 0 (fail)."""
+        Without a reference for this panel the old fixed gate
+        (bf_ring >= 0 and radius >= 0.5) is applied instead, and the
+        tail is reported as 1 (pass) or 0 (fail)."""
         X = np.asarray(X, float)
         if placed is None:
             placed = self.place(name, X)
-        bf, rad = np.asarray(placed['bf_ring'], float), np.asarray(placed['radius'], float)
-        ref = self.ring_ref.get(name)
-        if ref is None:
-            ok = (bf >= 0.0) & (rad >= 0.5)
-            return ok, ok.astype(float), np.column_stack([ok, ok]).astype(float)
-        q = placed.get('posterior')
-        if q is None:
-            q = self.posterior(name, X, prior='uniform')
-        b = np.clip(np.searchsorted(ref['cuts'], X.sum(1), side='right'), 0, len(ref['totals']) - 1)
-        levels = ref['levels']
-        tail = np.zeros(len(X))
-        tail_bf = np.zeros(len(X))
-        tail_rad = np.zeros(len(X))
-        for bi in np.unique(b):
-            k = b == bi
-            tb, tr = _ring_tails(ref['bf'][:, bi, :], ref['rad'][:, bi, :], levels, bf[k], rad[k], q[k])
-            tail_bf[k], tail_rad[k] = tb, tr
-            s = np.minimum(tb, tr)
-            for t in range(self.T):
-                tail[k] += q[k, t] * np.interp(s, ref['s'][t, bi], levels, left=0.0, right=1.0)
-        ok = (tail >= level) | ((bf >= 0.0) & (rad >= 0.5))
-        return ok, tail, np.column_stack([tail_bf, tail_rad])
+        tail = np.asarray(placed.get('ring_tail', np.nan), float) * np.ones(len(X))
+        if not np.isfinite(tail).any():
+            ok = ((np.asarray(placed['bf_ring'], float) >= 0.0)
+                  & (np.asarray(placed['radius'], float) >= 0.5))
+            return ok, ok.astype(float)
+        return tail >= float(miss), tail
+
 
     def place(self, name, X, groups=None, prior='uniform'):
         """Every per-cell verdict at once: theta, R, fit_z, bf_ring,
-        radius (and the posterior)."""
+        radius, ring_level and its calibrated tail (and the posterior)."""
+        X = np.asarray(X, float)
         th, R, q = self.phase(name, X, groups, prior)
         rho, resid = self.radius(name, X)
-        return {'theta': th, 'R': R, 'fit_z': self.fit_z(name, X),
-                'bf_ring': self.bf_ring(name, X), 'radius': rho, 'residual': resid,
-                'posterior': q}
+        out = {'theta': th, 'R': R, 'fit_z': self.fit_z(name, X),
+               'bf_ring': self.bf_ring(name, X), 'radius': rho, 'residual': resid,
+               'ring_level': self.ring_level(name, X), 'posterior': q}
+        out['ring_tail'] = self._level_tail(name, X, out)
+        return out
 
     def spectrum(self, q, smooth=None):
         """A population's spectrum from its cells' posteriors."""
@@ -1172,7 +1149,8 @@ class CycleModel:
 
 COUNT_GATE = 0.5        # the classifier's own operating point (design doc 4.2)
 CAPSULE_VERSION = 1
-CAPSULE_COLUMNS = ('cell', 'theta_deg', 'R', 'fit_z', 'bf_ring', 'radius', 'total')
+CAPSULE_COLUMNS = ('cell', 'theta_deg', 'R', 'fit_z', 'bf_ring', 'radius',
+                   'ring_level', 'ring_tail', 'total')
 
 
 def source_key(src):
@@ -1447,15 +1425,23 @@ def gallery_crops(storage_path, source, wanted, size=64, jobs=None):
 
 def capsule_rows(placed, cell_ids, totals):
     """The per-FOV capsule's rows from place()'s dict, in the order the
-    cells were placed."""
+    cells were placed. A verdict the caller's dict does not carry is
+    written as NaN, the way fit_z already is when a model has no
+    fit-quality reference."""
+    def val(key, i):
+        v = placed.get(key)
+        return float(v[i]) if v is not None else float('nan')
+
     out = []
     for i, cid in enumerate(cell_ids):
         out.append({'cell': int(cid),
                     'theta_deg': float(np.degrees(placed['theta'][i]) % 360.0),
                     'R': float(placed['R'][i]),
-                    'fit_z': float(placed['fit_z'][i]),
-                    'bf_ring': float(placed['bf_ring'][i]),
-                    'radius': float(placed['radius'][i]),
+                    'fit_z': val('fit_z', i),
+                    'bf_ring': val('bf_ring', i),
+                    'radius': val('radius', i),
+                    'ring_level': val('ring_level', i),
+                    'ring_tail': val('ring_tail', i),
                     'total': float(totals[i])})
     return out
 
@@ -1484,6 +1470,7 @@ def categorize(theta_deg, arcs):
 
 
 GATE_KEYS = (('min_R', 'R', 'ge'), ('min_bf_ring', 'bf_ring', 'ge'),
+             ('min_ring_tail', 'ring_tail', 'ge'),
              ('min_fit_z', 'fit_z', 'ge'), ('max_fit_z', 'fit_z', 'le'),
              ('min_radius', 'radius', 'ge'), ('max_radius', 'radius', 'le'),
              ('min_total', 'total', 'ge'))

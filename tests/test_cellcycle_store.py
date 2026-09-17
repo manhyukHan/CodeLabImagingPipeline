@@ -104,12 +104,17 @@ def main():
         print('the placement capsule and the model file')
         rows1 = CC.capsule_rows({'theta': np.radians([10.0, 350.0]), 'R': [0.9, 0.4],
                                  'fit_z': [0.1, -2.5], 'bf_ring': [5.0, -1.0],
-                                 'radius': [1.0, 0.4]}, [1, 2], [120, 40])
+                                 'radius': [1.0, 0.4], 'ring_level': [0.03, -0.12],
+                                 'ring_tail': [0.6, 0.01]}, [1, 2], [120, 40])
         check('capsule rows carry every column', all(set(r) == set(CC.CAPSULE_COLUMNS) for r in rows1)
               and rows1[1]['theta_deg'] == 350.0)
+        bare = CC.capsule_rows({'theta': [0.0], 'R': [0.5]}, [7], [10])
+        check('a verdict the caller did not compute is written as NaN',
+              set(bare[0]) == set(CC.CAPSULE_COLUMNS) and bare[0]['ring_tail'] != bare[0]['ring_tail'])
         A.write_fov_cellcycle(sp, 1, {'version': CC.CAPSULE_VERSION, 'model': 'm1', 'stamp': {}, 'rows': rows1})
         rows2 = CC.capsule_rows({'theta': np.radians([200.0]), 'R': [0.95], 'fit_z': [0.0],
-                                 'bf_ring': [3.0], 'radius': [1.1]}, [2], [80])
+                                 'bf_ring': [3.0], 'radius': [1.1], 'ring_level': [0.04],
+                                 'ring_tail': [0.7]}, [2], [80])
         A.write_fov_cellcycle(sp, 2, {'version': CC.CAPSULE_VERSION, 'model': 'm1', 'stamp': {}, 'rows': rows2})
         back = A.read_fov_cellcycle(sp, 1)
         check('capsule round-trips', back['model'] == 'm1' and back['rows'] == rows1)
