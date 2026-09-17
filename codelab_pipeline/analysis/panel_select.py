@@ -173,12 +173,21 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
     # angle, in units of the ring's radius. A panel whose ring returns to
     # its centre has a stretch where 'on the ring' and 'no phase' are one
     # composition: no gate can tell them apart and no angle can be
-    # trusted there. Measured on the stores: JP_002 0.63 at nine genes
-    # and 0.58 at six, but 0.31 at five whichever fifth gene is used --
-    # a size floor, not one missing gene. chr19 reads 0.20 at every size
-    # and JP_001 falls 0.22 -> 0.15 -> 0.09 -> 0.06 from 19 to 4 genes.
-    # Fisher share cannot see this: it ranks by information per gene,
-    # and the ring closes or folds on the arrangement of the peaks.
+    # trusted there.
+    #
+    # It is a property of WHICH genes, not how many. Every subset of
+    # JP_002's nine was fitted (profile frozen, intercepts refitted):
+    # 69 / 52 / 32 / 19 per cent of the 7- / 6- / 5- / 4-gene subsets
+    # stay open, and the best five (CCNE1, CCNB1, CDT1, CDK1, GAPDH)
+    # read 0.82 -- wider than the full nine at 0.63. Size only changes
+    # the odds that an arbitrary subset works, and how bad the worst one
+    # gets (0.31 -> 0.22 -> 0.08 -> 0.06).
+    #
+    # Fisher share does not predict it. Its top five fold at 0.31 while
+    # the best five reach 0.82: it ranks a gene by the information it
+    # carries, and the ring closes or folds on how the peaks are
+    # arranged around the circle. Searching with this measure in the
+    # rank is what finds the small panels that stay open.
     ring = CC.clr(np.exp(m.log_pi(data.name)))
     rdist = np.linalg.norm(ring - ring.mean(0), axis=1)
     ring_gap = float(rdist.min() / max(np.median(rdist), 1e-12))
@@ -295,7 +304,9 @@ simulated on the stores, the fixed gate kept 15% of true on-ring cells
 at chr19's fold and 9% at JP_001's, and the calibrated gate keeps them
 by refusing to decide. Panels are compared on this before the objective
 because the objective cannot see it -- a folded panel scores well on
-the cells it can still place."""
+the cells it can still place. chr19's eight genes read 0.20 and
+JP_001's nineteen 0.22, so both fold as they stand; JP_002's nine read
+0.63."""
 
 MIN_DNA_RATIO = 1.2
 """The smallest before/after DNA ratio a panel may report and still be
