@@ -843,6 +843,82 @@ class CycleModel:
         self.rotate(shift, flip)
         return shift, flip
 
+    def dna_direction(self, name, X, dna, n_bins=20, min_gap=0.5, min_cells=200):
+        """Which way round the cycle runs, read off the DNA.
+
+        The circle has two mirror images and the likelihood cannot tell
+        them apart: reverse theta, reverse every profile with it, and
+        every cell keeps its likelihood. `orient` breaks the tie with
+        gene roles -- the S genes must peak before the G2/M genes within
+        half a turn -- but that says nothing when the two mean peaks sit
+        a half turn apart, and chr19's are 178 degrees apart, a margin of
+        two degrees.
+
+        DNA settles it, because replication and division are not
+        symmetric in time: the content climbs through S over hours and
+        halves at division in minutes. So the binned DNA is a sawtooth,
+        and its steepest FALL must beat its steepest RISE. Mirroring
+        swaps the two, so the ratio below is the evidence, and it needs
+        no origin -- a rotation moves the bins but not the extremes.
+
+        Two details are not optional. It has to be read in CYCLE TIME,
+        not in degrees: the ring can crawl through division and sprint
+        through S, and then the fall looks gradual (chr19 reads 1.28 in
+        degrees and 1.88 in tau). And cells at angles where the ring
+        passes through its own centre have to go, because their angles
+        are not determined and they smear the fall (JP_001 reads 0.44
+        with them and 1.77 without). Returns (ratio, n) with ratio > 1
+        supporting the current handedness.
+
+        It has power only where the content's own step is resolved.
+        Measured against each stored model AND its mirror image, so a
+        working test must read a number and its reciprocal:
+
+            JP_002   3.37 / 0.25   (DNA halving 2.00, the physical value)
+            JP_001   1.93 / 0.50   (halving 1.85)
+            chr19    1.42 / 1.45   (halving 1.43 -- no power)
+
+        chr19's DAPI resolves the halving least well of the three and
+        the test cannot separate its two mirror images; refits of the
+        same cells read 0.63-0.93 whichever way they are oriented. Read
+        the halving factor beside the ratio, and do not orient on a
+        ratio near 1.
+        """
+        X = np.asarray(X, float)
+        dna = np.asarray(dna, float)
+        placed = self.place(name, X)
+        th = np.degrees(placed['theta']) % 360.0
+        ring = clr(np.exp(self.log_pi(name)))
+        d = np.linalg.norm(ring - ring.mean(0), axis=1)
+        d = d / max(np.median(d), 1e-12)
+        keep = (placed['posterior'] @ d >= float(min_gap)) & np.isfinite(dna) & (dna > 0)
+        if keep.sum() < int(min_cells):
+            return np.nan, int(keep.sum())
+        w = np.histogram(th[keep], bins=self.T, range=(0, 360))[0].astype(float)
+        w = _circ_smooth(w / max(w.sum(), 1), 5)
+        tau_grid = (np.cumsum(w / w.sum()) - w[0] / w.sum() / 2.0) % 1.0
+        tau = np.interp(th[keep], np.degrees(self.grid), tau_grid, period=360)
+        b = np.clip((tau * n_bins).astype(int), 0, n_bins - 1)
+        med = np.array([np.nanmedian(dna[keep][b == i]) if (b == i).sum() >= 8 else np.nan
+                        for i in range(n_bins)])
+        good = np.isfinite(med)
+        if good.sum() < n_bins - 6:
+            return np.nan, int(keep.sum())
+        lm = _circ_smooth(np.log(np.interp(np.arange(n_bins), np.where(good)[0], med[good],
+                                           period=n_bins)), 1)
+        step = np.diff(np.r_[lm, lm[0]])
+        return float((-step.min()) / max(step.max(), 1e-9)), int(keep.sum())
+
+    def orient_by_dna(self, name, X, dna, **kw):
+        """Flip the frame when dna_direction says the cycle runs the
+        other way. Returns (ratio, flipped); a ratio that cannot be
+        measured leaves the model alone."""
+        ratio, n = self.dna_direction(name, X, dna, **kw)
+        if not np.isfinite(ratio) or ratio >= 1.0:
+            return ratio, False
+        self.rotate(0.0, True)
+        return ratio, True
+
     def rotate_to_zero(self, deg):
         """Rotate (no reflection) so the angle `deg` becomes 0 -- the
         origin at a measured event, e.g. division (total_drop_angle)."""
