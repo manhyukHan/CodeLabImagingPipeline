@@ -169,6 +169,21 @@ def test_layout_join_and_channel_role():
     check('the layout supplies the human-readable name',
           fid['readout_name'] == 'Gorab_exon' and fid['datatype'] == 'H'
           and fid['readout_id'] == 15)
+    # -- the per-spot quality: what every count in this project is gated on ---
+    q = E.spot_rows([dict(SPOT, p_exist=0.87, z_status='accepted')])[0]
+    check('p_exist is exported as a number', q['p_exist'] == 0.87, str(q['p_exist']))
+    check('z_status is exported', q['z_status'] == 'accepted', str(q['z_status']))
+    check('a spot with a calibrated p_exist and a fitted z is marked learned',
+          q['engine'] == 'learned', str(q['engine']))
+    old = E.spot_rows([SPOT])[0]
+    check('a spot from before the field reads NaN, not an error',
+          old['p_exist'] != old['p_exist'], str(old['p_exist']))
+    check('and its z_status reads not_fit rather than empty',
+          old['z_status'] == 'not_fit', str(old['z_status']))
+    check('with no calibrated probability it is not called learned', old['engine'] == '')
+    v2 = E.spot_rows([dict(SPOT, p_exist=float('nan'), z_status='accepted')])[0]
+    check('a fitted z alone does not make it learned', v2['engine'] == '')
+
     bare = E.spot_rows([SPOT])[0]
     check('without a layout the columns are blank, not wrong',
           bare['readout_name'] == '' and bare['channel_role'] == '',

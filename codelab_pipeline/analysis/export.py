@@ -44,6 +44,8 @@ import numpy as np
 
 from . import polymer
 
+from codelab_pipeline.models import spot as spot_model  # noqa: E402
+
 DEFAULT_VOXEL_UM = polymer.DEFAULT_VOXEL_UM
 
 
@@ -83,8 +85,27 @@ SPOT_COLUMNS = (
     'adj_x', 'adj_y', 'adj_z',
     'raw_x_um', 'raw_y_um', 'raw_z_um',
     'adj_x_um', 'adj_y_um', 'adj_z_um',
-    'size', 'brightness', 'n_mixture_candidates', 'linked', 'linked_at',
+    'size', 'brightness', 'p_exist', 'z_status', 'engine',
+    'n_mixture_candidates', 'linked', 'linked_at',
 )
+
+
+class _Attr:
+    """A dict seen as an object, for the spot helpers that take either."""
+
+    def __init__(self, d):
+        self._d = d
+
+    def __getattr__(self, name):
+        return self._d.get(name)
+
+
+def _p_exist(s):
+    v = s.get('p_exist')
+    try:
+        return float('nan') if v is None else float(v)
+    except (TypeError, ValueError):
+        return float('nan')
 
 
 def _layout_of(layout_by_modality, modality, hybe):
@@ -153,6 +174,17 @@ def spot_rows(spot_dicts, fov=None, celltype_of=None, voxel_um=DEFAULT_VOXEL_UM,
             'adj_x_um': adj_um[0], 'adj_y_um': adj_um[1], 'adj_z_um': adj_um[2],
             'size': float(s.get('size', float('nan'))),
             'brightness': float(s.get('brightness', float('nan'))),
+            # The per-spot quality, and the two fields that say where it
+            # came from. p_exist is the learned engine's calibrated
+            # probability that the spot exists, and it is what every count
+            # in this project is gated on -- 'count@0.5' means p_exist >=
+            # 0.5. Exporting spots without it leaves a reader unable to
+            # reproduce a single published number. NaN where no learned
+            # engine ran; z_status reads 'not_fit' on anything that
+            # predates the field rather than raising.
+            'p_exist': _p_exist(s),
+            'z_status': spot_model.z_status_of(_Attr(s)),
+            'engine': 'learned' if spot_model.from_learned_engine(s) else '',
             'n_mixture_candidates': len(s.get('mixture_centroids') or ()),
             'linked': bool(s.get('linked', False)),
             'linked_at': s.get('linked_at') or '',
