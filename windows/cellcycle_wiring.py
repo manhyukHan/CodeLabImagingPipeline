@@ -346,6 +346,16 @@ class CellCycleWiring(QtCore.QObject):
             m = CC.CycleModel().fit(datasets, bridge_exclude=hk, orient_by=orient_by)
             if orient_by is not None:
                 m.orient(early, late)
+            # THE DISPERSION IS SET AFTER THE FIT. alpha also weights each
+            # cell in the M-step, so fitting with a depth-dependent one
+            # hands the profiles to the deep cells (measured on JP_001:
+            # the ring came out mirrored). Calibrated here, it only
+            # changes how cells are placed and gated -- and beta stays 0
+            # unless held-out FOVs say it earns its keep.
+            cal = CC.calibrate_dispersion(m, name, X[k], fov_of[k])
+            # the gate needs its reference, and the origin is measured on
+            # the cells the gate keeps, so build it before settling
+            m.ring_reference(name, X[k].sum(1))
             origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
                                                                origin_division, dapi_src, birth, gates)
             placed = m.place(name, X)
@@ -360,6 +370,10 @@ class CellCycleWiring(QtCore.QObject):
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
                     'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
+                    'dispersion': {'alpha0': m.alphas.get(name), 'beta': m.alpha_beta.get(name, 0.0),
+                                   's_ref': m.alpha_sref.get(name), 'gain_per_cell': cal['gain'],
+                                   'min_gain': cal['min_gain'], 'best_single_alpha': cal['best_scalar'],
+                                   'folds': cal['folds']},
                     'train_celltypes': list(train), 'fovs': fovs, 'min_total': int(min_total),
                     'n_train': int(k.sum()), 'n_placed': int(len(X)),
                     'bridges': [d.name for d in bridges], 'orient_by': [early, late],
@@ -369,10 +383,18 @@ class CellCycleWiring(QtCore.QObject):
                     'origin': origin, 'categories_from': arcs_from,
                     'categories': arcs, 'gates': gates, 'birth_deg': birth_used}
             self._persist(sp, spec, placed, keys, X)
-            return m, placed, spec
+            return m, placed, spec, cal
 
         def _done(res):
-            m, placed, spec = res
+            m, placed, spec, cal = res
+            d = spec['dispersion']
+            if d['beta']:
+                self._log(f'dispersion calibrated on held-out FOVs: alpha {d["alpha0"]:g} x (s/{d["s_ref"]:.0f})^'
+                          f'{d["beta"]:g}, worth {d["gain_per_cell"]:+.3f} evidence per cell over the best single '
+                          f'alpha ({d["best_single_alpha"]})')
+            else:
+                self._log(f'dispersion: one alpha ({d["alpha0"]}) kept -- a depth-dependent one earned only '
+                          f'{d["gain_per_cell"]:+.3f} evidence per cell, under the {d["min_gain"]:g} it needs')
             p.FitPushButton.setEnabled(True)
             self._adopt(m, spec, placed, keys, ct, X)
             rep = '; '.join(f'{k_}: flip {v.get("flip")} shift {v.get("shift_deg", float("nan")):.0f} '

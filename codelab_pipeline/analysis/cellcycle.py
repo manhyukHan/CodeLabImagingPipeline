@@ -21,7 +21,19 @@ Counts are Dirichlet-multinomial given the cell's panel total s_i:
 conditioning on the total is what makes cell size, mask depth and
 detection efficiency cancel, and alpha_d is the between-cell dispersion
 of composition at one phase (chosen per experiment by held-out
-evidence: chr19 100, JP_001 300, JP_002 100). Each (experiment,
+evidence: chr19 100, JP_001 300, JP_002 100).
+
+THE DISPERSION MAY DEPEND ON DEPTH: alpha_i = alpha_d (s_i / s_ref)^beta_d,
+beta 0 being the single alpha. A single alpha caps every cell at about
+alpha effective counts, however deep it is. Measured with held-out FOVs
+per depth quintile, JP_001 wants alpha 100 at s ~150 and 1000 at s
+~1000 -- its deep cells are more informative and its shallow ones less
+than one alpha allows, and its shallow cells failed the on-ring gate at
+0.65-0.76 where 0.95 is expected -- while JP_002 wants 100 at every
+depth. The exponent is chosen AFTER the fit, by held-out-FOV evidence
+with the profiles held (calibrate_dispersion): beta enters the
+likelihood, the per-cell weight and the ring reference, and fitting WITH
+it instead hands the profiles to the deep cells. Each (experiment,
 condition) group carries its own free, smoothed prior over the grid --
 the SPECTRUM, which is a result, not an input.
 
@@ -35,7 +47,7 @@ unsynchronised concentration 0.27 -> 0.91).
 THREE VERDICTS PER CELL, because posterior concentration alone cannot
 tell them apart (locally the posterior is von Mises with concentration
 kappa = s_eff * r^2 * rho -- effective count x ring radius^2 x the
-cell's own radial position, s_eff = s(1+alpha)/(s+alpha)):
+cell's own radial position, s_eff = s(1+alpha_i)/(s+alpha_i)):
     R        posterior concentration: how sharply the angle is known
     fit_z    KL distance to the ring against cycling cells of the same
              total: OUTSIDE the ring (drug response, doublets, debris)
@@ -192,8 +204,32 @@ def circular_agreement(a, b):
 
 
 def _dm_loglik(X, api):
-    """(n, T): sum_g lgamma(x + a pi) - lgamma(a pi) for api (T, G)."""
+    """(n, T): sum_g lgamma(x + a pi) - lgamma(a pi) for api (T, G), or
+    (n, T, G) when every cell has its own alpha."""
+    if api.ndim == 3:
+        return (gammaln(X[:, None, :] + api) - gammaln(api)).sum(2)
     return (gammaln(X[:, None, :] + api[None]) - gammaln(api)[None]).sum(2)
+
+
+def _alpha_at(alpha, beta, s_ref, s):
+    """The Dirichlet concentration a cell of panel total s is read with:
+    alpha * (s / s_ref)^beta. None stays None (multinomial); beta 0
+    returns the plain float, so a single-alpha model takes exactly the
+    path it always took. Totals below 1 count as 1 -- a zero total would
+    make the concentration zero and every lgamma infinite."""
+    if alpha is None:
+        return None
+    if not beta:
+        return float(alpha)
+    s = np.maximum(np.asarray(s, float), 1.0)
+    return float(alpha) * (s / float(s_ref)) ** float(beta)
+
+
+def _api(alpha, pi):
+    """alpha * pi for a scalar alpha (T, G) or a per-cell one (n, T, G)."""
+    if np.ndim(alpha) == 0:
+        return alpha * pi
+    return np.asarray(alpha, float)[:, None, None] * pi[None]
 
 
 RING_LEVELS = (0.005, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.99)
@@ -224,9 +260,12 @@ def _dm_const(X, alpha):
 class Dataset:
     """One experiment's counts: X (n, |genes|), gene names in column order,
     a condition label per cell, and the dispersion alpha (None =
-    multinomial)."""
+    multinomial). alpha_beta makes the dispersion depend on depth,
+    alpha_i = alpha * (s_i / alpha_sref)^alpha_beta; alpha_sref defaults
+    to the median panel total of these cells."""
 
-    def __init__(self, name, X, genes, groups=None, alpha=DEFAULT_ALPHA, dapi=None):
+    def __init__(self, name, X, genes, groups=None, alpha=DEFAULT_ALPHA, dapi=None,
+                 alpha_beta=0.0, alpha_sref=None):
         self.name = str(name)
         self.X = np.asarray(X, float)
         # log DAPI per cell, already normalised within its FOV; NaN where
@@ -238,6 +277,15 @@ class Dataset:
         self.groups = (np.asarray(groups, dtype=object) if groups is not None
                        else np.array(['all'] * len(self.X), dtype=object))
         self.alpha = None if alpha is None else float(alpha)
+        self.alpha_beta = 0.0 if alpha is None else float(alpha_beta or 0.0)
+        s = self.X.sum(1)
+        self.alpha_sref = (float(alpha_sref) if alpha_sref is not None
+                           else float(np.median(s[s > 0])) if (s > 0).any() else 1.0)
+
+    def alpha_cells(self):
+        """The concentration each of these cells is read with (None, one
+        float, or one per cell)."""
+        return _alpha_at(self.alpha, self.alpha_beta, self.alpha_sref, self.X.sum(1))
 
 
 # -- the model ----------------------------------------------------------------
@@ -271,7 +319,9 @@ class CycleModel:
         self.c = {}                 # name -> DAPI offset
         self.sigma = {}             # name -> DAPI residual sd
         self.w = {}                 # (name, group) -> (T,) spectrum
-        self.alphas = {}            # name -> alpha
+        self.alphas = {}            # name -> alpha (at the reference depth when beta != 0)
+        self.alpha_beta = {}        # name -> depth exponent of the dispersion (0 = one alpha)
+        self.alpha_sref = {}        # name -> the reference panel total of that exponent
         self.panels = {}            # name -> [genes]
         self.cols = {}              # name -> gene indices into self.genes
         self.ref = {}               # name -> fit-quality reference (edges, mean, sd)
@@ -299,6 +349,8 @@ class CycleModel:
             self.panels[d.name] = list(d.genes)
             self.cols[d.name] = np.array([self.gi[g] for g in d.genes])
             self.alphas[d.name] = d.alpha
+            self.alpha_beta[d.name] = d.alpha_beta
+            self.alpha_sref[d.name] = d.alpha_sref
             self.s[d.name] = np.ones(len(d.genes))
             # a gain is redundant with the gene's own (b, c) unless the
             # gene is also fitted somewhere else: free it only then
@@ -340,12 +392,21 @@ class CycleModel:
         eta = (self.B @ coef[gidx].T) * sv[aidx][None, :] + a[aidx][None, :]
         return eta - logsumexp(eta, axis=1, keepdims=True)
 
+    def alpha_of(self, name, X=None, total=None):
+        """The concentration rows of X (or cells of panel total `total`)
+        are read with: None (multinomial), one float (beta 0), or one per
+        row. It follows the total of the counts it is given, so a subset
+        placement reads a cell at its subset depth."""
+        s = np.asarray(X, float).sum(1) if total is None else total
+        return _alpha_at(self.alphas[name], self.alpha_beta.get(name, 0.0),
+                         self.alpha_sref.get(name, 1.0), s)
+
     def loglik_grid(self, name, X, coef=None, a=None, subset=None, alpha='own'):
-        alpha = self.alphas[name] if alpha == 'own' else alpha
+        alpha = self.alpha_of(name, X) if isinstance(alpha, str) and alpha == 'own' else alpha
         lpi = self.log_pi(name, coef, a, subset)
         if alpha is None:
             return X @ lpi.T
-        return _dm_loglik(X, alpha * np.exp(lpi))
+        return _dm_loglik(X, _api(alpha, np.exp(lpi)))
 
     def posterior(self, name, X, groups=None, prior='spectrum', subset=None, aux=None):
         """(n, T). prior='spectrum' uses the fitted group spectra (groups
@@ -381,7 +442,7 @@ class CycleModel:
                 k = groups == c
                 w = self.w.get((name, c), np.full(self.T, 1.0 / self.T))
                 out[k] = logsumexp(ll[k] + np.log(w + 1e-300)[None, :], axis=1)
-        return out + _dm_const(X, self.alphas[name])
+        return out + _dm_const(X, self.alpha_of(name, X))
 
     # -- fitting --
 
@@ -437,7 +498,8 @@ class CycleModel:
             mass = {}
             for d in datasets:
                 s = d.X.sum(1)
-                w = np.ones_like(s) if d.alpha is None else (1.0 + d.alpha) / (s + d.alpha)
+                ac = d.alpha_cells()
+                w = np.ones_like(s) if ac is None else (1.0 + ac) / (s + ac)
                 mass[d.name] = float((s * w).sum())
             target = float(np.mean(list(mass.values())))
             self.dataset_scale = {n: target / max(m, 1e-9) for n, m in mass.items()}
@@ -452,9 +514,11 @@ class CycleModel:
             # (measured on the real joint fit: chr19 collapsed to one lobe,
             # the two nocodazole anchors drifted 90 deg apart). Scaling each
             # cell's counts to its effective count restores the balance the
-            # exact M-step has; the polish then refines from there.
-            w = np.ones_like(s) if d.alpha is None else (1.0 + d.alpha) / (s + d.alpha)
-            pre[d.name] = (q, q.T @ (d.X * w[:, None]), q.T @ (s * w))
+            # exact M-step has; the polish then refines from there. With a
+            # depth-dependent alpha the weight is each cell's own.
+            ac = d.alpha_cells()
+            w = np.ones_like(s) if ac is None else (1.0 + ac) / (s + ac)
+            pre[d.name] = (q, q.T @ (d.X * w[:, None]), q.T @ (s * w), ac)
 
         def f(v):
             coef, a, s = self._unpack(v, names)
@@ -462,17 +526,23 @@ class CycleModel:
             gcoef = self.l2 * coef
             ga, gs = {}, {}
             for d in datasets:
-                q, Sx, Ss = pre[d.name]
+                q, Sx, Ss, ac = pre[d.name]
                 lpi = self.log_pi(d.name, coef, a[d.name], s=s[d.name])
                 pi = np.exp(lpi)
-                if not exact or d.alpha is None:
+                if not exact or ac is None:
                     val -= (Sx * lpi).sum()
                     g_eta = -(Sx - Ss[:, None] * pi)
-                else:
-                    api = d.alpha * pi
+                elif np.ndim(ac) == 0:
+                    api = ac * pi
                     Xb = d.X[:, None, :]
                     val -= (q[:, :, None] * (gammaln(Xb + api[None]) - gammaln(api)[None])).sum()
-                    dpi = d.alpha * (q[:, :, None] * (digamma(Xb + api[None]) - digamma(api)[None])).sum(0)
+                    dpi = ac * (q[:, :, None] * (digamma(Xb + api[None]) - digamma(api)[None])).sum(0)
+                    g_eta = -(pi * (dpi - (pi * dpi).sum(1, keepdims=True)))
+                else:
+                    api = _api(ac, pi)                          # (n, T, G)
+                    Xb = d.X[:, None, :]
+                    val -= (q[:, :, None] * (gammaln(Xb + api) - gammaln(api))).sum()
+                    dpi = (q[:, :, None] * ac[:, None, None] * (digamma(Xb + api) - digamma(api))).sum(0)
                     g_eta = -(pi * (dpi - (pi * dpi).sum(1, keepdims=True)))
                 sv = s[d.name]
                 gcoef[self.cols[d.name]] += (g_eta * sv[None, :]).T @ self.B
@@ -607,7 +677,8 @@ class CycleModel:
             # every experiment aligned to that anchor inherited the error
             m = CycleModel(K=self.K, T=self.T, prior_smooth=self.prior_smooth, l2=self.l2,
                            mstep=self.mstep, polish=self.polish, patience=self.patience)
-            m._fit_single(Dataset(d.name, d.X, d.genes, d.groups, alpha=d.alpha))
+            m._fit_single(Dataset(d.name, d.X, d.genes, d.groups, alpha=d.alpha,
+                                  alpha_beta=d.alpha_beta, alpha_sref=d.alpha_sref))
             if orient_by is not None:
                 early = [g for g in orient_by[0] if g in m.gi]
                 late = [g for g in orient_by[1] if g in m.gi]
@@ -974,14 +1045,14 @@ class CycleModel:
 
     def bf_ring(self, name, X):
         """log Bayes factor, ring (uniform over angles) vs centre."""
-        alpha = self.alphas[name]
+        alpha = self.alpha_of(name, X)
         ring = self.evidence(name, X, prior='uniform')
         pc = self.centre(name)
         if alpha is None:
             cen = X @ np.log(pc) + _dm_const(X, None)
         else:
-            api = alpha * pc
-            cen = (gammaln(X + api[None]) - gammaln(api)[None]).sum(1) + _dm_const(X, alpha)
+            api = (np.asarray(alpha, float)[:, None] if np.ndim(alpha) else alpha) * pc[None]
+            cen = (gammaln(X + api) - gammaln(api)).sum(1) + _dm_const(X, alpha)
         return ring - cen
 
     def radius(self, name, X, pseudo=0.5):
@@ -1071,9 +1142,14 @@ class CycleModel:
                          for b in range(len(cuts) + 1)])
         levels = np.asarray(levels, float)
         pis = np.exp(self.log_pi(name))
-        alpha = self.alphas[name]
         tab = np.empty((self.T, len(reps), len(levels)))
         for b, N in enumerate(reps):
+            # each depth bin is simulated with the dispersion of ITS depth:
+            # with one alpha for every bin, a panel whose shallow cells are
+            # noisier than its deep ones fails its own shallow cells
+            # (JP_001: on-ring 0.76 in the lowest depth quintile)
+            alpha = self.alpha_of(name, total=float(N))
+            alpha = None if alpha is None else float(alpha)
             Xs = np.vstack([_simulate_cells(rng, pis[t], alpha, int(N), n_sim) for t in range(self.T)])
             lv = self.ring_level(name, Xs)
             Q = self.posterior(name, Xs, prior='uniform')
@@ -1203,6 +1279,8 @@ class CycleModel:
                          'h': None if self.h is None else self.h.tolist(),
                          'c': dict(self.c), 'sigma': dict(self.sigma)},
                 'alphas': dict(self.alphas),
+                'alpha_beta': {n: float(v) for n, v in self.alpha_beta.items()},
+                'alpha_sref': {n: float(v) for n, v in self.alpha_sref.items()},
                 'w': [[n, str(c), v.tolist()] for (n, c), v in self.w.items()],
                 'ref': {n: {k: np.asarray(v).tolist() for k, v in r.items()} for n, r in self.ref.items()},
                 'ring_ref': {n: {k: np.asarray(v).tolist() for k, v in r.items()} for n, r in self.ring_ref.items()}}
@@ -1226,7 +1304,10 @@ class CycleModel:
         m.c = {k: float(v) for k, v in (dp.get('c') or {}).items()}
         m.sigma = {k: float(v) for k, v in (dp.get('sigma') or {}).items()}
         m.alphas = {n: (None if v is None else float(v)) for n, v in d['alphas'].items()}
-        m.w = {(n, c): np.asarray(v, float) for n, c, v in d['w']}
+        # a model written before the depth exponent existed has one alpha
+        m.alpha_beta = {n: float(v) for n, v in (d.get('alpha_beta') or {}).items()}
+        m.alpha_sref = {n: float(v) for n, v in (d.get('alpha_sref') or {}).items()}
+        m.w ={(n, c): np.asarray(v, float) for n, c, v in d['w']}
         m.ref = {n: {k: np.asarray(v, float) for k, v in r.items()} for n, r in d.get('ref', {}).items()}
         m.ring_ref = {n: {k: np.asarray(v, float) for k, v in r.items()} for n, r in (d.get('ring_ref') or {}).items()}
         return m
@@ -1663,6 +1744,109 @@ def _alpha_fold_iter(item):
     return float(m.evidence('cv', X[test], prior='uniform').mean())
 
 
+def _calibration_fold(item):
+    """One fold of calibrate_dispersion: fit the profiles on the training
+    FOVs at the model's own alpha, then score the held-out cells under
+    every (alpha, beta) candidate."""
+    X, genes, train, test, fit_alpha, cands, s_ref, K, kw, n_iter = item
+    m = CycleModel(K=K, **kw)
+    m.fit([Dataset('cv', X[train], genes, alpha=fit_alpha)], n_iter=n_iter)
+    m.alpha_sref['cv'] = float(s_ref)
+    out = {}
+    for a0, beta in cands:
+        m.alphas['cv'] = None if a0 is None else float(a0)
+        m.alpha_beta['cv'] = 0.0 if a0 is None else float(beta)
+        out[(a0, beta)] = m.evidence('cv', X[test], prior='uniform')
+    return out
+
+
+DISPERSION_ALPHAS = (30, 50, 100, 200, 300, 500, 1000, 2000, None)
+DISPERSION_BETAS = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5)
+DISPERSION_MIN_GAIN = 0.1       # evidence per cell a beta must earn to be adopted
+
+
+def calibrate_dispersion(model, name, X, fov, alphas=DISPERSION_ALPHAS, betas=DISPERSION_BETAS,
+                         folds=5, seed=0, jobs=None, n_iter=20, n_depth=5,
+                         min_gain=DISPERSION_MIN_GAIN, apply=True):
+    """Set the dispersion a placed cell is read with, AFTER the profiles
+    are fitted: alpha_i = alpha_0 (s_i / s_ref)^beta, chosen by held-out
+    evidence in folds of whole FOVs.
+
+    WHY AFTER THE FIT. alpha also weights each cell in the M-step
+    ((1+alpha_i)/(s_i+alpha_i) effective counts), so fitting WITH a
+    depth-dependent alpha hands the profiles to the deep cells: measured
+    on JP_001 (beta 1), the ring came out 10.5 deg away and MIRRORED,
+    its DNA ratio across division fell 1.62 -> 1.37, and the deepest
+    cells then failed their own gate (0.81 kept). Applied after the fit
+    the same calibration moves placements by 0.7 deg, leaves the DNA
+    ratio at 1.60, and evens the gate across depth (0.77 -> 0.94 in the
+    shallowest fifth).
+
+    WHY FOLDS OF FOVS. Cells of one field share its focus, background and
+    stain; random folds put a field's twins on both sides and reward the
+    alpha that fits that field's quirks.
+
+    WHEN IT DOES NOTHING. beta is adopted only if it earns `min_gain`
+    evidence per cell over the best single alpha -- on JP_002 it earns
+    0.036 and the single alpha is kept; on JP_001, 0.24, and alpha(s) is
+    taken (its depth quintiles want alpha 100 to 1000).
+
+    `X` and `fov` are the cells the model was fitted on. With apply=True
+    and the gain cleared, the model's dispersion is replaced and its ring
+    reference dropped, so the caller rebuilds it (ring_reference) before
+    gating. Returns the report."""
+    from codelab_pipeline import parallel
+    X = np.asarray(X, float)
+    fov = np.asarray(fov)
+    if len(fov) != len(X):
+        raise ValueError('calibrate_dispersion: one FOV label per cell')
+    genes = list(model.panels[name])
+    if X.shape[1] != len(genes):
+        raise ValueError(f'calibrate_dispersion: X has {X.shape[1]} columns, the panel has {len(genes)}')
+    s = X.sum(1)
+    s_ref = float(np.median(s[s > 0])) if (s > 0).any() else 1.0
+    uf = np.unique(fov)
+    if len(uf) < 2:
+        raise ValueError('calibrate_dispersion needs cells from at least two FOVs')
+    folds = int(min(folds, len(uf)))
+    perm = np.random.default_rng(seed).permutation(uf)
+    fold_of = {f: i % folds for i, f in enumerate(perm)}
+    fo = np.array([fold_of[f] for f in fov])
+    cands = [(a, b) for a in alphas for b in (betas if a is not None else (0.0,))]
+    kw = {'T': model.T, 'prior_smooth': model.prior_smooth, 'l2': model.l2,
+          'mstep': model.mstep, 'polish': 0}
+    fit_alpha = model.alphas.get(name)
+    items = [(X, genes, np.flatnonzero(fo != f), np.flatnonzero(fo == f), fit_alpha,
+              cands, s_ref, model.K, kw, n_iter) for f in range(folds)]
+    res = parallel.pmap(_calibration_fold, items, kind='cpu', jobs=jobs)
+    ev = {c: np.full(len(X), np.nan) for c in cands}
+    for f, r in enumerate(res):
+        if isinstance(r, parallel.Failure):
+            raise RuntimeError(f'calibrate_dispersion: fold {f}: {r}')
+        test = np.flatnonzero(fo == f)
+        for c, v in r.items():
+            ev[c][test] = v
+    scores = {c: float(np.nanmean(v)) for c, v in ev.items()}
+    edges = np.quantile(s, np.linspace(0, 1, n_depth + 1)[1:-1])
+    qb = np.searchsorted(edges, s, side='right')
+    by_depth = {c: [float(np.nanmean(v[qb == j])) for j in range(n_depth)] for c, v in ev.items()}
+    best = max(scores, key=lambda c: scores[c])
+    flat = {c: v for c, v in scores.items() if c[1] == 0.0}
+    best_scalar = max(flat, key=lambda c: flat[c])
+    gain = scores[best] - flat[best_scalar]
+    take = bool(apply and best[1] != 0.0 and gain >= float(min_gain))
+    if apply:
+        a0, beta = (best if take else (best_scalar[0], 0.0))
+        model.alphas[name] = None if a0 is None else float(a0)
+        model.alpha_beta[name] = float(beta)
+        model.alpha_sref[name] = s_ref
+        model.ring_ref.pop(name, None)
+    return {'scores': scores, 'by_depth': by_depth, 'depth_edges': edges.tolist(), 's_ref': s_ref,
+            'best': best, 'best_scalar': best_scalar[0], 'gain': float(gain),
+            'adopted': ((best if take else (best_scalar[0], 0.0)) if apply else None),
+            'min_gain': float(min_gain), 'folds': folds, 'n_cells': int(len(X))}
+
+
 def backward_elimination(model, name, X, groups=None, train_group=None, anchors=('Hydroxyurea', 'Nocodazole')):
     """Drop, one at a time, the gene whose removal least degrades the
     placement of the cycling cells (median |dtheta| against the full
@@ -1714,8 +1898,11 @@ def saturation_table(rows, accepted='n_p50', candidates='n_all', min_candidates=
 
 
 def simulate(n=1500, genes=None, K=DEFAULT_K, total=(40, 300), seed=0, coef=None, a=None,
-             theta=None, alpha=None):
-    """Synthetic cells on a circle, for tests and self-checks."""
+             theta=None, alpha=None, alpha_beta=0.0):
+    """Synthetic cells on a circle, for tests and self-checks. alpha_beta
+    makes the dispersion depend on depth, alpha_i = alpha * (s_i /
+    median s)^alpha_beta (the totals are then drawn first, so the random
+    stream differs from the single-alpha one)."""
     rng = np.random.default_rng(seed)
     genes = genes or [f'g{i}' for i in range(9)]
     G = len(genes)
@@ -1727,6 +1914,12 @@ def simulate(n=1500, genes=None, K=DEFAULT_K, total=(40, 300), seed=0, coef=None
     theta = rng.uniform(0, TWO_PI, n) if theta is None else np.asarray(theta, float)
     eta = _basis(theta, K) @ coef.T + a[None, :]
     pi = np.exp(eta - logsumexp(eta, axis=1, keepdims=True))
+    if alpha is not None and alpha_beta:
+        s = rng.integers(total[0], total[1], n)
+        ai = _alpha_at(alpha, alpha_beta, float(np.median(s)), s)
+        pi = np.stack([rng.dirichlet(a_ * p) for a_, p in zip(ai, pi)])
+        X = np.stack([rng.multinomial(int(si), p) for si, p in zip(s, pi)])
+        return X, theta, coef, a, genes
     if alpha is not None:
         pi = np.stack([rng.dirichlet(alpha * p) for p in pi])
     s = rng.integers(total[0], total[1], n)

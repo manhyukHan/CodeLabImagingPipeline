@@ -393,6 +393,89 @@ m2 = CC.CycleModel().fit([CC.Dataset('S1', XA_c, genA, alpha=100.0)], orient_by=
 med2, sgn2, _sh2 = CC.circular_agreement(m1.place('S1', XA_c)['theta'], m2.place('S1', XA_c)['theta'])
 check('two fits of the same cells keep the same handedness', sgn2 > 0, 'mirrored' if sgn2 < 0 else 'same')
 
+# -- 15. depth-dependent dispersion: alpha_i = alpha (s_i / s_ref)^beta --------
+print('depth-dependent alpha')
+from scipy.special import gammaln as _gl, logsumexp as _lse   # noqa: E402
+
+
+def manual_evidence(model, name, Xm, alpha_i):
+    pi_ = np.exp(model.log_pi(name))
+    A = alpha_i[:, None, None] * pi_[None]
+    ll = (_gl(Xm[:, None, :] + A) - _gl(A)).sum(2)
+    s_ = Xm.sum(1)
+    return (_lse(ll, axis=1) - np.log(model.T) + _gl(s_ + 1) - _gl(Xm + 1).sum(1)
+            + _gl(alpha_i) - _gl(s_ + alpha_i))
+
+
+Xs20 = X[:20]
+ev_scalar = m.evidence('A', Xs20, prior='uniform')
+check('beta 0 is the single-alpha likelihood exactly',
+      np.allclose(ev_scalar, manual_evidence(m, 'A', Xs20, np.full(20, 100.0)), atol=1e-8))
+m.alpha_beta['A'], m.alpha_sref['A'] = 0.7, 150.0
+ai = 100.0 * (Xs20.sum(1) / 150.0) ** 0.7
+check('a per-cell alpha is read at each cell\'s own depth',
+      np.allclose(m.evidence('A', Xs20, prior='uniform'), manual_evidence(m, 'A', Xs20, ai), atol=1e-8))
+bf_b = m.bf_ring('A', Xs20)
+check('bf_ring takes the per-cell alpha too (finite, differs from beta 0)',
+      np.isfinite(bf_b).all() and not np.allclose(bf_b, (m.alpha_beta.__setitem__('A', 0.0) or m.bf_ring('A', Xs20))))
+m.alpha_beta['A'] = 0.0
+check('back at beta 0 the evidence is unchanged', np.allclose(m.evidence('A', Xs20, prior='uniform'), ev_scalar))
+
+# synthetic panels: one whose dispersion grows with depth, one with a single alpha
+Xd, thd, _cd, _ad, gd = CC.simulate(n=1500, total=(30, 900), alpha=100.0, alpha_beta=1.0, seed=7)
+Xf, thf, _cf, _af, gf = CC.simulate(n=1500, total=(30, 900), alpha=100.0, seed=7)
+fov_lab = np.random.default_rng(3).integers(0, 10, 1500)
+t0 = time.time()
+md = CC.CycleModel().fit([CC.Dataset('D', Xd, gd, alpha=100.0)])
+mf = CC.CycleModel().fit([CC.Dataset('F', Xf, gf, alpha=100.0)])
+GRID = dict(alphas=(10, 30, 100, 300, 1000), betas=(0.0, 0.5, 1.0, 1.5), folds=3, jobs=1)
+rep_d = CC.calibrate_dispersion(md, 'D', Xd, fov_lab, **GRID)
+rep_f = CC.calibrate_dispersion(mf, 'F', Xf, fov_lab, **GRID)
+check('the depth-dependent panel calibrates to beta > 0 and gains over one alpha',
+      rep_d['adopted'][1] >= 0.5 and rep_d['gain'] > CC.DISPERSION_MIN_GAIN,
+      f"adopted {rep_d['adopted']}, gain {rep_d['gain']:+.3f}/cell")
+check('the single-alpha panel keeps one alpha (its gain does not clear the threshold)',
+      rep_f['adopted'][1] == 0.0 and rep_f['gain'] < CC.DISPERSION_MIN_GAIN,
+      f"adopted {rep_f['adopted']}, gain {rep_f['gain']:+.3f}/cell, {time.time() - t0:.0f}s")
+check('the report carries the per-depth table and the reference depth',
+      all(len(v) == 5 and np.isfinite(v).all() for v in rep_d['by_depth'].values())
+      and rep_d['s_ref'] > 0)
+check('applying the calibration drops the ring reference (the caller rebuilds it)',
+      'D' not in md.ring_ref and md.alpha_beta['D'] == rep_d['adopted'][1])
+
+a_b, b_b = rep_d['adopted']
+
+mb = md                                            # the calibrated model, profiles fitted at one alpha
+ms = CC.CycleModel().fit([CC.Dataset('D', Xd, gd, alpha=rep_d['best_scalar'])])
+medb, _, _ = CC.circular_agreement(thd, mb.phase('D', Xd)[0])
+meds, _, _ = CC.circular_agreement(thd, ms.phase('D', Xd)[0])
+check('the calibration leaves the placements where one alpha put them', deg(medb) <= deg(meds) + 1.0,
+      f'{deg(medb):.1f} vs {deg(meds):.1f} deg against the truth')
+sd_ = Xd.sum(1)
+tert = np.searchsorted(np.quantile(sd_, [1 / 3, 2 / 3]), sd_, side='right')
+onr = {}
+for lab_, mm in (('alpha(s)', mb), ('one alpha', ms)):
+    mm.ring_reference('D', sd_)
+    ok_, _t = mm.on_ring('D', Xd)
+    onr[lab_] = [float(ok_[tert == j].mean()) for j in range(3)]
+check('with alpha(s) the gate keeps true cells at every depth (>= 0.88 in each tertile)', min(onr['alpha(s)']) >= 0.88,
+      f"alpha(s) {np.round(onr['alpha(s)'], 2).tolist()}, one alpha {np.round(onr['one alpha'], 2).tolist()}")
+check('and more evenly than one alpha does',
+      np.ptp(onr['alpha(s)']) < np.ptp(onr['one alpha']), f"spread {np.ptp(onr['alpha(s)']):.2f} vs {np.ptp(onr['one alpha']):.2f}")
+mr = CC.CycleModel.from_dict(mb.to_dict())
+check('alpha_beta and alpha_sref survive to_dict / from_dict',
+      mr.alpha_beta['D'] == mb.alpha_beta['D'] and mr.alpha_sref['D'] == mb.alpha_sref['D']
+      and np.allclose(mr.evidence('D', Xd[:50], prior='uniform'), mb.evidence('D', Xd[:50], prior='uniform')))
+old = mb.to_dict()
+old.pop('alpha_beta')
+old.pop('alpha_sref')
+check('a model saved before the exponent existed reads as one alpha',
+      CC.CycleModel.from_dict(old).alpha_of('D', Xd[:5]) == a_b)
+me_b = CC.CycleModel(mstep='dm').fit([CC.Dataset('D', Xd, gd, alpha=a_b, alpha_beta=b_b,
+                                                 alpha_sref=rep_d['s_ref'])], n_iter=15)
+mede, _, _ = CC.circular_agreement(mb.phase('D', Xd)[0], me_b.phase('D', Xd)[0])
+check('the exact DM M-step runs with a per-cell alpha and agrees with the fast path', deg(mede) < 8, f'{deg(mede):.1f} deg')
+
 
 print(f'\n{len(PASS)} passed, {len(FAIL)} failed' + (f': {FAIL}' if FAIL else ''))
 sys.exit(1 if FAIL else 0)
