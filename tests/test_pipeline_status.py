@@ -89,6 +89,7 @@ def main():
         A.write_spot_dicts(rna, 1, 'RNA', 'Hyb_001', 635, [spot_dict(1, 1, 'Hyb_001', 1)])
         A.write_spot_dicts(rna, 1, 'RNA', 'Hyb_002', 635, [spot_dict(2, 1, 'Hyb_002', 1)])
         A.write_spot_dicts(dna, 1, 'DNA', 'Hyb_001', 555, [dict(spot_dict(3, 1, 'Hyb_001', 1), modality='DNA', channel=555)])
+        A.write_celltype_config(rna, {'A': [(1, 3)]}, {'A': ('Hyb_001', 635, 'RNA')}, {'scale': {}, 'lower_bound': {}, 'upper_bound': {}})
         A.write_fov_cellcycle(rna, 1, {'version': 1, 'model': 'm', 'rows': [{'cell': 1, 'theta_deg': 10.0}, {'cell': 2, 'theta_deg': 20.0}]})
         A.write_fov_alleles(rna, 1, [allele(1, 1, 1, True), allele(2, 1, 2, False)])
 
@@ -139,13 +140,31 @@ def main():
         check('parse_policy', S.parse_policy('segmentation=skip, localization=redo') == {'segmentation': 'skip', 'localization': 'redo'})
         check('parse_fovs', S.parse_fovs('1-3, 7, 9-10') == [1, 2, 3, 7, 9, 10])
         lvl = S.project_level(project)
-        check('project level: no model, no celltype config yet', lvl == {'cellcycle_model': False, 'celltype_config': False}, str(lvl))
-        check('tracing and cell cycle count as configured here', S.tracing_configured(project) and S.cellcycle_configured(project))
+        check('project level: no model yet, celltype config written', lvl == {'cellcycle_model': False, 'celltype_config': True}, str(lvl))
+        check('tracing, cell cycle and celltype count as configured here',
+              S.tracing_configured(project) and S.cellcycle_configured(project) and S.celltype_configured(project))
         bare = dict(project, params={}, modalities={'DNA': project['modalities']['DNA']})
         stb = S.fov_status(bare, 1)
         check('without tracing hybes or countable rounds both steps are n/a', stb['tracing']['state'] == 'n/a' and stb['cellcycle']['state'] == 'n/a',
               str((stb['tracing'], stb['cellcycle'])))
         check('and the plan never runs them', S.plan([dict(fov=1, **stb)])['tracing'] == [] and S.plan([dict(fov=1, **stb)])['cellcycle'] == [])
+        # the project the Celltype tab was never set up on: the step
+        # cannot start, so it must not enter the plan as work to do --
+        # even with typed cells sitting there to be counted. The config
+        # is project-level (<project_root>/analysis), so this needs a
+        # project of its own, not another modality of this one
+        dp2 = os.path.join(root, 'unconfigured')
+        os.makedirs(dp2)
+        paths.write_manifest(dp2, ['RNA'])
+        rna2 = os.path.join(dp2, 'RNA')
+        A.write_cell_dicts(rna2, 1, [cell_dict(1, 1, 'A'), cell_dict(2, 1, 'B')])
+        nct = dict(project, project_root=dp2,
+                   modalities={'RNA': dict(project['modalities']['RNA'], storage_path=rna2)})
+        ct = S.fov_status(nct, 1)['celltype']
+        check('a store with no celltype configuration reports celltype n/a, not done',
+              not S.celltype_configured(nct) and ct['state'] == 'n/a'
+              and ct['detail'] == 'no celltype configuration in the store', str(ct))
+        check('and the plan never runs it', S.plan([dict(fov=1, **S.fov_status(nct, 1))])['celltype'] == [])
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')

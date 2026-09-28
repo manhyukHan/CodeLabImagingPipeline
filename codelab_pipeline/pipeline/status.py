@@ -13,7 +13,8 @@ never from a flag somebody remembered to set:
     localization    every expected (hybe, channel) has a spot slice: the
                     config's localization round, the cell-cycle genes, and
                     every countable readout round
-    celltype        every cell has a celltype                 (deep)
+    celltype        every cell has a celltype (n/a without the store's
+                    celltype configuration)                   (deep)
     cellcycle       the FOV's cellcycle.json places every cell (deep)
     tracing         every allele carries a traced polymer     (deep)
 
@@ -140,6 +141,21 @@ def tracing_configured(project):
     tracing tab shows into an allele."""
     sec = (project.get('params', {}) or {}).get('chromatin_tracing', {}) or {}
     return bool(str(sec.get('hybes', '') or '').strip())
+
+
+def celltype_configured(project):
+    """Cell typing applies when the store carries the Celltype tab's own
+    setup (FOV ranges or barcode channels). Without it the step cannot
+    start at all -- it raises before touching a FOV -- so it is n/a, the
+    same as a project with no tracing hybes, rather than 'missing' work
+    the runner will pick up and fail on."""
+    if not project['modalities']:
+        return False
+    try:
+        ranges, channels, _cal, _method = analysis_store.read_celltype_config(_first_storage(project))
+    except Exception:                                           # noqa: BLE001
+        return False
+    return bool(ranges) or bool(channels)
 
 
 def cellcycle_configured(project):
@@ -321,6 +337,8 @@ def fov_status(project, fov, deep=True, targets=None):
         out['tracing'] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'no tracing hybes configured'}
     if not cellcycle_configured(project):
         out['cellcycle'] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'no cell-cycle genes, model or countable rounds'}
+    if not celltype_configured(project):
+        out['celltype'] = {'state': 'n/a', 'have': 0, 'want': 0, 'detail': 'no celltype configuration in the store'}
     return {s: out[s] for s in STEPS}
 
 
@@ -347,12 +365,7 @@ def project_level(project):
         model = analysis_store.read_cellcycle_model(sp)
     except Exception:                                           # noqa: BLE001
         model = None
-    try:
-        ranges, channels, _cal, method = analysis_store.read_celltype_config(sp)
-        ct = bool(ranges) or bool(channels)
-    except Exception:                                           # noqa: BLE001
-        ct = False
-    return {'cellcycle_model': bool(model), 'celltype_config': ct}
+    return {'cellcycle_model': bool(model), 'celltype_config': celltype_configured(project)}
 
 
 # -- summaries and plans ------------------------------------------------------------
