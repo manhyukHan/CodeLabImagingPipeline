@@ -136,7 +136,7 @@ class PipelineRunner(QtCore.QObject):
 
     def _tick(self):
         if self._current is not None:
-            step, t0, busy, finish, quiet = self._current
+            step, _t0, busy = self._current[0], self._current[1], self._current[2]
             try:
                 if busy():
                     return
@@ -167,10 +167,14 @@ class PipelineRunner(QtCore.QObject):
             self._report['steps'].append({'step': step, 'fovs': fovs, 'mode': mode, 'seconds': 0.0, 'error': msg})
             self.step_finished.emit(step, msg)
             return
-        self._current = (step, t0, busy, finish, quiet)
+        # an overwrite REDOES work the store already calls done, so its
+        # state counts are expected to come back identical -- only an
+        # append can be judged by whether the store moved
+        self._current = (step, t0, busy, finish, quiet,
+                         self._state_counts(step) if mode != 'overwrite' else None)
 
     def _finish_current(self):
-        step, t0, busy, finish, quiet = self._current
+        step, t0, busy, finish, quiet, before = self._current
         self._current = None
         quiet.__exit__(None, None, None)
         summary = ''
@@ -179,27 +183,46 @@ class PipelineRunner(QtCore.QObject):
         except Exception as exc:                                # noqa: BLE001
             summary = f'finish hook failed: {type(exc).__name__}: {exc}'
         seconds = time.time() - t0
-        after = self._after(step)
+        counts = self._state_counts(step)
+        after = self._after(step, counts)
+        # A STEP THAT MOVED NOTHING DID NOT SUCCEED. The step hooks report
+        # what their own worker told them, and a worker that dies in its
+        # pool tells them nothing: cell alignment on 32 C7 FOVs aborted on
+        # a BrokenProcessPool, wrote no FOV, and this run still ended
+        # '0 failed' with exit 0 -- in an unattended chain, indis-
+        # tinguishable from success. The store is the one witness that
+        # cannot be fooled by a silent worker, so compare it.
+        if before is not None and counts is not None and counts == before and sum(before.values()):
+            msg = (f'{step}: the store is unchanged after {seconds:.0f}s ({after}) -- '
+                   f'the step ran but completed no FOV')
+            self.log(msg)
+            self._report['failed'].append((step, msg))
         entry = {'step': step, 'seconds': round(seconds, 1), 'summary': summary, 'after': after}
         self._report['steps'].append(entry)
         text = f'{step}: {seconds:.0f}s; {summary}' + (f'; store now {after}' if after else '')
         self.log(text)
         self.step_finished.emit(step, text)
 
-    def _after(self, step):
-        """The step's store state over its FOVs after it ran."""
+    def _state_counts(self, step):
+        """{state: n} for the step over its FOVs, or None if unreadable."""
         if self.project is None:
-            return ''
+            return None
         try:
-            fovs = self._fovs_of(step)
             counts = {'done': 0, 'partial': 0, 'missing': 0, 'n/a': 0}
             targets = S.localization_targets(self.project)
-            for f in fovs:
+            for f in self._fovs_of(step):
                 st = S.fov_status(self.project, f, deep=(step in S.DEEP_STEPS), targets=targets)[step]
                 counts[st['state']] += 1
-            return ', '.join(f'{k} {v}' for k, v in counts.items() if v)
-        except Exception as exc:                                # noqa: BLE001
-            return f'(status unreadable: {type(exc).__name__})'
+            return counts
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    def _after(self, step, counts=None):
+        """The step's store state over its FOVs after it ran."""
+        counts = self._state_counts(step) if counts is None else counts
+        if counts is None:
+            return '(status unreadable)'
+        return ', '.join(f'{k} {v}' for k, v in counts.items() if v)
 
     def _fovs_of(self, step):
         ip = self.mw.ui.IngestionPanel
@@ -282,6 +305,13 @@ class PipelineRunner(QtCore.QObject):
         """
         mw = self.mw
         mw._run_cell_alignment_all_fovs()
+        # the worker's own failure text says WHERE it died and how far it
+        # got; without this the step only ever sees 'the store did not
+        # move', which is true but tells nobody what to fix
+        state = {'error': None}
+        worker = getattr(mw, '_cell_alignment_worker', None)
+        if worker is not None:
+            worker.failed.connect(lambda m: state.__setitem__('error', str(m).splitlines()[0]))
 
         def busy():
             if _running(getattr(mw, '_cell_alignment_worker', None)):
@@ -291,6 +321,9 @@ class PipelineRunner(QtCore.QObject):
                     or bool(getattr(mw, '_overlay_ready', None)))
 
         def summary():
+            if state['error']:
+                self._report['failed'].append(('cell_alignment', state['error']))
+                return state['error']
             n = getattr(mw, '_overlay_done', 0)
             return 'cell alignment batch ended' + (f'; {n} overlay PNG(s) written' if n else '')
         return busy, summary

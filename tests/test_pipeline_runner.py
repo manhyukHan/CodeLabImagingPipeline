@@ -173,6 +173,35 @@ def main():
     check('the failure is in the report and the next step still ran', r['failed'] and r['failed'][0][0] == 'fov_alignment'
           and [c[0] for c in mw.calls] == ['celltype'], str((r['failed'], mw.calls)))
 
+    print('a step whose worker dies quietly is still reported as failed')
+    mw = FakeMW()
+    runner = W.PipelineRunner(mw)
+    frozen = {'done': 0, 'partial': 0, 'missing': 2, 'n/a': 0}
+    runner._state_counts = lambda _step: dict(frozen)     # the store never moves
+    runner.start(project=None, plan={'fov_alignment': [1, 2]}, policies={})
+    r = drive(app, runner)
+    check('an unchanged store fails the step even when its worker said nothing',
+          r['failed'] and r['failed'][0][0] == 'fov_alignment' and 'completed no FOV' in r['failed'][0][1],
+          str(r['failed']))
+
+    mw = FakeMW()
+    runner = W.PipelineRunner(mw)
+    moved = iter([{'done': 0, 'missing': 2}, {'done': 2, 'missing': 0}])
+    runner._state_counts = lambda _step: next(moved)
+    runner.start(project=None, plan={'fov_alignment': [1, 2]}, policies={})
+    r = drive(app, runner)
+    check('a step that did move the store is not flagged', not r['failed'], str(r['failed']))
+
+    # an overwrite redoes work the store already calls done, so its counts
+    # cannot move -- judging it that way condemned a segmentation that had
+    # just rewritten all 42 C7 FOVs
+    mw = FakeMW()
+    runner = W.PipelineRunner(mw)
+    runner._state_counts = lambda _step: {'done': 2, 'missing': 0}
+    runner.start(project=None, plan={'fov_alignment': [1, 2]}, policies={'fov_alignment': 'redo'})
+    r = drive(app, runner)
+    check('an overwrite is not judged by whether the store moved', not r['failed'], str(r['failed']))
+
     print('the CLI runs the plan it printed, not one it reads again')
     seen = {}
 
