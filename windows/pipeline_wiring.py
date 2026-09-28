@@ -16,6 +16,7 @@ the GUI event loop) and the CLI (an offscreen MainWindow whose event
 loop the CLI pumps). Ingestion is never overwritten by the runner: a
 'redo' on ingestion runs as append and says so.
 """
+import os
 import time
 
 from PyQt5 import QtCore, QtWidgets
@@ -268,9 +269,31 @@ class PipelineRunner(QtCore.QObject):
         return busy, (lambda: 'cross-modal batch ended')
 
     def _run_cell_alignment(self, fovs, mode):
+        """The alignment, and then the overlays it queues.
+
+        The overlays are drawn by a SEPARATE pool of child processes, fed
+        in chunks by an idle timer, and in a window nobody is watching
+        that pool is the only thing keeping them alive: a headless run
+        that stopped when the alignment worker did took its children with
+        it on the way out. Of the 855 cell overlays the first two C7 runs
+        queued, 4 reached the store. So the step is not over until the
+        drip has drained -- which is the honest cost of "auto-save every
+        cell", not an extra one this adds.
+        """
         mw = self.mw
         mw._run_cell_alignment_all_fovs()
-        return (lambda: _running(getattr(mw, '_cell_alignment_worker', None))), (lambda: 'cell alignment batch ended')
+
+        def busy():
+            if _running(getattr(mw, '_cell_alignment_worker', None)):
+                return True
+            return (_running(getattr(mw, '_cell_overlay_worker', None))
+                    or bool(getattr(mw, '_overlay_pending', None))
+                    or bool(getattr(mw, '_overlay_ready', None)))
+
+        def summary():
+            n = getattr(mw, '_overlay_done', 0)
+            return 'cell alignment batch ended' + (f'; {n} overlay PNG(s) written' if n else '')
+        return busy, summary
 
     def _run_localization(self, fovs, mode):
         """The headless batch module, one group per (modality, channel)
@@ -281,7 +304,19 @@ class PipelineRunner(QtCore.QObject):
         sp_panel = mw.ui.SpotLocalizationPanel
         model_dir = sp_panel.selected_model_dir()
         if not model_dir:
-            raise ValueError('no localization model selected on the Spot Localization tab')
+            # the combo is filled when someone opens the tab, so a
+            # headless window has an empty one. Fill it the same way and
+            # take the pinned default -- the app's own answer to "nobody
+            # named a model" -- rather than refusing a run for a choice
+            # that was never anyone's to make here
+            try:
+                mw._refresh_model_list()
+                model_dir = sp_panel.selected_model_dir()
+            except Exception as exc:                            # noqa: BLE001
+                raise ValueError(f'no localization model selected and the model list could not be read: {type(exc).__name__}: {exc}')
+            if not model_dir:
+                raise ValueError('no localization model selected and none available under <repo>/models')
+        self.log(f'localization: model {os.path.basename(model_dir)}')
         targets = S.localization_targets(self.project)
         groups = []
         for modality, m in self.project['modalities'].items():
@@ -509,18 +544,23 @@ class PipelineTab:
             self.panel.append_log(f'refresh after the run failed: {type(exc).__name__}: {exc}')
 
 
-def run_headless(config_path, fovs=None, policies=None, explicit=(), log=print, timeout_s=None):
+def run_headless(config_path, fovs=None, policies=None, explicit=(), log=print, timeout_s=None, plan=None):
     """The CLI's door: an offscreen MainWindow, the runner, the event loop
-    pumped until it finishes. Returns the report."""
-    import os
+    pumped until it finishes. Returns the report.
+
+    `plan` is the caller's own {step: [fov]} -- the one it printed. It is
+    passed in rather than recomputed here so that what runs is what the
+    caller showed: a status read a second time (or at a different depth)
+    plans different work, and the CLI then reports one plan and executes
+    another."""
     from unittest import mock
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     project = S.load_project(config_path)
     if fovs:
         project['fovs'] = list(fovs)
-    rows = S.status_table(project)
-    plan = S.plan(rows, policies)
+    if plan is None:
+        plan = S.plan(S.status_table(project), policies)
     from windows.main_window import MainWindow
 
     def _dialog(kind):

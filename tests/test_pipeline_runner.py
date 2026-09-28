@@ -173,6 +173,26 @@ def main():
     check('the failure is in the report and the next step still ran', r['failed'] and r['failed'][0][0] == 'fov_alignment'
           and [c[0] for c in mw.calls] == ['celltype'], str((r['failed'], mw.calls)))
 
+    print('the CLI runs the plan it printed, not one it reads again')
+    seen = {}
+
+    def fake_headless(config_path, **kw):
+        seen.update(kw)
+        return {'steps': [], 'failed': [], 'seconds': 0.0}
+    real, W.run_headless = W.run_headless, fake_headless
+    try:
+        from codelab_pipeline.pipeline import __main__ as M
+        args = SimpleNamespace(config='x.xml', fovs='', shallow=True, progress=False, policy='', dry_run=False, timeout=None)
+        M._project = lambda _a: {'config': 'x', 'project_root': 'r', 'fovs': [1, 2], 'modalities': {}, 'params': {}}
+        rows = [{'fov': 1, **{s: {'state': 'missing', 'have': 0, 'want': 1, 'detail': ''} for s in S.STEPS}}]
+        M._rows = lambda _p, _a: rows
+        M.cmd_run(args)
+        check('run_headless is handed the printed plan', seen.get('plan') == S.plan(rows, {}), str(seen.get('plan')))
+        check('and the plan it was handed leaves segmentation to the app',
+              seen.get('plan', {}).get('segmentation') == [1] and 'segmentation' not in (seen.get('explicit') or ()), str(seen.get('explicit')))
+    finally:
+        W.run_headless = real
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     if FAIL:
         print('FAILED:', FAIL)

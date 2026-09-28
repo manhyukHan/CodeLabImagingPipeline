@@ -82,6 +82,13 @@ def cmd_run(args):
     todo = [(s, p[s]) for s in S.STEPS if p[s] and eff[s] != 'skip' and (s not in S.NEVER_AUTO or s in pol)]
     for s in S.STEPS:
         print(f'{s:15s} {eff[s]:8s} -> {len(p[s]):3d} FOVs' + ('' if (s not in S.NEVER_AUTO or s in pol or not p[s]) else '   (not run: choose segmentation explicitly)'))
+    if args.shallow:
+        # a shallow status cannot see cells, so the deep steps came back
+        # n/a and the plan leaves them out. The run honours that plan, so
+        # say plainly that those steps are not being assessed
+        unassessed = [s for s in S.DEEP_STEPS if eff[s] != 'skip']
+        if unassessed:
+            print('shallow status: ' + ', '.join(unassessed) + ' were not assessed and will not run (drop --shallow to include them)')
     if not todo:
         print('nothing to run')
         return
@@ -90,7 +97,7 @@ def cmd_run(args):
         return
     from windows.pipeline_wiring import run_headless
     report = run_headless(args.config, fovs=project['fovs'], policies=pol, explicit=tuple(pol), log=lambda m: print(m, flush=True),
-                          timeout_s=args.timeout)
+                          timeout_s=args.timeout, plan=p)
     print()
     for e in report['steps']:
         print(f'{e["step"]:15s} {e.get("seconds", 0):7.1f}s  {e.get("summary") or e.get("error", "")}' + (f'  [{e["after"]}]' if e.get('after') else ''))
