@@ -179,7 +179,7 @@ def main():
     mw._refresh_cell_fov_panels = lambda fov: None
     mw._cell_overlay_draw_args = lambda c, fov, *a, **k: events.append(('resolve', fov)) or {'save_path': 'x'}
     ap.CellOverlayAutoSaveThresholdSpinBox.setValue(0)     # every cell wants one
-    mw._cell_max_residual_shift = staticmethod(lambda c: 1.0)
+    mw._cell_max_residual_shift = lambda c: 1.0
 
     # ---- a FOV is SAVED THE MOMENT IT LANDS ----
     # Persisting only at the end meant stopping a whole-project run (a
