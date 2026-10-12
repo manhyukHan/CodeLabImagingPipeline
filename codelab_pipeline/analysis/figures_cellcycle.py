@@ -1077,8 +1077,18 @@ def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, p
     if top < g1_level * rise:
         raise ValueError(f'the DNA content never rises above {rise:.2f} x its post-birth level ({g1_level:.2f} -> {top:.2f}); '
                          'no S boundary can be read from DAPI')
-    # a SUSTAINED rise: two consecutive bins above the threshold
-    i_s = next(i for i in range(n - 1) if curve[i] >= g1_level * rise and curve[i + 1] >= g1_level * rise)
+    # a SUSTAINED rise: two consecutive bins above the threshold. The
+    # maximum clearing the threshold does not imply two neighbours do --
+    # a one-bin spike clears the check above and then finds nothing here,
+    # which used to let StopIteration out of a function documented to
+    # raise ValueError (hit on the area and density factors of chr19 and
+    # K562 while splitting the DNA proxy). A spike is a refusal in
+    # substance, so it is reported as one.
+    i_s = next((i for i in range(n - 1)
+                if curve[i] >= g1_level * rise and curve[i + 1] >= g1_level * rise), None)
+    if i_s is None:
+        raise ValueError(f'the DNA content clears {rise:.2f} x its post-birth level ({g1_level:.2f} -> {top:.2f}) '
+                         'in only one bin, never in two consecutive ones; no S boundary can be read from DAPI')
     target = g1_level + plateau * (top - g1_level)
     i_g = next((i for i in range(i_s, n) if curve[i] >= target), n - 1)
     half = 180.0 / n
