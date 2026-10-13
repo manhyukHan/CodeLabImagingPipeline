@@ -94,10 +94,39 @@ class SpotContainer:
                            [deepcopy(s) for s in other.slice(fov, modality, hybe, channel)])
 
     # -- diff / undo -----------------------------------------------------
+    @staticmethod
+    def _comparable(saved):
+        """
+        One save()-dict in a form where EQUAL STATES COMPARE EQUAL.
+
+        p_exist carries NaN by design -- it is the "no engine here
+        answered 'is a spot really here'" sentinel, which is every spot
+        from every engine except v3 (see ASpot). But NaN is never equal
+        to itself, so a plain `==` between two IDENTICAL spots' dicts
+        returned False, and that is exactly what this whole section is
+        built on: diff() called every unchanged spot 'changed', a no-op
+        edit consumed an undo slot, and fingerprint(fov) == fp -- undo's
+        "did I restore the before-state" check -- could never be true
+        again once any spot existed.
+
+        None is NaN's comparison-safe spelling here, and it is lossless:
+        ASpot.set_metadata maps None straight back to float('nan'), so
+        apply_inverse/apply_forward rebuild the identical spot from
+        these dicts. Nothing persisted goes through this -- fingerprints
+        and diffs are in-memory undo state only; save() itself still
+        writes the NaN.
+        """
+        p = saved.get('p_exist')
+        if isinstance(p, float) and p != p:        # NaN, without importing math
+            return {**saved, 'p_exist': None}
+        return saved
+
     def fingerprint(self, fov):
-        """{uid: save()-dict} -- the comparison form. Plain dicts, so a
-        fingerprint costs ~200 bytes/spot, not a deep ACell/ASpot graph."""
-        return {uid: s.save() for uid, s in self.data.get(int(fov), {}).items()}
+        """{uid: save()-dict} -- the comparison form (see _comparable).
+        Plain dicts, so a fingerprint costs ~200 bytes/spot, not a deep
+        ACell/ASpot graph."""
+        return {uid: self._comparable(s.save())
+                for uid, s in self.data.get(int(fov), {}).items()}
 
     @staticmethod
     def diff(before, after):
