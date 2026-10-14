@@ -71,7 +71,9 @@ class IngestionWorker(QtCore.QThread):
     lives, especially off a network share.
 
     jobs: [{'fov_list', 'hybe_records', 'dax_directory', 'storage_path',
-    'modality'}, ...] -- one entry per modality being ingested THIS run:
+    'modality', optional 'fov_map'}, ...] -- one entry per modality being
+    ingested THIS run ('fov_map' is the layout's parsed FovMap sheet,
+    preprocess.parse_fov_map, resolved per task with dax_index_for):
     a single dict for the ordinary per-modality "Run Ingestion" button, or
     2+ when several modalities' hybes are checked in the combined
     checklist (MainWindow._run_ingestion / _compose_checked_ingestion_jobs).
@@ -210,7 +212,9 @@ class IngestionWorker(QtCore.QThread):
                 with executor:
                     task_by_future = {executor.submit(preprocess.convert_dax_to_h5_worker,
                                                       fov, record, job['dax_directory'], job['storage_path'],
-                                                      job['modality'], overwrite=self.overwrite): (fov, record, job)
+                                                      job['modality'], overwrite=self.overwrite,
+                                                      dax_index=preprocess.dax_index_for(
+                                                          job.get('fov_map'), record['folder'], fov)): (fov, record, job)
                                       for fov, record, job in tasks}
                     for future in as_completed(task_by_future):
                         fov, record, job = task_by_future[future]
@@ -225,7 +229,8 @@ class IngestionWorker(QtCore.QThread):
                 for fov, record, job in tasks:
                     fov_r, hybe_r, err = preprocess.convert_dax_to_h5_worker(
                         fov, record, job['dax_directory'], job['storage_path'], job['modality'],
-                        overwrite=self.overwrite)
+                        overwrite=self.overwrite,
+                        dax_index=preprocess.dax_index_for(job.get('fov_map'), record['folder'], fov))
                     finish_task(fov_r, hybe_r, err, record, job)
             # dax_vlinks_h5 (a single aggregate vlinks.h5 across every hybe)
             # is deliberately NOT called here -- it's only ever read by the
@@ -3054,9 +3059,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     self, warn_title,
                     f"{name}'s checked hybes no longer match its parsed layout -- re-run Parse Layouts.")
                 return None, None
+            # The layout's optional FovMap sheet (FOV -> ConvZscan index),
+            # read once per job here so the workers never touch the xlsx.
+            try:
+                fov_map = preprocess.parse_fov_map(data.get('layout_path', ''))
+            except ValueError as e:
+                QtWidgets.QMessageBox.warning(self, warn_title, f'{name}: {e}')
+                return None, None
             jobs.append({'fov_list': fov_list, 'hybe_records': records,
                          'dax_directory': data['dax_directory'],
-                         'storage_path': data['storage_path'], 'modality': name})
+                         'storage_path': data['storage_path'], 'modality': name,
+                         'fov_map': fov_map})
         if not jobs:
             QtWidgets.QMessageBox.warning(self, warn_title, 'Check at least one hybe to ingest.')
             return None, None

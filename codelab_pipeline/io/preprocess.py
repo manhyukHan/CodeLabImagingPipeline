@@ -143,7 +143,18 @@ def parse_experiment_layout(xlsx_path):
     Returns a list of dicts: folder, readout_id, datatype, hybe_num,
     channels (list[int]), fiducial_channel (int), channel_layout (str),
     total_frames (int), readout_name (str or None -- DNA layouts have no
-    rnaNames column, so target rounds are anonymous).
+    rnaNames column, so target rounds are anonymous), buffer_frames and
+    buffer_frames_end (int, 0 when the optional bufferFrames /
+    bufferFramesEnd columns are absent or blank).
+
+    bufferFrames / bufferFramesEnd: frames the acquisition recorded at
+    the home z BEFORE the z scan started and AFTER it ended (Hal's
+    "buffer frames"; the 2021-06 K562/HepG2 CELF4 runs have 10 + 8 and
+    2 + 2 of them in every movie). They are part of totalFrames -- the
+    .inf frame count -- but not part of any z plane, so ingestion drops
+    them before de-interleaving: depth = (totalFrames - bufferFrames -
+    bufferFramesEnd) // len(channels). Both default to 0, which is the
+    old behaviour for every existing layout.
     """
     # mtime-keyed cache: the SAME layout is re-parsed inside several
     # doors per click (~46 ms at 16 hybes, ~300 ms at the real 111 --
@@ -183,6 +194,8 @@ def parse_experiment_layout(xlsx_path):
             'channel_layout': str(row['channelLayout']),
             'total_frames': int(row['totalFrames']),
             'readout_name': readout_name,
+            'buffer_frames': _optional_int(row, 'bufferFrames'),
+            'buffer_frames_end': _optional_int(row, 'bufferFramesEnd'),
         })
     if key is not None:
         # bounded, oldest-out: a stale (path, old-mtime) entry for a
@@ -193,6 +206,80 @@ def parse_experiment_layout(xlsx_path):
         _LAYOUT_CACHE[key] = records
         return [dict(r) for r in records]
     return records
+
+def _optional_int(row, column, default=0):
+    """An optional integer layout column: `default` when the column is
+    absent from the sheet or the cell is blank."""
+    if column not in row.index:
+        return default
+    value = row[column]
+    if pd.isna(value) or str(value).strip() == '':
+        return default
+    return int(value)
+
+
+FOV_MAP_SHEET = 'FovMap'
+
+
+def parse_fov_map(xlsx_path):
+    """
+    The optional `FovMap` sheet of an ExperimentLayout.xlsx: which
+    ConvZscan movie index each project FOV reads, when the two are not
+    the usual `fov - 1`.
+
+    Columns: `fov` (the project's 1-based FOV number), `daxIndex` (the
+    0-based ConvZscan_XX index on disk), and optionally `FolderName` --
+    a hybe folder this row applies to, or `*` / blank for every folder
+    of the modality. Folder-specific rows win over `*` rows; a FOV
+    absent from every applicable row keeps the default `fov - 1`
+    (dax_index_for is the one resolver).
+
+    Returns {folder_or_'*': {fov: dax_index}}; {} when the workbook has
+    no such sheet (every layout written before this sheet existed), so
+    nothing changes for them.
+
+    Why a sheet and not a renamed copy of the raw data: the mapping is
+    an experimental fact -- the 2021-06-07 Lamin run imaged 40 positions
+    for the IF rounds and Hyb_001 but 39 for every other DNA round
+    (position 26 was dropped), so IF movie 27..39 is DNA FOV 27..39 (1-
+    based) while IF movie 26 belongs to no DNA FOV at all. Recording it
+    beside the hybe table keeps the raw archive untouched and the
+    ingestion reproducible from the layout alone.
+    """
+    if not xlsx_path or not os.path.exists(xlsx_path):
+        return {}
+    try:
+        sheets = pd.ExcelFile(xlsx_path).sheet_names
+    except Exception:
+        return {}
+    if FOV_MAP_SHEET not in sheets:
+        return {}
+    df = pd.read_excel(xlsx_path, sheet_name=FOV_MAP_SHEET)
+    if 'fov' not in df.columns or 'daxIndex' not in df.columns:
+        raise ValueError(f'{xlsx_path}: sheet {FOV_MAP_SHEET!r} needs the columns '
+                         f'"fov" and "daxIndex" (optional "FolderName"); has {list(df.columns)}')
+    fov_map = {}
+    for _, row in df.iterrows():
+        if pd.isna(row['fov']) or pd.isna(row['daxIndex']):
+            continue
+        folder = row['FolderName'] if 'FolderName' in df.columns else None
+        folder = '*' if folder is None or pd.isna(folder) or str(folder).strip() in ('', '*') else str(folder).strip()
+        fov_map.setdefault(folder, {})[int(row['fov'])] = int(row['daxIndex'])
+    return fov_map
+
+
+def dax_index_for(fov_map, folder, fov):
+    """The ConvZscan index FOV `fov` of hybe `folder` reads: the folder's
+    own FovMap row, else the modality-wide `*` row, else `fov - 1`."""
+    fov = int(fov)
+    if not fov_map:
+        return fov - 1
+    for key in (folder, '*'):
+        entry = fov_map.get(key)
+        if entry is not None and fov in entry:
+            return int(entry[fov])
+    return fov - 1
+
 
 def make_xml_file(config, save_path):
     """
@@ -507,10 +594,19 @@ def publish_stack(stack_h5name, attributes, channel_arrays, storage_path,
         return str(e)
 
 
-def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False):
+def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, modality, overwrite=False,
+                             dax_index=None):
     """
     Convert one FOV's raw .dax for one hybe into a per-(fov,hybe) H5 file,
-    channel/readout/datatype-aware per parse_experiment_layout. Only the
+    channel/readout/datatype-aware per parse_experiment_layout.
+
+    dax_index: the 0-based ConvZscan_XX index to read for this FOV; None
+    (every caller before the FovMap sheet existed) means the usual
+    `fov - 1`. Callers resolve it with dax_index_for(parse_fov_map(layout),
+    folder, fov). The record's buffer_frames / buffer_frames_end are
+    dropped from the frame axis before de-interleaving (see
+    parse_experiment_layout), so depth is what the z scan actually
+    recorded. Only the
     channels actually listed for this hybe get a dataset -- e.g. this real
     dataset is always [555, 635], so no empty 405/488 containers are made.
     AXIS ORDER, and it is the SAME whatever produced the file. Every stored
@@ -536,8 +632,21 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
     # ExperimentLayout's totalFrames is the authoritative source for depth (z-plane
     # count) per hybe -- e.g. barcode hybes here have totalFrames=354 (177 z-planes
     # per channel) vs. 260 (130 z-planes) for regular hybes, so this must be read
-    # per-hybe from the layout, never assumed uniform across a dataset.
-    expected_depth = hybe_record['total_frames'] // len(channels)
+    # per-hybe from the layout, never assumed uniform across a dataset. Buffer
+    # frames (home-z frames before/after the scan) are part of totalFrames but
+    # of no plane, so they come off the frame count first.
+    total_frames = int(hybe_record['total_frames'])
+    buffer_frames = int(hybe_record.get('buffer_frames', 0) or 0)
+    buffer_frames_end = int(hybe_record.get('buffer_frames_end', 0) or 0)
+    scan_frames = total_frames - buffer_frames - buffer_frames_end
+    if scan_frames <= 0 or scan_frames % len(channels) != 0:
+        return fov, folder, (f'totalFrames {total_frames} minus buffer frames {buffer_frames} + '
+                             f'{buffer_frames_end} leaves {scan_frames} frames, not a multiple of '
+                             f'{len(channels)} channels')
+    expected_depth = scan_frames // len(channels)
+    if dax_index is None:
+        dax_index = fov - 1
+    dax_index = int(dax_index)
 
     if os.path.exists(stack_h5name) and not overwrite:
         # Completeness, not mere existence -- see stack_is_complete. A damaged
@@ -556,12 +665,17 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
             logging.warning(f'FOV {fov} {folder}: existing stack is incomplete or unreadable '
                             f'-- rebuilding it despite append mode')
 
-    dax_path = os.path.join(dax_directory, folder, f'ConvZscan_{fov-1:02d}.dax')
+    dax_path = os.path.join(dax_directory, folder, f'ConvZscan_{dax_index:02d}.dax')
     # Bound before the try: every handler below cleans it up, including the
     # read_dax failure that happens before it would otherwise be assigned.
     tmp_h5name = stack_h5name + '.part'
     try:
         dax = read_dax(dax_path)
+        if buffer_frames or buffer_frames_end:
+            # (height, width, frames): keep exactly the scan's frames. A
+            # movie shorter than the layout says falls through to the
+            # per-channel depth check below and fails loudly there.
+            dax = dax[:, :, buffer_frames:total_frames - buffer_frames_end]
         attributes = {
             'hybe': folder,
             'fov': fov,
@@ -571,7 +685,10 @@ def convert_dax_to_h5_worker(fov, hybe_record, dax_directory, storage_path, moda
             'modality': modality,
             'fiducial_channel': hybe_record['fiducial_channel'],
             'channel_list': np.array([str(ch) for ch in channels], dtype='S'),
-            'total_frames': hybe_record['total_frames'],
+            'total_frames': total_frames,
+            'buffer_frames': buffer_frames,
+            'buffer_frames_end': buffer_frames_end,
+            'dax_index': dax_index,
             'expected_depth': expected_depth,
             'shape': (),
             'path': dax_path,
