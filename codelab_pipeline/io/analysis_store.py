@@ -34,10 +34,12 @@ write goes to its own small file via '<name>.part' + os.replace, so:
     is already guaranteed by the FOV-major workers;
   - blast radius of any failure is one FOV's one kind of data.
 
-os.replace over a file a reader currently holds open raises
-PermissionError on Windows/SMB; writers retry briefly (_replace),
-which is sufficient because every read here is open-read-close over a
-small file.
+Replacing a file a reader currently holds open fails on Windows.
+Writers retry briefly (_replace), which is sufficient for a reader
+outside this codebase but NOT for a second app instance on the same
+store: that one reads often enough to exhaust any retry. So readers
+here share DELETE (_open_shared) and writers use ReplaceFileW
+(_swap) -- both are needed, neither suffices alone.
 
 The per-FOV manifest.json is DERIVED data, written after (never
 before) the data file it describes, so a crash between the two leaves
@@ -142,18 +144,71 @@ normalized correlation (1.0 = perfect).
 
 # -- atomic file primitives ----------------------------------------------
 
+#: ReplaceFileW flags; 0 is what was measured and is enough here
+_REPLACE_FLAGS = 0
+
+
+def _swap(tmp, target):
+    """Make `tmp` become `target`, even while a reader holds `target`.
+
+    os.replace calls MoveFileExW(MOVEFILE_REPLACE_EXISTING), which
+    refuses an open destination with ERROR_ACCESS_DENIED no matter what
+    sharing the reader granted -- share DELETE does not help it. The
+    Win32 call for exactly this job is ReplaceFileW, which succeeds
+    against a reader that shares DELETE (see _open_shared, which is why
+    readers here do). Measured on this machine:
+
+        writer          reader open()   reader share-delete
+        os.replace      err 5           err 5
+        ReplaceFileW    err 32          OK
+
+    Both halves are required and neither suffices alone.
+
+    Falls back to os.replace where ReplaceFileW does not apply: when the
+    destination does not exist yet, and on any non-Windows host, where
+    rename over an open file already works.
+    """
+    if os.name != 'nt' or not os.path.exists(target):
+        os.replace(tmp, target)
+        return
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.ReplaceFileW.restype = wintypes.BOOL
+    k32.ReplaceFileW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                 wintypes.LPCWSTR, wintypes.DWORD,
+                                 wintypes.LPVOID, wintypes.LPVOID)
+    if not k32.ReplaceFileW(target, tmp, None, _REPLACE_FLAGS, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def _replace(tmp, target):
-    """os.replace with a bounded retry: on Windows/SMB, replacing a file
-    a reader briefly holds open raises PermissionError; reads here are
-    open-read-close over small files, so waiting out the reader is both
-    correct and short. Gives up loudly after ~5 s."""
+    """_swap with a bounded retry, and no litter when it gives up.
+
+    The retry remains because a reader OUTSIDE this codebase -- a virus
+    scanner, an editor, another tool -- opens without sharing DELETE and
+    still blocks the swap; waiting one of those out is what it is for.
+    What the retry could never do is wait out a SECOND APP INSTANCE
+    reading the same store, which is what _swap and _open_shared fix.
+
+    On final failure the .part is removed. The target was never touched
+    and those bytes were never visible to any reader, so nothing is lost
+    -- and verify_store.py's stray-.part scan keeps meaning what it says
+    instead of gaining one file per failed save, which is how chr19's
+    analysis directory came to hold three of them.
+    """
     for attempt in range(20):
         try:
-            os.replace(tmp, target)
+            _swap(tmp, target)
             return
         except PermissionError:
             time.sleep(0.02 * (attempt + 1))
-    os.replace(tmp, target)
+    try:
+        _swap(tmp, target)
+    except PermissionError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 def _tmp_name(target):
@@ -193,9 +248,61 @@ def _atomic_bytes(target, blob):
     _replace(tmp, target)
 
 
+#: FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+_SHARE_ALL = 0x01 | 0x02 | 0x04
+_GENERIC_READ = 0x80000000
+_OPEN_EXISTING = 3
+
+
+def _open_shared(path):
+    """open(path) that does NOT block another process's os.replace.
+    
+    CPython's open() asks Windows for FILE_SHARE_READ | FILE_SHARE_WRITE
+    and NOT FILE_SHARE_DELETE, so while ANY reader holds the file --
+    for milliseconds, in another process -- a replace onto it fails with
+    ERROR_ACCESS_DENIED. _replace's retry was written for that and is
+    enough for one process, where reads are rare and short. It is not
+    enough for two: a second app instance on the same store reads this
+    file often enough to lose a writer all twenty attempts, which is how
+    chr19's analysis/params.json went unwritten from 2026-10-02 while
+    three .part files piled up beside it. HALF OF A PAIR: on its own
+    this changes nothing, because os.replace refuses an open
+    destination whatever the sharing says. See _swap.
+    
+    Granting DELETE is not a relaxation. The writer replaces the file
+    whole; a reader holding the old handle keeps reading the old bytes,
+    complete and self-consistent, which is exactly POSIX rename and
+    exactly what a full-replace writer already promises. On POSIX this
+    is the behaviour of plain open(), so only Windows needs the detour.
+    """
+    if os.name != 'nt':
+        return open(path)
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    # restype MUST be set: ctypes defaults to c_int and would truncate
+    # a 64-bit HANDLE to garbage that then fails to close.
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD,
+                                wintypes.HANDLE)
+    h = k32.CreateFileW(path, _GENERIC_READ, _SHARE_ALL, None,
+                        _OPEN_EXISTING, 0, None)
+    if h is None or h == wintypes.HANDLE(-1).value:
+        # an OSError subclass, so _read_json's own handler still sees a
+        # missing or unreadable file as None
+        raise ctypes.WinError(ctypes.get_last_error())
+    # open_osfhandle TRANSFERS ownership: closing the returned file
+    # object closes the handle, and closing both would be a double free.
+    fd = msvcrt.open_osfhandle(h, os.O_RDONLY)
+    return os.fdopen(fd, 'r')
+
+
 def _read_json(path):
     try:
-        with open(path) as f:
+        with _open_shared(path) as f:
             return json.load(f)
     except OSError:
         return None
