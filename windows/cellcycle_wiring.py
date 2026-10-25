@@ -778,7 +778,18 @@ class CellCycleWiring(QtCore.QObject):
         try:
             k = self._training_mask()
             w = self.model.spectrum(self.q[k])
-            return FC.PhaseScale.of(model=self.model, w=w, arcs=arcs, mode='tau')
+            # 'exponential', not the library's 'uniform' default: these
+            # are growing cultures, and a uniform clock is a population
+            # that is not growing. Three measurements say so -- a mock
+            # with a known true time reads hydroxyurea 8 % of a cycle
+            # late under 'uniform' and right under 'exponential'; C7's
+            # stored S arc is 0.238 of the cycle under 'exponential'
+            # against the 0.254 its PI fractions imply independently
+            # (0.195 under 'uniform'); and C7's own cycling cells read
+            # back a 1.90-fold age density, against the 2.0 an
+            # exponentially growing population must have.
+            return FC.PhaseScale.of(model=self.model, w=w, arcs=arcs, mode='tau',
+                                    growth='exponential')
         except Exception as e:                                  # noqa: BLE001
             self.panel.ModelStatusLabel.setText(f'cycle time needs placed training cells; axis stays in degrees ({e})')
             return FC.PhaseScale(arcs=arcs)
