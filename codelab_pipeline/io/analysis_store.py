@@ -151,29 +151,44 @@ _REPLACE_FLAGS = 0
 def _swap(tmp, target):
     """Make `tmp` become `target`, even while a reader holds `target`.
 
-    os.replace calls MoveFileExW(MOVEFILE_REPLACE_EXISTING), which
-    refuses an open destination with ERROR_ACCESS_DENIED no matter what
-    sharing the reader granted -- share DELETE does not help it. The
-    Win32 call for exactly this job is ReplaceFileW, which succeeds
-    against a reader that shares DELETE (see _open_shared, which is why
-    readers here do). Measured on this machine:
+    os.replace FIRST, and ReplaceFileW only when it refuses. The two
+    calls fail in opposite situations, so the order is the design:
+
+        os.replace (MoveFileExW)  atomic. Survives writers racing each
+                                  other for one target, which is
+                                  allowed here. Refuses an open
+                                  destination with ERROR_ACCESS_DENIED
+                                  whatever sharing the reader granted.
+
+        ReplaceFileW              replaces a destination a reader
+                                  shares DELETE on (see _open_shared,
+                                  which is why readers here do). But it
+                                  is a backup-rename-delete dance, not
+                                  one atomic step, so concurrent
+                                  writers of ONE target collide on it
+                                  with ERROR_UNABLE_TO_REMOVE_REPLACED.
+
+    Leading with ReplaceFileW made the ordinary path -- no reader, two
+    threads saving one manifest -- fail where it had always worked;
+    test_concurrency caught it. Leading with os.replace leaves the hot
+    path exactly as it was and spends the fallback only on the case it
+    was added for.
+
+    Measured on this machine:
 
         writer          reader open()   reader share-delete
         os.replace      err 5           err 5
         ReplaceFileW    err 32          OK
-
-    Both halves are required and neither suffices alone.
-
-    Falls back to os.replace where ReplaceFileW does not apply: when the
-    destination does not exist yet, and on any non-Windows host, where
-    rename over an open file already works.
     """
-    if os.name != 'nt' or not os.path.exists(target):
+    try:
         os.replace(tmp, target)
         return
+    except PermissionError:
+        if os.name != "nt" or not os.path.exists(target):
+            raise
     import ctypes
     from ctypes import wintypes
-    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.ReplaceFileW.restype = wintypes.BOOL
     k32.ReplaceFileW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR,
                                  wintypes.LPCWSTR, wintypes.DWORD,
@@ -182,12 +197,32 @@ def _swap(tmp, target):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+#: Windows codes meaning "someone else is touching this right now":
+#: ACCESS_DENIED, SHARING_VIOLATION, and UNABLE_TO_REMOVE_REPLACED. The
+#: last is what CONCURRENT WRITERS of one target produce, and it arrives
+#: as a plain OSError rather than a PermissionError -- so catching
+#: PermissionError alone let it past the retry AND past the .part
+#: cleanup, which test_concurrency caught as three stray manifest .part
+#: files and three raised exceptions.
+_BUSY_WINERR = (5, 32, 1175)
+
+
+def _busy(exc):
+    """is this 'try again', or a real failure?"""
+    return (isinstance(exc, PermissionError)
+            or getattr(exc, 'winerror', None) in _BUSY_WINERR)
+
+
 def _replace(tmp, target):
     """_swap with a bounded retry, and no litter when it gives up.
 
     The retry remains because a reader OUTSIDE this codebase -- a virus
     scanner, an editor, another tool -- opens without sharing DELETE and
     still blocks the swap; waiting one of those out is what it is for.
+    It also covers writers racing each other for one target, which is
+    allowed: _tmp_name is per-thread precisely so their replaces land
+    last-writer-wins.
+
     What the retry could never do is wait out a SECOND APP INSTANCE
     reading the same store, which is what _swap and _open_shared fix.
 
@@ -201,11 +236,13 @@ def _replace(tmp, target):
         try:
             _swap(tmp, target)
             return
-        except PermissionError:
+        except OSError as exc:
+            if not _busy(exc):
+                raise
             time.sleep(0.02 * (attempt + 1))
     try:
         _swap(tmp, target)
-    except PermissionError:
+    except OSError:
         with contextlib.suppress(OSError):
             os.remove(tmp)
         raise
