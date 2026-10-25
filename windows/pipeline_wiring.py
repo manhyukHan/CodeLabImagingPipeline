@@ -156,6 +156,14 @@ class PipelineRunner(QtCore.QObject):
         self.log(f'{step}: {len(fovs)} FOV(s), mode {mode}')
         quiet = Quiet(self.mw, mode, self.log)
         quiet.__enter__()
+        # BEFORE the step hook, not after: some steps do their work
+        # synchronously inside it (celltype in FOV mode types every cell
+        # and saves before it returns), and a snapshot taken afterwards
+        # is a snapshot of the finished state -- which then matches the
+        # end state and condemns a step that did its job. An overwrite is
+        # exempt either way: it redoes work the store already calls done,
+        # so its counts cannot move by construction.
+        before = self._state_counts(step) if mode != 'overwrite' else None
         t0 = time.time()
         try:
             busy, finish = getattr(self, f'_run_{step}')(fovs, mode)
@@ -167,11 +175,7 @@ class PipelineRunner(QtCore.QObject):
             self._report['steps'].append({'step': step, 'fovs': fovs, 'mode': mode, 'seconds': 0.0, 'error': msg})
             self.step_finished.emit(step, msg)
             return
-        # an overwrite REDOES work the store already calls done, so its
-        # state counts are expected to come back identical -- only an
-        # append can be judged by whether the store moved
-        self._current = (step, t0, busy, finish, quiet,
-                         self._state_counts(step) if mode != 'overwrite' else None)
+        self._current = (step, t0, busy, finish, quiet, before)
 
     def _finish_current(self):
         step, t0, busy, finish, quiet, before = self._current
