@@ -131,6 +131,13 @@ class FrameMatrices(dict):
                              modality=modality)
 
 
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class FrameResolver:
     """
     Resolves (hybe, modality) -> (hybe, modality) for one FOV.
@@ -172,10 +179,30 @@ class FrameResolver:
       anchors       {modality: 3x3} each modality's cell-alignment anchor
                     -> shared frame. Pass LIVE values; a stored snapshot
                     goes stale whenever FOV alignment is re-run.
+      cell_bridges  {modality: {cell_id: (H_yx, dz)}} -- the PER-CELL
+                    cross-modal layer, sitting between `bridges` (one
+                    correction per FOV) and the per-cell SAME-modality
+                    residual carried on the cell itself. Expressed in the
+                    SHARED frame, because that is where it is fitted and
+                    where it is applied: left-multiplied onto the FOV
+                    route, after that modality's bridge has already
+                    landed the point in `shared`.
+
+                    It is gated, and the gate's refusal needs no
+                    mechanism here: a store whose optics cannot support
+                    the layer (see alignment.cell_bridge_gate) simply
+                    supplies nothing, and the resolver's standing rule --
+                    an uncomputed layer contributes identity -- is
+                    exactly the hibernation wanted. A modality with no
+                    entry at all is therefore SILENT rather than
+                    `missing`, since the layer is deliberately off, not
+                    pending; a modality that HAS entries but not for this
+                    cell is a real gap and is reported.
     """
 
     def __init__(self, within, shared, bridge_xy=None, bridge_z=0.0,
-                 bridge_from=None, anchors=None, bridges=None):
+                 bridge_from=None, anchors=None, bridges=None,
+                 cell_bridges=None):
         self.within = within or {}
         self.shared = shared
         self.bridges = {m: (np.asarray(H, dtype=float), float(dz))
@@ -184,6 +211,19 @@ class FrameResolver:
             self.bridges.setdefault(
                 bridge_from, (np.asarray(bridge_xy, dtype=float), float(bridge_z)))
         self.anchors = anchors or {}
+        if cell_bridges and shared in cell_bridges:
+            # same rule as `bridges`, and for the same reason: the shared
+            # modality's leg to itself is identity BY DEFINITION, so a
+            # per-cell correction on it would move the shared frame
+            # itself, differently for every cell. There is no frame left
+            # to express that in.
+            raise ValueError(
+                'cell_bridges must not key the shared modality %r -- its '
+                'leg to itself is identity by definition' % (shared,))
+        self.cell_bridges = {
+            m: {k: (np.asarray(H, dtype=float), float(dz))
+                for k, (H, dz) in (per or {}).items()}
+            for m, per in (cell_bridges or {}).items()}
 
     # -- cross-modal leg -------------------------------------------------
 
@@ -197,6 +237,38 @@ class FrameResolver:
         if modality == self.shared:
             return (IDENTITY, 0.0)
         return self.bridges.get(modality)
+
+    def _cell_bridge_leg(self, modality, cell, missing=None):
+        """
+        (H, dz) in the SHARED frame for this one cell, or None.
+
+        Returns None both when the layer is off for this modality and
+        when it is on but has nothing for this cell -- the two are the
+        same correction (identity) and differ only in whether anyone
+        should be told. Only the second is a gap worth reporting: the
+        first is a gated-out store behaving as designed, and naming it
+        `missing` on every cell would bury the real gaps.
+        """
+        per = self.cell_bridges.get(modality)
+        if not per:
+            return None
+        if cell is None:
+            return None
+        cid = getattr(cell, 'id', None)
+        if cid is None:
+            return None
+        hit = per.get(cid)
+        if hit is None:
+            # ids survive a round trip through JSON as strings often
+            # enough that matching on one spelling alone loses entries
+            # silently, which looks exactly like a cell the fit refused
+            for alt in (str(cid), _as_int(cid)):
+                if alt is not None and alt in per:
+                    hit = per[alt]
+                    break
+        if hit is None and missing is not None:
+            missing.add('cell-bridge:%s/%s' % (modality, cid))
+        return hit
 
     def bridge(self, from_modality, to_modality):
         """
@@ -267,12 +339,18 @@ class FrameResolver:
         anchor = self.anchors.get(modality) if entry is not None else None
         if entry is not None and anchor is None and missing is not None:
             missing.add(f'cell-anchor:{modality}')
+        cb = self._cell_bridge_leg(modality, cell, missing)
         if entry is not None and anchor is not None and not entry.get('yx_is_residual'):
             # LEGACY entry: 'yx' is the complete hybe->anchor transform with
             # the FOV leg already baked in (compute_cell_alignment used to
             # store compose_chain([H1, H2])). Consume it whole -- recomposing
             # H1 on top would apply the FOV leg twice.
-            return np.asarray(anchor, dtype=float) @ np.asarray(entry['yx'], dtype=float)
+            #
+            # The per-cell cross-modal term is NOT in it, though: that
+            # layer post-dates these entries entirely, so it still has to
+            # be applied on top rather than assumed baked in.
+            legacy = np.asarray(anchor, dtype=float) @ np.asarray(entry['yx'], dtype=float)
+            return (cb[0] @ legacy) if cb is not None else legacy
 
         H_within = self.within.get(modality, {}).get(hybe)
         if H_within is None:
@@ -285,6 +363,12 @@ class FrameResolver:
             if missing is not None and modality != self.shared:
                 missing.add(f'cross-modal:{modality}->{self.shared}')
         fov_route = bridge @ np.asarray(H_within, dtype=float)
+        if cb is not None:
+            # the per-cell cross-modal term, applied AFTER the FOV bridge
+            # has put the point in the shared frame and BEFORE the cell's
+            # own same-modality residual -- the layer's whole definition
+            # is the order of these three
+            fov_route = cb[0] @ fov_route
         if entry is None or anchor is None:
             return fov_route
         # Cell-level route: the BARE residual re-composed onto the CURRENT
@@ -309,7 +393,10 @@ class FrameResolver:
         if cell is not None:
             from . import chain   # call-time import -- see module header
             z_cell = chain.entry_dz(getattr(cell, 'matrices', {}).get((hybe, modality)))
-        return z_cell + self.bridge_z_between(modality, self.shared)
+        cb = self._cell_bridge_leg(modality, cell)
+        z_bridge_cell = cb[1] if cb is not None else 0.0
+        return (z_cell + z_bridge_cell
+                + self.bridge_z_between(modality, self.shared))
 
     # -- the primitive ---------------------------------------------------
 
