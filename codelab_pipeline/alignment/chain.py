@@ -963,6 +963,19 @@ def prepare_cell_passes(cells, fov, passes_by_cell, channel_type, pad,
     for cell in cells:
         for p in passes_by_cell[cell.id]:
             key = (cell.id, p['modality'])
+            if not p['hybe_records']:
+                # EVERY hybe of this modality was filtered out upstream
+                # for not carrying the resolved channel -- the Lamin
+                # store's IF has no 545, and 'fiducial' resolves to one
+                # number for the whole run. Append mode warned and moved
+                # on; overwrite mode reached prepare_cell_alignment with
+                # zero records, failed to find reference_hybe among them
+                # and raised, which took the WHOLE step down and stopped
+                # the DNA pass that had nothing wrong with it. A pass
+                # with nothing to fit is a skip, in both modes.
+                skipped.append((cell.id, '%s: no hybe carries the '
+                                'resolved channel' % p['modality']))
+                continue
             try:
                 ctx, targets, plan = prepare_cell_alignment(
                     cell, p['storage_path'], fov, p['hybe_records'],
