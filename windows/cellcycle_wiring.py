@@ -1041,7 +1041,10 @@ class CellCycleWiring(QtCore.QObject):
         sp = self._storage()
         fovs = sorted(set(int(f) for f in self.placed['fov']))
         placed = self.placed.copy()
-        arcs, gates, marks, name = p.arcs(), p.gates(), self._marks(), self._name()
+        arcs, gates, name = p.arcs(), p.gates(), self._name()
+        # read on the GUI thread, like every other figure call here:
+        # _scale() touches the panel and can write the status label
+        marks, scale = self._marks(), self._scale()
         try:
             voxel = self.mw._voxel_um()
         except Exception:                                       # noqa: BLE001

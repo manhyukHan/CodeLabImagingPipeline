@@ -965,8 +965,14 @@ def fig_gallery(rows, size=64, title=None, outline='#E69F00'):
     hi), ...])], one tile per example, each on its own FOV scale, the
     cell mask outlined. The user's routine verification by eye -- a
     G2/M row should show larger, brighter nuclei and mitotic figures."""
-    ncol = max(len(ex) for _l, ex in rows) if rows else 1
-    fig, axes = plt.subplots(len(rows), ncol, figsize=(1.35 * ncol + 1.2, 1.35 * len(rows) + 0.8), squeeze=False)
+    # at least one of each: subplots REFUSES a zero count, and both
+    # zeros are reachable -- no rows at all, and rows that are all
+    # empty, which is what a gallery whose every FOV read failed
+    # looks like. Crashing there hid the real failure behind a
+    # ValueError about integers.
+    ncol = max((len(ex) for _l, ex in rows), default=0) or 1
+    nrow = len(rows) or 1
+    fig, axes = plt.subplots(nrow, ncol, figsize=(1.35 * ncol + 1.2, 1.35 * nrow + 0.8), squeeze=False)
     for i, (label, examples) in enumerate(rows):
         for j in range(ncol):
             ax = axes[i][j]
@@ -975,7 +981,12 @@ def fig_gallery(rows, size=64, title=None, outline='#E69F00'):
             for side in ('top', 'right', 'bottom', 'left'):
                 ax.spines[side].set_visible(False)
             if j >= len(examples):
-                ax.set_visible(False)
+                # the first tile of an EMPTY row stays visible, blank:
+                # the row label is drawn on it, and a hidden row takes
+                # its label with it, leaving a gap the reader cannot
+                # attribute to any phase bin
+                if examples or j:
+                    ax.set_visible(False)
                 continue
             crop, mask, lo, hi = examples[j]
             ax.imshow(crop, cmap='gray', vmin=lo, vmax=hi, interpolation='nearest')

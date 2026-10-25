@@ -144,6 +144,25 @@ def main():
     check('the gallery has one axes per tile slot and hides the empty ones',
           len(fig.axes) == 6 and sum(ax.get_visible() for ax in fig.axes) == 5)
     plt.close(fig)
+    # an EMPTY phase bin: the row goes blank but must keep its label,
+    # or the reader cannot tell which bin had no cells
+    fig = FC.fig_gallery([('0-45', tiles[:3]), ('45-90 (n=0)', [])], size=16)
+    drawn = [ax.get_ylabel() for ax in fig.axes if ax.get_visible() and ax.get_ylabel()]
+    check('an empty bin still shows its label', drawn == ['0-45', '45-90 (n=0)'], drawn)
+    plt.close(fig)
+    # zero counts reach subplots(), which refuses them: every bin empty
+    # is what a gallery whose FOV reads all failed looks like, and the
+    # ValueError hid that behind a complaint about integers
+    for lab, rows in (('every bin empty', [('0-45', []), ('45-90', [])]),
+                      ('no rows at all', [])):
+        try:
+            fig = FC.fig_gallery(rows, size=16)
+            ok, why = True, ''
+        except Exception as exc:                                # noqa: BLE001
+            ok, why = False, '%s: %s' % (type(exc).__name__, exc)
+        else:
+            plt.close(fig)
+        check('the gallery survives %s' % lab, ok, why)
     # arcs from DAPI: flat 2N from birth (215), rising from 300 to a 2x plateau at 60, back at birth
     th_d = np.linspace(0, 359.9, 1800)
     rel = (th_d - 215.0) % 360.0
