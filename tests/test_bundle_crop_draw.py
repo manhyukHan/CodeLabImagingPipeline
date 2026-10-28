@@ -32,10 +32,11 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 CHECKS = [0, 0]
 STORE = 'G:/Seonghyeok/2025-11-30-MP58/RNA'
-DRY_OUT = 'D:/claude-tmp/cropdraw_dry_never_written'
+DRY_OUT = scratch('cropdraw_dry_never_written')
 
 # fov -> ids as the store lists them (not sorted, on purpose)
 FAKE = {1: list(range(100, 120)),                       # 20

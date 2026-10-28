@@ -16,7 +16,7 @@ the same key. labels() files such a candidate as 'inconsistent' and
 nobody trains on it.
 
 Everything here runs on a REAL shard from the two-channel bundle at
-D:/claude-tmp/twoch, through Spot Check's own load/commit path; skips
+<artifacts>/twoch, through Spot Check's own load/commit path; skips
 with a reason when it is absent.
 
 Run:  python tests/test_features_in_verdicts.py
@@ -30,6 +30,7 @@ import tempfile
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 from codelab_pipeline.training import bundle as B          # noqa: E402
 from codelab_pipeline.training import dataset as D         # noqa: E402
@@ -37,7 +38,7 @@ from codelab_pipeline.training import features as F        # noqa: E402
 from codelab_pipeline.training import verdicts as V        # noqa: E402
 
 CHECKS = [0, 0]
-TWOCH = 'D:/claude-tmp/twoch'
+TWOCH = os.path.join(artifacts(), 'twoch')
 MODEL = 'D:/models/mp58_rna'
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

@@ -8,7 +8,7 @@ whole chain twice into two folders. The window owns every step and
 runs each long one in the background.
 
 Everything here that reads a bundle reads the REAL two-channel bundle
-built from G:/Seonghyeok/2025-11-30-MP58/RNA into D:/claude-tmp/twoch
+built from G:/Seonghyeok/2025-11-30-MP58/RNA into <artifacts>/twoch
 (116 crops in ch555 and 116 in ch635, FOV007 Hyb_101), and skips with
 a reason when it is absent. The report rendering reads the shipped
 model under D:/models/mp58_rna.
@@ -21,13 +21,16 @@ import sys
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 from PyQt5 import QtCore, QtWidgets                          # noqa: E402
 
 from ui.model_build_dialog import ModelBuildDialog, _parse_fovs  # noqa: E402
 
 CHECKS = [0, 0]
-TWOCH = 'D:/claude-tmp/twoch'
+TWOCH = os.path.join(artifacts(), 'twoch')
+#: named, never written -- the dialog only forwards it as --out
+WHATEVER = scratch('whatever')
 MODEL = 'D:/models/mp58_rna'
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -161,7 +164,7 @@ def test_build_commands():
     d = make(fov_pool=(7, 8, 9, 14, 19))
     set_checked(d, lambda m, h, c: m == 'RNA')
     d.FovListLineEdit.setText('7,14')
-    d.BundlePathLineEdit.setText('D:/claude-tmp/whatever')
+    d.BundlePathLineEdit.setText(WHATEVER)
     cmds = d.build_commands()
     check('one command per checked CHANNEL', len(cmds) == 2)
     ch = [c[c.index('--channel') + 1] for c in cmds]
@@ -176,7 +179,7 @@ def test_build_commands():
     check("the declared pool is passed, not build_bundle's 1-41 default",
           pool == {'7,8,9,14,19'}, str(pool))
     check('every command targets the one bundle directory',
-          all(c[c.index('--out') + 1] == 'D:/claude-tmp/whatever'
+          all(c[c.index('--out') + 1] == WHATEVER
               for c in cmds))
     check('every command runs the interpreter unbuffered',
           all(c[1] == '-u' for c in cmds))
@@ -280,7 +283,7 @@ def test_restore_from_manifest():
     appends exactly -- the manifest is the record of what was built."""
     print('restore from the manifest after a relaunch')
     import tempfile
-    root = tempfile.mkdtemp(prefix='resume_', dir='D:/claude-tmp')
+    root = tempfile.mkdtemp(prefix='resume_')
     runs = [dict(storage_path=STORES['RNA'], channel=555,
                  hybes=['Hyb_101', 'Hyb_103'], fovs=[7, 14, 19],
                  n_crops=5000, draw_seed=0, workers=6),
@@ -350,7 +353,7 @@ def test_one_bundle_one_store_across_sessions():
     experiment is not kept."""
     print('one bundle, one store, across sessions')
     import tempfile
-    root = tempfile.mkdtemp(prefix='foreign_', dir='D:/claude-tmp')
+    root = tempfile.mkdtemp(prefix='foreign_')
     with open(os.path.join(root, 'bundle_manifest.json'), 'w',
               encoding='utf-8') as f:
         json.dump({'storage_path': 'G:/Somebody/other-experiment/DNA',
@@ -416,7 +419,7 @@ def test_review_status():
     check('the label says what is there and who has reviewed',
           '232 crops' in txt and 'ch555, ch635' in txt and 'nobody yet' in txt,
           txt.splitlines()[0])
-    d.BundlePathLineEdit.setText('D:/claude-tmp/does-not-exist')
+    d.BundlePathLineEdit.setText(scratch('does-not-exist'))
     check('a missing directory is None, not a crash',
           d.review_status() is None)
 
@@ -470,7 +473,7 @@ def test_render_report():
     check('the multispot calibration is reported',
           'multispot' in txt and 'pillars' in txt)
     check('the PSF is reported', 'psf' in txt and 'confirmed spots' in txt)
-    bad = ModelBuildDialog.render_report('D:/claude-tmp/no-such-run')
+    bad = ModelBuildDialog.render_report(scratch('no-such-run'))
     check('a missing report is a message, not a crash',
           'no readable report.json' in bad)
 

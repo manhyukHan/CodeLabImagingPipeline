@@ -12,7 +12,7 @@ folder then claimed to be a one-channel bundle of the other channel.
 
 Verified against a REAL two-channel bundle built from
 G:/Seonghyeok/2025-11-30-MP58/RNA (FOV007, Hyb_101, ch635 then ch555)
-into D:/claude-tmp/twoch; skips with a reason when it is absent.
+into <artifacts>/twoch; skips with a reason when it is absent.
 
 Run:  python tests/test_bundle_multichannel.py
 """
@@ -21,9 +21,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 CHECKS = [0, 0]
-TWOCH = 'D:/claude-tmp/twoch'
+TWOCH = os.path.join(artifacts(), 'twoch')
 
 
 def check(name, ok, note=''):
@@ -119,7 +120,7 @@ def test_eta_and_workers():
           isinstance(w, int) and 1 <= w <= 6, str(w))
 
 
-ETACHECK = 'D:/claude-tmp/etacheck'
+ETACHECK = os.path.join(artifacts(), 'etacheck')
 MODEL = 'D:/models/mp58_rna'
 MP58_BUNDLE = 'D:/bundles/MP58_RNA_all_4fov'
 STORE = 'G:/Seonghyeok/2025-11-30-MP58/RNA'

@@ -25,6 +25,7 @@ import tempfile
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 import numpy as np                                          # noqa: E402
 
@@ -32,7 +33,7 @@ CHECKS = [0, 0]
 _APP = None
 MP58 = 'G:/Seonghyeok/2025-11-30-MP58/review_bundles/DNA_ch555'
 JP = 'G:/JP/2026-01-26-JP-chr19_downstream/review_bundles/DNA_ch555'
-OUT = 'D:/claude-tmp/models/resolution_test'
+OUT = os.path.join(artifacts(), 'models', 'resolution_test')
 
 
 def check(name, ok, note=''):
@@ -108,7 +109,7 @@ def test_bundle_and_dialog():
         ModelBuildDialog._recall_bundle_path = recall
     set_checked(d, lambda m, h, c: m == 'RNA')
     d.FovListLineEdit.setText('7,14')
-    d.BundlePathLineEdit.setText('D:/claude-tmp/whatever')
+    d.BundlePathLineEdit.setText(scratch('whatever'))
     cmds = d.build_commands()
     check('every build command carries the resolution',
           cmds and all(c[c.index('--genomic-resolution-kb') + 1] == '50'
@@ -158,7 +159,7 @@ def test_feature_contract():
         raised = str(exc)
     check('and a head with context refuses to score without it',
           'Ingestion tab' in raised)
-    with tempfile.TemporaryDirectory(dir='D:/claude-tmp') as d:
+    with tempfile.TemporaryDirectory() as d:
         path = clf17.save(os.path.join(d, 'spot_classifier_linear.json'))
         back = C.SpotClassifier.load(path)
         check('it round-trips through disk with its 17 inputs',

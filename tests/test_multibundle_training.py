@@ -12,7 +12,7 @@ beside the pooled one -- otherwise 'one model' hides exactly the
 difference a person wants to see.
 
 Verified on the two real DNA ch555 bundles (MP58 and JP chr19), read
-only; the run is written under D:/claude-tmp. Skips with a reason when
+only; the run is written under <artifacts>. Skips with a reason when
 they are absent.
 
 Run:  python tests/test_multibundle_training.py
@@ -23,11 +23,12 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 CHECKS = [0, 0]
 MP58 = 'G:/Seonghyeok/2025-11-30-MP58/review_bundles/DNA_ch555'
 JP = 'G:/JP/2026-01-26-JP-chr19_downstream/review_bundles/DNA_ch555'
-OUT = 'D:/claude-tmp/models/multibundle_test'
+OUT = os.path.join(artifacts(), 'models', 'multibundle_test')
 
 
 def check(name, ok, note=''):
@@ -86,7 +87,7 @@ def test_pooled_multispot():
           and set(r2['bundles']) == set(have)
           and isinstance(r2.get('banks'), list),
           str((ra.get('n'), rb.get('n'), r2.get('n'), r2.get('bundles'))))
-    empty = tempfile.mkdtemp(prefix='nomulti_', dir='D:/claude-tmp')
+    empty = tempfile.mkdtemp(prefix='nomulti_')
     none, r3 = C.fit_multispot([empty], template=(7, 7, 11))
     check('and a bundle without any says so',
           none is None and 'no multispot verdicts' in r3['skipped'])

@@ -22,6 +22,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _scratch_paths import artifacts, scratch        # noqa: E402
 
 import numpy as np                                          # noqa: E402
 
@@ -53,7 +54,7 @@ def test_bank_and_selection():
               'source': 'MP58', 'sigma_xy_um': 0.28, 'sigma_z_um': 0.76},
              {'template': t200, 'genomic_resolution_kb': 200.0, 'n_spots': 573,
               'source': 'chr19', 'sigma_xy_um': 0.27, 'sigma_z_um': 1.07}]
-    with tempfile.TemporaryDirectory(dir='D:/claude-tmp') as d:
+    with tempfile.TemporaryDirectory() as d:
         path = PB.save(os.path.join(d, 'psf_bank.h5'), mean, VOX, n_spots=2044,
                        candidates=cands)
         back = PB.candidates(path)
@@ -124,7 +125,7 @@ def test_engine_and_calibration():
               'sigma_xy_um': 0.22, 'sigma_z_um': 0.64},
              {'template': t200, 'genomic_resolution_kb': 200.0, 'source': 'chr19',
               'sigma_xy_um': 0.27, 'sigma_z_um': 1.07}]
-    with tempfile.TemporaryDirectory(dir='D:/claude-tmp') as d:
+    with tempfile.TemporaryDirectory() as d:
         path = PB.save(os.path.join(d, 'psf_bank.h5'), mean, VOX, candidates=cands)
         e = E.make_engine('psf-match', bank=path, voxel_um=VOX, resolution_kb=200.0)
         check("'select' with a known resolution takes that candidate",
