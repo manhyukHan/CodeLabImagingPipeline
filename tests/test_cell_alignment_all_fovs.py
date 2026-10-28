@@ -59,6 +59,20 @@ class FakeContainer:
     def get_cells(self, fov):
         return self.data.get(fov, [])
 
+    def edge_cell_ids(self, fov):
+        """No cell touches the frame here.
+
+        The product grew this (CellContainer.edge_cell_ids, called
+        from the Remove Edge Cells path) and the stub did not
+        follow, so every run of this test died on AttributeError
+        before reaching what it actually checks -- that a FOV with
+        no cells is skipped rather than fatal, and that each FOV is
+        saved the moment it lands. These fake cells carry no masks
+        or frame shape, so the honest answer for them is 'none', and
+        the removal path is then a no-op rather than something this
+        test pretends to exercise."""
+        return []
+
 
 def main():
     mw = MainWindow()
