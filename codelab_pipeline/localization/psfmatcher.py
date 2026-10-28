@@ -284,9 +284,11 @@ class PsfMatcherV3Engine(LocalizeEngine):
         A missing PSF bank is not a reason to answer nothing -- model 1
         still says whether a spot is there, and an anchor still says
         roughly where. But it is a reason to be able to TELL, so this is
-        a property a caller can read and `no_refine_why` says what went
-        wrong, rather than positions quietly losing their sub-voxel
-        precision and every p going NaN with no explanation.
+        a property a caller can read, rather than positions quietly
+        losing their sub-voxel precision and every p going NaN with
+        no explanation. The reason itself stays on `_no_refine` for a
+        caller that wants it; the public accessor was never read and
+        is gone.
         """
         if self._refines is None:
             try:
@@ -296,11 +298,6 @@ class PsfMatcherV3Engine(LocalizeEngine):
                 self._refines = False
                 self._no_refine = f'{type(exc).__name__}: {exc}'
         return self._refines
-
-    @property
-    def no_refine_why(self):
-        self.refines
-        return self._no_refine
 
     @property
     def multispot_cal(self):

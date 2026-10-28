@@ -34,6 +34,7 @@ Skipped by name: dunders, and Qt virtual hooks the framework calls
 
 Exit code 1 when anything is flagged, so this can gate a commit.
 """
+import io
 import ast
 import collections
 import os
@@ -134,7 +135,7 @@ def code_only(source):
 def main():
     live_files = list(iter_py(LIVE))
     all_files = live_files + list(iter_py(REF_ONLY))
-    full_src = {f: open(f).read() for f in all_files}
+    full_src = {f: io.open(f, encoding='utf-8').read() for f in all_files}
     code_src = {f: code_only(s) for f, s in full_src.items()}
 
     defs = []
