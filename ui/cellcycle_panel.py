@@ -274,7 +274,24 @@ class CellCyclePanelUI(object):
         self.MinRadiusSpinBox = QtWidgets.QDoubleSpinBox(); self.MinRadiusSpinBox.setRange(0.0, 100.0); self.MinRadiusSpinBox.setSingleStep(0.05); self.MinRadiusSpinBox.setValue(0.5)
         self.MinTotalGateCheckBox = QtWidgets.QCheckBox('min panel total')
         self.MinTotalGateSpinBox = QtWidgets.QDoubleSpinBox(); self.MinTotalGateSpinBox.setRange(0.0, 1e6); self.MinTotalGateSpinBox.setDecimals(0); self.MinTotalGateSpinBox.setValue(10.0)
-        self.MinBfCheckBox.setChecked(True)
+        # EVERY VERDICT GATE IS OFF BY DEFAULT, so the default turn of
+        # an angle into a phase is as generous as the angle allows: a
+        # placed cell gets its arc's name, and nothing but a non-finite
+        # angle takes it away.
+        #
+        # min log BF_ring >= 0 used to be on. That gate asks "is this
+        # cell NOT at the centre of the circle", which a random
+        # composition also passes -- it is the test ring_level replaced,
+        # and leaving it on as a default quietly removed cells on a
+        # criterion the project had already withdrawn. The gates are
+        # still here, still stored with the model, and still applied at
+        # read time: turning one on is a decision an experiment makes
+        # for itself, with its own number, not something a new fit
+        # inherits.
+        for cb in (self.MinRCheckBox, self.MinBfCheckBox,
+                   self.MinFitZCheckBox, self.MaxRadiusCheckBox,
+                   self.MinRadiusCheckBox, self.MinTotalGateCheckBox):
+            cb.setChecked(False)
         for i, (cb, sb) in enumerate(((self.MinRCheckBox, self.MinRSpinBox), (self.MinBfCheckBox, self.MinBfSpinBox),
                                       (self.MinFitZCheckBox, self.MinFitZSpinBox), (self.MaxRadiusCheckBox, self.MaxRadiusSpinBox),
                                       (self.MinRadiusCheckBox, self.MinRadiusSpinBox),

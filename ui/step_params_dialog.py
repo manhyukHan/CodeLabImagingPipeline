@@ -69,6 +69,17 @@ MEASURED_NOT_SET = {
         'z_start': 'the detected plateau, per FOV',
         'z_end': 'the detected plateau, per FOV',
     },
+    'celltype': {
+        # the tab's box applies to whichever celltype is SELECTED in its
+        # list, and there is no selection here; the run reads the ranges
+        # from the store anyway (_refresh_celltype_config_from_vlinks)
+        'fov_ranges': 'per celltype, on the Celltype tab; the run reads '
+                      'them from the store',
+    },
+    'cellcycle': {
+        # the runner sets it from the step's own plan before it starts
+        'fov_list': "the step's own FOV list is used",
+    },
 }
 
 #: the rounds picker edits this one, so the generated form must not also
@@ -85,7 +96,14 @@ PICKER_PARAMS = {('localization_run', 'rounds')}
 #: dialog asks it rather than keeping a second answer.
 VERSION_STACK = {
     'chromatin_tracing': ('engine', 'ChromatinTracingPanel',
-                          'FitParamsStackedWidget'),
+                          'FitParamsStackedWidget', None),
+    # the same shape for a two-way mode: FOV is page 0, barcode page 1,
+    # and `fov_mode` is one radio of the pair. Without this the celltype
+    # dialog listed the barcode calibration and the FOV ranges together,
+    # as if a run used both -- it uses one, and which one decides what
+    # every other parameter in the section means.
+    'celltype': ('fov_mode', 'CelltypeDeterminationPanel',
+                 'ModeStackedWidget', ('FOV ranges', 'Barcode channel')),
 }
 
 #: a readable name for the tab a section writes to
@@ -119,7 +137,9 @@ def _editor_for(src):
         if src.isEditable():
             w.setCurrentText(src.currentText())
         return w
-    if isinstance(src, QtWidgets.QCheckBox):
+    if isinstance(src, (QtWidgets.QCheckBox, QtWidgets.QRadioButton)):
+        # a radio's partner is handled by its button group when the
+        # value is applied, so one checkable editor is the whole choice
         w = QtWidgets.QCheckBox(src.text())
         w.setChecked(src.isChecked())
         return w
@@ -311,6 +331,49 @@ class RoundsPicker(QtWidgets.QWidget):
         return ','.join('%s|%s|%d' % cb.key for cb in picked)
 
 
+class NamesEditor(QtWidgets.QWidget):
+    """The experiment's celltype names, one per line.
+
+    WHY IT IS HERE AND NOT ONLY ON THE TAB. These names are the shared
+    identity both celltype modes write, and they are saved as soon as
+    they are typed -- the config's own `celltype_names`, written
+    straight from this list. So they exist BEFORE celltype
+    determination has run, which is what lets the cell-cycle step name
+    a training target by celltype instead of training on everything.
+
+    Removing a name removes it from the LIST, not from a cell: a cell
+    already classified keeps its celltype string, and the next scan of
+    the store puts the name back if it is really in use.
+    """
+
+    def __init__(self, names, parent=None):
+        super().__init__(parent)
+        self.start = list(names or [])
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.Edit = QtWidgets.QPlainTextEdit(chr(10).join(self.start))
+        self.Edit.setPlaceholderText('one celltype name per line')
+        self.Edit.setMaximumHeight(96)
+        lay.addWidget(self.Edit)
+        note = QtWidgets.QLabel(
+            'Saved with the config as they stand — the cell-cycle step '
+            'can train on one of these before any cell is classified.')
+        note.setWordWrap(True)
+        note.setStyleSheet(f'color: {GREY};')
+        lay.addWidget(note)
+
+    def value(self):
+        out = []
+        for line in self.Edit.toPlainText().splitlines():
+            name = line.strip()
+            if name and name not in out:
+                out.append(name)
+        return out
+
+    def changed(self):
+        return self.value() != self.start
+
+
 class StepParamsDialog(QtWidgets.QDialog):
     """The parameters of one step, applied to the tabs they belong to."""
 
@@ -324,6 +387,7 @@ class StepParamsDialog(QtWidgets.QDialog):
         self._fields = []          # (section, param, editor, original)
         self._machine = []         # (src widget, editor)
         self.rounds = None
+        self.names = None
 
         outer = QtWidgets.QVBoxLayout(self)
         panels = sorted({PANEL_TITLES.get(p, p)
@@ -348,6 +412,18 @@ class StepParamsDialog(QtWidgets.QDialog):
             box = self._section_box(section)
             if box is not None:
                 inner.addWidget(box)
+
+        if step == 'celltype':
+            box = QtWidgets.QGroupBox(
+                'Celltypes — the identity both modes write')
+            lay = QtWidgets.QVBoxLayout(box)
+            try:
+                panel = mw.ui.CelltypeDeterminationPanel
+                self.names = NamesEditor(panel.celltype_names())
+                lay.addWidget(self.names)
+            except Exception:                               # noqa: BLE001
+                self.names = None
+            inner.addWidget(box)
 
         if step == 'localization':
             box = QtWidgets.QGroupBox('Rounds to localize')
@@ -492,17 +568,27 @@ class StepParamsDialog(QtWidgets.QDialog):
                 form, text = main, param
             label = QtWidgets.QLabel(text.replace('_', ' '))
             label.setToolTip(f'config: {section}/{param}')
+            names = (VERSION_STACK.get(section) or (None, None, None, None))[3]
+            if (names and param == VERSION_STACK[section][0]
+                    and isinstance(ed, QtWidgets.QCheckBox)):
+                # 'FOV' alone does not say what unchecking it means.
+                # From VERSION_STACK, not from the page titles built
+                # above: a mode whose page has no settable parameter
+                # left contributes no title, and that is exactly the
+                # mode whose name the label needs most.
+                ed.setText('%s   (off: %s)' % (names[0], names[1]))
             form.addRow(label, ed)
 
         if section in VERSION_STACK and group_boxes:
             version = VERSION_STACK[section][0]
-            combo = next((ed for p, ed, _pa, _w in rows if p == version), None)
-            if isinstance(combo, QtWidgets.QComboBox):
-                self._bind_version(combo, group_boxes)
+            selector = next((ed for p, ed, _pa, _w in rows if p == version),
+                            None)
+            if selector is not None:
+                self._bind_version(selector, group_boxes)
         if measured:
             note = QtWidgets.QLabel(
-                'Measured per FOV, not set here: '
-                + '; '.join('%s (%s)' % (k.replace('_', ' '), why)
+                'Not set here: '
+                + '; '.join('%s — %s' % (k.replace('_', ' '), why)
                             for k, why in measured.items()) + '.')
             note.setWordWrap(True)
             note.setStyleSheet(f'color: {GREY};')
@@ -521,7 +607,7 @@ class StepParamsDialog(QtWidgets.QDialog):
         entry = VERSION_STACK.get(section)
         if entry is None:
             return None
-        _version, panel, attr = entry
+        _version, panel, attr, page_titles = entry
         try:
             stack = self.mw._config_widget(panel, attr)
         except Exception:                                   # noqa: BLE001
@@ -544,23 +630,37 @@ class StepParamsDialog(QtWidgets.QDialog):
         titles = {}
         combo = next((ed for p, ed, _pa, _w in rows if p == _version), None)
         for i in set(families.values()):
-            titles[i] = (combo.itemText(i) if combo is not None
-                         and i < combo.count() else 'engine %d' % i)
+            if page_titles and i < len(page_titles):
+                titles[i] = page_titles[i]
+            elif isinstance(combo, QtWidgets.QComboBox) and i < combo.count():
+                titles[i] = combo.itemText(i)
+            else:
+                titles[i] = 'mode %d' % i
         return families, titles
 
-    def _bind_version(self, combo, group_boxes):
-        """Show only the chosen engine's page of parameters.
+    def _bind_version(self, selector, group_boxes):
+        """Show only the chosen page of parameters.
 
         The keys of `group_boxes` are page INDICES of the panel's own
-        stack, and the combo's index selects the page -- the panel wires
-        the same two together (ChromatinTracingPanel line 1236), so the
-        dialog shows exactly what the tab would show.
+        stack, and the selector picks one: a combo by its index (the
+        panel wires the same two together, ChromatinTracingPanel line
+        1236), or a checkable editor standing in for one radio of a
+        two-way pair, where checked IS page 0.
         """
+        if isinstance(selector, QtWidgets.QComboBox):
+            current, changed = (lambda: selector.currentIndex(),
+                                selector.currentIndexChanged)
+        elif isinstance(selector, QtWidgets.QAbstractButton):
+            current, changed = (lambda: 0 if selector.isChecked() else 1,
+                                selector.toggled)
+        else:
+            return
+
         def _apply():
-            current = combo.currentIndex()
+            now = current()
             for index, g in group_boxes.items():
-                g.setVisible(index == current)
-        combo.currentIndexChanged.connect(lambda _i: _apply())
+                g.setVisible(index == now)
+        changed.connect(lambda *_a: _apply())
         _apply()
 
     def _restore(self):
@@ -588,7 +688,18 @@ class StepParamsDialog(QtWidgets.QDialog):
             value = self.rounds.value()
             if value != field.text():
                 field.setText(value)
-                changed.append('pipeline/localization_rounds')
+                changed.append('localization_run/rounds')
+        if self.names is not None and self.names.changed():
+            self.mw.ui.CelltypeDeterminationPanel.set_celltype_names(
+                self.names.value())
+            # the window keeps its own copy, and every seeding path adds
+            # to it rather than replacing it -- so a name removed here
+            # would come straight back on the next scan
+            try:
+                self.mw.current_celltype_list = list(self.names.value())
+            except Exception:                               # noqa: BLE001
+                pass
+            changed.append('celltype/names')
         return ', '.join(changed)
 
 

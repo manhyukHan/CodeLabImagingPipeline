@@ -289,6 +289,32 @@ class CelltypeDeterminationPanelUI(object):
         if self.CelltypeNamesListWidget.currentItem() is None and self.CelltypeNamesListWidget.count() > 0:
             self.CelltypeNamesListWidget.setCurrentRow(0)
 
+    def set_celltype_names(self, names):
+        """REPLACE the list, which ensure_celltype_names deliberately
+        cannot do.
+
+        That one only ever adds, because it is fed from the store and
+        from a loaded config and must not throw away what someone typed.
+        This is the other direction: somebody editing the list on
+        purpose, so a name they took out stays out. Removing a name here
+        removes it from the LIST, never from a cell -- a cell already
+        classified keeps its celltype string, and the next scan of the
+        store puts the name back if it is really in use.
+        """
+        keep = self.selected_celltype()
+        self.CelltypeNamesListWidget.clear()
+        seen = []
+        for name in names or []:
+            name = str(name).strip()
+            if name and name not in seen:
+                seen.append(name)
+                self.CelltypeNamesListWidget.addItem(name)
+        if keep in seen:
+            self.CelltypeNamesListWidget.setCurrentRow(seen.index(keep))
+        elif seen:
+            self.CelltypeNamesListWidget.setCurrentRow(0)
+        return seen
+
     def _add_celltype_name(self):
         name = self.NewCelltypeNameLineEdit.text().strip()
         if not name or name in self.celltype_names():

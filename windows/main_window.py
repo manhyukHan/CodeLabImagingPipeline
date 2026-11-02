@@ -14329,6 +14329,13 @@ One PNG PER MODALITY: each modality has its own reference and its
             'upper_bound_mode': ('CelltypeDeterminationPanel', 'UpperBoundModeComboBox'),
             'upper_bound_value': ('CelltypeDeterminationPanel', 'UpperBoundValueDoubleSpinBox'),
             'include_transient': ('CelltypeDeterminationPanel', 'IncludeTransientCheckBox'),
+            # WHICH MODE THE STEP RUNS IN was not in the config at all,
+            # so a saved experiment could not say whether its celltypes
+            # came from FOV ranges or from a barcode channel -- the one
+            # thing that decides what every other parameter in this
+            # section means. One radio of the pair: its button group
+            # answers for the other.
+            'fov_mode': ('CelltypeDeterminationPanel', 'FOVModeRadioButton'),
         },
         'chromatin_tracing': {
             'reference_hybe': ('ChromatinTracingPanel', 'ReferenceHybeComboBox'),
@@ -14421,7 +14428,10 @@ One PNG PER MODALITY: each modality has its own reference and its
             return w.currentText()
         if isinstance(w, QtWidgets.QLineEdit):
             return w.text()
-        if isinstance(w, QtWidgets.QCheckBox):
+        if isinstance(w, (QtWidgets.QCheckBox, QtWidgets.QRadioButton)):
+            # a radio too: a two-way mode choice is a checkable widget
+            # like any other, and the button group takes care of the
+            # other half when this one is set
             return '1' if w.isChecked() else '0'
         return str(w.value())   # QSpinBox / QDoubleSpinBox
 
@@ -14453,7 +14463,7 @@ One PNG PER MODALITY: each modality has its own reference and its
         if isinstance(w, QtWidgets.QLineEdit):
             w.setText(value)
             return True
-        if isinstance(w, QtWidgets.QCheckBox):
+        if isinstance(w, (QtWidgets.QCheckBox, QtWidgets.QRadioButton)):
             w.setChecked(value == '1')
             return True
         if isinstance(w, QtWidgets.QDoubleSpinBox):
