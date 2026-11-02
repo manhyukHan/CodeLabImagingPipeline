@@ -1701,6 +1701,34 @@ def _alpha_fold(item):
     return float(m.evidence('cv', X[test], prior='uniform').mean())
 
 
+#: tokens in a celltype name that usually mean the population was
+#: ARRESTED. Fitting the cycle profiles on an arrested population
+#: collapses the conditions into clusters (design 4.3): arrested cells
+#: are placed, never trained on.
+#: 'dmso' is deliberately NOT here: a vehicle control is the CYCLING
+#: arm of an arrest experiment, so flagging it would warn about exactly
+#: the population the fit wants.
+ARREST_TOKENS = ('hu', 'hydroxyurea', 'noco', 'nocodazole', 'arrest',
+                 'arrested', 'thymidine', 'starve', 'starved', 'g0',
+                 'ro3306', 'cdk1i', 'palbo', 'mitotic')
+
+
+def arrested_looking(names):
+    """The subset of `names` whose spelling suggests an arrested arm.
+
+    A WARNING AND NEVER A FILTER. Guessing a treatment from a label and
+    then silently dropping its cells would be a worse fault than the
+    one it prevents -- the name is the experimenter's shorthand, not a
+    declaration. The caller says so and leaves the choice alone.
+    """
+    out = []
+    for name in names or []:
+        low = str(name).lower()
+        if any(t in low for t in ARREST_TOKENS):
+            out.append(str(name))
+    return out
+
+
 def select_alpha(X, alphas=(10, 30, 100, 300, None), K=DEFAULT_K, folds=3, seed=0, jobs=None,
                  n_iter=20, **kw):
     """Held-out mean evidence per alpha for one cycling population:

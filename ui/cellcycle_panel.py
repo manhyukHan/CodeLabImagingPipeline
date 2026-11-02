@@ -128,8 +128,22 @@ class CellCyclePanelUI(object):
         self.AlphaSpinBox.setToolTip('Dirichlet-multinomial dispersion: a cell carries at most ~alpha effective counts. '
                                      'Measured by held-out evidence: chr19 100, JP_001 300, JP_002 100.')
         self.AlphaHeldOutPushButton = QtWidgets.QPushButton('Choose by held-out evidence')
+        #: the same chooser, run by the FIT instead of by a button, so an
+        #: unattended run does not inherit whatever number was last typed
+        self.AlphaAutoCheckBox = QtWidgets.QCheckBox('auto')
+        self.AlphaAutoCheckBox.setChecked(True)
+        self.AlphaAutoCheckBox.setToolTip(
+            'Choose alpha by held-out evidence as part of the fit, the '
+            'same cross-validation the button runs (cellcycle.select_'
+            'alpha: 5 alphas x 3 folds, short fits). The number actually '
+            'used is written back here and stored with the model. Off '
+            'means the fit takes the value beside it as given.')
         alphaLayout.addWidget(self.AlphaSpinBox)
+        alphaLayout.addWidget(self.AlphaAutoCheckBox)
         alphaLayout.addWidget(self.AlphaHeldOutPushButton)
+        self.AlphaAutoCheckBox.toggled.connect(
+            lambda on: self.AlphaSpinBox.setEnabled(not on))
+        self.AlphaSpinBox.setEnabled(not self.AlphaAutoCheckBox.isChecked())
         mform.addRow('Dispersion alpha:', alphaRow)
         self.OriginComboBox = QtWidgets.QComboBox()
         self.OriginComboBox.addItems(['division: where the DAPI content halves (falls back to the panel-total drop)',
@@ -503,14 +517,28 @@ class CellCyclePanelUI(object):
     # -- 2. model state ---------------------------------------------------
 
     def set_celltype_names(self, names):
-        """Refresh the training list, keeping what was checked."""
+        """Refresh the training list, keeping what was checked.
+
+        A NAME NOBODY HAS DECIDED ON YET ARRIVES CHECKED. None checked
+        means "train on every cell", and on an experiment whose
+        celltypes are defined that is the weaker choice: the celltypes
+        are defined precisely because the populations differ. So a name
+        appearing for the first time starts as a training target, and
+        unchecking it is the decision.
+
+        That matters for ARRESTED populations, which must be placed and
+        never trained on (design 4.3): see arrested_looking() for the
+        warning this puts in front of whoever is looking.
+        """
         lw = self.TrainingCelltypeListWidget
         checked = set(self.training_celltypes())
+        known = {lw.item(i).text() for i in range(lw.count())}
         lw.clear()
         for n in names:
             item = QtWidgets.QListWidgetItem(str(n))
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Checked if n in checked else QtCore.Qt.Unchecked)
+            on = (str(n) in checked) or (str(n) not in known)
+            item.setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
             lw.addItem(item)
 
     def training_celltypes(self):

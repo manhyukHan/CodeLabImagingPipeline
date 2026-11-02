@@ -320,6 +320,14 @@ class CellCycleWiring(QtCore.QObject):
                              f'circle. Check the training celltypes, the minimum total, and that the store holds spots '
                              f'for every panel hybe.')
         alpha = float(p.AlphaSpinBox.value())
+        auto_alpha = bool(p.AlphaAutoCheckBox.isChecked())
+        warn = CC.arrested_looking(train)
+        if warn:
+            self._log('training on %s -- those names read as ARRESTED arms, '
+                      'and fitting the profiles on an arrested population '
+                      'collapses the conditions into clusters (design 4.3). '
+                      'Uncheck them above to place those cells without '
+                      'training on them.' % ', '.join(warn))
         early, late, hk = self._role_lists(self.roles)
         bridges = []
         for path in p.bridges():
@@ -343,6 +351,19 @@ class CellCycleWiring(QtCore.QObject):
         p.ModelStatusLabel.setText(f'fitting on {int(k.sum())} training cells' + (f' with {len(bridges)} bridge(s)' if bridges else '') + '...')
 
         def _compute():
+            # ALPHA FIRST, in the worker: the chooser is a short
+            # cross-validated fit per (alpha, fold) and belongs nowhere
+            # near the GUI thread. An unattended run that skipped this
+            # would fit at whatever number was last typed into the box.
+            chosen = alpha
+            scores = None
+            if auto_alpha:
+                scores = CC.select_alpha(X[k])
+                if scores:
+                    best = max(scores, key=lambda a: scores[a])
+                    chosen = None if best is None else float(best)
+                    datasets[0] = CC.Dataset(name, X[k], genes, ct[k],
+                                             alpha=chosen)
             m = CC.CycleModel().fit(datasets, bridge_exclude=hk, orient_by=orient_by)
             if orient_by is not None:
                 m.orient(early, late)
@@ -369,7 +390,10 @@ class CellCycleWiring(QtCore.QObject):
             arcs, arcs_from = self._propose_after(m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares)
             spec = {'version': 1, 'model': m.to_dict(), 'experiment': name,
                     'sources': {CC.source_key(s): g for s, g in names_map.items()},
-                    'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE, 'alpha': alpha,
+                    'roles': roles, 'proxy': metric, 'gate': CC.COUNT_GATE,
+                    'alpha': chosen, 'alpha_auto': bool(auto_alpha),
+                    'alpha_scores': ({str(a): float(v) for a, v in scores.items()}
+                                     if scores else None),
                     'dispersion': {'alpha0': m.alphas.get(name), 'beta': m.alpha_beta.get(name, 0.0),
                                    's_ref': m.alpha_sref.get(name), 'gain_per_cell': cal['gain'],
                                    'min_gain': cal['min_gain'], 'best_single_alpha': cal['best_scalar'],
@@ -387,6 +411,13 @@ class CellCycleWiring(QtCore.QObject):
 
         def _done(res):
             m, placed, spec, cal = res
+            if spec.get('alpha_auto'):
+                got = spec.get('alpha')
+                self._log('alpha chosen by held-out evidence: %s'
+                          % ('multinomial (no dispersion)' if got is None
+                             else '%g' % got))
+                if got is not None:
+                    p.AlphaSpinBox.setValue(float(got))
             d = spec['dispersion']
             if d['beta']:
                 self._log(f'dispersion calibrated on held-out FOVs: alpha {d["alpha0"]:g} x (s/{d["s_ref"]:.0f})^'

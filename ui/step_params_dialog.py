@@ -374,6 +374,72 @@ class NamesEditor(QtWidgets.QWidget):
         return self.value() != self.start
 
 
+class TrainingPicker(QtWidgets.QWidget):
+    """Which celltypes the cell-cycle fit trains the profiles on.
+
+    None checked means every cell. A name that has never been decided
+    on arrives checked (CellCyclePanel.set_celltype_names), because an
+    experiment that bothered to define its celltypes has said its
+    populations differ.
+
+    ARRESTED ARMS ARE NAMED HERE AND NEVER REMOVED. Fitting the
+    profiles on an arrested population collapses the conditions into
+    clusters (design 4.3), so a name whose spelling suggests one is
+    called out -- but guessing a treatment from a label and then
+    dropping its cells would be the worse fault, so the choice stays
+    with whoever is reading.
+    """
+
+    def __init__(self, names, checked, parent=None):
+        super().__init__(parent)
+        from codelab_pipeline.analysis import cellcycle as CC
+        self.boxes = []
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(2, 2, 2, 2)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(2)
+        on = set(checked or [])
+        suspect = set(CC.arrested_looking(names))
+        for i, name in enumerate(names or []):
+            cb = QtWidgets.QCheckBox(name)
+            cb.setChecked(name in on)
+            cb.key = name
+            if name in suspect:
+                cb.setStyleSheet('color: #9a3b2f;')
+            self.boxes.append(cb)
+            grid.addWidget(cb, i // 3, i % 3)
+        lay.addLayout(grid)
+        if not names:
+            msg = QtWidgets.QLabel(
+                'No celltypes defined — the fit trains on every cell. '
+                'Define them on the Celltype step above.')
+            msg.setWordWrap(True)
+            msg.setStyleSheet(f'color: {GREY};')
+            lay.addWidget(msg)
+        bad = [b.key for b in self.boxes if b.isChecked() and b.key in suspect]
+        self.Warning = QtWidgets.QLabel('')
+        self.Warning.setWordWrap(True)
+        self.Warning.setStyleSheet('color: #9a3b2f;')
+        lay.addWidget(self.Warning)
+        for cb in self.boxes:
+            cb.toggled.connect(lambda _on: self._warn(suspect))
+        self._warn(suspect)
+
+    def _warn(self, suspect):
+        bad = [b.key for b in self.boxes if b.isChecked() and b.key in suspect]
+        self.Warning.setText(
+            ('Training on %s. Those names read as ARRESTED arms, and '
+             'fitting the profiles on an arrested population collapses '
+             'the conditions into clusters. Arrested cells should be '
+             'PLACED, not trained on.' % ', '.join(bad)) if bad else '')
+        self.Warning.setVisible(bool(bad))
+
+    def value(self):
+        return [b.key for b in self.boxes if b.isChecked()]
+
+
 class StepParamsDialog(QtWidgets.QDialog):
     """The parameters of one step, applied to the tabs they belong to."""
 
@@ -388,6 +454,7 @@ class StepParamsDialog(QtWidgets.QDialog):
         self._machine = []         # (src widget, editor)
         self.rounds = None
         self.names = None
+        self.training = None
 
         outer = QtWidgets.QVBoxLayout(self)
         panels = sorted({PANEL_TITLES.get(p, p)
@@ -412,6 +479,20 @@ class StepParamsDialog(QtWidgets.QDialog):
             box = self._section_box(section)
             if box is not None:
                 inner.addWidget(box)
+
+        if step == 'cellcycle':
+            box = QtWidgets.QGroupBox(
+                'Training celltypes — the CYCLING populations')
+            lay = QtWidgets.QVBoxLayout(box)
+            try:
+                cc = mw.ui.CellCyclePanel
+                names = [cc.TrainingCelltypeListWidget.item(i).text()
+                         for i in range(cc.TrainingCelltypeListWidget.count())]
+                self.training = TrainingPicker(names, cc.training_celltypes())
+                lay.addWidget(self.training)
+            except Exception:                               # noqa: BLE001
+                self.training = None
+            inner.addWidget(box)
 
         if step == 'celltype':
             box = QtWidgets.QGroupBox(
@@ -579,6 +660,18 @@ class StepParamsDialog(QtWidgets.QDialog):
                 ed.setText('%s   (off: %s)' % (names[0], names[1]))
             form.addRow(label, ed)
 
+        # a `<x>_auto` parameter owns `<x>`: when the automatic choice
+        # is on, the number beside it is an OUTPUT, and an editable box
+        # saying 100 next to a ticked 'auto' is a lie about what runs
+        by_name = {param: ed for param, ed, _p, _w in rows}
+        for param, ed in by_name.items():
+            base = param[:-5] if param.endswith('_auto') else None
+            if base and base in by_name and isinstance(ed, QtWidgets.QCheckBox):
+                target = by_name[base]
+                ed.toggled.connect(
+                    lambda on, t=target: t.setEnabled(not on))
+                target.setEnabled(not ed.isChecked())
+
         if section in VERSION_STACK and group_boxes:
             version = VERSION_STACK[section][0]
             selector = next((ed for p, ed, _pa, _w in rows if p == version),
@@ -700,6 +793,12 @@ class StepParamsDialog(QtWidgets.QDialog):
             except Exception:                               # noqa: BLE001
                 pass
             changed.append('celltype/names')
+        if self.training is not None:
+            cc = self.mw.ui.CellCyclePanel
+            want = self.training.value()
+            if want != cc.training_celltypes():
+                cc.set_training_celltypes(want)
+                changed.append('cellcycle/training_celltypes')
         return ', '.join(changed)
 
 

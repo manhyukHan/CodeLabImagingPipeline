@@ -217,6 +217,93 @@ def test_the_localization_dialog_offers_what_the_batch_takes():
     assert 'rounds' not in offered, 'the picker edits rounds, not a text field'
 
 
+def test_the_celltype_dialog_shows_one_mode_at_a_time():
+    """FOV mode and barcode mode are the panel's own stacked pages. Which
+    one runs decides what every other parameter in the section means, so
+    listing both reads as if a run used both."""
+    win = FakeWindow()
+    ct = win.ui.CelltypeDeterminationPanel
+    ct.BarcodeModeRadioButton.setChecked(True)
+    dlg = _dialog(win, 'celltype')
+    boxes = {c.title(): c for c in dlg.findChildren(QtWidgets.QGroupBox)
+             if c.title() in ('FOV ranges', 'Barcode channel')}
+    assert 'Barcode channel' in boxes, sorted(boxes)
+    assert boxes['Barcode channel'].isVisibleTo(dlg)
+
+    mode = next(ed for s_, p_, ed, _o in dlg._fields
+                if (s_, p_) == ('celltype', 'fov_mode'))
+    mode.setChecked(True)                      # FOV
+    assert not boxes['Barcode channel'].isVisibleTo(dlg)
+
+
+def test_the_mode_is_a_config_parameter_at_last():
+    """A saved experiment could not say which mode produced its
+    celltypes. The radio goes through the same capture/apply pair as
+    every other widget."""
+    from windows.main_window import MainWindow
+    win = FakeWindow()
+    radio = win._config_widget('CelltypeDeterminationPanel',
+                               'FOVModeRadioButton')
+    win.ui.CelltypeDeterminationPanel.BarcodeModeRadioButton.setChecked(True)
+    assert MainWindow._widget_value(radio) == '0'
+    MainWindow._apply_widget_value(radio, '1')
+    assert radio.isChecked() and MainWindow._widget_value(radio) == '1'
+    assert not win.ui.CelltypeDeterminationPanel.BarcodeModeRadioButton.isChecked(), (
+        'the button group did not answer for the other half')
+
+
+def test_the_celltype_names_can_be_removed_not_only_added():
+    """ensure_celltype_names only ever adds, on purpose. A name taken out
+    deliberately has to stay out -- and taking it out must not touch a
+    cell that already carries it."""
+    win = FakeWindow()
+    ct = win.ui.CelltypeDeterminationPanel
+    ct.ensure_celltype_names(['A', 'B', 'C'])
+    assert ct.celltype_names() == ['A', 'B', 'C']
+    ct.ensure_celltype_names(['B'])
+    assert ct.celltype_names() == ['A', 'B', 'C'], 'ensure_ removed one'
+    assert ct.set_celltype_names(['C', 'A']) == ['C', 'A']
+    assert ct.celltype_names() == ['C', 'A'], ct.celltype_names()
+
+
+def test_a_new_celltype_starts_as_a_training_target():
+    """None checked means 'every cell', which on an experiment whose
+    celltypes ARE defined is the weaker choice. A name appearing for the
+    first time arrives checked; unchecking it is the decision."""
+    win = FakeWindow()
+    cc = win.ui.CellCyclePanel
+    cc.set_celltype_names(['GM2-5', 'C2-6'])
+    assert cc.training_celltypes() == ['GM2-5', 'C2-6'], cc.training_celltypes()
+    cc.set_training_celltypes(['GM2-5'])
+    cc.set_celltype_names(['GM2-5', 'C2-6', 'HU_2mM'])
+    assert cc.training_celltypes() == ['GM2-5', 'HU_2mM'], (
+        'a name already decided on was re-checked, or the new one was not')
+
+
+def test_an_arrested_looking_name_is_named_but_never_dropped():
+    from codelab_pipeline.analysis import cellcycle as CC
+    assert CC.arrested_looking(['GM2-5', 'HU_2mM', 'Noco 3h', 'C2-6']) == [
+        'HU_2mM', 'Noco 3h']
+    assert CC.arrested_looking(['GM2-5', 'C2-6']) == []
+    assert CC.arrested_looking([]) == []
+    # a vehicle control is the CYCLING arm of an arrest experiment,
+    # so warning about it would point at the one population the fit
+    # wants
+    assert CC.arrested_looking(['DMSO', 'DMSO 0.1%']) == []
+
+
+def test_an_auto_choice_greys_out_the_number_it_chooses():
+    # an editable 100 beside a ticked 'auto' is a lie about what runs
+    win = FakeWindow()
+    dlg = _dialog(win, 'cellcycle')
+    by = {p_: ed for _s, p_, ed, _o in dlg._fields}
+    assert 'alpha' in by and 'alpha_auto' in by, sorted(by)
+    by['alpha_auto'].setChecked(True)
+    assert not by['alpha'].isEnabled()
+    by['alpha_auto'].setChecked(False)
+    assert by['alpha'].isEnabled()
+
+
 def _run_all():
     tests = {k: v for k, v in globals().items() if k.startswith('test_')}
     failures = []

@@ -14310,6 +14310,11 @@ One PNG PER MODALITY: each modality has its own reference and its
             'proxy': ('CellCyclePanel', 'ProxyComboBox'),
             'min_total': ('CellCyclePanel', 'MinTotalSpinBox'),
             'alpha': ('CellCyclePanel', 'AlphaSpinBox'),
+            # chosen by held-out evidence as part of the fit when
+            # on, and the number it picked is written back into
+            # `alpha` -- so the pair records both the choice and
+            # what the choice came to
+            'alpha_auto': ('CellCyclePanel', 'AlphaAutoCheckBox'),
             'birth_deg': ('CellCyclePanel', 'BirthDegSpinBox'),
             'origin': ('CellCyclePanel', 'OriginComboBox'),
             'phase_shares': ('CellCyclePanel', 'PhaseSharesLineEdit'),
