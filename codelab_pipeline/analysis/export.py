@@ -258,6 +258,75 @@ _CELL_STRUCTURAL = frozenset((
     'matrix_provenance', 'linked', 'linked_at',
 ))
 
+#: the cell-cycle placement, prefixed so a project's own field cannot
+#: collide with it. The placement is NOT on the cell: it lives in that
+#: FOV's own capsule (analysis_store.read_fov_cellcycle) because a refit
+#: rewrites it wholesale, so the exporter joins it on here.
+CELLCYCLE_COLUMNS = (
+    # DERIVED AT EXPORT TIME, not read. The capsule stores the angle and
+    # the verdicts; the phase NAME comes from the arcs and gates kept
+    # with the model (analysis_store.read_cellcycle_model), because
+    # re-cutting a boundary is meant to be a re-read and never a refit.
+    # So this column is a snapshot of the arcs in force when the file
+    # was written -- `cellcycle_model` names the fit, and the arcs are
+    # in cellcycle_model.json beside it. A cell that fails a verdict
+    # gate reads '' here and still carries its angle below.
+    'cellcycle_phase',
+    'cellcycle_theta_deg', 'cellcycle_R', 'cellcycle_fit_z',
+    'cellcycle_bf_ring', 'cellcycle_ring_level', 'cellcycle_ring_tail',
+    'cellcycle_radius', 'cellcycle_total', 'cellcycle_model',
+)
+
+#: the capsule's own names, in the order CELLCYCLE_COLUMNS carries them
+_CELLCYCLE_FIELDS = ('theta_deg', 'R', 'fit_z', 'bf_ring', 'ring_level',
+                     'ring_tail', 'radius', 'total')
+
+
+def cellcycle_of(storage_path, fov, spec=None):
+    """{cell id: {column: value}} -- one FOV's cell-cycle placements.
+
+    `spec` is the project's cellcycle_model.json, read once by the
+    caller when it is looping over FOVs; left out, it is read here.
+    Returns {} when the FOV has no placement, which is the normal state
+    of a project that has not run the stage.
+    """
+    from ..io import analysis_store
+    from . import cellcycle as CC
+
+    capsule = analysis_store.read_fov_cellcycle(storage_path, fov) or {}
+    rows = list(capsule.get('rows') or [])
+    if not rows:
+        return {}
+    if spec is None:
+        spec = analysis_store.read_cellcycle_model(storage_path) or {}
+    arcs = (spec or {}).get('categories') or []
+    if arcs:
+        keys = set()
+        for r in rows:
+            keys.update(r)
+        table = {k: [r.get(k) for r in rows] for k in keys}
+        try:
+            cats = list(CC.assign(table, arcs, (spec or {}).get('gates')))
+        except Exception:                                   # noqa: BLE001
+            # a model whose gates name a verdict these rows do not carry
+            # (an older capsule): the angles are still worth exporting
+            cats = [''] * len(rows)
+    else:
+        cats = [''] * len(rows)
+    model = str(capsule.get('model') or (spec or {}).get('model') or '')
+    out = {}
+    for r, cat in zip(rows, cats):
+        try:
+            cid = int(r.get('cell'))
+        except (TypeError, ValueError):
+            continue
+        row = {'cellcycle_phase': str(cat), 'cellcycle_model': model}
+        for k in _CELLCYCLE_FIELDS:
+            row['cellcycle_' + k] = r.get(k)
+        out[cid] = row
+    return out
+
+
 CELL_COLUMNS = (
     'cell_key', 'fov', 'cell', 'celltype',
     'home_hybe', 'home_modality',
@@ -282,7 +351,7 @@ CELL_COLUMNS = (
     'home_yx_scale', 'home_yx_is_residual',
     'n_hybes_aligned', 'arrays',
     'linked', 'linked_at',
-)
+) + CELLCYCLE_COLUMNS
 
 
 def _is_scalar(v):
@@ -316,7 +385,7 @@ def _mask_stats(mask, voxel_um):
 
 def cell_rows(cell_dicts, fov=None, voxel_um=DEFAULT_VOXEL_UM,
               n_spots_of=None, n_readout_spots_of=None,
-              n_alleles_of=None, arrays=None):
+              n_alleles_of=None, arrays=None, cellcycle=None):
     """One row per segmented cell, as plain dicts.
 
     NOTHING IS HARDCODED AWAY. The columns above are the ones this
@@ -398,6 +467,10 @@ def cell_rows(cell_dicts, fov=None, voxel_um=DEFAULT_VOXEL_UM,
             'linked': bool(c.get('linked', False)),
             'linked_at': c.get('linked_at') or '',
         }
+        # before the generic pass below, so a project that writes its
+        # own cellcycle_* field onto the cell keeps its own value: that
+        # pass skips a key already in the row
+        row.update((cellcycle or {}).get(cid) or {})
         kept = []
         for k, v in c.items():
             if k in _CELL_STRUCTURAL:
@@ -798,6 +871,16 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
 
     cells_out, spots_out, alleles_out, seen = [], [], [], []
     arrays = {} if want_arrays else None
+    # the model is PROJECT level (one circle per experiment), so it is
+    # read once per analysis dir rather than once per FOV -- the phase
+    # name every row gets comes from its arcs and gates
+    cc_spec = {}
+    for key, rep in by_analysis.items():
+        try:
+            cc_spec[key] = analysis_store.read_cellcycle_model(rep) or {}
+        except Exception as e:                              # noqa: BLE001
+            errors.append(f'cell-cycle model: {e}')
+            cc_spec[key] = {}
     for i, (sp, fov) in enumerate(todo, start=1):
         if should_stop is not None and should_stop():
             errors.append('cancelled by the user')
@@ -830,7 +913,9 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
             cells_out.extend(cell_rows(
                 cells, fov, voxel_um=voxel_um, n_spots_of=n_spots,
                 n_readout_spots_of=n_read, n_alleles_of=n_all,
-                arrays=arrays))
+                arrays=arrays,
+                cellcycle=cellcycle_of(sp, fov, cc_spec.get(
+                    os.path.normcase(paths.analysis_dir(sp)), {}))))
             spots_out.extend(srows)
             alleles_out.extend(arows)
             seen.append(fov)

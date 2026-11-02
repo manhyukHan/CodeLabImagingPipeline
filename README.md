@@ -50,6 +50,17 @@ frames, alignment and link state that are already in the other sheets.
 A reader handed 84 columns cannot tell which carry the result.
 `--combined-full` keeps them all.
 
+**The cell cycle rides on the cell row.** `cellcycle_phase` plus the
+angle and every verdict the placement carries (`cellcycle_theta_deg`,
+`_R`, `_fit_z`, `_ring_level`, `_radius`, `_total`, and the
+`cellcycle_model` that placed them). The phase NAME is derived when the
+file is written, from the arcs and gates kept in
+`analysis/cellcycle_model.json`, because re-cutting a boundary is meant
+to be a re-read and never a refit -- so the column is a snapshot of the
+arcs in force at export time, and a cell that fails a verdict gate
+reads `''` there while keeping its angle. A project that never ran the
+stage gets the columns empty.
+
 **The columns are discovered, not declared.** A field a project writes
 onto its cells or spots appears as a column without anything in the
 exporter naming it. The alignment is exported AS STORED -- the cell's

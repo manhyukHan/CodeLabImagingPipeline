@@ -407,6 +407,72 @@ def test_unknown_fields_survive_the_export():
           r['arrays'])
 
 
+def test_cellcycle_joins_onto_the_cell_and_derives_the_phase():
+    """The placement is not on the cell: it lives in that FOV's own
+    capsule, and the PHASE NAME is not in the capsule either -- it comes
+    from the arcs and gates kept with the model, so that re-cutting a
+    boundary stays a re-read and never a refit. Both halves have to meet
+    on the cell row or the export says nothing about the cell cycle."""
+    capsule = {'version': 1, 'model': 'fit-2026-10-02', 'rows': [
+        {'cell': 7, 'theta_deg': 20.0, 'R': 0.8, 'fit_z': 1.0,
+         'bf_ring': 0.5, 'ring_level': 0.4, 'ring_tail': 0.3,
+         'radius': 9.0, 'total': 120},
+        {'cell': 8, 'theta_deg': 200.0, 'R': 0.1, 'fit_z': 1.0,
+         'bf_ring': 0.5, 'ring_level': 0.4, 'ring_tail': 0.3,
+         'radius': 9.0, 'total': 120}]}
+    spec = {'model': 'fit-2026-10-02',
+            'categories': [{'name': 'G1', 'start_deg': 350, 'end_deg': 90},
+                           {'name': 'S', 'start_deg': 90, 'end_deg': 260}],
+            'gates': {'min_R': 0.5}}
+
+    import types
+    from codelab_pipeline.io import analysis_store as A
+    saved = (A.read_fov_cellcycle, A.read_cellcycle_model)
+    A.read_fov_cellcycle = lambda sp, fov: capsule if fov == 3 else None
+    A.read_cellcycle_model = lambda sp: spec
+    try:
+        placed = E.cellcycle_of('<store>', 3)
+        empty = E.cellcycle_of('<store>', 4)
+    finally:
+        A.read_fov_cellcycle, A.read_cellcycle_model = saved
+
+    check('a FOV with no capsule contributes nothing', empty == {}, str(empty))
+    check('the angle comes straight from the capsule',
+          placed[7]['cellcycle_theta_deg'] == 20.0, str(placed[7]))
+    check('the phase is derived from the arcs',
+          placed[7]['cellcycle_phase'] == 'G1',
+          placed[7]['cellcycle_phase'])
+    check('a cell that fails a verdict gate has NO phase but keeps its '
+          'angle', placed[8]['cellcycle_phase'] == ''
+          and placed[8]['cellcycle_theta_deg'] == 200.0, str(placed[8]))
+    check('the fit that placed it is named',
+          placed[7]['cellcycle_model'] == 'fit-2026-10-02')
+
+    rows = E.cell_rows([CELL], fov=3, cellcycle=placed)
+    r = rows[0]
+    check('the placement reaches the cell row',
+          r['cellcycle_phase'] == 'G1' and r['cellcycle_R'] == 0.8, str(r))
+    check('every cell-cycle column is declared, so the order is stable',
+          all(c in E.CELL_COLUMNS for c in E.CELLCYCLE_COLUMNS))
+    cols = E.columns_for(rows, E.CELL_COLUMNS)
+    check('and none of them is appended twice',
+          len(cols) == len(set(cols)), str([c for c in cols if cols.count(c) > 1]))
+
+
+def test_a_cell_without_a_placement_still_exports():
+    """A project that never ran the stage must not lose its cell table,
+    and a cell the fit skipped must not borrow the previous row's."""
+    rows = E.cell_rows([CELL], fov=3, cellcycle={999: {
+        'cellcycle_phase': 'G1', 'cellcycle_theta_deg': 20.0}})
+    r = rows[0]
+    check('no placement means no cell-cycle value, not a neighbour',
+          'cellcycle_phase' not in r or r['cellcycle_phase'] in ('', None),
+          str(r.get('cellcycle_phase')))
+    rows2 = E.cell_rows([CELL], fov=3)
+    check('and the column set survives a project with no cell cycle',
+          rows2 and 'cell_key' in rows2[0])
+
+
 def test_combined_joins_cell_onto_spot():
     class _T(object):
         pass
@@ -457,7 +523,9 @@ def main():
                test_cell_row_shape_and_masks,
                test_cell_alignment_is_stored_not_resolved,
                test_unknown_fields_survive_the_export,
-               test_combined_joins_cell_onto_spot):
+               test_combined_joins_cell_onto_spot,
+               test_cellcycle_joins_onto_the_cell_and_derives_the_phase,
+               test_a_cell_without_a_placement_still_exports):
         print(f'\n{fn.__name__}')
         fn()
     print(f'\n{len(PASSED)} passed, {len(FAILED)} failed')
