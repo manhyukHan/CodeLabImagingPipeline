@@ -122,6 +122,10 @@ class ASpot():
        columnar.unpack_spots). Nothing infers it from coordinates.
     """
     def __init__(self):
+        #: whatever an analysis attached that this class does not
+        #: declare. Round-trips through save()/set_metadata and is
+        #: stored as its own column -- see _KNOWN.
+        self.properties = {}
         self.uid = 0
         self.fov = 0
         self.modality = ''
@@ -144,7 +148,29 @@ class ASpot():
         # localization/engine.py's LocalizedSpot docstring.
         self.p_exist = float('nan')
 
+    #: Keys set_metadata handles itself. Anything else it is given is
+    #: a PROPERTY: kept on `properties`, written back out by save(),
+    #: and stored as its own column by io/columnar. The model used to
+    #: drop it, which meant an analysis could measure something, attach
+    #: it, save, and find it gone -- indistinguishable from never
+    #: having run. The model does not have to know the field; it has to
+    #: not lose it.
+    _KNOWN = frozenset((
+        'uid', 'fov', 'modality', 'hybe', 'channel', 'cell',
+        'celltype', 'adj_coordinate', 'raw_coordinate', 'size',
+        'brightness', 'linked', 'linked_at', 'mixture_centroids',
+        'p_exist', 'z_status', 'properties',
+        # the v1 spelling of adj_coordinate -- the same field, not
+        # a property (see the alias below)
+        'coordinate',
+    ))
+
     def set_metadata(self, **kwargs):
+        if 'properties' in kwargs:
+            self.properties = dict(kwargs['properties'] or {})
+        for _k, _v in kwargs.items():
+            if _k not in self._KNOWN:
+                self.properties[_k] = _v
         if 'uid' in kwargs: self.uid = int(kwargs['uid'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'modality' in kwargs: self.modality = str(kwargs['modality'])
@@ -215,4 +241,9 @@ class ASpot():
                 # exactly 0.0 and erase the tail the p-gate histogram
                 # is drawn from.
                 'p_exist': round(float(self.p_exist), 6),
-                'z_status': z_status_of(self)}
+                'z_status': z_status_of(self),
+                # last, and only for keys the model does not
+                # declare, so a property can never shadow a real
+                # field by being named like one
+                **{k: v for k, v in self.properties.items()
+                   if k not in self._KNOWN}}

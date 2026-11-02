@@ -41,6 +41,32 @@ DEFAULT_POLICY = {'ingestion': 'existing', 'segmentation': 'existing', 'fov_alig
 # own, a person has to ask for it explicitly
 NEVER_AUTO = ('segmentation',)
 
+#: the config sections that hold each step's parameters. The section
+#: names are the config file's own, and the widgets behind them are
+#: named once in MainWindow._CONFIG_PARAM_MAP, which already drives both
+#: Save Config and Load Config -- so the Pipeline tab's per-step
+#: parameter dialog generates itself from that map rather than carrying
+#: a second list of what a step's parameters are. A step with no section
+#: here has no configurable parameter of its own.
+#: Ingestion's section is 'acquisition' because the voxel size and the
+#: genomic resolution are experiment-level values whose widgets live on
+#: the Ingestion tab -- not because ingestion owns them.
+STEP_SECTIONS = {
+    'ingestion': ('acquisition',),
+    'segmentation': ('cell_segmentation',),
+    'fov_alignment': ('fov_alignment',),
+    'cross_modal': ('cross_modal_alignment',),
+    'cell_alignment': ('cell_alignment',),
+    # NOT 'spot_localization': that section is the TAB's interactive
+    # run. The headless batch this step calls is v3 only and reads a
+    # model, a p_exist floor, a pad and the chosen rounds -- nothing
+    # else from the tab reaches it.
+    'localization': ('localization_run',),
+    'celltype': ('celltype',),
+    'cellcycle': ('cellcycle',),
+    'tracing': ('chromatin_tracing',),
+}
+
 
 # -- the project from its config -------------------------------------------
 
@@ -100,11 +126,25 @@ def _parse_source_label(text):
 def localization_targets(project):
     """{modality: [(hybe, channel)]} the store should hold spot slices
     for: the config's spot_localization hybe/channel (the anchor round
-    for tracing), the cell-cycle panel's gene sources when the config
-    carries them ('MOD|HYBE|CH|GENE|ROLE', comma separated), and every
-    countable readout round (an _mRNA / _exon readout that is not a
-    Rep_/Toe_ round) at its readout channels. Nascent, intron, repeat,
-    toe and anonymous (DNA) rounds are not expected unless named."""
+    for tracing), EVERY round chromatin tracing is configured for, the
+    cell-cycle panel's gene sources when the config carries them
+    ('MOD|HYBE|CH|GENE|ROLE', comma separated), and every countable
+    readout round (an _mRNA / _exon readout that is not a Rep_/Toe_
+    round) at its readout channels.
+
+    THE TRACING ROUNDS ARE WHY THIS IS NOT ONE ROUND. Tracing reads
+    spots, so a round named in chromatin_tracing/hybes must be localized
+    before tracing can use it -- a dependency the config already states,
+    not a guess about which rounds "look like" readouts. Without them a
+    DNA project expected exactly the one anchor round
+    `spot_localization` names: on the SG store that read 1 instead of
+    29, so the status said `done` after one hybe, a `redo` re-ran one
+    hybe, and `partial` could never appear however much was missing.
+
+    A round nobody named anywhere is still not expected. Anonymous DNA
+    rounds, Rep_ and Toe_ rounds reach this list through the tracing
+    config or not at all, which is the one place that knows whether they
+    carry anything to find."""
     from codelab_pipeline.analysis import cellcycle as CC
     params = project.get('params', {}) or {}
     out = {name: [] for name in project['modalities']}
@@ -120,6 +160,15 @@ def localization_targets(project):
             mod = next(iter(out))
         if mod is not None:
             add(mod, hybe, int(loc['channel']))
+    tracing = params.get('chromatin_tracing', {}) or {}
+    tracing_ch = str(tracing.get('readout_channel', '') or '').strip()
+    if tracing_ch.isdigit():
+        # 'HYBE|MOD' here -- the opposite order from the cellcycle
+        # genes below, which is the config's own spelling in each tab
+        for part in str(tracing.get('hybes', '') or '').split(','):
+            bits = [b.strip() for b in part.split('|')]
+            if len(bits) >= 2 and bits[0] and bits[1]:
+                add(bits[1], bits[0], int(tracing_ch))
     for part in str((params.get('cellcycle', {}) or {}).get('genes', '')).split(','):
         bits = part.strip().split('|')
         if len(bits) >= 3 and bits[2].strip().isdigit():
@@ -132,6 +181,37 @@ def localization_targets(project):
                     if fid is None or int(ch) != int(fid):
                         add(name, r['folder'], ch)
     return out
+
+
+def localization_run_targets(project):
+    """The subset of localization_targets a run should actually localize.
+
+    TWO SETS, DELIBERATELY. `localization_targets` is the EXPECTATION --
+    what the store should hold -- and the status grid reads it, so it is
+    never filtered: a store missing 24 of 29 rounds must keep saying
+    `partial 5/29` whatever anyone chose to run today. This is the
+    narrower question, "which rounds does the next run touch", and only
+    the runner asks it.
+
+    The choice lives in the config as `localization_run/rounds`, comma
+    separated `MOD|HYBE|CH` (the cellcycle genes' spelling). EMPTY
+    MEANS EVERY TARGET, and that is not the same as listing them all:
+    an empty value keeps following the config, so a tracing round added
+    later is localized without anyone revisiting this setting.
+    """
+    targets = localization_targets(project)
+    params = project.get('params', {}) or {}
+    chosen = str((params.get('localization_run', {}) or {}).get(
+        'rounds', '') or '').strip()
+    if not chosen:
+        return targets
+    keep = set()
+    for part in chosen.split(','):
+        bits = [b.strip() for b in part.split('|')]
+        if len(bits) >= 3 and bits[2].isdigit():
+            keep.add((bits[0], bits[1], int(bits[2])))
+    return {mod: [(h, c) for h, c in rounds if (mod, h, int(c)) in keep]
+            for mod, rounds in targets.items()}
 
 
 def tracing_configured(project):

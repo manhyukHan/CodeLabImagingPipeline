@@ -55,6 +55,7 @@ class FakeMW:
         self._chromatin_worker = None
         self._celltype_worker = None
         self._segment_worker = None
+        self._focus_worker = None
 
     def log(self, m):
         self.logs.append(m)
@@ -75,6 +76,12 @@ class FakeMW:
         w = FakeWorker(2)
         self._active_ingestions.append(w)
         self._ingest_worker = w
+
+    def _autodetect_segmentation_focus(self):
+        # a PROCESS worker in the real app; the step must WAIT for it
+        # or it segments whatever projection was already selected
+        self.calls.append(('focus', self.ui.CellSegmentPanel.FovSpinBox.value()))
+        self._focus_worker = FakeWorker(2)
 
     def _run_fov_alignment_all(self):
         self.calls.append(('fov_alignment', self.ui.IngestionPanel.FovListLineEdit.text()))
@@ -161,7 +168,11 @@ def main():
     runner.step_finished.connect(lambda s, t: runner.stop() if s == 'segmentation' else None)
     r = drive(app, runner)
     seq = [c for c in mw.calls]
-    check('segmentation runs FOV by FOV with a save after each', seq[:4] == [('segment', 7), ('save_cells', 7), ('segment', 8), ('save_cells', 8)], str(seq))
+    check('segmentation runs focus -> segment -> save, FOV by FOV',
+          seq[:6] == [('focus', 7), ('segment', 7), ('save_cells', 7),
+                      ('focus', 8), ('segment', 8), ('save_cells', 8)], str(seq))
+    check('the focal plane is detected BEFORE the FOV is segmented',
+          seq.index(('focus', 7)) < seq.index(('segment', 7)), str(seq))
     check('stop() ends the run after the current step', r['stopped'] and 'fov_alignment' not in [c[0] for c in seq], str(seq))
 
     print('a step that raises at start is reported, the run continues')

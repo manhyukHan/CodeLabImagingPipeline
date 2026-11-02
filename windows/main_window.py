@@ -1280,6 +1280,21 @@ from was resolved on the GUI thread and shipped in `job`.
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    # THE LOG SINK CROSSES THREADS, so it may not touch the widget.
+    # log() ends in QPlainTextEdit.appendPlainText, and worker threads
+    # reach it: every compute module takes a `log=` callback, and the
+    # pipeline runner hands it one that calls self.mw.log() from inside
+    # an FnWorker. Appending to a text widget off the GUI thread re-enters
+    # its QTextDocument, which connects its own layout signals; the
+    # connection is then cross-thread and Qt refuses the arguments --
+    #     QObject::connect: Cannot queue arguments of type 'QTextBlock'
+    #     QObject::connect: Cannot queue arguments of type 'QTextCursor'
+    # -- and the process dies shortly after, taking the run with it. The
+    # fix belongs HERE and not at the call site: a str signal is the one
+    # thing that is safe to emit from any thread, so no future worker can
+    # reintroduce the fault by logging.
+    _log_line = QtCore.pyqtSignal(str)
+
     def __init__(self, config_file=None):
         super().__init__()
         self.ui = MainWindowUI()
@@ -1396,7 +1411,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cssd.cell_fov_changed.connect(self._refresh_cell_spot_status_cell_panel)
         cssd.spot_scope_changed.connect(self._on_cell_spot_status_spot_scope_changed)
         cssd.allele_fov_changed.connect(self._refresh_cell_spot_status_allele_panel)
-        cssd.export_requested.connect(self._export_spots_and_alleles)
+        cssd.export_requested.connect(self._export_tables)
 
         self.barcode_overview_displayer = BarcodeOverviewDisplayer()
         self.celltype_result_displayer = CelltypeResultDisplayer()
@@ -1489,6 +1504,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # from here on already has its sink; main.py shows it alongside the
         # main window itself.
         self.log_window = LogWindow()
+        # The off-thread path into the sink. The receiver is a method of
+        # THIS window, which lives on this thread, so an emit from a
+        # worker is delivered queued, on the GUI thread, in order -- see
+        # the _log_line comment on the class. It is deliberately not
+        # connected to self.log_window.append directly: connect() binds
+        # the callable once, so that would resolve the sink here while the
+        # GUI-thread path resolves it per call, and the two paths could
+        # then write to different places.
+        self._log_line.connect(self._append_log_line)
         self.log('CODE Lab Imaging Pipeline started.')
         # Samples how late this thread's own event loop is running, which
         # is what "Not Responding" actually means. Created here, on the GUI
@@ -1521,7 +1545,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def log(self, message):
         """The single log sink: every message that used to land in some
         panel's own log box goes to the combined pop-up log window, which
-        timestamps it. The panels carry no log boxes at all any more."""
+        timestamps it. The panels carry no log boxes at all any more.
+
+        SAFE FROM ANY THREAD. A caller on the GUI thread appends straight
+        away, so ordering against everything else that thread does is
+        unchanged; a caller anywhere else hands the line over as a str
+        signal. The thread test is explicit rather than left to
+        AutoConnection so that the reason stays readable here."""
+        if QtCore.QThread.currentThread() is self.thread():
+            self._append_log_line(message)
+        else:
+            self._log_line.emit(str(message))
+
+    def _append_log_line(self, message):
+        """The one place the log widget is written. Both halves of log()
+        end here -- the GUI-thread call directly, an off-thread one over
+        _log_line -- so a line cannot land somewhere different depending
+        on which thread it came from."""
         self.log_window.append(message)
 
     def _notify_complete(self, title, message, seconds=20000):
@@ -1629,6 +1669,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for worker in (getattr(self, '_fov_overlay_workers', None) or []):
             if worker is not None and worker.isRunning():
                 out.append(('fov overlay render', worker))
+        # A recast WRITES spots, so it is the one entry here that an
+        # overwrite ingestion must not race -- and it outlives the
+        # alignment that queued it by minutes.
+        for worker in (getattr(self, '_spot_recast_workers', None) or []):
+            if worker is not None and worker.isRunning():
+                out.append(('spot recast', worker))
         return out
 
     def _stop_store_workers(self, why):
@@ -3425,18 +3471,24 @@ class MainWindow(QtWidgets.QMainWindow):
         legitimately run at once now."""
         return bool(self._active_ingestions)
 
-    def _export_spots_and_alleles(self):
-        """Write every PERSISTED spot and allele to flat tables.
+    def _export_tables(self):
+        """Write every PERSISTED cell, spot and allele to flat tables.
 
         Reads the store, never the session's own containers -- same
         contract as the window this is launched from: it answers "what is
         really saved", which is also the only thing worth handing to
         someone for analysis.
 
-        .xlsx gives one workbook with a spots sheet and an alleles sheet;
-        .csv gives two files (the alleles table is the big one and Excel
-        stops at ~1.05M rows, so a large project must be CSV -- rather
-        than truncate, the writer refuses and this falls back, saying so).
+        .xlsx gives one workbook with a sheet per table; .csv gives one
+        file each (the alleles table is the big one and Excel stops at
+        ~1.05M rows, so a large project must be CSV -- rather than
+        truncate, the writer refuses and this falls back, saying so).
+
+        The masks and per-hybe matrices do not fit a table cell, so they
+        go beside it in cells_arrays.npz, keyed by cell_key; the table
+        carries their summary and names what was kept.
+
+        tools/export_tables.py is this same call without the app.
         """
         # imported HERE, like the rest of the analysis toolbox: it is not
         # needed to start the app, and the toolbox stays Qt-free
@@ -3455,9 +3507,9 @@ class MainWindow(QtWidgets.QMainWindow):
         fovs = self._parse_fov_list(self.ui.IngestionPanel.FovListLineEdit.text()) or None
         default = os.path.join(
             os.path.dirname(next(iter(by_modality.values()))) or '.',
-            'spots_and_alleles.xlsx')
+            'cells_spots_alleles.xlsx')
         path, _sel = QtWidgets.QFileDialog.getSaveFileName(
-            cssd, 'Export spots and alleles', default,
+            cssd, 'Export cells, spots and alleles', default,
             'Excel workbook (*.xlsx);;CSV files (*.csv)')
         if not path:
             return
@@ -3466,27 +3518,28 @@ class MainWindow(QtWidgets.QMainWindow):
         cssd.ExportStatusLabel.setText('reading the store...')
 
         def work():
-            rows_s, rows_a, summary = export.collect(
-                by_modality, fovs=fovs, voxel_um=voxel)
-            wrote = []
+            t = export.collect(by_modality, fovs=fovs, voxel_um=voxel)
+            summary = t.summary
+            base = os.path.splitext(path)[0]
+            sheets = t.sheets()
+
+            def as_csv(why=None):
+                out = [export.write_csv(rows, cols, f'{base}_{name}.csv')
+                       for name, rows, cols in sheets]
+                if why:
+                    summary['errors'].append(f'wrote CSV instead: {why}')
+                return out
+
             if path.lower().endswith('.csv'):
-                base = path[:-4]
-                wrote.append(export.write_csv(rows_s, export.SPOT_COLUMNS,
-                                              base + '_spots.csv'))
-                wrote.append(export.write_csv(rows_a, export.ALLELE_COLUMNS,
-                                              base + '_alleles.csv'))
+                wrote = as_csv()
             else:
                 try:
-                    wrote.append(export.write_excel(
-                        [('spots', rows_s, export.SPOT_COLUMNS),
-                         ('alleles', rows_a, export.ALLELE_COLUMNS)], path))
+                    wrote = [export.write_excel(sheets, path)]
                 except ValueError as e:
-                    base = os.path.splitext(path)[0]
-                    wrote.append(export.write_csv(rows_s, export.SPOT_COLUMNS,
-                                                  base + '_spots.csv'))
-                    wrote.append(export.write_csv(rows_a, export.ALLELE_COLUMNS,
-                                                  base + '_alleles.csv'))
-                    summary['errors'].append(f'wrote CSV instead: {e}')
+                    wrote = as_csv(e)
+            p = export.write_npz(t.arrays, base + '_cells_arrays.npz')
+            if p:
+                wrote.append(p)
             summary['files'] = wrote
             return summary
 
@@ -3494,16 +3547,18 @@ class MainWindow(QtWidgets.QMainWindow):
             cssd.ExportPushButton.setEnabled(True)
             files = '\n'.join(summary.get('files') or [])
             cssd.ExportStatusLabel.setText(
-                f"exported {summary['n_spots']} spot(s), "
+                f"exported {summary['n_cells']} cell(s), "
+                f"{summary['n_spots']} spot(s), "
                 f"{summary['n_allele_rows']} allele row(s)")
             note = ''
             if summary.get('errors'):
                 note = ('\n\nNot everything succeeded:\n  '
                         + '\n  '.join(summary['errors'][:8]))
-                self.log('spot/allele export: '
+                self.log('cell/spot/allele export: '
                          + '; '.join(summary['errors'][:8]))
             QtWidgets.QMessageBox.information(
                 self, 'Export complete',
+                f"{summary['n_cells']} cell row(s), "
                 f"{summary['n_spots']} spot row(s) and "
                 f"{summary['n_allele_rows']} allele row(s) across "
                 f"{len(summary['fovs'])} FOV(s) written to:\n\n{files}{note}")
@@ -4473,22 +4528,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_focus_result(self, panel, zs, values, log):
         """GUI-thread half of Detect Focal Plane: seed the spinboxes and
         the profile plot from an already-computed focus profile."""
-        peak = int(zs[int(np.argmax(values))])
-        plateau = zs[values >= 0.9 * values.max()]
+        peak, how = segment.focal_plane(zs, values)
+        if peak is None:
+            log('Focal plane: the profile is empty; nothing changed.')
+            return None
         panel.set_depth(int(zs.max()) + 1)
         panel.ZPlaneSpinBox.setValue(peak)
-        panel.ZStartSpinBox.setValue(int(plateau.min()))
-        panel.ZEndSpinBox.setValue(int(plateau.max()))
+        middle = int(zs[len(zs) // 2])
+        if how == 'peak':
+            plateau = zs[values >= 0.9 * values.max()]
+            lo, hi = int(plateau.min()), int(plateau.max())
+        else:
+            # NO PLATEAU WITHOUT A PEAK. The >=90% band of a monotonic or
+            # flat profile is the edge of the stack, which is the very
+            # answer the fallback exists to refuse -- seeding the range
+            # with it would put back through the range what the plane
+            # just rejected.
+            lo = hi = peak
+        panel.ZStartSpinBox.setValue(lo)
+        panel.ZEndSpinBox.setValue(hi)
         panel.show_focus_profile(zs, values, peak)
         # Detecting a focal plane and then not using it was the trap the Run
         # confirmation existed to catch; switching here removes the trap at
         # its source. The confirmation stays for the case where the mode is
         # later put BACK to the stored MIP by hand.
         panel.ProjectionModeComboBox.setCurrentText('single plane')
-        middle = int(zs.max()) // 2
-        log(f'Focal plane z={peak} (middle would have been z={middle}, '
-            f'off by {peak - middle:+d}); >=90% plateau z={int(plateau.min())}-{int(plateau.max())}. '
-            f'Projection switched to single plane z={peak}.')
+        if how == 'peak':
+            log(f'Focal plane z={peak} (middle would have been z={middle}, '
+                f'off by {peak - middle:+d}); >=90% plateau z={lo}-{hi}. '
+                f'Projection switched to single plane z={peak}.')
+        else:
+            log(f'Focal plane NOT detected ({how}): the sharpness profile '
+                f'has no usable maximum, so the MIDDLE plane z={peak} is '
+                f'used instead of the stack edge argmax would have given. '
+                f'Projection switched to single plane z={peak}.')
         return peak
 
     def _on_segmentation_plane_changed(self):
@@ -5232,7 +5305,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # nothing left to key on. Once per session, so a slice the user
         # cleared in memory is not resurrected by a later activation.
         if fov not in self._spot_loaded_fovs:
-            self._spot_loaded_fovs.add(fov)
             any_path = next(iter(self._all_analysis_storage_paths()), None)
             if any_path:
                 # Heal legacy modality='' spots at the door where possible:
@@ -5261,8 +5333,28 @@ class MainWindow(QtWidgets.QMainWindow):
                         twin = ASpot()
                         twin.set_metadata(**d)
                         self.spot_container.add(fov, twin)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # NOT silent: a swallowed read is what made this bug
+                    # take three rounds to find.
+                    self.log('spot load failed for FOV%03d: %s' % (fov, exc))
+                else:
+                    # Flagged LAST, and only on a load that actually RAN.
+                    # The flag means "the session is now authoritative for
+                    # this FOV's spots", which _persist_fov_spots trusts to
+                    # decide that enumerating every slice on disk and
+                    # writing it from the session is safe. Setting it
+                    # BEFORE the load made that true-by-assertion: when
+                    # any_path was unresolved (only ever the case for the
+                    # MINIMUM fov, activated during __init__ before the
+                    # storage paths are) or read_spots threw, the FOV was
+                    # flagged staged while holding nothing, the guard
+                    # "not loaded means nothing to say, never delete
+                    # everything" passed, and the stale-slice pass wrote
+                    # every slice EMPTY. Measured on fov003 of the toy
+                    # store: 94 spots on disk, 0 in session, flagged --
+                    # and 94 -> 0 on disk after one save. An empty read is
+                    # still a load: both sides agree, so flagging is right.
+                    self._spot_loaded_fovs.add(fov)
         # Only once per FOV per session (per confirmed real regression):
         # _try_show_existing_cells unconditionally OVERWRITES self.
         # cell_container.data[fov] with a fresh deepcopy of cell_container_
@@ -7688,9 +7780,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None
             return resolver.to_shared(hybe, m, owner), resolver.z_to_shared(hybe, m, owner)
 
+        def area_in_frame(cell, hybe, modality):
+            # NOT cell.get_area_in_readout: that raises on a residual-form
+            # matrix, label_mask_for_frame swallows it, and every cell that
+            # has run cell alignment then drops out of the mask -- which
+            # unassigns every spot inside it. The twin of the line
+            # _reassign_fov_spots already carries.
+            return self._cell_area_in_readout(cell, hybe, modality, fov)
+
         if cells:
             assignment.assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
-                                    matrix_to_shared=to_shared)
+                                    matrix_to_shared=to_shared,
+                                    area_in_frame=area_in_frame)
         else:
             # no cells on disk: ownership stays as stored (-1 by
             # definition), coordinates still recast through the FOV/
@@ -14123,6 +14224,9 @@ One PNG PER MODALITY: each modality has its own reference and its
             'z_plane': ('CellSegmentPanel', 'ZPlaneSpinBox'),
             'z_start': ('CellSegmentPanel', 'ZStartSpinBox'),
             'z_end': ('CellSegmentPanel', 'ZEndSpinBox'),
+            # which flags REMOVE a cell in a batch run; empty means
+            # none, and the flags are measured either way
+            'gate_drop_flags': ('CellSegmentPanel', 'CellGateDropLineEdit'),
         },
         'fov_alignment': {
             # reference_hybe is per-modality now (reference_hybe_{name}),
@@ -14178,6 +14282,28 @@ One PNG PER MODALITY: each modality has its own reference and its
             'cellcycle_policy': ('PipelinePanel', 'CellcyclePolicyComboBox'),
             'tracing_policy': ('PipelinePanel', 'TracingPolicyComboBox'),
             'deep_status': ('PipelinePanel', 'DeepCheckBox'),
+        },
+        # WHAT A PIPELINE LOCALIZATION RUN ACTUALLY TAKES, which is not
+        # what the Spot Localization tab holds. The headless batch
+        # (localization/batch.run) is v3 only -- it has no engine
+        # parameter at all -- and reads exactly a model directory, a
+        # p_exist floor and a pad. The tab's threshold/min-distance/
+        # engine belong to its own interactive run and reach nothing
+        # here, so they are not this step's parameters.
+        # The floor and the pad lived as batch.py defaults (0.5 and 10)
+        # that no run could state or change: this experiment settled on
+        # p_exist 0.2 and the pipeline went on localizing at 0.5.
+        'localization_run': {
+            'model': ('SpotLocalizationPanel', 'ModelComboBox'),
+            'min_p_exist': ('PipelinePanel', 'LocalizationMinPExistSpinBox'),
+            'pad': ('PipelinePanel', 'LocalizationPadSpinBox'),
+            # which rounds a run touches, 'MOD|HYBE|CH,...'. EMPTY MEANS
+            # ALL OF THEM, and that is not the same as naming all of
+            # them: empty keeps following the config, so a tracing round
+            # added later is localized without anyone revisiting this.
+            # Only the run is narrowed -- the status grid keeps
+            # expecting every target (status.localization_run_targets).
+            'rounds': ('PipelinePanel', 'LocalizationRoundsLineEdit'),
         },
         'cellcycle': {
             'fov_list': ('CellCyclePanel', 'FovListLineEdit'),
@@ -14399,6 +14525,18 @@ One PNG PER MODALITY: each modality has its own reference and its
         for key, w in alp.QcFields.items():
             out['analysis_polymer_qc'][key] = w.text()
         return out
+
+    @property
+    def cell_gate_drop(self):
+        """Flags that REMOVE a cell in a batch run, as a comma string.
+
+        One place the runner asks, so the GUI checkboxes and a config
+        written by someone else cannot disagree about what a run will
+        throw away."""
+        try:
+            return self.ui.CellSegmentPanel.cell_gate_drop()
+        except Exception:                                   # noqa: BLE001
+            return ''
 
     def _apply_config_params(self, params):
         """

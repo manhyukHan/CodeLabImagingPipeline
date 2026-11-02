@@ -253,8 +253,9 @@ def test_modalities_sharing_one_analysis_dir_are_read_once():
          mock.patch.object(analysis_store, 'read_cells', return_value=([], '')), \
          mock.patch.object(analysis_store, 'read_fov_alleles', return_value=[]), \
          mock.patch.object(E.polymer, 'records_for', return_value=[]):
-        spots, _alleles, summary = E.collect(
-            {'DNA': '/proj/DNA', 'RNA': '/proj/RNA'}, fovs=[1, 2])
+        t = E.collect({'DNA': '/proj/DNA', 'RNA': '/proj/RNA'},
+                      fovs=[1, 2])
+    summary = t.summary
 
     check('each FOV is read ONCE, not once per modality',
           len(calls) == 2, f'{len(calls)} reads: {calls}')
@@ -302,6 +303,146 @@ def test_writers_are_atomic_and_round_trip():
         shutil.rmtree(d, ignore_errors=True)
 
 
+CELL = {
+    'id': 7, 'fov': 3, 'celltype': 'real',
+    'reference_hybe': 'Hyb_IFdapi', 'reference_modality': 'DNA',
+    'nucleus_hybe': 'Hyb_IFdapi', 'nucleus_modality': 'DNA',
+    # y and x far apart again, for the same reason as SPOT
+    'nucleus': (np.array([10.0, 11.0, 12.0]), np.array([800.0, 801.0, 802.0])),
+    'area': (np.array([9.0, 13.0]), np.array([799.0, 803.0])),
+    'frame_shape': (1024, 1024),
+    'matrices': {('Hyb_IFdapi', 'DNA'): {'yx': np.eye(3), 'dz': 0.0,
+                                         'yx_is_residual': True},
+                 ('Hyb_015', 'DNA'): {'yx': np.array([[1.0, 0.0, -2.0],
+                                                      [0.0, 1.0, -5.0],
+                                                      [0.0, 0.0, 1.0]]),
+                                      'dz': -3.0, 'yx_is_residual': True}},
+    'matrix_anchors': {'DNA': np.eye(3)},
+    'matrix_provenance': {},
+    'distmap': np.zeros(4),
+    'linked': False, 'linked_at': None,
+}
+
+
+def test_cell_row_shape_and_masks():
+    arrays = {}
+    rows = E.cell_rows([CELL], fov=3, voxel_um=(0.208, 0.208, 0.2),
+                       n_spots_of={7: 11}, n_readout_spots_of={7: 4},
+                       n_alleles_of={7: 2}, arrays=arrays)
+    r = rows[0]
+    check('one row per cell', len(rows) == 1)
+    check('cell_key matches the one the spot row builds',
+          r['cell_key'] == 'F003-C7', r['cell_key'])
+    check('the nucleus centroid takes y from index 0, x from index 1',
+          r['nucleus_centroid_y'] == 11.0
+          and r['nucleus_centroid_x'] == 801.0,
+          f"x={r['nucleus_centroid_x']} y={r['nucleus_centroid_y']}")
+    check('nucleus and area are counted SEPARATELY',
+          r['nucleus_px'] == 3 and r['area_px'] == 2,
+          f"nucleus={r['nucleus_px']} area={r['area_px']}")
+    check('area in um2 uses both in-plane axes',
+          abs(r['nucleus_um2'] - 3 * 0.208 * 0.208) < 1e-12,
+          str(r['nucleus_um2']))
+    check('the counts come from the caller, not the cell',
+          (r['n_spots'], r['n_spots_readout'], r['n_alleles']) == (11, 4, 2))
+    check('a cell away from every border does not read as touching it',
+          r['touches_frame_edge'] is False, str(r['touches_frame_edge']))
+
+
+def test_cell_alignment_is_stored_not_resolved():
+    rows = E.cell_rows([CELL], fov=3)
+    r = rows[0]
+    check('the home hybe is named, so a reader can resolve against it',
+          r['home_hybe'] == 'Hyb_IFdapi' and r['home_modality'] == 'DNA')
+    check('and the row SAYS the stored matrix is a bare residual',
+          r['home_yx_is_residual'] is True)
+    check('every aligned hybe is counted', r['n_hybes_aligned'] == 2)
+    # the decomposition itself, on the one entry that is not identity
+    th, dx, dy, dz, sc = E._affine_parts(
+        CELL['matrices'][('Hyb_015', 'DNA')]['yx'], -3.0)
+    check('a translation decomposes to dx/dy in OUTPUT order, not y-major',
+          dx == -5.0 and dy == -2.0, f'dx={dx} dy={dy}')
+    check('a pure translation has no rotation and unit scale',
+          abs(th) < 1e-12 and abs(sc - 1.0) < 1e-12, f'theta={th} scale={sc}')
+    check('z travels beside the matrix, never inside it', dz == -3.0)
+    # a rotation, so the decomposition is not only exercised on identity
+    import math
+    a = math.radians(30.0)
+    R = np.array([[math.cos(a), -math.sin(a), 0.0],
+                  [math.sin(a), math.cos(a), 0.0],
+                  [0.0, 0.0, 1.0]])
+    th2, _dx2, _dy2, _dz2, sc2 = E._affine_parts(R, 0.0)
+    check('a rotation comes back in degrees', abs(th2 - 30.0) < 1e-9,
+          str(th2))
+    check('and is not mistaken for a scale', abs(sc2 - 1.0) < 1e-12,
+          str(sc2))
+    check('a missing matrix is NaN, not identity',
+          E._affine_parts(None)[0] != E._affine_parts(None)[0])
+
+
+def test_unknown_fields_survive_the_export():
+    """The whole point: export.py must not be a list of one project's
+    fields. Nothing below is known to it."""
+    c = dict(CELL)
+    c['n_speckle'] = 23
+    c['speckle_frac'] = 0.064
+    c['genotype'] = 'C'
+    c['adj_nucleus'] = (np.array([10.5]), np.array([800.5]))
+    arrays = {}
+    rows = E.cell_rows([c], fov=3, arrays=arrays)
+    r = rows[0]
+    check('a scalar field export.py never heard of becomes a column',
+          r.get('n_speckle') == 23 and r.get('genotype') == 'C',
+          str({k: r.get(k) for k in ('n_speckle', 'genotype')}))
+    cols = E.columns_for(rows, E.CELL_COLUMNS)
+    check('and columns_for puts it after the curated ones, not instead',
+          cols[:len(E.CELL_COLUMNS)] == tuple(E.CELL_COLUMNS)
+          and 'n_speckle' in cols)
+    check('a non-scalar one goes to the arrays sidecar',
+          'F003-C7/adj_nucleus' in arrays, str(sorted(arrays)[:4]))
+    check('WITHOUT overwriting the original mask',
+          'F003-C7/nucleus_y' in arrays and 'F003-C7/nucleus_x' in arrays)
+    check('and the row says what was kept beside it',
+          'adj_nucleus' in r['arrays'] and 'nucleus' in r['arrays'],
+          r['arrays'])
+
+
+def test_combined_joins_cell_onto_spot():
+    class _T(object):
+        pass
+    t = _T()
+    # a project field on each side; the cache must keep BOTH
+    t.cells = E.cell_rows([dict(CELL, n_speckle=23)], fov=3,
+                          n_spots_of={7: 2})
+    homeless = dict(SPOT, uid=6, cell=-1)
+    t.spots = E.spot_rows([dict(SPOT, d_surface_um=0.37), homeless], fov=3)
+    rows = E.combined_rows(t)
+    check('one row per SPOT, not per cell', len(rows) == 2)
+    r = [x for x in rows if x['cell'] == 7][0]
+    check('the cell fields arrive prefixed',
+          r.get('cell_nucleus_um2') is not None,
+          str(sorted(k for k in r if k.startswith('cell_'))[:6]))
+    check('fov/celltype are NOT duplicated -- one column, from the spot',
+          'cell_fov' not in r and 'cell_celltype' not in r)
+    # the compact rule: the project's own fields are what the cache is FOR
+    check('a field the schema does not declare is KEPT, both sides',
+          r.get('d_surface_um') == 0.37 and r.get('cell_n_speckle') == 23,
+          str((r.get('d_surface_um'), r.get('cell_n_speckle'))))
+    check('while the pipeline bookkeeping already in the other sheets '
+          'is dropped',
+          'cell_nucleus_px' not in r and 'raw_x' not in r
+          and 'cell_home_yx_dx' not in r,
+          str([k for k in ('cell_nucleus_px', 'raw_x', 'cell_home_yx_dx')
+               if k in r]))
+    full = E.combined_rows(t, compact=False)
+    r2 = [x for x in full if x['cell'] == 7][0]
+    check('compact=False still gives the whole join',
+          r2.get('cell_nucleus_px') == 3 and r2.get('raw_x') == 800.0)
+    h = [x for x in rows if x['cell'] == -1][0]
+    check('a homeless spot keeps its row',
+          h['spot_key'].endswith('U6') and 'cell_nucleus_um2' not in h)
+
+
 def main():
     for fn in (test_spot_row_coordinate_mapping,
                test_layout_join_and_channel_role,
@@ -312,7 +453,11 @@ def main():
                test_modalities_sharing_one_analysis_dir_are_read_once,
                test_stored_final_polymer_wins,
                test_mismatched_candidate_lists_are_not_paired,
-               test_writers_are_atomic_and_round_trip):
+               test_writers_are_atomic_and_round_trip,
+               test_cell_row_shape_and_masks,
+               test_cell_alignment_is_stored_not_resolved,
+               test_unknown_fields_survive_the_export,
+               test_combined_joins_cell_onto_spot):
         print(f'\n{fn.__name__}')
         fn()
     print(f'\n{len(PASSED)} passed, {len(FAILED)} failed')

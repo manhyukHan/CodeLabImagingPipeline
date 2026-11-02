@@ -15,7 +15,14 @@ flat-array + offsets.
 The model classes are UNTOUCHED: pack_* consume exactly the
 ACell/ASpot/AnAllele.save() dicts, unpack_* return dicts of the same
 shape, so CellContainer.load / the spot hydrators / allele loaders work
-unchanged. vlinks_store picks pickle vs columnar per store (see its
+unchanged.
+
+THE SCHEMA IS NO LONGER CLOSED. A key a save() dict carries that the
+packer does not know is written as its own typed column under 'props'
+and handed back on read -- see pack_props. It was closed, and an
+analysis that attached its own measurement to a cell lost it on the
+next save without a word, which is the worst way for a store to behave:
+indistinguishable from the analysis never having run. vlinks_store picks pickle vs columnar per store (see its
 analysis_schema stamp); this module never opens files itself -- it
 packs into / unpacks from an already-open h5py group.
 
@@ -87,6 +94,146 @@ def _coords_at(flat_off, i):
 
 # -- cells ---------------------------------------------------------------
 
+#: a property value this module can store as a column. Anything else
+#: is refused loudly rather than dropped quietly -- an analysis that
+#: writes a field and finds it gone on the next read has no way to
+#: tell that from "the analysis never ran".
+_PROP_KINDS = {'b': bool, 'i': int, 'f': float, 's': str}
+
+
+def _prop_kind(values):
+    """Which column type holds these values, or None if none can.
+
+    Decided over the WHOLE column, not per value: a key that is 3 on
+    one cell and 3.5 on the next is a float column, and bool is checked
+    before int because bool IS an int in Python and would otherwise
+    come back as 0/1.
+    """
+    seen = set()
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, (bool, np.bool_)):
+            seen.add('b')
+        elif isinstance(v, (int, np.integer)):
+            seen.add('i')
+        elif isinstance(v, (float, np.floating)):
+            seen.add('f')
+        elif isinstance(v, (str, bytes)):
+            seen.add('s')
+        else:
+            return None
+    if not seen:
+        return 'f'                      # all None: a float column of NaN
+    if seen == {'b'}:
+        return 'b'
+    if seen <= {'b', 'i'}:
+        return 'i'
+    if seen <= {'b', 'i', 'f'}:
+        return 'f'
+    if seen == {'s'}:
+        return 's'
+    return None                         # mixed text and numbers
+
+
+def pack_props(grp, dicts, known):
+    """Every key the model does NOT declare, as its own column.
+
+    The store's schema was closed: pack_cells/pack_spots wrote the
+    fields they knew and an analysis that attached its own -- a speckle
+    count, a distance, a p value -- lost them on the next save without
+    a word. This is the opening. A property is one scalar per item, so
+    it is one typed dataset per key plus a presence mask, which is what
+    distinguishes "this item has no value" from "its value is 0".
+
+    Non-scalar values RAISE. They have nowhere to go in a column, and
+    the alternative -- skipping them -- is exactly the silent loss this
+    exists to end. Array-shaped per-item data belongs in its own
+    dataset with its own offsets, the way geometry and centroids
+    already do.
+    """
+    keys, bad = [], []
+    for d in dicts or []:
+        for k in d:
+            if k not in known and k not in keys:
+                keys.append(k)
+    props = grp.require_group('props')
+    for k in sorted(keys):
+        if '/' in k:
+            bad.append('%s (a key may not contain "/")' % k)
+            continue
+        values = [d.get(k) for d in dicts]
+        kind = _prop_kind(values)
+        if kind is None:
+            bad.append('%s (%s)' % (k, type(
+                next((v for v in values if v is not None), None)).__name__))
+            continue
+        present = np.asarray([d.get(k) is not None for d in dicts], np.uint8)
+        g = props.require_group(k)
+        if kind == 's':
+            col = np.asarray([_s(v) for v in values], dtype=_STR)
+        elif kind == 'b':
+            col = np.asarray([bool(v) if v is not None else False
+                              for v in values], np.uint8)
+        elif kind == 'i':
+            col = np.asarray([int(v) if v is not None else 0
+                              for v in values], np.int64)
+        else:
+            col = np.asarray([float(v) if v is not None else np.nan
+                              for v in values], np.float64)
+        _write(g, 'value', col)
+        _write(g, 'present', present)
+        g.attrs['kind'] = kind
+    if bad:
+        raise TypeError(
+            'these properties are not scalars and cannot be stored as '
+            'columns: %s. Give array-shaped data its own dataset '
+            'instead of a property.' % ', '.join(bad))
+
+
+def unpack_props(grp, dicts):
+    """Put the property columns back on the dicts, in place.
+
+    A file written before properties existed has no 'props' group at
+    all, so absence is normal and silent -- the reverse (a reader that
+    required the group) would make every older store unreadable.
+    """
+    props = grp.get('props')
+    if props is None:
+        return dicts
+    for k in props:
+        g = props[k]
+        kind = g.attrs.get('kind', 'f')
+        kind = kind.decode() if isinstance(kind, bytes) else str(kind)
+        col, present = g['value'][()], g['present'][()]
+        for i, d in enumerate(dicts):
+            if i >= len(col) or not present[i]:
+                continue
+            v = col[i]
+            if kind == 's':
+                d[k] = _rd(v)
+            elif kind == 'b':
+                d[k] = bool(v)
+            elif kind == 'i':
+                d[k] = int(v)
+            else:
+                d[k] = float(v)
+    return dicts
+
+
+#: what pack_cells writes itself. A key outside this set is a
+#: PROPERTY: stored as its own column and handed back on read, so an
+#: analysis can attach whatever it measured without this module
+#: knowing the name. 'distmap' is here because it is deliberately
+#: dropped (a legacy slot that stays empty), not because it is stored.
+CELL_KEYS = frozenset((
+    'id', 'fov', 'linked', 'frame_shape', 'reference_hybe',
+    'reference_modality', 'nucleus_hybe', 'nucleus_modality', 'celltype',
+    'linked_at', 'area', 'nucleus', 'matrices', 'matrix_anchors',
+    'matrix_provenance', 'distmap',
+))
+
+
 def pack_cells(grp, dicts):
     n = len(dicts)
     tab = np.zeros(n, dtype=[('id', 'i4'), ('fov', 'i4'), ('linked', 'u1'),
@@ -134,6 +281,7 @@ def pack_cells(grp, dicts):
     _write(grp, 'prov_steps',
            np.concatenate(prov['steps'], axis=0) if prov['steps'] else np.empty((0, 3, 3)))
     _write(grp, 'prov_nsteps', np.asarray(prov['n_steps'], dtype=np.int32))
+    pack_props(grp, dicts, CELL_KEYS)
 
 
 def unpack_cells(grp):
@@ -176,10 +324,21 @@ def unpack_cells(grp):
         dicts[ci]['matrix_provenance'][(_rd(prov_hybe[j]), _rd(prov_mod[j]))] = {
             'reference_sequence': _rd(prov_ref[j]), 'steps': steps_all[k:k + ns]}
         k += ns
-    return dicts
+    return unpack_props(grp, dicts)
 
 
 # -- spots (one slice group) --------------------------------------------
+
+#: what pack_spots writes itself; see CELL_KEYS.
+SPOT_KEYS = frozenset((
+    'uid', 'fov', 'channel', 'cell', 'adj_coordinate', 'raw_coordinate',
+    'size', 'brightness', 'linked', 'modality', 'hybe', 'celltype',
+    'linked_at', 'z_status', 'mixture_centroids', 'p_exist',
+    # the v1 read-side alias for adj_coordinate: a value under the old
+    # name is not a property, it is the same field spelled the old way
+    'coordinate',
+))
+
 
 def pack_spots(grp, dicts):
     n = len(dicts)
@@ -216,6 +375,7 @@ def pack_spots(grp, dicts):
     # here for exactly that reason and this follows it.
     _write(grp, 'p_exist', np.asarray(
         [float(d.get('p_exist', np.nan)) for d in dicts], dtype=np.float64))
+    pack_props(grp, dicts, SPOT_KEYS)
     widths = np.asarray([len(c) for c in mix], dtype=np.int8)
     _write(grp, 'mix_vals', np.concatenate(mix) if mix else np.empty(0))
     _write(grp, 'mix_width', widths)
@@ -253,7 +413,7 @@ def unpack_spots(grp):
             'p_exist': (float(pex[i]) if pex is not None else float('nan')),
             'mixture_centroids': tuple(tuple(mvals[mstart[j]:mstart[j + 1]])
                                        for j in range(off[i], off[i + 1]))})
-    return out
+    return unpack_props(grp, out)
 
 
 # -- alleles -------------------------------------------------------------
@@ -282,6 +442,18 @@ def _widen(vals, width):
         return vals[:, :width]
     pad = np.full((vals.shape[0], width - vals.shape[1]), np.nan)
     return np.concatenate([vals, pad], axis=1)
+
+
+#: what pack_alleles writes itself; see CELL_KEYS.
+ALLELE_KEYS = frozenset((
+    'id', 'fov', 'cell', 'anchor_uid', 'anchor_hybe',
+    'anchor_channel', 'provenance', 'coordinate', 'raw_coordinate',
+    'fiducial_trace_adj', 'fiducial_trace_raw', 'fiducial_drift',
+    'polymer_adj', 'polymer_raw', 'rejected_hybes', 'final_polymer',
+    'linked', 'linked_at',
+    # v1 spellings, read as aliases by the model
+    'fiducial_trace', 'polymer',
+))
 
 
 def pack_alleles(grp, dicts):
@@ -362,6 +534,7 @@ def pack_alleles(grp, dicts):
     _write(grp, 'rj_reason', np.asarray(rj['reason'], dtype='S256'))
     _write(grp, 'fp', np.concatenate(fp, axis=0) if fp else np.empty((0, 3)))
     _write(grp, 'fp_off', np.asarray(fp_off, dtype=np.int64))
+    pack_props(grp, dicts, ALLELE_KEYS)
 
 
 def unpack_alleles(grp):
@@ -416,4 +589,4 @@ def unpack_alleles(grp):
     rj_hybe, rj_reason = grp['rj_hybe'][()], grp['rj_reason'][()]
     for j, ai in enumerate(grp['rj_allele'][()]):
         out[ai]['rejected_hybes'][_rd(rj_hybe[j])] = _rd(rj_reason[j])
-    return out
+    return unpack_props(grp, out)

@@ -3,6 +3,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from codelab_pipeline.segmentation.segment import PROJECTION_MODES, describe_projection
+from codelab_pipeline.segmentation.cell_gate import FLAGS as CELL_FLAGS
 
 
 class CellSegmentPanelUI(object):
@@ -89,6 +90,42 @@ class CellSegmentPanelUI(object):
         self.FocusCanvas.setMinimumHeight(115)
         projLayout.addRow(self.FocusCanvas)
         layout.addWidget(projGroup)
+
+        gateGroup = QtWidgets.QGroupBox('Cell gate (batch runs)')
+        gateLayout = QtWidgets.QFormLayout(gateGroup)
+        # WHICH flags drop, not WHETHER to measure them: the five
+        # quantities are always computed and logged per FOV, and this
+        # only says which of them remove a cell. Empty means remove
+        # nothing, which is the default on purpose -- the Lamin set
+        # dropped dim+irregular+border and the first SRRM1 set dropped
+        # border+irregular+large and KEPT dim, each after looking at its
+        # own overlay. A default that suited one would silently mis-gate
+        # the other.
+        self.CellGateDropCheckBoxes = {}
+        boxRow = QtWidgets.QWidget()
+        boxLayout = QtWidgets.QHBoxLayout(boxRow)
+        boxLayout.setContentsMargins(0, 0, 0, 0)
+        for name in CELL_FLAGS:
+            cb = QtWidgets.QCheckBox(name)
+            self.CellGateDropCheckBoxes[name] = cb
+            boxLayout.addWidget(cb)
+        gateLayout.addRow('Drop:', boxRow)
+        self.CellGateLabel = QtWidgets.QLabel('nothing is removed')
+        self.CellGateLabel.setWordWrap(True)
+        gateLayout.addRow(self.CellGateLabel)
+        # The config sees ONE value, a comma list, so the existing
+        # param map (one biological name -> one widget) keeps working
+        # and the setting round-trips. The boxes are the way to edit
+        # it; this is the thing that is saved. Kept in step both ways,
+        # with a guard because each side sets the other.
+        self.CellGateDropLineEdit = QtWidgets.QLineEdit()
+        self.CellGateDropLineEdit.setVisible(False)
+        self._cell_gate_syncing = False
+        for _cb in self.CellGateDropCheckBoxes.values():
+            _cb.toggled.connect(self._cell_gate_boxes_changed)
+        self.CellGateDropLineEdit.textChanged.connect(
+            self._cell_gate_text_changed)
+        layout.addWidget(gateGroup)
 
         self.RunSegmentationPushButton = QtWidgets.QPushButton('Run Segmentation')
         # Label restated from the live projection on every change -- see
@@ -292,3 +329,40 @@ class CellSegmentPanelUI(object):
                     self.ChannelComboBox.setCurrentIndex(idx)
         self.ChannelComboBox.blockSignals(False)
         self.ChannelComboBox.currentIndexChanged.emit(self.ChannelComboBox.currentIndex())
+
+    def cell_gate_drop(self):
+        """The flags that REMOVE a cell, as the config's comma string."""
+        return ','.join(n for n, cb in self.CellGateDropCheckBoxes.items()
+                        if cb.isChecked())
+
+    def set_cell_gate_drop(self, text):
+        self.CellGateDropLineEdit.setText(str(text or ''))
+
+    def refresh_cell_gate_label(self):
+        got = self.cell_gate_drop()
+        self.CellGateLabel.setText(
+            'a cell flagged %s is removed, per FOV, after that FOV is saved'
+            % ' or '.join(got.split(',')) if got else
+            'nothing is removed; the flags are still measured and logged')
+
+    def _cell_gate_boxes_changed(self, _checked=None):
+        if self._cell_gate_syncing:
+            return
+        self._cell_gate_syncing = True
+        try:
+            self.CellGateDropLineEdit.setText(self.cell_gate_drop())
+        finally:
+            self._cell_gate_syncing = False
+        self.refresh_cell_gate_label()
+
+    def _cell_gate_text_changed(self, text):
+        if self._cell_gate_syncing:
+            return
+        self._cell_gate_syncing = True
+        try:
+            want = set(t.strip() for t in str(text or '').split(',') if t.strip())
+            for n, cb in self.CellGateDropCheckBoxes.items():
+                cb.setChecked(n in want)
+        finally:
+            self._cell_gate_syncing = False
+        self.refresh_cell_gate_label()

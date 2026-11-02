@@ -937,6 +937,123 @@ def write_cellcycle_model(storage_path, payload):
     _poke_cache(path, 'cellcycle_model', json.loads(json.dumps(payload)))
 
 
+# -- speckles (per-cell segmentation and the images behind it) ----------
+
+def speckles_path(storage_path, fov):
+    """THE path of this FOV's speckles.h5. Public for the same reason
+    cells_path is: a caller deciding whether to recompute has to tell
+    'never written' from 'written and unreadable', and read_fov_speckles
+    collapses both to None."""
+    return os.path.join(_fov_dir(storage_path, fov), 'speckles.h5')
+
+
+def write_fov_speckles(storage_path, fov, per_cell, recipe=None):
+    """Full atomic replace of the FOV's speckle capsule.
+
+    per_cell: {cell_id: {'sig': (y, x, z) float array or None,
+                         'lab': (y, x, z) integer label array,
+                         'props': [{label, cy, cx, cz, volume_um3,
+                                    n_vox, int_sum, int_mean}, ...],
+                         'y0', 'x0', 'z0': ints placing the arrays in
+                             the FOV's own frame,
+                         'z_lo', 'z_hi': the nucleus DAPI band}}
+    recipe: whatever made it -- rule, filter sigmas, PSF, iterations.
+        Stored as file attrs, because a capsule that does not say how it
+        was made cannot be told from one made a different way, and this
+        one WILL be remade.
+
+    The images are the point: they are kept so a figure never has to
+    re-deconvolve, which is both slow and a second chance to use
+    different parameters than the measurement did.
+    """
+    target = speckles_path(storage_path, fov)
+
+    def build(f):
+        f.attrs['version'] = 1
+        f.attrs['n_cells'] = len(per_cell)
+        for k, v in (recipe or {}).items():
+            f.attrs[str(k)] = json.dumps(v) if isinstance(v, (dict, list)) else v
+        for cid, d in per_cell.items():
+            g = f.create_group('cell%d' % int(cid))
+            for k in ('y0', 'x0', 'z0', 'z_lo', 'z_hi'):
+                if d.get(k) is not None:
+                    g.attrs[k] = int(d[k])
+            lab = d.get('lab')
+            if lab is not None:
+                g.create_dataset('lab', data=np.asarray(lab, 'uint16'),
+                                 compression='gzip', compression_opts=4,
+                                 shuffle=True)
+            sig = d.get('sig')
+            if sig is not None:
+                g.create_dataset('sig', data=np.asarray(sig, 'float32'),
+                                 compression='gzip', compression_opts=4,
+                                 shuffle=True)
+            props = d.get('props') or []
+            g.attrs['n_speckles'] = len(props)
+            if props:
+                cols = ('label', 'cy', 'cx', 'cz', 'volume_um3', 'n_vox',
+                        'int_sum', 'int_mean')
+                arr = np.array([[float(p.get(c, np.nan)) for c in cols]
+                                for p in props], 'float64')
+                ds = g.create_dataset('props', data=arr, compression='gzip')
+                ds.attrs['columns'] = json.dumps(list(cols))
+
+    _atomic_h5(target, build)
+    _update_fov_manifest(
+        _fov_dir(storage_path, fov),
+        lambda m: m.__setitem__('speckles',
+                                {'n_cells': len(per_cell),
+                                 'saved_at': datetime.now().isoformat()}))
+
+
+def read_fov_speckles(storage_path, fov, cells=None, images=True):
+    """The FOV's speckle capsule, or None if nothing is persisted.
+
+    cells: only these ids (one group opened each) -- the images are the
+        bulk of the file, so a caller after the properties of one cell
+        should not pay for the whole FOV.
+    images: False returns props and geometry only. A table of speckle
+        positions is a few kB; the arrays behind it are megabytes.
+
+    Returns {'recipe': {...}, 'cells': {id: {...}}} in the shape
+    write_fov_speckles takes, so what comes out can go back in.
+    """
+    path = speckles_path(storage_path, fov)
+    if not os.path.exists(path):
+        return None
+    try:
+        # h5py.File, not _open_shared: that one hands back a TEXT handle
+        # for the JSON capsules. _read_slice_file opens HDF5 the same
+        # plain way under the same OSError guard.
+        with h5py.File(path, 'r') as f:
+            recipe = {k: f.attrs[k] for k in f.attrs
+                      if k not in ('version', 'n_cells', 'coordinate_order',
+                                   'saved_at')}
+            want = (['cell%d' % int(c) for c in cells] if cells is not None
+                    else [k for k in f.keys() if k.startswith('cell')])
+            out = {}
+            for name in want:
+                if name not in f:
+                    continue
+                g = f[name]
+                d = {k: int(g.attrs[k]) for k in g.attrs
+                     if k in ('y0', 'x0', 'z0', 'z_lo', 'z_hi')}
+                if 'props' in g:
+                    cols = json.loads(g['props'].attrs['columns'])
+                    arr = np.asarray(g['props'])
+                    d['props'] = [dict(zip(cols, row)) for row in arr]
+                else:
+                    d['props'] = []
+                if images:
+                    for k in ('lab', 'sig'):
+                        if k in g:
+                            d[k] = np.asarray(g[k])
+                out[int(name[4:])] = d
+            return {'recipe': recipe, 'cells': out}
+    except OSError:
+        return None
+
+
 # -- counts (status panels) ----------------------------------------------
 
 def fov_counts(storage_path, fovs):

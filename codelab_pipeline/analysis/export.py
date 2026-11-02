@@ -5,7 +5,10 @@ The point is a file someone who has never seen this codebase can open and
 work from: one row per thing, every coordinate spelled out, no nested
 dicts, no knowledge of the store layout required.
 
-TWO SHAPES, because the data has two shapes:
+THREE SHAPES, because the data has three shapes:
+
+  cells   -- one row per segmented cell. Geometry, provenance and the
+             counts that let a reader check the other two tables add up.
 
   spots   -- one row per spot. A spot IS a single position.
 
@@ -76,6 +79,51 @@ def _um(xyz, voxel_um):
     dy, dx, dz = (float(v) for v in voxel_um)
     return (xyz[0] * dx, xyz[1] * dy, xyz[2] * dz)
 
+
+def _affine_parts(H, dz=0.0):
+    """A 3x3 yx affine plus its z shift, as (theta_deg, dx, dy, dz).
+
+    The stored transform is a general affine, but what it carries here
+    is a rigid move: a rotation in the plane and a translation, with z
+    separable and additive (alignment/frames.py, "Z is separable"). So
+    four numbers say it, and they say it in the reader's units --
+    degrees and pixels -- instead of nine matrix entries nobody can
+    read.
+
+    theta comes from the linear block, dx/dy from the translation
+    column, and both are reported in the OUTPUT order (x, y) like every
+    other coordinate in this file, while the matrix is y-major.
+
+    A scale or a shear would make four numbers a lossy summary. There
+    is no silent rounding: `scale` is returned beside them, and a
+    reader who sees it away from 1 knows the summary is not the whole
+    transform. Returns NaNs for a missing matrix rather than identity,
+    because "no alignment ran" and "alignment found nothing to do" are
+    different facts.
+    """
+    import math
+    if H is None:
+        return (float('nan'),) * 5
+    A = np.asarray(H, float)
+    if A.shape != (3, 3):
+        return (float('nan'),) * 5
+    # y-major: row 0 is y, row 1 is x
+    theta = math.degrees(math.atan2(A[1, 0], A[0, 0]))
+    scale = math.hypot(A[0, 0], A[1, 0])
+    return (theta, float(A[1, 2]), float(A[0, 2]),
+            float(dz if dz is not None else 0.0), scale)
+
+
+#: the keys spot_rows reads itself. Everything else a stored spot
+#: carries is passed through as its own column -- the same rule
+#: cell_rows follows, and the reason an analysis can attach a
+#: measurement to a spot and find it in the file.
+_SPOT_STRUCTURAL = frozenset((
+    'uid', 'fov', 'modality', 'hybe', 'channel', 'cell', 'celltype',
+    'raw_coordinate', 'adj_coordinate', 'coordinate', 'size',
+    'brightness', 'p_exist', 'z_status', 'mixture_centroids', 'linked',
+    'linked_at', 'properties',
+))
 
 SPOT_COLUMNS = (
     'spot_key', 'fov', 'modality', 'hybe', 'readout_name', 'datatype',
@@ -189,8 +237,242 @@ def spot_rows(spot_dicts, fov=None, celltype_of=None, voxel_um=DEFAULT_VOXEL_UM,
             'linked': bool(s.get('linked', False)),
             'linked_at': s.get('linked_at') or '',
         })
+        for k, v in s.items():
+            # `k not in rows[-1]` is the guard that matters: a
+            # stored field named like a column this function
+            # already filled would otherwise replace it silently,
+            # and the file would say something the exporter never
+            # computed under a name that promises it did.
+            if (k not in _SPOT_STRUCTURAL and k not in rows[-1]
+                    and _is_scalar(v)):
+                rows[-1][k] = v
     return rows
 
+
+#: structural fields the cell row spells out itself. Everything else a
+#: cell carries is passed through untouched -- see cell_rows.
+_CELL_STRUCTURAL = frozenset((
+    'id', 'fov', 'celltype', 'nucleus', 'area', 'frame_shape',
+    'reference_hybe', 'reference_modality', 'nucleus_hybe',
+    'nucleus_modality', 'matrices', 'matrix_anchors',
+    'matrix_provenance', 'linked', 'linked_at',
+))
+
+CELL_COLUMNS = (
+    'cell_key', 'fov', 'cell', 'celltype',
+    'home_hybe', 'home_modality',
+    'nucleus_hybe', 'nucleus_modality',
+    'nucleus_px', 'nucleus_um2',
+    'nucleus_centroid_x', 'nucleus_centroid_y',
+    'nucleus_centroid_x_um', 'nucleus_centroid_y_um',
+    'nucleus_min_x', 'nucleus_max_x', 'nucleus_min_y', 'nucleus_max_y',
+    'area_px', 'area_um2', 'area_centroid_x', 'area_centroid_y',
+    'touches_frame_edge', 'frame_width', 'frame_height',
+    'n_spots', 'n_spots_readout', 'n_alleles',
+    # The cell's OWN stored alignment, not a resolved one. home_yx_* is
+    # the matrix it keeps for (home_hybe, home_modality) and
+    # home_yx_is_residual says whether it is a bare residual -- which
+    # it is for everything written since the residual change, meaning
+    # the FOV leg is NOT in it. A reader composes the two with
+    # alignment.frames.FrameResolver, exactly as the app does. Nothing
+    # here is pre-composed on purpose: a composition baked into a file
+    # goes stale the moment FOV alignment is re-run, and the file
+    # cannot say so.
+    'home_yx_theta_deg', 'home_yx_dx', 'home_yx_dy', 'home_dz',
+    'home_yx_scale', 'home_yx_is_residual',
+    'n_hybes_aligned', 'arrays',
+    'linked', 'linked_at',
+)
+
+
+def _is_scalar(v):
+    """True when a value belongs in a table cell as it stands."""
+    if v is None or isinstance(v, (bool, int, float, str, bytes)):
+        return True
+    if isinstance(v, np.generic):
+        return True
+    return False
+
+
+def _mask_stats(mask, voxel_um):
+    """(count, um2, centroid_x, centroid_y, min_x, max_x, min_y, max_y).
+
+    A stored mask is (ys, xs) -- pixel INDICES, not an image -- so the
+    area is how many there are and the extent is their range. Empty
+    gives NaNs rather than zeros: a cell with no mask and a cell whose
+    mask sits at the origin must not read the same.
+    """
+    nan = float('nan')
+    if mask is None or len(mask) < 2 or not len(mask[0]):
+        return (0, nan, nan, nan, nan, nan, nan, nan)
+    ys = np.asarray(mask[0], float)
+    xs = np.asarray(mask[1], float)
+    dy, dx, _dz = (float(v) for v in voxel_um)
+    return (int(len(ys)), float(len(ys)) * dy * dx,
+            float(xs.mean()), float(ys.mean()),
+            float(xs.min()), float(xs.max()),
+            float(ys.min()), float(ys.max()))
+
+
+def cell_rows(cell_dicts, fov=None, voxel_um=DEFAULT_VOXEL_UM,
+              n_spots_of=None, n_readout_spots_of=None,
+              n_alleles_of=None, arrays=None):
+    """One row per segmented cell, as plain dicts.
+
+    NOTHING IS HARDCODED AWAY. The columns above are the ones this
+    function spells out -- geometry, provenance, counts, the stored
+    alignment -- and every OTHER key a cell carries becomes a column of
+    its own, named exactly as the store names it. A project that writes
+    `n_speckle` or `d_surface_um` onto its cells gets those columns
+    without a line changing here, which is the point: the exporter must
+    not be a list of one project's fields.
+
+    TWO MASKS, and they are not the same thing. `nucleus` is the
+    nuclear segmentation and `area` the whole-cell one; both get their
+    own count, area and centroid, because which one a number was
+    computed over changes what it means. Neither is overwritten by an
+    adjusted copy: an `adj_nucleus`, if a project ever writes one,
+    arrives as its own field beside the original.
+
+    `arrays` (a dict, optional) collects everything that is not a
+    scalar -- the masks themselves, the per-hybe matrices, distmap --
+    under '<cell_key>/<field>' for write_npz. The table then carries
+    only what is readable in a cell, and the column `arrays` lists the
+    field names stored beside it, so a reader can see what was kept
+    without opening the .npz. Pass None to drop them.
+
+    The counts come from the caller, not the cell, which carries none:
+    they are what lets a reader check the three tables agree. n_spots
+    counts every spot assigned to the cell, fiducial detections
+    included; n_spots_readout counts only readout-channel ones, which
+    is the far smaller number most analyses mean.
+
+    touches_frame_edge is computed here rather than trusted from a
+    stored flag -- it is a property of the mask and the frame, both in
+    hand, and a stale flag is worse than none.
+    """
+    rows = []
+    for c in cell_dicts or []:
+        f = int(c.get('fov', fov if fov is not None else -1))
+        cid = int(c.get('id', -1))
+        key = 'F%03d-C%d' % (f, cid)
+        frame = c.get('frame_shape') or ()
+        fh = float(frame[0]) if len(frame) > 0 else float('nan')
+        fw = float(frame[1]) if len(frame) > 1 else float('nan')
+        nuc = _mask_stats(c.get('nucleus'), voxel_um)
+        ar = _mask_stats(c.get('area'), voxel_um)
+        edge = ''
+        if nuc[0]:
+            edge = bool(nuc[4] <= 0 or nuc[6] <= 0
+                        or (fw == fw and nuc[5] >= fw - 1)
+                        or (fh == fh and nuc[7] >= fh - 1))
+        home_h = str(c.get('reference_hybe') or '')
+        home_m = str(c.get('reference_modality') or '')
+        mats = c.get('matrices') or {}
+        entry = mats.get((home_h, home_m)) or {}
+        th, dx_, dy_, dz_, sc = _affine_parts(entry.get('yx'),
+                                              entry.get('dz', 0.0))
+        row = {
+            'cell_key': key, 'fov': f, 'cell': cid,
+            'celltype': str(c.get('celltype') or ''),
+            'home_hybe': home_h, 'home_modality': home_m,
+            'nucleus_hybe': str(c.get('nucleus_hybe') or ''),
+            'nucleus_modality': str(c.get('nucleus_modality') or ''),
+            'nucleus_px': nuc[0], 'nucleus_um2': nuc[1],
+            'nucleus_centroid_x': nuc[2], 'nucleus_centroid_y': nuc[3],
+            'nucleus_centroid_x_um': nuc[2] * float(voxel_um[1]),
+            'nucleus_centroid_y_um': nuc[3] * float(voxel_um[0]),
+            'nucleus_min_x': nuc[4], 'nucleus_max_x': nuc[5],
+            'nucleus_min_y': nuc[6], 'nucleus_max_y': nuc[7],
+            'area_px': ar[0], 'area_um2': ar[1],
+            'area_centroid_x': ar[2], 'area_centroid_y': ar[3],
+            'touches_frame_edge': edge,
+            'frame_width': fw, 'frame_height': fh,
+            'n_spots': int((n_spots_of or {}).get(cid, 0)),
+            'n_spots_readout': int((n_readout_spots_of or {}).get(cid, 0)),
+            'n_alleles': int((n_alleles_of or {}).get(cid, 0)),
+            'home_yx_theta_deg': th, 'home_yx_dx': dx_,
+            'home_yx_dy': dy_, 'home_dz': dz_, 'home_yx_scale': sc,
+            'home_yx_is_residual': bool(entry.get('yx_is_residual', False)),
+            'n_hybes_aligned': len(mats),
+            'linked': bool(c.get('linked', False)),
+            'linked_at': c.get('linked_at') or '',
+        }
+        kept = []
+        for k, v in c.items():
+            if k in _CELL_STRUCTURAL:
+                continue
+            if _is_scalar(v) and k not in row:
+                row[k] = v
+            elif arrays is not None:
+                arrays['%s/%s' % (key, k)] = v
+                kept.append(k)
+        if arrays is not None:
+            for k in ('nucleus', 'area'):
+                if c.get(k) is not None and len(c.get(k) or ()) >= 2:
+                    arrays['%s/%s_y' % (key, k)] = np.asarray(c[k][0])
+                    arrays['%s/%s_x' % (key, k)] = np.asarray(c[k][1])
+                    kept.append(k)
+            for (hy, mo), e in mats.items():
+                arrays['%s/matrix/%s/%s/yx' % (key, mo, hy)] = np.asarray(
+                    e.get('yx'), float)
+            if mats:
+                kept.append('matrices')
+            for mo, H in (c.get('matrix_anchors') or {}).items():
+                arrays['%s/anchor/%s' % (key, mo)] = np.asarray(H, float)
+                kept.append('matrix_anchors')
+        row['arrays'] = ' '.join(sorted(set(kept)))
+        rows.append(row)
+    return rows
+
+
+def columns_for(rows, known):
+    """`known` first, in order, then every other key the rows carry.
+
+    The curated order is what makes a table readable; discovery is what
+    keeps it complete. A field a project invented appears at the end
+    rather than not at all, and the writers take this instead of a
+    fixed tuple so nothing is silently dropped on the way out.
+    """
+    seen, extra = set(known), []
+    for r in rows or []:
+        for k in r:
+            if k not in seen:
+                seen.add(k)
+                extra.append(k)
+    return tuple(known) + tuple(sorted(extra))
+
+
+def write_npz(arrays, path):
+    """The non-scalar fields, beside their table.
+
+    Keys are '<cell_key>/<field>', so np.load(path)['F001-C5/nucleus_y']
+    is the mask the row F001-C5 summarises. Written atomically like
+    every other writer here.
+    """
+    if not arrays:
+        return None
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    tmp = path + '.part.npz'
+    np.savez_compressed(tmp, **{k: np.asarray(v, dtype=object)
+                                if np.asarray(v).dtype == object
+                                else np.asarray(v)
+                                for k, v in arrays.items()})
+    _replace(tmp, path)
+    return path
+
+
+#: the keys allele_rows reads itself; see _SPOT_STRUCTURAL. An
+#: allele's own extra field repeats on each of its rows, which is what
+#: a long table does with a per-item value.
+_ALLELE_STRUCTURAL = frozenset((
+    'id', 'fov', 'cell', 'celltype', 'anchor_uid', 'anchor_hybe',
+    'anchor_channel', 'provenance', 'coordinate', 'raw_coordinate',
+    'fiducial_trace_adj', 'fiducial_trace_raw', 'fiducial_trace',
+    'fiducial_drift', 'polymer_adj', 'polymer_raw', 'polymer',
+    'rejected_hybes', 'final_polymer', 'linked', 'linked_at',
+    'properties',
+))
 
 ALLELE_COLUMNS = (
     'allele_key', 'allele_id', 'fov', 'cell', 'cell_key', 'celltype',
@@ -397,6 +679,10 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                     'readout_adj_x_um': ca_um[0], 'readout_adj_y_um': ca_um[1],
                     'readout_adj_z_um': ca_um[2],
                 })
+                for _k, _v in a.items():
+                    if (_k not in _ALLELE_STRUCTURAL
+                            and _k not in row and _is_scalar(_v)):
+                        row[_k] = _v
                 rows.append(row)
     return rows
 
@@ -426,9 +712,39 @@ def _layouts(storage_paths_by_modality, errors):
     return by_hybe, bins
 
 
+class Tables(object):
+    """What one export pass produced.
+
+    A class and not a tuple because the pass now yields four things
+    plus a summary, and `cells, spots, alleles, arrays, summary = ...`
+    is a line nobody can read or safely extend.
+    """
+
+    __slots__ = ('cells', 'spots', 'alleles', 'arrays', 'summary')
+
+    def __init__(self, cells, spots, alleles, arrays, summary):
+        self.cells = cells
+        self.spots = spots
+        self.alleles = alleles
+        self.arrays = arrays
+        self.summary = summary
+
+    def sheets(self):
+        """[(name, rows, columns)] for write_excel / write_csv.
+
+        Columns are DISCOVERED per table (columns_for), so a field a
+        project wrote onto its cells or spots reaches the file without
+        anything here naming it.
+        """
+        return [('cells', self.cells, columns_for(self.cells, CELL_COLUMNS)),
+                ('spots', self.spots, columns_for(self.spots, SPOT_COLUMNS)),
+                ('alleles', self.alleles,
+                 columns_for(self.alleles, ALLELE_COLUMNS))]
+
+
 def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
-            progress=None, should_stop=None):
-    """Build both tables for a whole project.
+            progress=None, should_stop=None, want_arrays=True):
+    """Build every table for a whole project.
 
     storage_paths_by_modality: {modality: storage_path}.
 
@@ -444,6 +760,14 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
     The layout is still resolved per modality -- that is genuinely
     per-modality data -- and each allele is binned against ITS OWN
     modality's genomic bins.
+
+    The cells of each FOV were already being read here for celltype and
+    then thrown away; they now become the third table at no extra I/O,
+    carrying the per-cell counts computed from the two tables beside
+    them -- which is what lets a reader check that the three agree.
+
+    want_arrays=False skips collecting the masks and matrices, for a
+    caller who only wants the tables (they are ~10 KB per cell).
 
     fovs: None means every FOV the project holds. progress(done, total,
     message) is called per FOV; should_stop() is polled so a long export
@@ -472,7 +796,8 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
             todo.append((sp, int(fov)))
     total = len(todo)
 
-    spots_out, alleles_out, seen = [], [], []
+    cells_out, spots_out, alleles_out, seen = [], [], [], []
+    arrays = {} if want_arrays else None
     for i, (sp, fov) in enumerate(todo, start=1):
         if should_stop is not None and should_stop():
             errors.append('cancelled by the user')
@@ -483,22 +808,128 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
             cells, _ = analysis_store.read_cells(sp, fov)
             ct = {int(c['id']): str(c.get('celltype') or '')
                   for c in (cells or [])}
-            spots_out.extend(spot_rows(
+            srows = spot_rows(
                 analysis_store.read_spots(sp, fov), fov, celltype_of=ct,
-                voxel_um=voxel_um, layout_by_modality=layout_by_modality))
+                voxel_um=voxel_um, layout_by_modality=layout_by_modality)
+            arows = []
             for a in analysis_store.read_fov_alleles(sp, fov) or []:
                 m = str((a.get('provenance') or {}).get('modality')
                         or default_modality)
-                alleles_out.extend(allele_rows(
+                arows.extend(allele_rows(
                     [a], fov, bins_by_modality.get(m, []), modality=m,
                     celltype_of=ct, voxel_um=voxel_um,
                     records_by_hybe=layout_by_modality.get(m, {})))
+            n_spots, n_read, n_all = {}, {}, {}
+            for r in srows:
+                c = r['cell']
+                n_spots[c] = n_spots.get(c, 0) + 1
+                if r['channel_role'] == 'readout':
+                    n_read[c] = n_read.get(c, 0) + 1
+            for a in {(r['cell'], r['allele_id']) for r in arows}:
+                n_all[a[0]] = n_all.get(a[0], 0) + 1
+            cells_out.extend(cell_rows(
+                cells, fov, voxel_um=voxel_um, n_spots_of=n_spots,
+                n_readout_spots_of=n_read, n_alleles_of=n_all,
+                arrays=arrays))
+            spots_out.extend(srows)
+            alleles_out.extend(arows)
             seen.append(fov)
         except Exception as e:
             errors.append(f'FOV{fov:03d}: {e}')
-    return spots_out, alleles_out, {
-        'fovs': seen, 'n_spots': len(spots_out),
-        'n_allele_rows': len(alleles_out), 'errors': errors}
+    return Tables(cells_out, spots_out, alleles_out, arrays, {
+        'fovs': seen, 'n_cells': len(cells_out), 'n_spots': len(spots_out),
+        'n_allele_rows': len(alleles_out), 'errors': errors})
+
+
+#: fields a spot row already carries under the same name -- taken from
+#: the SPOT row, not duplicated from the cell, so the combined table
+#: never holds two columns that should be one.
+_COMBINED_SKIP = frozenset(('fov', 'cell', 'celltype', 'cell_key'))
+
+#: what a COMPACT combined row keeps from the spot: what identifies the
+#: measurement, and where it is. Everything dropped here is still in
+#: the spots sheet -- this table is not the record, it is the thing you
+#: group by.
+COMBINED_SPOT = (
+    'spot_key', 'fov', 'modality', 'hybe', 'readout_name', 'readout_id',
+    'channel_role', 'cell', 'cell_key', 'celltype', 'uid',
+    'adj_x_um', 'adj_y_um', 'adj_z_um', 'p_exist',
+)
+#: and from the cell. Two summaries earn their place because analyses
+#: routinely divide by one and filter on the other; the geometry, the
+#: alignment and the bookkeeping do not.
+COMBINED_CELL = ('nucleus_um2', 'n_spots_readout', 'touches_frame_edge')
+
+
+def combined_rows(tables, prefix='cell_', compact=True):
+    """One row per spot, with its cell joined on. THE ANALYSIS CACHE.
+
+    Every number in it is already in `spots` or `cells`; the join is
+    cell_key. It exists because the question an analysis actually asks
+    -- this locus, in this cell, of this genotype, at this distance --
+    spans two tables, and joining them by hand is where the first
+    mistake goes.
+
+    COMPACT BY DEFAULT, and that is the point of the table. A reader
+    handed 84 columns cannot tell which ones carry the result, so this
+    keeps three things and drops the rest:
+
+      1. what identifies the measurement and where it is (COMBINED_SPOT)
+      2. two cell summaries analyses divide by or filter on
+         (COMBINED_CELL)
+      3. EVERY FIELD THAT IS NOT PART OF THE DECLARED SCHEMA
+
+    (3) is the rule that makes this generic rather than a list of one
+    project's columns. The declared schema is the pipeline's own
+    bookkeeping -- geometry, frames, alignment, link state, all of it
+    already in the other sheets. A field outside it got there because
+    somebody measured it and attached it, which is exactly what an
+    analysis cache should carry. So a project's own fields arrive
+    automatically and the pipeline's plumbing does not.
+
+    compact=False joins the whole cell row instead, for a caller who
+    wants one flat file with everything in it.
+
+    Cell fields arrive under `prefix` so a reader can always tell which
+    table a column came from. The four the spot row already carries
+    under the same name (fov, cell, celltype, cell_key) are not copied:
+    one column, from the spot.
+
+    A spot with no cell (cell == -1, most of the real data) keeps its
+    row with the cell columns blank -- dropping it would silently
+    change every count, the same rule spot_rows follows.
+    """
+    by_cell = {r['cell_key']: r for r in (tables.cells or [])}
+    keep_s = set(COMBINED_SPOT)
+    keep_c = set(COMBINED_CELL)
+    declared_s, declared_c = set(SPOT_COLUMNS), set(CELL_COLUMNS)
+    out = []
+    for s in (tables.spots or []):
+        if compact:
+            row = {k: v for k, v in s.items()
+                   if k in keep_s or k not in declared_s}
+        else:
+            row = dict(s)
+        c = by_cell.get(s.get('cell_key') or '')
+        if c:
+            for k, v in c.items():
+                if k in _COMBINED_SKIP:
+                    continue
+                if compact and k not in keep_c and k in declared_c:
+                    continue
+                row[prefix + k] = v
+        out.append(row)
+    return out
+
+
+def combined_columns(rows, tables, prefix='cell_', compact=True):
+    """Spot columns first, then the joined cell ones, then discoveries."""
+    spot_known = COMBINED_SPOT if compact else SPOT_COLUMNS
+    cell_known = (COMBINED_CELL if compact
+                  else [k for k in CELL_COLUMNS if k not in _COMBINED_SKIP])
+    known = tuple(spot_known) + tuple(prefix + k for k in cell_known)
+    present = [k for k in known if any(k in r for r in rows)] if rows         else list(known)
+    return columns_for(rows, present)
 
 
 def _fovs_in_store(paths, storage_path):

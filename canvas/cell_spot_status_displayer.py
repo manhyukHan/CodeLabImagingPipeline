@@ -241,10 +241,15 @@ class CellSpotStatusDisplayer(QtWidgets.QMainWindow):
         # mirrored no longer exists.
         self.RefreshPushButton = QtWidgets.QPushButton('Refresh')
         topRowLayout.addWidget(self.RefreshPushButton)
-        self.ExportPushButton = QtWidgets.QPushButton('Export Spots / Alleles...')
+        self.ExportPushButton = QtWidgets.QPushButton(
+            'Export Cells / Spots / Alleles...')
         self.ExportPushButton.setToolTip(
-            'Write every persisted spot and allele to flat CSV/Excel tables:\n'
-            'one row per spot, and one row per (allele, genomic bin, candidate).')
+            'Write everything persisted to flat tables -- one row per\n'
+            'segmented cell, one per spot, one per (allele, genomic bin,\n'
+            'candidate) -- as one .xlsx with a sheet each, or one .csv per\n'
+            'table. Every field is exported, including ones an analysis\n'
+            'attached itself; the masks and per-hybe matrices go beside it\n'
+            'in cells_arrays.npz, keyed by cell_key.')
         topRowLayout.addWidget(self.ExportPushButton)
         self.ExportStatusLabel = QtWidgets.QLabel('')
         topRowLayout.addWidget(self.ExportStatusLabel)

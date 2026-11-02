@@ -292,6 +292,73 @@ def focus_profile(storage_path, fov, hybe, channel, step=1, crop=512):
     return np.array(zs), np.array(vals)
 
 
+#: a peak this close to either end of the stack is not a peak: measured
+#: as a FRACTION of the sampled planes, so it follows the stack depth.
+#: On the SG store (129 planes) this is 2 planes, and the four FOVs it
+#: rejects had their argmax at z=0, 0, 0 and 1 while every accepted FOV
+#: peaked at z>=29.
+FOCUS_EDGE_FRAC = 0.02
+
+#: and a noise guard, not a focus test: the peak must clear the
+#: profile's own baseline by this much of the peak. DELIBERATELY LOW.
+#: Real peaks differ enormously by channel -- on the SG store DAPI runs
+#: 0.155 to 0.35 and brightfield 0.86 to 0.95 -- so one threshold cannot
+#: judge focus for both, and a value high enough to be a focus test
+#: rejected three DAPI fields whose peaks were interior and plausible
+#: (fov001 z=47, fov006 z=54, fov033 z=41, at 0.110 to 0.145). The edge
+#: rule does the work; this only catches a profile that is flat noise.
+FOCUS_MIN_PROMINENCE = 0.05
+
+
+def focal_plane(zs, values, min_prominence=FOCUS_MIN_PROMINENCE,
+                edge_frac=FOCUS_EDGE_FRAC):
+    """(z, how): the sharpest plane, or the MIDDLE when there is no peak.
+
+    WHY THIS IS NOT argmax. The variance of the Laplacian has an
+    interior maximum only when the stack actually brackets the focus.
+    When it does not -- a stack that starts or ends inside the sample,
+    a field with too little in it to sharpen -- the profile is monotonic
+    or flat, and argmax then returns a plane AT THE EDGE of the stack.
+    That is the worst possible answer: the top and bottom of a stack are
+    where a nucleus is least in focus, so segmentation ran on the one
+    plane guaranteed to be wrong, silently, and the GUI reported it as a
+    detected focal plane.
+
+    MEASURED, on G:/Seeun/2026-10-11_MAZ_IF+15ug, Hyb_IFdapi ch390, all
+    68 FOVs: four fields peak at z = 0, 0, 0 and 1 while every other
+    field peaks between z=29 and z=65. Those four are fov009, fov026,
+    fov043 and fov060 -- which are exactly the four the store already
+    showed as broken (0, 1 and 4 cells segmented, and fov060 localized
+    in 2 of its 29 rounds). The same scan on brightfield (ch999) finds
+    no edge case at all, so this is a property of the DAPI profile, not
+    of the stacks.
+
+    The middle is not a better estimate of focus; it is the honest
+    answer when the measurement failed, and it is where this pipeline's
+    stacks are centred by acquisition. The caller is told WHICH it got
+    so it can say so rather than present a fallback as a detection.
+    """
+    zs = np.asarray(zs)
+    values = np.asarray(values, float)
+    if zs.size == 0 or values.size != zs.size:
+        return None, 'no profile'
+    middle = int(zs[zs.size // 2])
+    i = int(np.argmax(values))
+    peak = float(values[i])
+    if not np.isfinite(peak) or peak <= 0:
+        return middle, 'flat profile'
+    # the edge test FIRST, so the reason reported is the real one: three
+    # of the four rejected fields are also below the noise guard, and
+    # calling them 'flat' would hide that their peak sat on z=0
+    margin = max(1, int(zs.size * edge_frac))
+    if i < margin or i >= zs.size - margin:
+        return middle, 'no interior peak'
+    base = float(np.percentile(values, 10))
+    if (peak - base) / peak < min_prominence:
+        return middle, 'flat profile'
+    return int(zs[i]), 'peak'
+
+
 def read_projection(storage_path, fov, hybe, channel, mode='MIP (stored)', z_plane=None, z_range=None):
     """
     The 2D image to run cytoplasm segmentation on, per PROJECTION_MODES.
@@ -464,9 +531,22 @@ def segment_cytoplasm(cyto_image, nucleus_seed_image, diameter=60, min_size=1000
     property of the projection, not of the Cellpose version, and it is
     unmeasured.
 
-    All of the above is synthetic besides. This route has never run on
-    persisted production data under EITHER version, so nothing here is
-    validated against a real cytoplasm.
+    The measurements ABOVE are synthetic. The route itself is not: it has
+    run on real data and the result is persisted. G:/Seeun/toy_ingested
+    carries a cytoplasm on essentially every cell of every FOV checked
+    (154/154, 69/69, 95/96 on FOVs 3, 12, 20 -- area != nucleus), and a
+    2026-10-30 run on the SG MAZ store (Hyb_IFdapi, nuclei ch390 d=40,
+    brightfield ch999 d=60, seed 'rim emphasis', z=58) claimed a cytoplasm
+    for 112/112, 167/167 and 187/187 nuclei on FOVs 1-3, with boundaries
+    following real brightfield cell edges -- see
+    D:/figures/validation/sg_maz_bf_cytoplasm.
+
+    What those runs did NOT establish is the SIZE. Median cell/nucleus
+    came out 1.25-1.65x there against the ~5x of the synthetic field
+    above. The images say the cells are nucleus-dominated, so the low
+    ratio looks like the specimen rather than under-segmentation, but
+    with no ground-truth cytoplasm that is an argument from the picture,
+    not a measurement. Treat the ratio as unvalidated; the route is not.
 
     Returns cellpose's own raw labels, deliberately NOT relabeled: the
     caller has to match them back to real nucleus ids (see

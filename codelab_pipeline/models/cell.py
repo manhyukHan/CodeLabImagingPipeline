@@ -113,6 +113,10 @@ class ACell():
        (Cell/Spot Status Detail's own checkbox), never maintained here
     """
     def __init__(self):
+        #: whatever an analysis attached that this class does not
+        #: declare. Round-trips through save()/set_metadata and is
+        #: stored as its own column -- see _KNOWN.
+        self.properties = {}
         self.id = 0
         self.fov = 0
         self.reference_hybe = ''
@@ -130,7 +134,27 @@ class ACell():
         self.linked = False
         self.linked_at = None
 
+    #: Keys set_metadata handles itself. Anything else it is given is
+    #: a PROPERTY: kept on `properties`, written back out by save(),
+    #: and stored as its own column by io/columnar. The model used to
+    #: drop it, which meant an analysis could measure something, attach
+    #: it, save, and find it gone -- indistinguishable from never
+    #: having run. The model does not have to know the field; it has to
+    #: not lose it.
+    _KNOWN = frozenset((
+        'id', 'fov', 'reference_hybe', 'reference_modality',
+        'nucleus', 'nucleus_hybe', 'nucleus_modality', 'celltype',
+        'area', 'frame_shape', 'matrices', 'matrix_anchors',
+        'matrix_provenance', 'distmap', 'linked', 'linked_at',
+        'properties',
+    ))
+
     def set_metadata(self, **kwargs):
+        if 'properties' in kwargs:
+            self.properties = dict(kwargs['properties'] or {})
+        for _k, _v in kwargs.items():
+            if _k not in self._KNOWN:
+                self.properties[_k] = _v
         if 'id' in kwargs: self.id = int(kwargs['id'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'reference_hybe' in kwargs: self.reference_hybe = str(kwargs['reference_hybe'])
@@ -335,4 +359,9 @@ class ACell():
                 # session's SpotContainer in memory, linked by ASpot.cell.
                 'distmap': np.array(self.distmap),
                 'linked': bool(self.linked),
-                'linked_at': self.linked_at}
+                'linked_at': self.linked_at,
+                # last, and only for keys the model does not
+                # declare, so a property can never shadow a real
+                # field by being named like one
+                **{k: v for k, v in self.properties.items()
+                   if k not in self._KNOWN}}

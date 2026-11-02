@@ -114,6 +114,32 @@ def main():
               st1['localization']['want'] == 3
               and S.localization_targets(project) == {'RNA': [('Hyb_001', 635), ('Hyb_002', 635)], 'DNA': [('Hyb_001', 555)]},
               str(S.localization_targets(project)))
+        # The tracing rounds. A DNA project names them in
+        # chromatin_tracing/hybes, and tracing READS spots, so every one
+        # of them has to be localized first -- a dependency, not a guess.
+        # Without this the expectation was the single anchor round the
+        # spot_localization section names: on the real SG store that read
+        # 1 where the store holds 29, so the status said 'done' after one
+        # hybe and 'partial' could never appear.
+        with_tracing = dict(project, params=dict(
+            project['params'],
+            chromatin_tracing={'hybes': 'Hyb_002|DNA,Toe_002|DNA,Hyb_003|DNA',
+                               'readout_channel': '635'}))
+        tgt = S.localization_targets(with_tracing)
+        check('every configured tracing round is expected, Toe_ included',
+              set(tgt['DNA']) >= {('Hyb_002', 635), ('Toe_002', 635), ('Hyb_003', 635)},
+              str(tgt['DNA']))
+        check('and the anchor round the config names is still there',
+              ('Hyb_001', 555) in tgt['DNA'], str(tgt['DNA']))
+        check('a round named twice is counted once',
+              len(tgt['DNA']) == len(set(tgt['DNA'])), str(tgt['DNA']))
+        no_ch = dict(project, params=dict(
+            project['params'],
+            chromatin_tracing={'hybes': 'Hyb_002|DNA', 'readout_channel': ''}))
+        check('tracing hybes with no readout channel add nothing (there is '
+              'no channel to expect them on)',
+              S.localization_targets(no_ch) == S.localization_targets(project),
+              str(S.localization_targets(no_ch)))
         with_genes = dict(project, params=dict(project['params'], cellcycle={'genes': 'RNA|Hyb_003|635|MCM2_nascent|-'}))
         check('cell-cycle gene sources from the config are expected too', ('Hyb_003', 635) in S.localization_targets(with_genes)['RNA'])
         shallow = S.fov_status(project, 1, deep=False)

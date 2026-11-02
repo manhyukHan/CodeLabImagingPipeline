@@ -128,6 +128,10 @@ class AnAllele():
        computed, matching ACell.distmap's placeholder-until-calculated pattern
     """
     def __init__(self):
+        #: whatever an analysis attached that this class does not
+        #: declare. Round-trips through save()/set_metadata and is
+        #: stored as its own column -- see _KNOWN.
+        self.properties = {}
         self.id = 0
         self.fov = 0
         self.cell = -1
@@ -164,7 +168,29 @@ class AnAllele():
         self.linked = False
         self.linked_at = None
 
+    #: Keys set_metadata handles itself. Anything else it is given
+    #: is a PROPERTY: kept on `properties`, written back out by
+    #: save(), stored as its own column by io/columnar. See
+    #: ACell._KNOWN for why the model must not drop what it does
+    #: not recognise.
+    _KNOWN = frozenset((
+        'id', 'fov', 'cell', 'anchor_uid', 'anchor_hybe',
+        'anchor_channel', 'provenance', 'coordinate',
+        'raw_coordinate', 'fiducial_trace_adj', 'fiducial_trace_raw',
+        'fiducial_drift', 'polymer_adj', 'polymer_raw',
+        'rejected_hybes', 'final_polymer', 'linked', 'linked_at',
+        'properties',
+        # v1 spellings read as aliases above -- the same fields,
+        # not properties
+        'fiducial_trace', 'polymer',
+    ))
+
     def set_metadata(self, **kwargs):
+        if 'properties' in kwargs:
+            self.properties = dict(kwargs['properties'] or {})
+        for _k, _v in kwargs.items():
+            if _k not in self._KNOWN:
+                self.properties[_k] = _v
         if 'id' in kwargs: self.id = int(kwargs['id'])
         if 'fov' in kwargs: self.fov = int(kwargs['fov'])
         if 'cell' in kwargs: self.cell = int(kwargs['cell'])
@@ -231,6 +257,10 @@ class AnAllele():
                 'final_polymer': np.array(self.final_polymer),
                 'provenance': dict(self.provenance or {}),
                 'linked': bool(self.linked),
-                'linked_at': self.linked_at}
+                'linked_at': self.linked_at,
+                # last, and only for undeclared keys, so a property
+                # cannot shadow a real field by being named like one
+                **{k: v for k, v in self.properties.items()
+                   if k not in self._KNOWN}}
 
 

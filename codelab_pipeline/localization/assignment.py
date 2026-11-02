@@ -69,6 +69,39 @@ def label_mask_for_frame(cells, hybe, modality, frame_shape, area_in_frame=None)
     return labels
 
 
+def area_in_frame_via_resolver(resolver):
+    """(cell, hybe, modality) -> (y, x): the cell's mask in that frame.
+
+    THE projection label_mask_for_frame's docstring demands, built from a
+    plain FrameResolver instead of a live MainWindow -- so a child
+    process and a disk-scoped pass can have it too. It is the same
+    composition MainWindow._cell_area_in_readout performs: hybe's raw
+    frame -> the frame cell.area lives in, then the mask through its
+    inverse.
+
+    WHY THIS EXISTS. Without it those callers fell back to
+    cell.get_area_in_readout, which RAISES by design on a residual-form
+    matrix -- that is, on every cell that has run cell alignment. The
+    except-continue in label_mask_for_frame then left those cells OUT of
+    the label mask, and every spot inside them came back cell = -1. On
+    C7 that emptied 32 of 42 FOVs, silently: the FOVs open in the
+    session took the resolver-backed path and were fine, and the rest
+    went through the recast worker and were not.
+    """
+    import numpy.linalg as _la
+
+    from codelab_pipeline.alignment.chain import align_cell
+
+    def area_in_frame(cell, hybe, modality):
+        H, _dz, _missing = resolver.transform(
+            (hybe, modality or cell.reference_modality),
+            (cell.reference_hybe, cell.reference_modality), cell)
+        if H is None:
+            return np.array([]), np.array([])
+        return align_cell(cell.area, _la.inv(H), cell.frame_shape)
+    return area_in_frame
+
+
 def count_unassigned(spots):
     """How many of `spots` currently belong to no cell."""
     return sum(1 for s in spots if int(getattr(s, 'cell', -1)) == -1)
@@ -253,8 +286,11 @@ def recast_fov_spots_worker(payload):
                     resolver.z_to_shared(hybe, m, owner))
 
         if cells:
+            # area_in_frame is NOT optional here: see
+            # area_in_frame_via_resolver for what its absence cost
             assign_spots(spots, cells, cells[0].frame_shape, cells_by_id,
-                         matrix_to_shared=to_shared)
+                         matrix_to_shared=to_shared,
+                         area_in_frame=area_in_frame_via_resolver(resolver))
         else:
             recast_spots_to_shared(spots, to_shared, cells_by_id)
 

@@ -253,34 +253,153 @@ class PipelineRunner(QtCore.QObject):
         return (lambda: bool(getattr(mw, '_active_ingestions', []))), (lambda: 'ingestion run ended')
 
     def _run_segmentation(self, fovs, mode):
-        """FOV by FOV through the Cell Segmentation tab: run, wait, save."""
+        """FOV by FOV through the Cell Segmentation tab, the whole
+        convention: focal plane, segment, save, gate, overlay.
+
+        THREE PHASES PER FOV, not one. The step used to launch
+        segmentation and watch `_segment_worker` alone, which quietly
+        skipped two things:
+
+          - Detect Focal Plane is a ProcWorker (a PROCESS: profiling
+            reads every z-slab, and in a thread h5py's process-wide lock
+            starves the GUI). Not waiting for it meant reading the panel
+            before it answered, so the projection stayed on the stored
+            MIP and the run segmented a projection nobody chose. The
+            focal plane is also PER FOV -- 44 to 59 across six fields of
+            one experiment -- so a config's single z cannot stand in.
+
+          - the gate that decides which objects are cells was done by
+            hand in the GUI afterwards, so a batch run reproduced the
+            segmentation but not the population.
+
+        The gate runs per FOV on that FOV's own population, because
+        every driver is relative to it (see segmentation.cell_gate), and
+        an overlay is written per FOV so the removal can be looked at
+        rather than taken on trust.
+        """
+        import numpy as np
+        from codelab_pipeline.io import analysis_store
+        from codelab_pipeline.io import paths as _paths
+        from codelab_pipeline.segmentation import cell_gate
+        from codelab_pipeline.segmentation import segment as _seg
+
         mw = self.mw
         cp = mw.ui.CellSegmentPanel
-        state = {'todo': list(fovs), 'started': None, 'saved': 0, 'errors': []}
+        drop = cell_gate.parse_drop(getattr(mw, 'cell_gate_drop', '') or '')
+        state = {'todo': list(fovs), 'fov': None, 'phase': None,
+                 'saved': 0, 'removed': 0, 'errors': []}
+
+        def _stain(fov):
+            sp = mw._storage_path_for_modality(cp.current_reference_modality())
+            hybe = cp.current_reference_hybe()
+            ch = int(cp.ChannelComboBox.currentText())
+            kind, zp, zr = cp.current_projection()
+            img = _seg.read_projection(sp, fov, hybe, ch, mode=kind,
+                                       z_plane=zp, z_range=zr)
+            return sp, img
+
+        def _overlay(fov, sp, img, rows, dropped):
+            """One PNG per FOV: the stain, every mask outlined, the
+            dropped ones warm. Drawn BEFORE the removal is believed."""
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            out = _paths.figure_dir(sp, 'cells', fov)
+            os.makedirs(out, exist_ok=True)
+            lo, hi = np.percentile(img, (1, 99.7))
+            fig, ax = plt.subplots(figsize=(8, 8))
+            ax.imshow(np.clip((img - lo) / max(hi - lo, 1e-9), 0, 1),
+                      cmap='gray', interpolation='nearest')
+            gone = set(dropped)
+            for r in rows:
+                m = np.zeros(img.shape, bool)
+                m[r['_ys'], r['_xs']] = True
+                ax.contour(m.astype(float), levels=[0.5], linewidths=0.55,
+                           colors=['#ff7b00' if r['id'] in gone else '#00d5ff'])
+            ax.set_title('FOV%03d  %d nuclei, %d dropped (%s)'
+                         % (fov, len(rows), len(gone),
+                            '+'.join(drop) if drop else 'gate open'),
+                         fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            p = os.path.join(out, 'segmentation_gate_fov%03d.png' % fov)
+            fig.savefig(p, dpi=130, bbox_inches='tight')
+            plt.close(fig)
+            return p
+
+        def _gate(fov):
+            # getattr: the step must not require a container to
+            # exist -- a gate with nothing to gate is a no-op, not
+            # an error (absence is never a failure state here).
+            container = getattr(mw, 'cell_container_permanent', None)
+            cells = container.get_cells(fov) if container is not None else []
+            if not cells:
+                return 0
+            sp, img = _stain(fov)
+            px = float(mw._voxel_um()[0])
+            rows = cell_gate.flag(cells, img, px, frame_shape=img.shape)
+            for r, c in zip(rows, cells):
+                r['_ys'] = np.asarray(c['area'][0], int)
+                r['_xs'] = np.asarray(c['area'][1], int)
+            ids = cell_gate.to_drop(rows, drop)
+            self.log('segmentation: FOV%03d %s'
+                     % (fov, cell_gate.summarise(rows, drop)))
+            try:
+                _overlay(fov, sp, img, rows, ids)
+            except Exception as exc:                            # noqa: BLE001
+                self.log('segmentation: FOV%03d overlay not drawn (%s: %s)'
+                         % (fov, type(exc).__name__, exc))
+            if not ids:
+                return 0
+            container.remove(fov, ids)
+            other = mw.cell_container
+            if other is not None and other.data.get(fov):
+                other.remove(fov, ids)
+            sps = mw._all_analysis_storage_paths()
+            if sps:
+                analysis_store.mirror_write_cells(sps, fov, container)
+                try:
+                    mw._recast_persisted_spots(fov)
+                except Exception as exc:                        # noqa: BLE001
+                    self.log('segmentation: FOV%03d spots not recast after '
+                             'the gate (%s)' % (fov, exc))
+            return len(ids)
 
         def _launch():
-            fov = state['todo'].pop(0)
-            state['started'] = fov
+            state['fov'] = fov = state['todo'].pop(0)
             cp.FovSpinBox.setValue(int(fov))
-            mw._run_cell_segmentation()
+            state['phase'] = 'focus'
+            mw._autodetect_segmentation_focus()
 
         def busy():
-            w = getattr(mw, '_segment_worker', None)
-            if state['started'] is not None:
-                if _running(w):
+            fov, phase = state['fov'], state['phase']
+            if phase == 'focus':
+                if _running(getattr(mw, '_focus_worker', None)):
+                    return True
+                state['phase'] = 'segment'
+                mw._run_cell_segmentation()
+                return True
+            if phase == 'segment':
+                if _running(getattr(mw, '_segment_worker', None)):
                     return True
                 try:
                     mw._save_cells()
                     state['saved'] += 1
+                    state['removed'] += _gate(fov)
                 except Exception as exc:                        # noqa: BLE001
-                    state['errors'].append(f'FOV {state["started"]}: {type(exc).__name__}: {exc}')
-                state['started'] = None
+                    state['errors'].append('FOV %s: %s: %s'
+                                           % (fov, type(exc).__name__, exc))
+                state['phase'] = None
             if state['todo']:
                 _launch()
                 return True
             return False
+
         _launch()
-        return busy, (lambda: f'{state["saved"]} FOV(s) segmented and saved' + (f'; errors: {state["errors"][:5]}' if state['errors'] else ''))
+        return busy, (lambda: '%d FOV(s) segmented and saved, %d cell(s) '
+                      'removed by the gate' % (state['saved'], state['removed'])
+                      + ('; errors: %s' % state['errors'][:5]
+                         if state['errors'] else ''))
 
     def _run_fov_alignment(self, fovs, mode):
         mw = self.mw
@@ -320,6 +439,17 @@ class PipelineRunner(QtCore.QObject):
         def busy():
             if _running(getattr(mw, '_cell_alignment_worker', None)):
                 return True
+            # The recast too: the finish handler queues it per FOV in
+            # child processes, and it is what re-answers "which cell
+            # contains this spot" now that the masks have moved. A step
+            # that ended before it drained would let localization read
+            # half-recast spots -- and in a headless run the process
+            # exits and takes the children with it, which is how 851 of
+            # 855 overlays were lost before the same wait was added for
+            # them.
+            if any(_running(w) for w in
+                   (getattr(mw, '_spot_recast_workers', None) or [])):
+                return True
             return (_running(getattr(mw, '_cell_overlay_worker', None))
                     or bool(getattr(mw, '_overlay_pending', None))
                     or bool(getattr(mw, '_overlay_ready', None)))
@@ -354,7 +484,16 @@ class PipelineRunner(QtCore.QObject):
             if not model_dir:
                 raise ValueError('no localization model selected and none available under <repo>/models')
         self.log(f'localization: model {os.path.basename(model_dir)}')
-        targets = S.localization_targets(self.project)
+        # the RUN set, not the expectation: a chosen subset narrows what
+        # this localizes and deliberately does NOT narrow what the status
+        # grid expects, so a store missing rounds keeps saying so
+        targets = S.localization_run_targets(self.project)
+        full = S.localization_targets(self.project)
+        n_run = sum(len(v) for v in targets.values())
+        n_all = sum(len(v) for v in full.values())
+        if n_run != n_all:
+            self.log(f'localization: {n_run} of {n_all} round(s) chosen on '
+                     f'the Pipeline tab; the rest are left alone')
         groups = []
         for modality, m in self.project['modalities'].items():
             by_ch = {}
@@ -369,14 +508,36 @@ class PipelineRunner(QtCore.QObject):
             jobs = int(mw.ui.IngestionPanel.IngestWorkersSpinBox.value()) or None
         except Exception:                                       # noqa: BLE001
             jobs = None
+        # THE FLOOR AND THE PAD WERE NEVER PASSED. batch.run defaults
+        # them (p_exist 0.5, pad 10) and this call left both out, so
+        # whatever anyone set, every pipeline localization wrote spots
+        # at 0.5 -- on an experiment that had settled on 0.2. They are
+        # the Pipeline tab's own settings now, config section
+        # localization_run, edited in the step's parameter dialog.
+        pp = mw.ui.PipelinePanel
+        min_p = float(pp.LocalizationMinPExistSpinBox.value())
+        pad = int(pp.LocalizationPadSpinBox.value())
+        self.log('localization: p_exist >= %g, pad %d%s'
+                 % (min_p, pad, ', %d worker(s)' % jobs if jobs else ''))
         overwrite = (mode == 'overwrite')
+        # This callback is invoked FROM THE WORKER THREAD below, on every
+        # progress line batch.run emits. Both of its ends are built for
+        # that: logged is a str signal, and MainWindow.log marshals an
+        # off-thread call onto the GUI thread rather than writing to the
+        # log widget where it stands. It did not always -- the direct
+        # write killed a localization run mid-flight (see the _log_line
+        # comment in windows/main_window.py and
+        # tests/test_log_thread_safety.py). Anything added here that
+        # touches a widget instead of emitting needs the same treatment.
         log = self.log
         state = {'result': None}
 
         def _work():
             out = []
             for storage_path, modality, ch, hybes in groups:
-                res = batch.run(storage_path, fovs, hybes, ch, model_dir, jobs=jobs, overwrite=overwrite,
+                res = batch.run(storage_path, fovs, hybes, ch, model_dir,
+                                min_p_exist=min_p, pad=pad, jobs=jobs,
+                                overwrite=overwrite,
                                 log=lambda m: log(f'localize {modality} ch{ch}: {m}'))
                 out.append((modality, ch, res))
             return out
@@ -501,8 +662,11 @@ class PipelineTab:
         p.RefreshPushButton.clicked.connect(lambda: self._guard(self.refresh))
         p.StartPushButton.clicked.connect(lambda: self._guard(self.start))
         p.StopPushButton.clicked.connect(lambda: self._guard(self.runner.stop))
+        p.StepsTable.cellClicked.connect(
+            lambda row, col: self._guard(lambda: self.open_params(row, col)))
         for combo in p.policy_combos.values():
             combo.currentTextChanged.connect(lambda _t: self._update_plan())
+        self.refresh_settings()
         self.runner.logged.connect(p.append_log)
         self.runner.step_started.connect(lambda s, f: p.ProgressLabel.setText(f'running {s} on {len(f)} FOV(s)...'))
         self.runner.step_finished.connect(lambda s, t: p.ProgressLabel.setText(t))
@@ -555,6 +719,52 @@ class PipelineTab:
             return
         plan = S.plan(self.rows, self.panel.policies())
         self.panel.set_status_rows(self.rows, plan)
+
+    def refresh_settings(self):
+        """The 'settings' column, read from the tabs as they stand."""
+        from ui import step_params_dialog as SPD
+        try:
+            self.panel.set_settings({s: SPD.summary_line(self.mw, s)
+                                     for s in S.STEPS})
+        except Exception as exc:                                # noqa: BLE001
+            self.panel.append_log(f'settings column: {type(exc).__name__}: {exc}')
+
+    def open_params(self, row, _col=0):
+        """A step's parameters, written back to the tab they live on.
+
+        The targets the rounds picker offers come from the project as the
+        tab last read it; without a Refresh there is none, so the picker
+        says so rather than offering an empty list as if nothing were
+        configured.
+        """
+        from ui import pipeline_panel as PP
+        from ui import step_params_dialog as SPD
+        step = self.panel.step_at(row)
+        if step is None or self.runner.running:
+            return
+        targets = None
+        project = self.project
+        if step == 'localization':
+            if project is None:
+                try:
+                    project = project_from_app(self.mw)
+                except Exception:                               # noqa: BLE001
+                    project = None
+            if project is not None:
+                targets = S.localization_targets(project)
+        plan_line = ''
+        if self.rows is not None:
+            plan = S.plan(self.rows, self.panel.policies())
+            pol = self.panel.policies()[step]
+            n = len(plan.get(step, []))
+            plan_line = ('This run: %s · %d FOV(s)' % (pol, n) if pol != 'skip'
+                         else 'This run: skipped')
+        changed = SPD.open_for(self.mw, step, note=PP.STEP_NOTES[step],
+                               plan_line=plan_line, targets=targets)
+        if changed is None:
+            return
+        self.refresh_settings()
+        self.panel.append_log(f'{step}: {changed or "no parameter changed"}')
 
     def start(self):
         if self.runner.running:

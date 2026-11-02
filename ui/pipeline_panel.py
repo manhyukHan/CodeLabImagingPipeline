@@ -7,10 +7,25 @@ leaves the step out. Segmentation defaults to 'skip': it is the step
 the user does by hand, and the runner never starts it unless it is
 chosen here. Ingestion is never overwritten from here (a redo runs as
 append). The FOV list is the Ingestion tab's, as for every batch button.
+
+CLICKING A STEP opens its parameters (ui/step_params_dialog), generated
+from the config map and written straight back to the tab they belong
+to. The 'settings' column is a reminder of what that dialog holds, and
+STEP_NOTES -- which used to be a column of prose wider than the table --
+is what the dialog says about the step.
 """
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from codelab_pipeline.pipeline import status as S
+
+#: (min_p_exist, pad) seeded from the batch module itself, so the panel
+#: opens on what a run would have done anyway and nobody's first Save
+#: Config silently changes the floor.
+try:
+    from codelab_pipeline.localization import batch as _batch
+    _BATCH_DEFAULTS = (float(_batch.DEFAULT_MIN_P_EXIST), int(_batch.DEFAULT_PAD))
+except Exception:                                           # noqa: BLE001
+    _BATCH_DEFAULTS = (0.5, 10)
 
 STEP_LABELS = {'ingestion': 'Ingestion', 'segmentation': 'Cell segmentation', 'fov_alignment': 'FOV alignment',
                'cross_modal': 'Cross-modal alignment', 'cell_alignment': 'Cell alignment', 'localization': 'Spot localization',
@@ -20,7 +35,7 @@ STEP_NOTES = {'ingestion': 'append only from here (an overwrite clears stacks: d
               'fov_alignment': 'the Alignment tab\'s "all FOVs" batch, append = missing (FOV, hybe) pairs',
               'cross_modal': 'n/a with one modality',
               'cell_alignment': 'the slowest step; append = cells without matrices',
-              'localization': 'headless v3 batch on the selected model; expected rounds = localization round + cell-cycle genes + countable readouts',
+              'localization': 'headless v3 batch on the selected model; expected rounds = every tracing round + the localization round + cell-cycle genes + countable readouts',
               'celltype': 'FOV ranges or barcode config from the store',
               'cellcycle': 'build counts, then fit (redo, or no model) or place with the stored model',
               'tracing': 'build alleles for every FOV, then fit all (append = alleles without a trace)'}
@@ -38,9 +53,8 @@ class PipelinePanelUI:
     def setupUi(self, widget):
         outer = QtWidgets.QVBoxLayout(widget)
         intro = QtWidgets.QLabel(
-            'One run over the whole store, in pipeline order, using each tab\'s current settings. '
-            'The FOV list is the Ingestion tab\'s. Refresh reads what the store already holds; a policy of '
-            '"existing" runs only what is missing, "redo" runs every FOV, "skip" leaves the step out.')
+            'One run over the whole store, in pipeline order. '
+            '<b>Click a step to set its parameters.</b>')
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
@@ -48,14 +62,19 @@ class PipelinePanelUI:
         box1 = QtWidgets.QGroupBox('1. Steps and policies')
         l1 = QtWidgets.QVBoxLayout(box1)
         self.StepsTable = QtWidgets.QTableWidget(len(S.STEPS), 4)
-        self.StepsTable.setHorizontalHeaderLabels(['step', 'policy', 'to run', 'note'])
+        self.StepsTable.setHorizontalHeaderLabels(['step', 'policy', 'to run', 'settings'])
         self.StepsTable.verticalHeader().setVisible(False)
         self.StepsTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.StepsTable.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.StepsTable.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.StepsTable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.policy_combos = {}
         for i, step in enumerate(S.STEPS):
             item = QtWidgets.QTableWidgetItem(STEP_LABELS[step])
-            item.setToolTip(step)
+            item.setToolTip(STEP_NOTES[step])
+            font = item.font()
+            font.setUnderline(True)
+            item.setFont(font)
+            item.setForeground(QtGui.QBrush(QtGui.QColor(30, 70, 140)))
             self.StepsTable.setItem(i, 0, item)
             combo = QtWidgets.QComboBox()
             combo.addItems(list(S.POLICIES))
@@ -63,14 +82,56 @@ class PipelinePanelUI:
             setattr(self, COMBO_NAMES[step], combo)
             self.policy_combos[step] = combo
             self.StepsTable.setCellWidget(i, 1, combo)
-            self.StepsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(''))
-            note = QtWidgets.QTableWidgetItem(STEP_NOTES[step])
-            note.setForeground(QtGui.QBrush(QtGui.QColor(90, 90, 90)))
-            self.StepsTable.setItem(i, 3, note)
+            to_run = QtWidgets.QTableWidgetItem('')
+            to_run.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.StepsTable.setItem(i, 2, to_run)
+            settings = QtWidgets.QTableWidgetItem('')
+            # 70 rather than 90: at this size subpixel antialiasing puts
+            # a colour fringe on light grey text, which reads as a dull
+            # red -- the thing that looked like a palette choice in the
+            # old note column and was not one
+            settings.setForeground(QtGui.QBrush(QtGui.QColor(70, 70, 70)))
+            settings.setToolTip(STEP_NOTES[step])
+            self.StepsTable.setItem(i, 3, settings)
         self.StepsTable.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        # the settings column is a stretched one holding left-aligned
+        # text; a centred header over it floats in empty space
+        self.StepsTable.horizontalHeaderItem(3).setTextAlignment(
+            QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.StepsTable.resizeColumnsToContents()
         self.StepsTable.setMinimumHeight(30 * (len(S.STEPS) + 1) + 8)
         l1.addWidget(self.StepsTable)
+        # THE PIPELINE'S LOCALIZATION RUN SETTINGS, config section
+        # 'localization_run'. WIDGETS because _CONFIG_PARAM_MAP's entries
+        # are widgets -- that is what makes them save and load like every
+        # other parameter. Their editor is the step dialog, so they are
+        # not shown on the tab itself.
+        #
+        # They exist because localization/batch.run read its p_exist
+        # floor and its pad from module defaults that no run could state
+        # or change: this experiment settled on p_exist 0.2 and the
+        # pipeline went on localizing at batch.py's 0.5.
+        self.LocalizationRoundsLineEdit = QtWidgets.QLineEdit()
+        self.LocalizationRoundsLineEdit.setReadOnly(True)
+        self.LocalizationMinPExistSpinBox = QtWidgets.QDoubleSpinBox()
+        self.LocalizationMinPExistSpinBox.setRange(0.0, 1.0)
+        self.LocalizationMinPExistSpinBox.setSingleStep(0.05)
+        self.LocalizationMinPExistSpinBox.setDecimals(2)
+        self.LocalizationMinPExistSpinBox.setValue(_BATCH_DEFAULTS[0])
+        self.LocalizationMinPExistSpinBox.setToolTip(
+            'A spot is written only if the model gives it at least this '
+            'p_exist. The floor is applied AT WRITE TIME, so lowering it '
+            'later means re-running the round.')
+        self.LocalizationPadSpinBox = QtWidgets.QSpinBox()
+        self.LocalizationPadSpinBox.setRange(0, 64)
+        self.LocalizationPadSpinBox.setValue(_BATCH_DEFAULTS[1])
+        self.LocalizationPadSpinBox.setToolTip(
+            'Half-width of the crop the model sees around each candidate.')
+        for w in (self.LocalizationRoundsLineEdit,
+                  self.LocalizationMinPExistSpinBox,
+                  self.LocalizationPadSpinBox):
+            w.setVisible(False)
+            l1.addWidget(w)
         outer.addWidget(box1)
 
         # -- 2. status ----------------------------------------------------------------------
@@ -126,6 +187,19 @@ class PipelinePanelUI:
         for step, pol in (policies or {}).items():
             if step in self.policy_combos and pol in S.POLICIES:
                 self.policy_combos[step].setCurrentText(pol)
+
+    def set_settings(self, texts):
+        """The 'settings' column: one line per step of the parameters it
+        would run with right now, read from the tabs themselves."""
+        for i, step in enumerate(S.STEPS):
+            item = self.StepsTable.item(i, 3)
+            if item is not None:
+                text = texts.get(step, '')
+                item.setText(text)
+                item.setToolTip((text + '\n\n' if text else '') + STEP_NOTES[step])
+
+    def step_at(self, row):
+        return S.STEPS[row] if 0 <= row < len(S.STEPS) else None
 
     def explicit_steps(self):
         """The steps whose policy a person chose away from 'skip' among
