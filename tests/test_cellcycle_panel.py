@@ -73,11 +73,18 @@ def main():
 
     print('training celltypes, arcs, gates')
     p.set_celltype_names(['Unsynchronized', 'Hydroxyurea', 'Nocodazole'])
-    check('no celltype checked by default', p.training_celltypes() == [])
+    # A NAME NOBODY HAS DECIDED ON YET ARRIVES CHECKED: none checked means
+    # "train on every cell", and defining celltypes at all says the
+    # populations differ. Unchecking is the decision -- which is also what
+    # makes the arrested-arm warning worth showing.
+    check('a celltype nobody has decided on yet arrives checked',
+          p.training_celltypes() == ['Unsynchronized', 'Hydroxyurea', 'Nocodazole'],
+          str(p.training_celltypes()))
     p.set_training_celltypes(['Unsynchronized'])
     check('training celltypes set', p.training_celltypes() == ['Unsynchronized'])
     p.set_celltype_names(['Unsynchronized', 'Hydroxyurea', 'Nocodazole', 'WT'])
-    check('a refresh keeps what was checked', p.training_celltypes() == ['Unsynchronized'])
+    check('a refresh keeps what was checked and checks only the new name',
+          p.training_celltypes() == ['Unsynchronized', 'WT'], str(p.training_celltypes()))
     p.set_arcs([{'name': 'S', 'start_deg': 330, 'end_deg': 60}, {'name': 'G2/M', 'start_deg': 90, 'end_deg': 210}])
     arcs = p.arcs()
     check('arcs round-trip through the table', arcs == [{'name': 'S', 'start_deg': 330.0, 'end_deg': 60.0},
@@ -85,7 +92,11 @@ def main():
     p._add_arc_row('', 0, 0)
     check('a row without a name is skipped', len(p.arcs()) == 2)
     g = p.gates()
-    check('default gates: only min log BF_ring on, at 0', g['min_bf_ring'] == 0.0 and g['min_R'] is None and g['min_fit_z'] is None)
+    # EVERY VERDICT GATE IS OFF BY DEFAULT. min log BF_ring >= 0 used to be
+    # on, and that gate asks "is this cell NOT at the centre" -- the test
+    # ring_level replaced, so a new fit was inheriting a withdrawn criterion.
+    check('every verdict gate is off by default',
+          all(v is None for v in g.values()), str(g))
     p.set_gates({'min_R': 0.6, 'min_bf_ring': None, 'max_radius': 1.5})
     g = p.gates()
     check('gates round-trip, None = off', g['min_R'] == 0.6 and g['min_bf_ring'] is None and g['max_radius'] == 1.5

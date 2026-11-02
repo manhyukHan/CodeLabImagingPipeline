@@ -36,6 +36,11 @@ from canvas.analysis_figure_displayer import AnalysisFigureDisplayer
 
 TAB_TITLE = 'Cell Cycle'
 
+# Below this many on-ring training cells the origin is measured on all of
+# them instead: the step detector needs the cells more than it needs the
+# subset, and it says which it used in the origin dict.
+MIN_CELLS_FOR_ORIGIN = 200
+
 
 class CellCycleWiring(QtCore.QObject):
     def __init__(self, mw):
@@ -374,11 +379,11 @@ class CellCycleWiring(QtCore.QObject):
             # changes how cells are placed and gated -- and beta stays 0
             # unless held-out FOVs say it earns its keep.
             cal = CC.calibrate_dispersion(m, name, X[k], fov_of[k])
-            # the gate needs its reference, and the origin is measured on
-            # the cells the gate keeps, so build it before settling
+            # the on-ring subset needs its reference, and the origin is
+            # measured on that subset, so build it before settling
             m.ring_reference(name, X[k].sum(1))
             origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
-                                                               origin_division, dapi_src, birth, gates)
+                                                               origin_division, dapi_src, birth)
             placed = m.place(name, X)
             # the arcs are RE-PROPOSED after every fit, never carried over:
             # a fit can move the frame (the origin, a bridge), and arcs
@@ -520,20 +525,33 @@ class CellCycleWiring(QtCore.QObject):
 
     # -- the origin and the arcs, shared by fit and by the origin door ---------------
 
-    def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth, gates=None):
+    def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth):
         """Rotate `m` so 0 deg is division, measured on the ON-RING
         training cells: the DAPI halving when a DAPI source is given,
         else the panel-total drop, else nothing (0 stays the S genes'
         mean peak).
 
-        Cells the verdicts put off the ring do not divide on this circle,
+        Cells that are not on the ring do not divide on this circle,
         and mixing them in dilutes the step. Measured on the three
         stores: chr19 (42% of its training cells off the ring) reads
         x1.39 at 0 deg over every training cell and x1.63 at 40 deg over
         the on-ring ones; JP_001 and JP_002, which keep most cells on the
-        ring, are unchanged. Fewer than 200 on-ring cells falls back to
-        all of them (the step detector needs the cells more than it needs
-        the gate) and says so in the origin dict.
+        ring, are unchanged.
+
+        THE SUBSET IS NOT THE VERDICT GATE, and it used to be read out
+        of the same dict. When the verdict gates became off by default
+        the origin therefore began measuring the step on EVERY cell,
+        while the origin dict still said 'on-ring training cells' --
+        chr19's division would have settled 40 deg away, silently and
+        with a label that denied it. Two different decisions: a verdict
+        gate says what an angle may be CALLED and belongs to the
+        experiment; this says which cells a STEP is measured ON and
+        belongs to the measurement. So it asks the question ring_level
+        answers -- is this cell's composition as sharp as a true on-ring
+        cell's at its own angle and depth -- and never the withdrawn one
+        the old pair asked (is it away from the centre). It needs no
+        threshold of its own either: on_ring loses about 5% of true
+        on-ring cells at EVERY angle by construction.
 
         Returns (origin dict, birth angle to use, the DAPI table or None).
         Runs in the worker: no widgets."""
@@ -542,16 +560,14 @@ class CellCycleWiring(QtCore.QObject):
         dapi_tab = None
         done = False
         placed_tr = m.place(name, X_tr)
-        g = dict(gates or {})
-        min_bf = g.get('min_bf_ring', 0.0)
-        min_rad = g.get('min_radius', 0.5)
-        on = np.ones(len(X_tr), bool)
-        if min_bf is not None:
-            on &= placed_tr['bf_ring'] >= float(min_bf)
-        if min_rad is not None:
-            on &= placed_tr['radius'] >= float(min_rad)
-        measured_on = 'on-ring training cells'
-        if on.sum() < 200:
+        on, _tail = m.on_ring(name, X_tr, placed=placed_tr)
+        # on_ring falls back to the pre-ring_level pair when the model
+        # carries no reference (a spec stored before it existed), so the
+        # origin records which rule actually ran instead of claiming the
+        # calibrated one
+        measured_on = ('on-ring training cells (ring_level tail)' if name in m.ring_ref
+                       else 'on-ring training cells (no ring reference: the pre-ring_level pair)')
+        if on.sum() < MIN_CELLS_FOR_ORIGIN:
             on = np.ones(len(X_tr), bool)
             measured_on = 'every training cell (too few on the ring)'
         if dapi_src is not None:
@@ -649,7 +665,6 @@ class CellCycleWiring(QtCore.QObject):
             self._log('origin: no DAPI source in the layouts -- falling back to the panel-total drop')
         birth = float(p.BirthDegSpinBox.value())
         shares = p.phase_shares()
-        gates = p.gates()
         spec = dict(self.spec or {})
         if origin_choice == 2:
             early = [g for g, r in (self.roles or {}).items() if r == 'S']
@@ -665,7 +680,7 @@ class CellCycleWiring(QtCore.QObject):
                 origin, birth_used, dapi_tab = {'mode': 'S mean peak'}, birth, None
             else:
                 origin, birth_used, dapi_tab = self._settle_origin(m, name, X[k], fov_of[k], cell_of[k], sp,
-                                                                   origin_division, dapi_src, birth, gates)
+                                                                   origin_division, dapi_src, birth)
             placed = m.place(name, X)
             arcs, arcs_from = self._propose_after(m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares)
             spec['model'] = m.to_dict()
