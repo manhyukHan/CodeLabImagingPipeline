@@ -275,7 +275,11 @@ class PipelineRunner(QtCore.QObject):
         The gate runs per FOV on that FOV's own population, because
         every driver is relative to it (see segmentation.cell_gate), and
         an overlay is written per FOV so the removal can be looked at
-        rather than taken on trust.
+        rather than taken on trust. Everything it measures is STORED on
+        the surviving cells (cell_gate.annotate), so "why was this cell
+        kept" is a read rather than a re-flagging of a population that
+        no longer exists -- and the cells are written even when the gate
+        dropped nothing.
         """
         import numpy as np
         from codelab_pipeline.io import analysis_store
@@ -296,7 +300,10 @@ class PipelineRunner(QtCore.QObject):
             kind, zp, zr = cp.current_projection()
             img = _seg.read_projection(sp, fov, hybe, ch, mode=kind,
                                        z_plane=zp, z_range=zr)
-            return sp, img
+            # named, because dapi_z and mean_stain are statements about
+            # THIS projection of THIS round and mean nothing without it
+            return sp, img, '%s ch%d %s' % (hybe, ch,
+                                            _seg.describe_projection(kind, zp, zr))
 
         def _overlay(fov, sp, img, rows, dropped):
             """One PNG per FOV: the stain, every mask outlined, the
@@ -335,34 +342,48 @@ class PipelineRunner(QtCore.QObject):
             cells = container.get_cells(fov) if container is not None else []
             if not cells:
                 return 0
-            sp, img = _stain(fov)
+            sp, img, stain = _stain(fov)
             px = float(mw._voxel_um()[0])
             rows = cell_gate.flag(cells, img, px, frame_shape=img.shape)
             for r, c in zip(rows, cells):
-                r['_ys'] = np.asarray(c['area'][0], int)
-                r['_xs'] = np.asarray(c['area'][1], int)
+                r['_ys'] = np.asarray(c.area[0], int)
+                r['_xs'] = np.asarray(c.area[1], int)
             ids = cell_gate.to_drop(rows, drop)
-            self.log('segmentation: FOV%03d %s'
-                     % (fov, cell_gate.summarise(rows, drop)))
+            # BEFORE THE REMOVAL: every nucleus is annotated with the
+            # population it was measured against, which the removal is
+            # about to change. Both tiers, since either can be the one a
+            # later save writes.
+            other = mw.cell_container
+            n_props = cell_gate.annotate(cells, rows, drop, stain)
+            if other is not None and other.data.get(fov):
+                cell_gate.annotate(other.get_cells(fov), rows, drop, stain)
+            self.log('segmentation: FOV%03d %s; gate numbers stored on '
+                     '%d cell(s)' % (fov, cell_gate.summarise(rows, drop),
+                                     n_props))
             try:
                 _overlay(fov, sp, img, rows, ids)
             except Exception as exc:                            # noqa: BLE001
                 self.log('segmentation: FOV%03d overlay not drawn (%s: %s)'
                          % (fov, type(exc).__name__, exc))
-            if not ids:
-                return 0
-            container.remove(fov, ids)
-            other = mw.cell_container
-            if other is not None and other.data.get(fov):
-                other.remove(fov, ids)
+            if ids:
+                container.remove(fov, ids)
+                if other is not None and other.data.get(fov):
+                    other.remove(fov, ids)
+            # WRITTEN EVEN WHEN NOTHING WAS DROPPED, which `return 0`
+            # used to skip: the cells carry the gate's measurements now,
+            # and an open gate is a real state (cell_gate.to_drop) whose
+            # numbers are worth exactly as much as a closed one's.
             sps = mw._all_analysis_storage_paths()
             if sps:
                 analysis_store.mirror_write_cells(sps, fov, container)
-                try:
-                    mw._recast_persisted_spots(fov)
-                except Exception as exc:                        # noqa: BLE001
-                    self.log('segmentation: FOV%03d spots not recast after '
-                             'the gate (%s)' % (fov, exc))
+                # only the removal moves masks; an annotation leaves
+                # every spot's cell exactly where it was
+                if ids:
+                    try:
+                        mw._recast_persisted_spots(fov)
+                    except Exception as exc:                    # noqa: BLE001
+                        self.log('segmentation: FOV%03d spots not recast '
+                                 'after the gate (%s)' % (fov, exc))
             return len(ids)
 
         def _launch():

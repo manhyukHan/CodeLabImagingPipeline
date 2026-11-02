@@ -30,6 +30,24 @@ THE FLAGS MOVE WHEN CELLS ARE REMOVED. Every driver is relative to the
 FOV's own population, so re-flagging after a removal gives different
 numbers -- correctly. Flag once, drop once; do not iterate to a fixed
 point.
+
+AND THE NUMBERS ARE STORED, ALL OF THEM. annotate() writes every
+quantity flag() measured onto the cells themselves, prefixed `gate_`.
+They used to be computed, used to drop, logged as counts and thrown
+away -- so "why was this cell kept" could only be answered by
+re-reading the stain and re-flagging a population that no longer
+exists. A cell carries arbitrary properties through save() and the
+columnar store, and the exporter turns every undeclared field into a
+column of its own, so storing them costs one float per cell per field
+and nothing else.
+
+Every field, not the drivers in use: which flags an experiment drops is
+its own decision (the Lamin set dropped dim+irregular+border, the first
+MAZ/SRRM1 set border+irregular+large), and a store that kept only the
+drivers somebody chose today answers the next question with a re-run
+instead of a read. The per-cell provenance says what the numbers are
+relative to, because `area_rel` and `dapi_z` are relative to the FOV's
+population AT FLAG TIME and that population is about to shrink.
 """
 import numpy as np
 
@@ -64,17 +82,19 @@ def flag(cells, image, px_um, frame_shape=None, edge_px=EDGE_PX):
 
     `image` is the 2D stain the cells were found in, read in the same
     frame as the masks -- the mean inside each mask is what dapi_z
-    scores. `cells` are the container's own dicts (area = (ys, xs)).
+    scores. `cells` are the container's own ACell objects, which is what
+    CellContainer.get_cells hands out and what annotate() has to mutate;
+    this read them as dicts and raised TypeError on every real call.
     """
     if not len(cells):
         return []
     shape = frame_shape or getattr(image, 'shape', (1024, 1024))
     rows = []
     for c in cells:
-        ys = np.asarray(c['area'][0], int)
-        xs = np.asarray(c['area'][1], int)
+        ys = np.asarray(c.area[0], int)
+        xs = np.asarray(c.area[1], int)
         r = _mask_metrics(ys, xs, shape, edge_px)
-        r['id'] = int(c['id'])
+        r['id'] = int(c.id)
         r['area_um2'] = r['n_px'] * float(px_um) ** 2
         r['mean_stain'] = (float(np.asarray(image)[ys, xs].mean())
                            if image is not None else float('nan'))
@@ -93,6 +113,72 @@ def flag(cells, image, px_um, frame_shape=None, edge_px=EDGE_PX):
         r['dim'] = bool(r['dapi_z'] < DIM_Z)
         r['bright'] = bool(r['dapi_z'] > BRIGHT_Z)
     return rows
+
+
+#: every stored field carries this prefix. The exporter spells out
+#: `area_um2` and `solidity` of its own (from the mask and the voxel
+#: size), so an unprefixed field would quietly overwrite a column that
+#: means something else.
+PREFIX = 'gate_'
+
+#: what flag() measures, stored in this order. All of it -- see the
+#: module docstring for why not just the drivers in use.
+MEASURED = ('n_px', 'area_um2', 'area_rel', 'solidity', 'dapi_z',
+            'mean_stain', 'centroid_y', 'centroid_x')
+
+
+def annotate(cells, rows, drop=(), stain=''):
+    """Write what the gate measured onto the cells, and return how many
+    cells were written.
+
+    CALL THIS BEFORE THE REMOVAL. `rows` covers every nucleus the FOV
+    had, the dropped ones included, and those cells are about to be
+    deleted -- their numbers go with them, which is why the overlay PNG
+    is drawn from the same rows and is the only record of what left.
+
+    Three provenance fields go on every cell beside the measurements:
+
+        gate_drop            the flags honoured, '' when the gate was
+                             left open (flagging without dropping is a
+                             real state, and then these numbers are a
+                             pure description, not a reason)
+        gate_stain           where dapi_z and mean_stain were measured
+        gate_n_population    how many nuclei the FOV held when flagged
+
+    The last one is not decoration. `area_rel` is this cell's area over
+    the population's MEDIAN area and `dapi_z` is its z-score within the
+    population, so both are statements about a population -- the one
+    about to shrink by `drop`. Without its size the stored numbers
+    cannot be compared with a later re-flagging of the same field.
+    """
+    names = parse_drop(drop) if isinstance(drop, str) else tuple(drop or ())
+    by_id = {int(r['id']): r for r in rows}
+    label = '+'.join(names)
+    n = 0
+    for c in cells:
+        r = by_id.get(int(c.id))
+        if r is None:
+            continue
+        props = {PREFIX + k: _scalar(r.get(k)) for k in MEASURED}
+        props.update({PREFIX + f: bool(r.get(f)) for f in FLAGS})
+        props[PREFIX + 'drop'] = label
+        props[PREFIX + 'stain'] = str(stain or '')
+        props[PREFIX + 'n_population'] = int(len(rows))
+        c.set_metadata(**props)
+        n += 1
+    return n
+
+
+def _scalar(v):
+    """A plain Python number, never a numpy one: the columnar store types
+    a property column off the first value it sees."""
+    if v is None:
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    return float(v)
 
 
 def parse_drop(text):
