@@ -47,27 +47,47 @@ MIN_CELLS_FOR_ORIGIN = 200
 DAPI_MIN_DROP = 1.3
 TOTAL_MIN_DROP = 1.8
 
-#: WHICH CELLS THE STEP IS MEASURED ON. PROVISIONAL, 2026-11-03.
+#: WHICH CELLS THE STEP IS MEASURED ON. Settled 2026-11-03.
 #:
 #: A cell near the ring's centre carries no angle, so its DAPI lands at
 #: a random one and dilutes the step. `radius` asks exactly that
-#: question, and 0.5 is not a number chosen here -- it predates this.
+#: question, and 0.5 is not a number chosen here -- figlib's own
+#: MIN_RADIUS reached the same 0.5 independently, for the same reason
+#: ("a figure that reads an angle off a population must filter on
+#: radius as well"), measured on JP_001's hydroxyurea arm.
 #:
-#: But this is NOT settled, and the code says so by surveying the
-#: alternatives on every fit instead of hiding them. Measured on chr19's
-#: 11-round model of 2026-11-03T14:03 (2600 cells), the four candidates
-#: read x1.29 at 280 deg (on_ring), x1.52 at 260 (the withdrawn pair),
-#: x1.33 at 230 (radius) and x1.32 at 230 (every cell). A subset that
-#: moves the VERDICT and the ANGLE by 50 deg is not choosing between
-#: good answers; it is reading a curve that has no step in it. chr19's
-#: DAPI runs peak-to-trough x1.80 over the WHOLE cycle and falls over
-#: about a third of a turn, where one division alone should be x2.
+#: The four candidates disagree, and that was the reason to doubt all
+#: of them. On chr19's 11-round model they read x1.29 at 280 deg
+#: (on_ring, which is what 0f35d7e left in place), x1.52 at 260 (the
+#: withdrawn pair), x1.33 at 230 (radius) and x1.32 at 230 (every
+#: cell): a subset that moves the VERDICT and the ANGLE by 50 deg looks
+#: like a curve with no step in it rather than one right subset.
 #:
-#: The suspect is the proxy, not the subset: `sum_above_bg` is an
-#: integral over a MAX PROJECTION, which is not linear in DNA content.
-#: Until that is replaced and scored on JP_001/JP_002, where the halving
-#: is clean, no subset here is the answer -- so every origin carries
-#: `subset_survey` and this constant is one line to change.
+#: SO THE PROXY WAS THE SUSPECT, AND IT WAS MEASURED AND CLEARED.
+#: Candidates scored where 0 deg really is division, by G2/G1 against
+#: the physical 2.0 (the 90 deg before division over the 90-270 after),
+#: on-ring and radius >= 0.5, three stores:
+#:
+#:   store    mip_clip  mip_raw  pk_slab3  slab3  mip_mean  area
+#:   JP_001      1.734    1.754     1.519  1.479     1.506  1.224
+#:   JP_002      1.510    1.510     1.466  1.441     1.226  1.313
+#:   chr19       1.405    1.406     1.380  1.339     1.143  1.166
+#:
+#: The MIP sum -- what the app already uses -- wins on every store. A
+#: z integral is WORSE, and notes/CELL_LEVEL_CROSSMODAL_3D.md 3.0c-d
+#: says why: the widefield missing cone is exactly zero over low
+#: lateral frequency at every axial frequency, and a DAPI-filled
+#: nucleus IS low lateral frequency, so its depth was never recorded
+#: (chr19 still at 43 % of peak +-10 um from focus). Summing a 2D mask
+#: over z integrates a column with no ends. Nor is the answer density
+#: alone or area alone: both put the drop at an angle that is not
+#: division (JP_001: 70 and 60 deg against the true 10).
+#:
+#: And the store ordering JP_001 > JP_002 > chr19 is the same for EVERY
+#: proxy, so chr19's shallow step is its data, not the formula. The
+#: subset is therefore the right place to make this choice, and
+#: `subset_survey` stays on every origin so a future proxy can be
+#: judged against the same record.
 ORIGIN_SUBSET = 'radius'
 ORIGIN_MIN_RADIUS = 0.5
 
