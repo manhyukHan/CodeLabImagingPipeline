@@ -1057,13 +1057,32 @@ def dna_curve(theta_deg, dna_norm, n_bins=36, smooth=1):
 
 def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, plateau=0.85):
     """Category arcs from the measured DNA content of the training cells:
-    from birth the content is flat (G1, 2N) until it starts to RISE
-    (S begins where the smoothed median first exceeds `rise` x the G1
-    level), S ends where it reaches `plateau` of the way from the G1
-    level to the maximum (G2/M), and G2/M ends at birth. dna: the DAPI
-    sum per cell, divided per FOV when fov is given. Returns (arcs,
-    info) with the levels used; raises ValueError when no rise is
-    found (a flat curve says nothing)."""
+    after birth the content settles at 2N (G1) until it starts to RISE
+    (S begins where the binned median first exceeds `rise` x the 2N
+    level), S ends where it reaches `plateau` of the way from 2N to the
+    maximum (G2/M), and G2/M ends at birth. dna: the DAPI sum per cell,
+    divided per FOV when fov is given. Returns (arcs, info) with the
+    levels used; raises ValueError when no rise is found (a flat curve
+    says nothing).
+
+    THE 2N LEVEL IS THE CURVE'S OWN TROUGH, not the stretch just after
+    birth. Taking it after birth assumes the content is already 2N as
+    soon as division is behind it, which holds only where the division
+    step is sharp. Measured: chr19's step is x1.33 and smeared, so the
+    first sixth after birth reads 1.09 while the real trough is 0.86 at
+    100 deg -- the threshold came out 1.26 instead of 0.99 and S began
+    at 260 deg instead of 170, which is 80 deg after GMNN (175) and
+    GINS2 (185) peak and after all three G2/M genes have crossed their
+    cycle mean. JP_001 is smeared the same way at x1.81: its stored S
+    was 30 deg wide, 8 % of the cycle, when its own content runs a full
+    2.13-fold from trough to top.
+
+    AND THE RISE IS LOOKED FOR AFTER THE TROUGH. Moving the reference
+    without this moves the fault to the other side: the bins just after
+    birth sit ABOVE a trough-referenced threshold (chr19: 1.08-1.12
+    against 0.99), so a search from birth returns S = 0 deg. The cycle
+    runs birth -> 2N trough -> rise, so the rise that ends G1 is the one
+    after the trough by construction, and nothing before it can be it."""
     th = np.asarray(theta_deg, float) % 360.0
     d = np.asarray(dna, float).copy()
     if fov is not None:
@@ -1083,10 +1102,15 @@ def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, p
     start = int(np.searchsorted(cen - width / 2, birth_deg % 360.0)) % n
     order = [(start + i) % n for i in range(n)]
     curve = med[order]
-    g1_level = float(np.median(curve[:max(3, n // 6)]))          # the first sixth of the cycle after birth
+    # the 2N level and where it sits: a 3-bin mean so one dim bin cannot
+    # be the reference, and the index is where the rise is looked for
+    smoothed = np.array([np.take(curve, [(i - 1) % n, i % n, (i + 1) % n]).mean()
+                         for i in range(n)])
+    i_2n = int(np.argmin(smoothed))
+    g1_level = float(smoothed[i_2n])
     top = float(np.nanmax(curve))
     if top < g1_level * rise:
-        raise ValueError(f'the DNA content never rises above {rise:.2f} x its post-birth level ({g1_level:.2f} -> {top:.2f}); '
+        raise ValueError(f'the DNA content never rises above {rise:.2f} x its 2N trough ({g1_level:.2f} -> {top:.2f}); '
                          'no S boundary can be read from DAPI')
     # a SUSTAINED rise: two consecutive bins above the threshold. The
     # maximum clearing the threshold does not imply two neighbours do --
@@ -1095,11 +1119,12 @@ def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, p
     # raise ValueError (hit on the area and density factors of chr19 and
     # K562 while splitting the DNA proxy). A spike is a refusal in
     # substance, so it is reported as one.
-    i_s = next((i for i in range(n - 1)
+    i_s = next((i for i in range(i_2n, n - 1)
                 if curve[i] >= g1_level * rise and curve[i + 1] >= g1_level * rise), None)
     if i_s is None:
-        raise ValueError(f'the DNA content clears {rise:.2f} x its post-birth level ({g1_level:.2f} -> {top:.2f}) '
-                         'in only one bin, never in two consecutive ones; no S boundary can be read from DAPI')
+        raise ValueError(f'the DNA content clears {rise:.2f} x its 2N trough ({g1_level:.2f} -> {top:.2f}) '
+                         'in only one bin after the trough, never in two consecutive ones; '
+                         'no S boundary can be read from DAPI')
     target = g1_level + plateau * (top - g1_level)
     i_g = next((i for i in range(i_s, n) if curve[i] >= target), n - 1)
     half = 180.0 / n
@@ -1109,7 +1134,8 @@ def propose_arcs_from_dapi(theta_deg, dna, birth_deg=0.0, fov=None, rise=1.15, p
     arcs = [{'name': 'G1', 'start_deg': b, 'end_deg': s_start},
             {'name': 'S', 'start_deg': s_start, 'end_deg': g_start},
             {'name': 'G2/M', 'start_deg': g_start, 'end_deg': b}]
-    return arcs, {'g1_level': g1_level, 'top': top, 'ratio': top / g1_level if g1_level > 0 else float('nan')}
+    return arcs, {'g1_level': g1_level, 'top': top, 'trough_deg': (cen[order[i_2n]] - half) % 360.0,
+                  'ratio': top / g1_level if g1_level > 0 else float('nan')}
 
 
 def post_division_end(w, grid, birth_deg=0.0, level=0.5, smooth=5):
