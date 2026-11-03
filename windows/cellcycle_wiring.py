@@ -47,6 +47,67 @@ MIN_CELLS_FOR_ORIGIN = 200
 DAPI_MIN_DROP = 1.3
 TOTAL_MIN_DROP = 1.8
 
+#: WHICH CELLS THE STEP IS MEASURED ON. PROVISIONAL, 2026-11-03.
+#:
+#: A cell near the ring's centre carries no angle, so its DAPI lands at
+#: a random one and dilutes the step. `radius` asks exactly that
+#: question, and 0.5 is not a number chosen here -- it predates this.
+#:
+#: But this is NOT settled, and the code says so by surveying the
+#: alternatives on every fit instead of hiding them. Measured on chr19's
+#: 11-round model of 2026-11-03T14:03 (2600 cells), the four candidates
+#: read x1.29 at 280 deg (on_ring), x1.52 at 260 (the withdrawn pair),
+#: x1.33 at 230 (radius) and x1.32 at 230 (every cell). A subset that
+#: moves the VERDICT and the ANGLE by 50 deg is not choosing between
+#: good answers; it is reading a curve that has no step in it. chr19's
+#: DAPI runs peak-to-trough x1.80 over the WHOLE cycle and falls over
+#: about a third of a turn, where one division alone should be x2.
+#:
+#: The suspect is the proxy, not the subset: `sum_above_bg` is an
+#: integral over a MAX PROJECTION, which is not linear in DNA content.
+#: Until that is replaced and scored on JP_001/JP_002, where the halving
+#: is clean, no subset here is the answer -- so every origin carries
+#: `subset_survey` and this constant is one line to change.
+ORIGIN_SUBSET = 'radius'
+ORIGIN_MIN_RADIUS = 0.5
+
+
+def origin_candidates(m, name, X_tr, placed):
+    """{key: (mask, rule)} -- the subsets the step could be measured on.
+
+    Keyed so the one in use can be named in `measured_on` and the rest
+    surveyed beside it under `subset_survey`.
+    """
+    on_ring, _tail = m.on_ring(name, X_tr, placed=placed)
+    radius = np.asarray(placed['radius'], float) >= ORIGIN_MIN_RADIUS
+    bf = np.asarray(placed['bf_ring'], float) >= 0.0
+    # on_ring falls back to the pre-ring_level pair when the model
+    # carries no reference (a spec stored before it existed), so the
+    # survey names the rule that actually ran rather than the
+    # calibrated one
+    ring_rule = ('on_ring, the ring_level tail' if name in m.ring_ref
+                 else 'on_ring, with no ring reference: the pre-ring_level pair')
+    return {'radius': (radius, 'radius >= %.2g' % ORIGIN_MIN_RADIUS),
+            'on_ring': (on_ring, ring_rule),
+            'pair': (bf & radius,
+                     'the withdrawn pair (bf_ring >= 0 and radius >= %.2g)' % ORIGIN_MIN_RADIUS),
+            'all': (np.ones(len(X_tr), bool), 'every training cell')}
+
+
+def survey_subsets(cand, theta_deg, value, bar, chosen):
+    """What each candidate subset would have said about this
+    measurement, so a fit records the decision it did not get to make."""
+    out = {}
+    for key, (k, rule) in cand.items():
+        row = {'rule': rule, 'n': int(k.sum()), 'factor': None,
+               'angle_deg': None, 'passes': False, 'used': key == chosen}
+        if k.sum() >= MIN_CELLS_FOR_ORIGIN:
+            a, f = CC.total_drop_angle(np.asarray(theta_deg)[k], np.asarray(value)[k])
+            if f is not None:
+                row.update(factor=float(f), angle_deg=float(a), passes=bool(f >= bar))
+        out[key] = row
+    return out
+
 
 def origin_text(o):
     """The origin, in one line for the status bar and the log.
@@ -571,12 +632,12 @@ class CellCycleWiring(QtCore.QObject):
         left unrotated and 0 deg stays the S genes' mean peak -- which
         the returned dict says in as many words.
 
-        Cells that are not on the ring do not divide on this circle,
-        and mixing them in dilutes the step. Measured on the three
-        stores: chr19 (42% of its training cells off the ring) reads
-        x1.39 at 0 deg over every training cell and x1.63 at 40 deg over
-        the on-ring ones; JP_001 and JP_002, which keep most cells on the
-        ring, are unchanged.
+        Cells near the ring's centre do not divide anywhere on this
+        circle: they carry no angle, so their DAPI lands at a random one
+        and dilutes the step. Which cells to drop for that reason is
+        PROVISIONAL -- see ORIGIN_SUBSET -- and every origin therefore
+        carries `subset_survey`, what each candidate would have said
+        about this same measurement.
 
         THE SUBSET IS NOT THE VERDICT GATE, and it used to be read out
         of the same dict. When the verdict gates became off by default
@@ -586,12 +647,8 @@ class CellCycleWiring(QtCore.QObject):
         with a label that denied it. Two different decisions: a verdict
         gate says what an angle may be CALLED and belongs to the
         experiment; this says which cells a STEP is measured ON and
-        belongs to the measurement. So it asks the question ring_level
-        answers -- is this cell's composition as sharp as a true on-ring
-        cell's at its own angle and depth -- and never the withdrawn one
-        the old pair asked (is it away from the centre). It needs no
-        threshold of its own either: on_ring loses about 5% of true
-        on-ring cells at EVERY angle by construction.
+        belongs to the measurement. The panel's gates are never read
+        here, whatever they are set to.
 
         A REFUSAL ENDS IT. When a DAPI source was given and DAPI shows
         no halving, this returns the refusal rather than asking the
@@ -605,28 +662,34 @@ class CellCycleWiring(QtCore.QObject):
         birth_used = birth
         dapi_tab = None
         placed_tr = m.place(name, X_tr)
-        on, _tail = m.on_ring(name, X_tr, placed=placed_tr)
-        # on_ring falls back to the pre-ring_level pair when the model
-        # carries no reference (a spec stored before it existed), so the
-        # origin records which rule actually ran instead of claiming the
-        # calibrated one
-        measured_on = ('on-ring training cells (ring_level tail)' if name in m.ring_ref
-                       else 'on-ring training cells (no ring reference: the pre-ring_level pair)')
+        th_all = np.degrees(placed_tr['theta']) % 360.0
+        cand = origin_candidates(m, name, X_tr, placed_tr)
+        chosen = ORIGIN_SUBSET
+        on, rule = cand[chosen]
         if on.sum() < MIN_CELLS_FOR_ORIGIN:
-            on = np.ones(len(X_tr), bool)
-            measured_on = 'every training cell (too few on the ring)'
+            chosen = 'all'
+            on, rule = cand[chosen]
+            rule += ' (too few cells in the chosen subset)'
+        measured_on = rule
         if dapi_src is not None:
-            th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
-            tr = pd.DataFrame({'fov': np.asarray(fov_tr)[on], 'cell': np.asarray(cell_tr)[on], 'theta_deg': th_tr})
-            dapi_tab, fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
-            merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
-            dna = merged['sum_above_bg'].to_numpy(float).copy()
-            fv = merged['fov'].to_numpy()
-            for f_ in np.unique(fv):
-                kk = (fv == f_) & np.isfinite(dna)
+            # THE WHOLE TRAINING SET IS READ, NOT THE SUBSET. It costs
+            # nothing -- mask_intensity_table reads every cell of a FOV
+            # whatever is asked of it -- and it buys two things: the
+            # per-FOV median is taken over all of a FOV's cells rather
+            # than whichever the subset kept, and the subsets can be
+            # surveyed against each other on one normalisation.
+            fov_tr = np.asarray(fov_tr)
+            cell_tr = np.asarray(cell_tr)
+            dapi_tab, fails = CC.mask_intensity_table(sp, sorted(set(int(f) for f in fov_tr)), dapi_src)
+            got = {(int(f), int(c)): float(v) for f, c, v in
+                   zip(dapi_tab['fov'], dapi_tab['cell'], dapi_tab['sum_above_bg'])}
+            dna = np.array([got.get((int(f), int(c)), np.nan)
+                            for f, c in zip(fov_tr, cell_tr)], float)
+            for f_ in np.unique(fov_tr):
+                kk = (fov_tr == f_) & np.isfinite(dna)
                 med = np.median(dna[kk]) if kk.sum() >= 5 else np.nan
-                dna[fv == f_] = dna[fv == f_] / med if np.isfinite(med) and med > 0 else np.nan
-            angle, factor = CC.total_drop_angle(merged['theta_deg'].to_numpy(), dna)
+                dna[fov_tr == f_] = dna[fov_tr == f_] / med if np.isfinite(med) and med > 0 else np.nan
+            angle, factor = CC.total_drop_angle(th_all[on], dna[on])
             # EVERY BRANCH RECORDS WHAT IT MEASURED AND ON WHAT. Only the
             # two success branches used to, so the one case that needs
             # diagnosing afterwards was the one that left no trace: three
@@ -634,11 +697,13 @@ class CellCycleWiring(QtCore.QObject):
             # nothing said which cells, which measurement, or that DAPI
             # had been consulted at all. `fails` was dropped on the floor.
             base = {'dapi_source': list(dapi_src), 'measured_on': measured_on,
-                    'n_cells': int(on.sum()), 'n_dapi_cells': int(len(merged)),
+                    'n_cells': int(on.sum()),
+                    'n_dapi_cells': int(np.isfinite(dna[on]).sum()),
                     'n_dapi_fovs_unread': len(fails),
                     'dapi_unread': [int(f) for f, _e in fails[:8]],
                     'dapi_factor': None if factor is None else float(factor),
-                    'dapi_angle_deg': None if angle is None else float(angle)}
+                    'dapi_angle_deg': None if angle is None else float(angle),
+                    'subset_survey': survey_subsets(cand, th_all, dna, DAPI_MIN_DROP, chosen)}
             if angle is not None and factor >= DAPI_MIN_DROP:
                 m.rotate_to_zero(angle)
                 return (dict(base, mode='division (DAPI halving)',
@@ -658,11 +723,12 @@ class CellCycleWiring(QtCore.QObject):
                          needed=DAPI_MIN_DROP,
                          zero_is='the S genes mean peak -- NOT division'), birth, dapi_tab)
         if origin_division:
-            th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
-            angle, factor = CC.total_drop_angle(th_tr, X_tr[on].sum(1))
+            totals = X_tr.sum(1)
+            angle, factor = CC.total_drop_angle(th_all[on], totals[on])
             base = {'measured_on': measured_on, 'n_cells': int(on.sum()),
                     'total_factor': None if factor is None else float(factor),
-                    'total_angle_deg': None if angle is None else float(angle)}
+                    'total_angle_deg': None if angle is None else float(angle),
+                    'subset_survey': survey_subsets(cand, th_all, totals, TOTAL_MIN_DROP, chosen)}
             # the drop must be real: measured, the Tirosh-list panel
             # (JP_001) drops x5.4 within 30 deg, chr19 x1.9, the cyclin/CDK
             # panel (JP_002) x2.1 -- and JP_002's DAPI halves at the same

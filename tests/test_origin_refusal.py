@@ -120,9 +120,15 @@ check('THE PANEL TOTAL WAS NEVER ASKED', 'total_factor' not in origin,
 check('and nothing is reported as the drop the origin was placed at',
       'drop_factor' not in origin and 'angle_before_deg' not in origin)
 check('the refusal records its subset and its n, which only successes used to',
-      origin.get('measured_on', '').startswith('on-ring')
+      origin.get('measured_on') == (origin.get('subset_survey') or {})
+      .get(CW.ORIGIN_SUBSET, {}).get('rule')
       and origin.get('n_cells', 0) >= CW.MIN_CELLS_FOR_ORIGIN,
       '%s on %s cells' % (origin.get('measured_on'), origin.get('n_cells')))
+check('and a REFUSAL surveys the other subsets too -- which is the one '
+      'case where that record is the whole point',
+      set(origin.get('subset_survey') or {}) == {'radius', 'on_ring', 'pair', 'all'},
+      ' | '.join('%s x%s' % (k, v['factor'])
+                 for k, v in sorted((origin.get('subset_survey') or {}).items())))
 check('it says what 0 deg is instead', 'NOT division' in origin.get('zero_is', ''),
       origin.get('zero_is', ''))
 

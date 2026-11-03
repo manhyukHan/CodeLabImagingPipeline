@@ -12,9 +12,16 @@ off the other had a consequence: the moment the verdict gates became
 off by default, the subset became every cell, while the stored origin
 still reported 'on-ring training cells'.
 
-So: no gates parameter, the subset comes from ring_level (the test that
-replaced the withdrawn bf_ring pair), and the origin dict says which
-rule actually ran.
+So: no gates parameter, and the origin dict says which rule actually
+ran.
+
+WHICH rule that is remains open (ORIGIN_SUBSET, provisionally
+`radius`), because on chr19 the four candidates disagree not only on
+the verdict but on the angle, by 50 deg -- the mark of a proxy with no
+step in it rather than of one right subset. A fit therefore does not
+settle it quietly: it measures every candidate and stores them all
+under `subset_survey`, so the choice can be made later from the record
+instead of from whoever happened to run the fit.
 
 Run: QT_QPA_PLATFORM=offscreen python tests/test_origin_subset.py
 """
@@ -96,9 +103,6 @@ origin, birth_used, dapi_tab = CW.CellCycleWiring._settle_origin(
 
 check('the step was found', origin['mode'].startswith('division (total drop)'),
       '%s, drop x%.2f' % (origin['mode'], origin.get('drop_factor', float('nan'))))
-check('it was measured on the on-ring subset, and says so',
-      origin.get('measured_on', '').startswith('on-ring training cells (ring_level tail)'),
-      origin.get('measured_on', ''))
 check('the subset is a strict subset and still big enough',
       CW.MIN_CELLS_FOR_ORIGIN <= origin.get('n_cells', 0) < len(X_tr),
       '%s of %d' % (origin.get('n_cells'), len(X_tr)))
@@ -106,13 +110,39 @@ check('a found division puts birth at 0 and reads no DAPI table',
       birth_used == 0.0 and dapi_tab is None)
 
 
+# -- the choice is recorded, and so are the ones not taken ---------------------
+# ORIGIN_SUBSET is provisional: chr19's four candidates disagree on the
+# VERDICT and on the ANGLE by 50 deg, which says the proxy has no step
+# in it rather than that one subset is right. So a fit does not get to
+# make that decision quietly -- it measures all four and stores them.
+survey = origin.get('subset_survey') or {}
+check('every candidate subset is surveyed, not only the one used',
+      set(survey) == {'radius', 'on_ring', 'pair', 'all'}
+      and sum(bool(r['used']) for r in survey.values()) == 1,
+      ', '.join('%s n=%d%s' % (k, v['n'], ' USED' if v['used'] else '')
+                for k, v in sorted(survey.items())))
+check('measured_on names the rule that actually ran, and the survey agrees',
+      origin.get('measured_on') == survey.get(CW.ORIGIN_SUBSET, {}).get('rule')
+      and survey[CW.ORIGIN_SUBSET]['used'],
+      '%s   (ORIGIN_SUBSET = %r)' % (origin.get('measured_on'), CW.ORIGIN_SUBSET))
+check('the used row carries the very number the origin acted on',
+      abs(survey[CW.ORIGIN_SUBSET]['factor'] - origin['drop_factor']) < 1e-9
+      and survey[CW.ORIGIN_SUBSET]['angle_deg'] == origin['angle_before_deg'],
+      'x%.4f at %.0f deg' % (survey[CW.ORIGIN_SUBSET]['factor'],
+                             survey[CW.ORIGIN_SUBSET]['angle_deg']))
+check('and the subsets NOT chosen carry their own verdicts',
+      all(v['factor'] is not None for v in survey.values()),
+      ' | '.join('%s x%.2f@%.0f' % (k, v['factor'], v['angle_deg'])
+                 for k, v in sorted(survey.items())))
+
+
 # -- the honest label when the model carries no reference ----------------------
 m_noref = CC.CycleModel.from_dict({**m.to_dict(), 'ring_ref': {}})
 origin2, _b, _d = CW.CellCycleWiring._settle_origin(
     None, m_noref, NAME, X_tr, fov_tr, cell_tr, None, True, None, 0.0)
-check('without a reference the origin names the fallback rule instead',
-      'no ring reference' in origin2.get('measured_on', ''),
-      origin2.get('measured_on', ''))
+check('without a reference the survey names on_ring\'s fallback rule',
+      'no ring reference' in (origin2.get('subset_survey') or {}).get('on_ring', {}).get('rule', ''),
+      (origin2.get('subset_survey') or {}).get('on_ring', {}).get('rule', ''))
 
 
 print('')
