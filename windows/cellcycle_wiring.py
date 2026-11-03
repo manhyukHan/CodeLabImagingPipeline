@@ -41,6 +41,46 @@ TAB_TITLE = 'Cell Cycle'
 # subset, and it says which it used in the origin dict.
 MIN_CELLS_FOR_ORIGIN = 200
 
+#: how deep a fall has to be before it is called division. DAPI is the
+#: DNA itself and halves at division (the physical step is x2), so it is
+#: held to less than the panel total, which falls for its own reasons.
+DAPI_MIN_DROP = 1.3
+TOTAL_MIN_DROP = 1.8
+
+
+def origin_text(o):
+    """The origin, in one line for the status bar and the log.
+
+    A REFUSAL SAYS SO. The old formatter printed the mode and a factor
+    and nothing else, so an origin that had never been set reported as
+    'origin set on the model of ...: S mean peak (no clear drop) (x1.6)'
+    -- and the x1.6 was the PANEL TOTAL's, measured after a DAPI
+    refusal had already been overwritten. Three refits of chr19 on
+    2026-11-03 were read as successes on the strength of that line.
+    """
+    o = o or {}
+    if not o.get('refused'):
+        txt = o.get('mode', 'S mean peak')
+        if o.get('drop_factor') is not None:
+            txt += ' (x%.2f' % o['drop_factor']
+            txt += (' at %.0f deg before the rotation)' % o['angle_before_deg']
+                    if o.get('angle_before_deg') is not None else ')')
+        if o.get('measured_on'):
+            txt += ' on %d %s' % (o.get('n_cells', 0), o['measured_on'])
+        return txt
+    by_dapi = 'dapi_source' in o
+    got = o.get('dapi_factor') if by_dapi else o.get('total_factor')
+    at = o.get('dapi_angle_deg') if by_dapi else o.get('total_angle_deg')
+    txt = '*** ORIGIN NOT SET *** %s showed no drop: ' % ('DAPI' if by_dapi else 'the panel total')
+    txt += ('x%.2f at %.0f deg' % (got, at)) if got is not None else 'too few cells to measure it'
+    txt += ', under the x%.1f it needs' % o.get('needed', 0.0)
+    txt += ' (measured on %d %s)' % (o.get('n_cells', 0), o.get('measured_on', 'cells'))
+    txt += '. The model was NOT rotated: 0 deg is %s' % o.get('zero_is', 'the S genes mean peak')
+    if o.get('n_dapi_fovs_unread'):
+        txt += '. DAPI was unreadable on %d FOV(s): %s' % (
+            o['n_dapi_fovs_unread'], ', '.join('FOV%03d' % f for f in o.get('dapi_unread') or []))
+    return txt
+
 
 class CellCycleWiring(QtCore.QObject):
     def __init__(self, mw):
@@ -436,10 +476,7 @@ class CellCycleWiring(QtCore.QObject):
             rep = '; '.join(f'{k_}: flip {v.get("flip")} shift {v.get("shift_deg", float("nan")):.0f} '
                             f'residual {v.get("err_deg", float("nan")):.0f} deg'
                             for k_, v in spec['align_report'].items() if 'flip' in v)
-            o = spec.get('origin') or {}
-            otxt = o.get('mode', '')
-            if 'drop_factor' in o and o.get('drop_factor') is not None:
-                otxt += f' (drop x{o["drop_factor"]:.1f}' + (f' at {o["angle_before_deg"]:.0f} deg before the rotation)' if 'angle_before_deg' in o else ')')
+            otxt = origin_text(spec.get('origin'))
             p.ModelStatusLabel.setText(
                 f'fitted {spec["fitted_at"]}: {spec["n_train"]} training cells, {spec["n_placed"]} placed over '
                 f'{len(fovs)} FOVs; alpha {alpha:g}; evidence {m.history[-1]:.3f}; origin {otxt}'
@@ -527,9 +564,12 @@ class CellCycleWiring(QtCore.QObject):
 
     def _settle_origin(self, m, name, X_tr, fov_tr, cell_tr, sp, origin_division, dapi_src, birth):
         """Rotate `m` so 0 deg is division, measured on the ON-RING
-        training cells: the DAPI halving when a DAPI source is given,
-        else the panel-total drop, else nothing (0 stays the S genes'
-        mean peak).
+        training cells. ONE measurement decides it, the one that was
+        asked for: the DAPI halving when a DAPI source is given, the
+        panel-total drop when it is not. Neither is a fallback for the
+        other, and when the one that was asked for refuses, the model is
+        left unrotated and 0 deg stays the S genes' mean peak -- which
+        the returned dict says in as many words.
 
         Cells that are not on the ring do not divide on this circle,
         and mixing them in dilutes the step. Measured on the three
@@ -553,12 +593,17 @@ class CellCycleWiring(QtCore.QObject):
         threshold of its own either: on_ring loses about 5% of true
         on-ring cells at EVERY angle by construction.
 
+        A REFUSAL ENDS IT. When a DAPI source was given and DAPI shows
+        no halving, this returns the refusal rather than asking the
+        panel total and then settling for the S mean peak -- see the
+        comment at that branch for the three angles involved.
+
         Returns (origin dict, birth angle to use, the DAPI table or None).
-        Runs in the worker: no widgets."""
+        Runs in the worker: no widgets, and no logging either -- what a
+        caller should say is in the dict (see origin_text)."""
         origin = {'mode': 'S mean peak'}
         birth_used = birth
         dapi_tab = None
-        done = False
         placed_tr = m.place(name, X_tr)
         on, _tail = m.on_ring(name, X_tr, placed=placed_tr)
         # on_ring falls back to the pre-ring_level pair when the model
@@ -573,7 +618,7 @@ class CellCycleWiring(QtCore.QObject):
         if dapi_src is not None:
             th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
             tr = pd.DataFrame({'fov': np.asarray(fov_tr)[on], 'cell': np.asarray(cell_tr)[on], 'theta_deg': th_tr})
-            dapi_tab, _fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
+            dapi_tab, fails = CC.mask_intensity_table(sp, sorted(set(tr['fov'].tolist())), dapi_src)
             merged = tr.merge(dapi_tab[['fov', 'cell', 'sum_above_bg']], on=['fov', 'cell'], how='inner')
             dna = merged['sum_above_bg'].to_numpy(float).copy()
             fv = merged['fov'].to_numpy()
@@ -582,28 +627,53 @@ class CellCycleWiring(QtCore.QObject):
                 med = np.median(dna[kk]) if kk.sum() >= 5 else np.nan
                 dna[fv == f_] = dna[fv == f_] / med if np.isfinite(med) and med > 0 else np.nan
             angle, factor = CC.total_drop_angle(merged['theta_deg'].to_numpy(), dna)
-            if angle is not None and factor >= 1.3:
+            # EVERY BRANCH RECORDS WHAT IT MEASURED AND ON WHAT. Only the
+            # two success branches used to, so the one case that needs
+            # diagnosing afterwards was the one that left no trace: three
+            # chr19 refits stored {'mode': ..., 'drop_factor': 1.588} and
+            # nothing said which cells, which measurement, or that DAPI
+            # had been consulted at all. `fails` was dropped on the floor.
+            base = {'dapi_source': list(dapi_src), 'measured_on': measured_on,
+                    'n_cells': int(on.sum()), 'n_dapi_cells': int(len(merged)),
+                    'n_dapi_fovs_unread': len(fails),
+                    'dapi_unread': [int(f) for f, _e in fails[:8]],
+                    'dapi_factor': None if factor is None else float(factor),
+                    'dapi_angle_deg': None if angle is None else float(angle)}
+            if angle is not None and factor >= DAPI_MIN_DROP:
                 m.rotate_to_zero(angle)
-                origin = {'mode': 'division (DAPI halving)', 'angle_before_deg': angle, 'drop_factor': factor,
-                          'dapi_source': list(dapi_src), 'measured_on': measured_on, 'n_cells': int(on.sum())}
-                birth_used = 0.0
-                done = True
-            else:
-                origin = {'mode': 'DAPI showed no halving', 'drop_factor': factor}
-        if origin_division and not done:
+                return (dict(base, mode='division (DAPI halving)',
+                             angle_before_deg=angle, drop_factor=factor), 0.0, dapi_tab)
+            # A DAPI REFUSAL IS THE ANSWER, NOT A REASON TO ASK SOMETHING
+            # ELSE. This used to fall through to the panel total and then
+            # to the S genes' mean peak, and those three angles are not
+            # near each other: measured on chr19, DAPI falls at 280 deg,
+            # the panel total at 20 deg, and the S peak is 0 by
+            # definition. The total falls for its own reasons (G2/M
+            # transcripts leaving, the panel's own depth) and the S peak
+            # is not division at all, so neither can stand in for the DNA
+            # halving that was asked for. Worse, the fall-through then
+            # stored the TOTAL's factor under a mode naming neither, so
+            # the DAPI number that made the decision was destroyed.
+            return (dict(base, mode='REFUSED: DAPI showed no halving', refused=True,
+                         needed=DAPI_MIN_DROP,
+                         zero_is='the S genes mean peak -- NOT division'), birth, dapi_tab)
+        if origin_division:
             th_tr = np.degrees(placed_tr['theta'][on]) % 360.0
             angle, factor = CC.total_drop_angle(th_tr, X_tr[on].sum(1))
+            base = {'measured_on': measured_on, 'n_cells': int(on.sum()),
+                    'total_factor': None if factor is None else float(factor),
+                    'total_angle_deg': None if angle is None else float(angle)}
             # the drop must be real: measured, the Tirosh-list panel
             # (JP_001) drops x5.4 within 30 deg, chr19 x1.9, the cyclin/CDK
             # panel (JP_002) x2.1 -- and JP_002's DAPI halves at the same
             # place, so that gentler drop IS division too
-            if angle is not None and factor >= 1.8:
+            if angle is not None and factor >= TOTAL_MIN_DROP:
                 m.rotate_to_zero(angle)
-                origin = {'mode': 'division (total drop)' + (' after DAPI showed no halving' if dapi_src is not None else ''),
-                          'angle_before_deg': angle, 'drop_factor': factor, 'measured_on': measured_on, 'n_cells': int(on.sum())}
-                birth_used = 0.0
-            else:
-                origin = {'mode': 'S mean peak (no clear drop)', 'drop_factor': factor}
+                return (dict(base, mode='division (total drop)',
+                             angle_before_deg=angle, drop_factor=factor), 0.0, dapi_tab)
+            return (dict(base, mode='REFUSED: the panel total showed no drop', refused=True,
+                         needed=TOTAL_MIN_DROP,
+                         zero_is='the S genes mean peak -- NOT division'), birth, dapi_tab)
         return origin, birth_used, dapi_tab
 
     def _propose_after(self, m, name, X, k, placed, fov_of, cell_of, dapi_tab, birth_used, shares):
@@ -696,10 +766,9 @@ class CellCycleWiring(QtCore.QObject):
             p.SetOriginPushButton.setEnabled(True)
             self._adopt(m, spec_, placed, keys, ct, X)
             o = spec_.get('origin') or {}
-            otxt = o.get('mode', '')
-            if o.get('drop_factor') is not None:
-                otxt += f' (x{o["drop_factor"]:.1f}' + (f' at {o["angle_before_deg"]:.0f} deg before the rotation)' if 'angle_before_deg' in o else ')')
-            p.ModelStatusLabel.setText(f'origin set on the model of {spec_.get("fitted_at")}: {otxt}; {len(X)} cells re-placed'
+            otxt = origin_text(o)
+            head = 'origin NOT set on' if o.get('refused') else 'origin set on'
+            p.ModelStatusLabel.setText(f'{head} the model of {spec_.get("fitted_at")}: {otxt}; {len(X)} cells re-placed'
                                        + (f'; categories proposed from {spec_["categories_from"]}' if spec_.get('categories_from') else ''))
             self._log(p.ModelStatusLabel.text())
 
