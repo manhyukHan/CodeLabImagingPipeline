@@ -900,7 +900,8 @@ def read_fov_cellcycle(storage_path, fov):
       {'version': 1,
        'model': <the model id the rows were placed with>,
        'stamp': fov_input_stamp(...)   what the counts were read from,
-       'rows': [{cell, theta_deg, R, fit_z, bf_ring, radius, total}]}
+       'rows': [{cell, theta_deg, R, fit_z, radius, ring_level,
+                 ring_tail, total}]}
 
     A per-FOV capsule beside expression.json rather than new columns in
     cells.h5: the placement is a DERIVED per-cell attribute that a refit

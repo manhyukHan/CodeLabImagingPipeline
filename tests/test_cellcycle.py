@@ -126,17 +126,34 @@ Xc = np.stack([rng.multinomial(int(s), pc) for s in rng.integers(150, 400, 600)]
 Xo = Xr.copy()
 Xo[:, 0] = Xo[:, 0] * 8 + 50                                                              # one gene blown up: outside
 out_r, out_c, out_o = (mj.place('A', Xd) for Xd in (Xr, Xc, Xo))
-check('ring cells: log bf_ring high, radius ~1, fit_z ~0',
-      np.median(out_r['bf_ring']) > 3 and 0.7 < np.median(out_r['radius']) < 1.3 and abs(np.nanmedian(out_r['fit_z'])) < 1.0,
-      f"bf {np.median(out_r['bf_ring']):.1f}, radius {np.median(out_r['radius']):.2f}, z {np.nanmedian(out_r['fit_z']):.2f}")
-check('centre cells: log bf_ring far below the ring cells, radius small',
-      np.median(out_c['bf_ring']) < np.median(out_r['bf_ring']) - 3 and np.median(out_c['radius']) < 0.5,
-      f"bf {np.median(out_c['bf_ring']):.1f}, radius {np.median(out_c['radius']):.2f}, z {np.nanmedian(out_c['fit_z']):.2f}")
-check('centre cells still get a confident-looking R (why bf_ring exists)', np.median(out_c['R']) > 0.5, f"R {np.median(out_c['R']):.2f}")
+check('ring cells: ring_level near zero, radius ~1, fit_z ~0',
+      np.median(out_r['ring_level']) > -0.05 and 0.7 < np.median(out_r['radius']) < 1.3 and abs(np.nanmedian(out_r['fit_z'])) < 1.0,
+      f"level {np.median(out_r['ring_level']):.3f}, radius {np.median(out_r['radius']):.2f}, z {np.nanmedian(out_r['fit_z']):.2f}")
+check('centre cells: ring_level far below the ring cells, radius small',
+      np.median(out_c['ring_level']) < np.median(out_r['ring_level']) - 0.02 and np.median(out_c['radius']) < 0.5,
+      f"level {np.median(out_c['ring_level']):.3f}, radius {np.median(out_c['radius']):.2f}, z {np.nanmedian(out_c['fit_z']):.2f}")
+check('centre cells still get a confident-looking R (why an on-ring verdict is needed at all)', np.median(out_c['R']) > 0.5, f"R {np.median(out_c['R']):.2f}")
 check('outside cells: fit_z far below the cycling reference', np.nanmedian(out_o['fit_z']) < -2, f"z {np.nanmedian(out_o['fit_z']):.2f}")
-# the real-data regime: a SMALL ring (profile amplitude ~0.4), where the
-# centre lies inside the dispersion band -- fit_z is blind there and
-# only bf_ring / radius see the centre cells
+# the real-data regime: a SMALL ring (profile amplitude ~0.4), where
+# the centre lies inside the dispersion band.
+#
+# THE ONE THING LOST WITH bf_ring, pinned here so it is not a surprise.
+# bf_ring separated centre-drawn cells from ring cells on a ring this
+# small, by about 2 nats, because it compared the ring marginalised over
+# 72 angles against the centre as a SINGLE point: the marginalisation
+# penalty was the whole of its power. ring_level compares the ring
+# against a composition free to be ANYTHING, which is a far weaker
+# alternative, so a centre-drawn cell beats it just as a ring cell does
+# -- and calibrating that statistic cannot recover a separation that is
+# not in it. Measured below: fit_z blind, raw ring_level blind, the
+# calibrated tail blind too; only radius sees them, at 0.30 against
+# 1.00, and radius is geometry.
+#
+# radius is also centre-referenced, so where a ring is BOTH this small
+# and folded through its own centre, no verdict here sees a no-phase
+# cell. That combination is not fixtured; it is stated, not measured.
+# On a full-amplitude ring the calibrated tail does separate them --
+# test_origin_subset pins that at 0.96 against 0.01.
 Xs, ths, coefs, a_s, gens = CC.simulate(n=1200, seed=50, total=(150, 500))
 coefs = coefs * 0.3
 Xs, ths, _, _, _ = CC.simulate(n=1200, seed=51, total=(150, 500), coef=coefs, a=a_s, genes=gens)
@@ -148,9 +165,17 @@ o_sr, o_sc = ms.place('S', Xsr), ms.place('S', Xsc)
 check('small ring: fit_z cannot tell centre cells from ring cells',
       abs(np.nanmedian(o_sc['fit_z']) - np.nanmedian(o_sr['fit_z'])) < 1.5,
       f"z centre {np.nanmedian(o_sc['fit_z']):.2f} vs ring {np.nanmedian(o_sr['fit_z']):.2f}")
-check('small ring: bf_ring and radius still separate them',
-      np.median(o_sc['bf_ring']) < np.median(o_sr['bf_ring']) - 2 and np.median(o_sc['radius']) < 0.6 < np.median(o_sr['radius']),
-      f"bf centre {np.median(o_sc['bf_ring']):.1f} vs ring {np.median(o_sr['bf_ring']):.1f}; radius {np.median(o_sc['radius']):.2f} vs {np.median(o_sr['radius']):.2f}")
+check('small ring: the RAW ring_level cannot tell them apart either (bf_ring could)',
+      abs(np.median(o_sc['ring_level']) - np.median(o_sr['ring_level'])) < 0.01,
+      f"level centre {np.median(o_sc['ring_level']):.3f} vs ring {np.median(o_sr['ring_level']):.3f}")
+ms.ring_reference('S', np.concatenate([Xsr.sum(1), Xsc.sum(1)]), n_sim=200, seed=3)
+on_sr, _t = ms.on_ring('S', Xsr)
+on_sc, _t = ms.on_ring('S', Xsc)
+check('small ring: NOT the calibrated tail either -- only radius, which is geometry',
+      on_sc.mean() > 0.80 and on_sr.mean() > 0.80
+      and np.median(o_sc['radius']) < 0.6 < np.median(o_sr['radius']),
+      f"on_ring keeps ring {on_sr.mean():.2f} / centre {on_sc.mean():.2f}; "
+      f"radius {np.median(o_sc['radius']):.2f} vs {np.median(o_sr['radius']):.2f}")
 
 # -- 4b. two experiments of very different count depth share every gene:
 #        the fast path must not let the deep one own the profiles
@@ -298,9 +323,11 @@ print('the on-ring gate at a fold')
 # the composition there is c1 - b2 per gene, so b2 = c1 puts every gene
 # at its intercept at that angle. Both real panels without a gene that
 # separates post-M from G2/M have this shape right after division, and
-# the old fixed gate (bf_ring >= 0, radius >= 0.5) empties those angles:
-# it compares the cell with the centre, and at a fold the centre IS the
-# ring.
+# a CENTRE-REFERENCED rule empties those angles: it compares the cell
+# with the centre, and at a fold the centre IS the ring. The pair that
+# used to stand here (bf_ring >= 0, radius >= 0.5) was removed from the
+# codebase on 2026-11-04, so what stands in for it below is the half
+# that survived -- radius >= 0.5, which asks the same question.
 fold = np.zeros((6, 4))
 fold[:, 0] = np.random.default_rng(5).normal(0, 1.0, 6)
 fold[:, 1] = np.random.default_rng(6).normal(0, 1.0, 6)
@@ -319,9 +346,9 @@ keep_fixed, keep_gate = [], []
 for t in range(0, mf.T, 6):
     Xs = CC._simulate_cells(rngf, pisf[t], 100.0, 150, 200)
     pl = mf.place('F', Xs)
-    keep_fixed.append(((pl['bf_ring'] >= 0) & (pl['radius'] >= 0.5)).mean())
+    keep_fixed.append((pl['radius'] >= 0.5).mean())
     keep_gate.append(mf.on_ring('F', Xs, miss=0.05, placed=pl)[0].mean())
-check('the old fixed gate empties the fold', min(keep_fixed) < 0.5, f'worst angle keeps {min(keep_fixed):.2f}')
+check('a centre-referenced rule empties the fold', min(keep_fixed) < 0.5, f'worst angle keeps {min(keep_fixed):.2f}')
 check('the gate keeps true on-ring cells at every angle, the fold included',
       min(keep_gate) >= 0.8, f'worst angle keeps {min(keep_gate):.2f}, mean {np.mean(keep_gate):.2f}')
 mf2 = CC.CycleModel.from_dict(mf.to_dict())
@@ -329,18 +356,26 @@ Xchk = CC._simulate_cells(rngf, pisf[0], 100.0, 150, 100)
 check('the reference survives to_dict / from_dict',
       'F' in mf2.ring_ref and np.array_equal(mf2.on_ring('F', Xchk)[0], mf.on_ring('F', Xchk)[0]))
 plchk = mf.place('F', Xchk)
-check('without a reference on_ring falls back to the fixed gate',
-      np.array_equal(CC.CycleModel.from_dict({**mf.to_dict(), 'ring_ref': {}}).on_ring('F', Xchk)[0],
-                     (plchk['bf_ring'] >= 0) & (plchk['radius'] >= 0.5)))
+# THERE IS NO FALLBACK RULE. A model with no reference for this panel
+# builds one from the depths of the very cells it is judging. Until
+# 2026-11-04 it answered the withdrawn pair's question instead, and
+# that was live rather than theoretical: of the three stored models,
+# JP_001 and JP_002 carried no reference, and on JP_001 the pair kept
+# 0.520 of the cells where the calibrated gate keeps 0.952.
+mf3 = CC.CycleModel.from_dict({**mf.to_dict(), 'ring_ref': {}})
+on3, tail3 = mf3.on_ring('F', Xchk)
+check('without a reference on_ring BUILDS one -- no fallback rule is left',
+      'F' in mf3.ring_ref and np.isfinite(tail3).all() and on3.mean() >= 0.8,
+      f'keeps {on3.mean():.2f} of true on-ring cells, off their own depths')
 check('place carries the level and its tail', np.isfinite(plchk['ring_level']).all() and np.isfinite(plchk['ring_tail']).all())
 
 # -- 13. a ring that does NOT fold, and cells that are not cells --------------
 print('the on-ring gate on a circular ring')
 # an exact circle in CLR: log pi_t = a + u cos t + v sin t with u, v
 # mean-zero, orthogonal and of equal length, so every angle sits the same
-# distance from the centre. Here the fixed gate misses almost nothing --
-# but it also passes compositions that have nothing to do with the ring,
-# because 'far from the centre' is all it ever asked.
+# distance from the centre. Here a centre-referenced rule misses almost
+# nothing -- but it also passes compositions that have nothing to do
+# with the ring, because 'far from the centre' is all it ever asked.
 rngc = np.random.default_rng(11)
 u = rngc.normal(0, 1, 6); u -= u.mean()
 v = rngc.normal(0, 1, 6); v -= v.mean()
@@ -368,9 +403,9 @@ perm = rngc2.permutation(6)
 Xscr = CC._simulate_cells(rngc2, pisc[0][perm], 100.0, 150, 400)
 for labl, Xbad in (('a random composition', Xrand), ('the ring composition with its genes scrambled', Xscr)):
     plb = mc.place('C1', Xbad)
-    fx = ((plb['bf_ring'] >= 0) & (plb['radius'] >= 0.5)).mean()
+    fx = (plb['radius'] >= 0.5).mean()
     gt = mc.on_ring('C1', Xbad, miss=0.05, placed=plb)[0].mean()
-    check(f'the gate rejects {labl}', gt <= 0.25, f'gate passes {gt:.2f}, the old fixed gate passed {fx:.2f}')
+    check(f'the gate rejects {labl}', gt <= 0.25, f'gate passes {gt:.2f}, radius >= 0.5 alone passed {fx:.2f}')
 
 # -- 14. orient_by must hold for a single dataset too -------------------------
 print('orientation of a single fit')
@@ -415,9 +450,9 @@ m.alpha_beta['A'], m.alpha_sref['A'] = 0.7, 150.0
 ai = 100.0 * (Xs20.sum(1) / 150.0) ** 0.7
 check('a per-cell alpha is read at each cell\'s own depth',
       np.allclose(m.evidence('A', Xs20, prior='uniform'), manual_evidence(m, 'A', Xs20, ai), atol=1e-8))
-bf_b = m.bf_ring('A', Xs20)
-check('bf_ring takes the per-cell alpha too (finite, differs from beta 0)',
-      np.isfinite(bf_b).all() and not np.allclose(bf_b, (m.alpha_beta.__setitem__('A', 0.0) or m.bf_ring('A', Xs20))))
+lv_b = m.ring_level('A', Xs20)
+check('ring_level takes the per-cell alpha too (finite, differs from beta 0)',
+      np.isfinite(lv_b).all() and not np.allclose(lv_b, (m.alpha_beta.__setitem__('A', 0.0) or m.ring_level('A', Xs20))))
 m.alpha_beta['A'] = 0.0
 check('back at beta 0 the evidence is unchanged', np.allclose(m.evidence('A', Xs20, prior='uniform'), ev_scalar))
 

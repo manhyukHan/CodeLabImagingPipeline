@@ -71,11 +71,12 @@ class PanelData:
     groups: the per-cell celltype, dna/area: the per-cell DNA content
     (per-FOV normalised) and mask area, roles: {gene: 'S'|'G2/M'|...},
     train: the cycling celltype (None = every cell), alpha: the DM
-    concentration, gates: the on-ring rule.
+    concentration. What counts as an on-ring cell is not a parameter
+    here: it is on_ring's calibrated rule, see RING_REF_SIM.
     """
 
     def __init__(self, X, genes, groups, dna, area, roles, train=None, alpha=CC.DEFAULT_ALPHA,
-                 min_total=10, gates=None, name='panel'):
+                 min_total=10, name='panel'):
         self.X = np.asarray(X, float)
         self.genes = list(genes)
         self.groups = np.asarray(groups, dtype=object)
@@ -85,7 +86,6 @@ class PanelData:
         self.train = train
         self.alpha = float(alpha)
         self.min_total = int(min_total)
-        self.gates = dict(gates or {'min_bf_ring': 0.0, 'min_radius': 0.5})
         self.name = name
         self.gi = {g: i for i, g in enumerate(self.genes)}
 
@@ -117,13 +117,21 @@ def _binned_r2(theta_deg, values, n_bins=24, min_per_bin=3):
     return float(1.0 - np.var(v[ok] - pred[ok]) / np.var(v[ok]))
 
 
-def _on_ring(placed, gates):
-    on = np.ones(len(placed['theta']), bool)
-    if gates.get('min_bf_ring') is not None:
-        on &= placed['bf_ring'] >= float(gates['min_bf_ring'])
-    if gates.get('min_radius') is not None:
-        on &= placed['radius'] >= float(gates['min_radius'])
-    return on
+#: WHAT THE SEARCH CALLS AN ON-RING CELL. The real rule, on_ring's
+#: calibrated ring_level tail -- not the pair it replaced. The search
+#: fits a model per candidate panel, so each one needs its own ring
+#: reference, and these settings are what make that affordable:
+#: measured on JP_001 (19 genes, 2617 training cells) the fit costs
+#: 31.7 s, the reference 14.2 s at the defaults (+42 %) and 1.8 s here
+#: (+5 %), keeping 0.914 of the cells against 0.952 at the defaults.
+#:
+#: Until 2026-11-04 this filter was the withdrawn pair (bf_ring >= 0
+#: and radius >= 0.5), which on the same cells kept 0.520 -- so every
+#: panel-search number recorded before that date was scored on half
+#: the cells, and on the wrong half: the question it asked was "is this
+#: cell not at the ring's centre", which a random composition passes.
+RING_REF_SIM = 50
+RING_REF_BINS = 3
 
 
 def evaluate(data, genes, seed=0, with_half_panel=False):
@@ -154,7 +162,8 @@ def evaluate(data, genes, seed=0, with_half_panel=False):
     m.orient(early, late)
     placed = m.place(data.name, X)
     th = np.degrees(placed['theta']) % 360.0
-    on = _on_ring(placed, data.gates)
+    on, _tail = m.on_ring(data.name, X, placed=placed,
+                          n_sim=RING_REF_SIM, n_bins=RING_REF_BINS)
     cyc = k & on
     if cyc.sum() < MIN_CELLS_FOR_STEP:
         cyc = k

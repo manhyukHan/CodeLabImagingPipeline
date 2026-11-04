@@ -16,8 +16,8 @@ plain tables:
               modality, hybe, channel, z_status,    spot_sources
               y_um, x_um, z_um, brightness]
   cellcycle   DataFrame [fov, cell, theta_deg, R,   None until the Cell
-              fit_z, bf_ring, radius, total,        Cycle stage placed
-              category]                             the FOV's cells
+              fit_z, radius, ring_level,            Cycle stage placed
+              ring_tail, total, category]           the FOV's cells
 
 Keys are ALWAYS (fov, cell) pairs. The SG scripts carry a measured scar
 here: cells keyed by basename collided across FOVs and silently merged

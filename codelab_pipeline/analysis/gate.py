@@ -190,11 +190,13 @@ class PhaseRange(Predicate):
 class CycleRange(Predicate):
     """One per-cell cell-cycle verdict within [lo, hi]: metric is 'R'
     (posterior concentration), 'fit_z' (evidence against the training
-    cells of the same depth; negative = worse than them), 'bf_ring'
-    (log Bayes factor ring vs centre), 'radius' (plane radius, 1 = on
-    the ring) or 'total' (panel counts). Open bounds via None."""
+    cells of the same depth; negative = worse than them),
+    'ring_level' (how much better the ring explains the cell than a
+    composition free to be anything, per count) or its calibrated
+    'ring_tail', 'radius' (plane radius, 1 = on the ring) or 'total'
+    (panel counts). Open bounds via None."""
     kind = 'cycle_range'
-    METRICS = ('R', 'fit_z', 'bf_ring', 'radius', 'total')
+    METRICS = ('R', 'fit_z', 'ring_level', 'ring_tail', 'radius', 'total')
 
     def __init__(self, metric, lo=None, hi=None):
         if metric not in self.METRICS:

@@ -48,15 +48,43 @@ THREE VERDICTS PER CELL, because posterior concentration alone cannot
 tell them apart (locally the posterior is von Mises with concentration
 kappa = s_eff * r^2 * rho -- effective count x ring radius^2 x the
 cell's own radial position, s_eff = s(1+alpha_i)/(s+alpha_i)):
-    R        posterior concentration: how sharply the angle is known
-    fit_z    KL distance to the ring against cycling cells of the same
-             total: OUTSIDE the ring (drug response, doublets, debris)
-    bf_ring  log Bayes factor ring-vs-centre (centre = softmax(a_d),
-             exactly the CLR centre of the ring): INSIDE the ring, the
-             composition of a cell with no phase (G0-like, transcription
-             shut down). Measured on JP_001 hydroxyurea: radius 0.45 of
-             the ring with fit_z +0.5 and, at alpha 300, R 0.84 -- a
-             confidently random angle that only this verdict flags.
+    R          posterior concentration: how sharply the angle is known
+    fit_z      KL distance to the ring against cycling cells of the
+               same total: OUTSIDE the ring (drug response, doublets,
+               debris)
+    ring_tail  where this cell's ring_level falls among cells that truly
+               sit ON the ring, placed where it is placed and read as
+               deeply: calibrated, so true on-ring cells are lost at
+               the same rate at every angle
+and `radius` beside them as geometry (1 = on the ring, 0 = its centre),
+a diagnostic and not a gate -- see ring_level for why the centre cannot
+serve as a reference.
+
+WHAT IS NO LONGER ASKED. A log Bayes factor ring-vs-centre (bf_ring)
+was the third verdict until 2026-11-04. Its question was whether a cell
+sits INSIDE the ring: the composition of a cell with no phase (G0-like,
+transcription shut down), measured on JP_001 hydroxyurea at radius 0.45
+of the ring with fit_z +0.5 and, at alpha 300, R 0.84 -- a confidently
+random angle. It is withdrawn because its null is the ring's own
+CENTRE, which is the wrong reference and no reference at all where the
+ring folds through it: the gate built on it passed 72-97 % of random
+compositions while emptying the angles just after division. ring_level
+replaced it and does NOT ask this question -- a cell halfway to the
+centre passes (0.93-0.97).
+
+WHAT THAT COSTS, measured. bf_ring's power came from comparing the ring
+MARGINALISED over the grid against the centre as a single point, and on
+a ring of small amplitude that penalty was the only thing that could
+separate a no-phase cell from a cycling one: it did so by about 2 nats
+where fit_z and ring_level, raw or calibrated, see nothing (synthetic
+small ring, tests/test_cellcycle.py -- centre-drawn cells pass the
+on-ring gate at 1.00). On a full-amplitude ring the calibrated tail
+does separate them, 0.96 against 0.01. So on a small ring only `radius`
+still sees a no-phase cell, at 0.30 of the ring against 1.00, and
+radius is itself centre-referenced -- which means a ring both small and
+folded has no verdict here that flags one. That trade was taken
+knowingly: the gate bf_ring carried was wrong in a way that cost real
+cells at real angles, and this costs a cell type at one ring shape.
 
 FITTING. EM on a T-point grid. E-step closed form (DM). M-step by
 default on the multinomial sufficient statistics S_tg = sum_i q_it x_ig
@@ -1043,24 +1071,12 @@ class CycleModel:
         a = self.a[name]
         return np.exp(a - logsumexp(a))
 
-    def bf_ring(self, name, X):
-        """log Bayes factor, ring (uniform over angles) vs centre."""
-        alpha = self.alpha_of(name, X)
-        ring = self.evidence(name, X, prior='uniform')
-        pc = self.centre(name)
-        if alpha is None:
-            cen = X @ np.log(pc) + _dm_const(X, None)
-        else:
-            api = (np.asarray(alpha, float)[:, None] if np.ndim(alpha) else alpha) * pc[None]
-            cen = (gammaln(X + api) - gammaln(api)).sum(1) + _dm_const(X, alpha)
-        return ring - cen
-
     def radius(self, name, X, pseudo=0.5):
         """(rho, residual): the cell's distance from the ring's centre in
         the ring's own plane, relative to the ring's radius (1 = on the
         ring, 0 = centre), and the length of what lies outside that
         plane. Geometry only -- alpha-free, count-noise blind; the
-        diagnostic picture beside bf_ring.
+        diagnostic picture beside ring_level.
 
         The plane is the first two principal directions of the ring's
         CLR points and the radius is their median distance from the
@@ -1095,9 +1111,10 @@ class CycleModel:
         integrate to lgamma(G) - lgamma(N+G) + lgamma(N+1), a function
         of the depth alone, so the statistic costs one evidence call.
 
-        This is what the on-ring gate asks. The older pair (bf_ring >= 0
-        and radius >= 0.5) compares the cell with the ring's CENTRE
-        instead, which is a different question and the wrong one: a
+        This is what the on-ring gate asks. The pair it replaced --
+        bf_ring >= 0 and radius >= 0.5, removed outright 2026-11-04 --
+        compares the cell with the ring's CENTRE instead, which is a
+        different question and the wrong one: a
         random composition lies far from the centre too and sails
         through it (measured: 72-97% of random compositions and 88-100%
         of gene-scrambled ones pass on the three panels), while cells
@@ -1182,7 +1199,7 @@ class CycleModel:
                 out[k] += q[k, t] * np.interp(lv[k], ref['lvl'][t, bi], levels, left=0.0, right=1.0)
         return out
 
-    def on_ring(self, name, X, miss=0.05, placed=None):
+    def on_ring(self, name, X, miss=0.05, placed=None, **ref_kw):
         """(mask, tail). The cell is on the ring when its tail (see
         _level_tail) is at least `miss`, so true on-ring cells are lost
         at a rate of about `miss` at EVERY angle -- by construction, not
@@ -1195,28 +1212,43 @@ class CycleModel:
         those angles. Cells halfway in pass here (0.93-0.97); R is what
         says whether a cell may carry an angle.
 
-        Without a reference for this panel the old fixed gate
-        (bf_ring >= 0 and radius >= 0.5) is applied instead, and the
-        tail is reported as 1 (pass) or 0 (fail)."""
+        A MODEL WITH NO REFERENCE FOR THIS PANEL BUILDS ONE, from the
+        depths of these very cells, and keeps it. There is no fallback
+        rule because none is needed: the reference is a simulation from
+        the fitted profiles plus the depths of the cells being judged,
+        and both are in hand right here.
+
+        Until 2026-11-04 this fell back to the withdrawn pair
+        (bf_ring >= 0 and radius >= 0.5), which is not a weaker form of
+        this question but a different and wrong one. The fallback was
+        live, not theoretical: of the three stored models, JP_001 and
+        JP_002 carried no reference, and on JP_001 the pair kept 0.520
+        of the cells where this gate keeps 0.952.
+
+        `ref_kw` goes to ring_reference (n_sim, n_bins, seed), for a
+        caller that fits a model per candidate panel and cannot pay the
+        default -- measured on JP_001, 14.2 s beside a 31.7 s fit, and
+        1.8 s at n_sim=50, n_bins=3."""
         X = np.asarray(X, float)
         if placed is None:
             placed = self.place(name, X)
         tail = np.asarray(placed.get('ring_tail', np.nan), float) * np.ones(len(X))
         if not np.isfinite(tail).any():
-            ok = ((np.asarray(placed['bf_ring'], float) >= 0.0)
-                  & (np.asarray(placed['radius'], float) >= 0.5))
-            return ok, ok.astype(float)
+            self.ring_reference(name, X.sum(1), **ref_kw)
+            if 'posterior' not in placed:
+                placed = dict(placed, posterior=self.posterior(name, X, prior='uniform'))
+            tail = self._level_tail(name, X, placed)
         return tail >= float(miss), tail
 
 
     def place(self, name, X, groups=None, prior='uniform'):
-        """Every per-cell verdict at once: theta, R, fit_z, bf_ring,
-        radius, ring_level and its calibrated tail (and the posterior)."""
+        """Every per-cell verdict at once: theta, R, fit_z, radius,
+        ring_level and its calibrated tail (and the posterior)."""
         X = np.asarray(X, float)
         th, R, q = self.phase(name, X, groups, prior)
         rho, resid = self.radius(name, X)
         out = {'theta': th, 'R': R, 'fit_z': self.fit_z(name, X),
-               'bf_ring': self.bf_ring(name, X), 'radius': rho, 'residual': resid,
+               'radius': rho, 'residual': resid,
                'ring_level': self.ring_level(name, X), 'posterior': q}
         out['ring_tail'] = self._level_tail(name, X, out)
         return out
@@ -1228,7 +1260,7 @@ class CycleModel:
 
     def group_summary(self, name, X, groups, prior='uniform'):
         """Per condition: n, circular mean, concentration, spectrum mode,
-        median R, median fit_z, fraction fit_z < -2, median log bf_ring,
+        median R, median fit_z, fraction fit_z < -2, median ring_level,
         median radius."""
         out = self.place(name, X, groups, prior)
         groups = np.asarray(groups, dtype=object)
@@ -1243,7 +1275,7 @@ class CycleModel:
                        'median_R': float(np.median(out['R'][k])),
                        'median_fit_z': float(np.nanmedian(out['fit_z'][k])),
                        'frac_outside': float(np.nanmean(out['fit_z'][k] < -2)),
-                       'median_log_bf_ring': float(np.median(out['bf_ring'][k])),
+                       'median_ring_level': float(np.median(out['ring_level'][k])),
                        'median_radius': float(np.median(out['radius'][k]))}
         return rows
 
@@ -1319,7 +1351,7 @@ class CycleModel:
 
 COUNT_GATE = 0.5        # the classifier's own operating point (design doc 4.2)
 CAPSULE_VERSION = 1
-CAPSULE_COLUMNS = ('cell', 'theta_deg', 'R', 'fit_z', 'bf_ring', 'radius',
+CAPSULE_COLUMNS = ('cell', 'theta_deg', 'R', 'fit_z', 'radius',
                    'ring_level', 'ring_tail', 'total')
 
 
@@ -1608,7 +1640,6 @@ def capsule_rows(placed, cell_ids, totals):
                     'theta_deg': float(np.degrees(placed['theta'][i]) % 360.0),
                     'R': float(placed['R'][i]),
                     'fit_z': val('fit_z', i),
-                    'bf_ring': val('bf_ring', i),
                     'radius': val('radius', i),
                     'ring_level': val('ring_level', i),
                     'ring_tail': val('ring_tail', i),
@@ -1639,7 +1670,7 @@ def categorize(theta_deg, arcs):
     return out
 
 
-GATE_KEYS = (('min_R', 'R', 'ge'), ('min_bf_ring', 'bf_ring', 'ge'),
+GATE_KEYS = (('min_R', 'R', 'ge'),
              ('min_ring_tail', 'ring_tail', 'ge'),
              ('min_fit_z', 'fit_z', 'ge'), ('max_fit_z', 'fit_z', 'le'),
              ('min_radius', 'radius', 'ge'), ('max_radius', 'radius', 'le'),
@@ -1650,7 +1681,7 @@ def assign(table, arcs, gates=None):
     """The final call per placed cell: the arc's name when every verdict
     gate passes, '' (unassigned) otherwise. table: rows with theta_deg
     and the verdict columns; arcs as in categorize; gates: {gate key:
-    value or None} over GATE_KEYS (min_R, min_bf_ring, min_fit_z,
+    value or None} over GATE_KEYS (min_R, min_ring_tail, min_fit_z,
     max_fit_z, min_radius, max_radius, min_total). A cell with no value
     for a gated verdict fails that gate. The Cell Cycle stage decides
     both the arcs and the gates and stores them with the model; the app

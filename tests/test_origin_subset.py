@@ -83,18 +83,17 @@ check('the centre-drawn cells are the ones ring_level drops',
       on[~is_off].mean() > 0.80 and on[is_off].mean() < 0.35,
       'on-ring %.2f, centre-drawn %.2f' % (on[~is_off].mean(), on[is_off].mean()))
 
-# what the OLD rule would have done with the gates the panel now sends:
-# every key present and None, so g.get(key, default) never reaches its
-# default and no cell is dropped
-old_gates = {'min_bf_ring': None, 'min_radius': None}
-old_on = np.ones(len(X_tr), bool)
-for key, col in (('min_bf_ring', 'bf_ring'), ('min_radius', 'radius')):
-    v = old_gates.get(key, {'min_bf_ring': 0.0, 'min_radius': 0.5}[key])
-    if v is not None:
-        old_on &= m.place(NAME, X_tr)[col] >= float(v)
-check('the old rule would have kept every cell once the gates went off',
-      old_on.all() and not on.all(),
-      'old %d/%d, new %d/%d' % (old_on.sum(), len(X_tr), on.sum(), len(X_tr)))
+# the surviving half of the withdrawn pair, on the same cells. This
+# ring does not fold through its own centre, and there radius is not
+# worse -- it keeps slightly MORE on-ring cells than the calibrated
+# gate. That is the whole shape of the thing: a centre-referenced rule
+# is wrong only where the centre stops being a reference, which is at a
+# fold, and test_cellcycle's fold fixture is where that shows.
+rad = np.asarray(m.place(NAME, X_tr)['radius'], float) >= 0.5
+check('on an unfolded ring radius alone agrees with the calibrated gate',
+      rad[is_off].mean() < 0.35 and abs(rad[~is_off].mean() - on[~is_off].mean()) < 0.10,
+      'radius keeps on-ring %.2f / centre %.2f; on_ring keeps %.2f / %.2f'
+      % (rad[~is_off].mean(), rad[is_off].mean(), on[~is_off].mean(), on[is_off].mean()))
 
 
 # -- the origin itself ---------------------------------------------------------
@@ -111,13 +110,15 @@ check('a found division puts birth at 0 and reads no DAPI table',
 
 
 # -- the choice is recorded, and so are the ones not taken ---------------------
-# ORIGIN_SUBSET is provisional: chr19's four candidates disagree on the
+# ORIGIN_SUBSET is provisional: chr19's candidates disagree on the
 # VERDICT and on the ANGLE by 50 deg, which says the proxy has no step
 # in it rather than that one subset is right. So a fit does not get to
-# make that decision quietly -- it measures all four and stores them.
+# make that decision quietly -- it measures them all and stores them.
+# There were four until 2026-11-04; the fourth was the bf_ring pair,
+# which went when bf_ring did.
 survey = origin.get('subset_survey') or {}
 check('every candidate subset is surveyed, not only the one used',
-      set(survey) == {'radius', 'on_ring', 'pair', 'all'}
+      set(survey) == {'radius', 'on_ring', 'all'}
       and sum(bool(r['used']) for r in survey.values()) == 1,
       ', '.join('%s n=%d%s' % (k, v['n'], ' USED' if v['used'] else '')
                 for k, v in sorted(survey.items())))
@@ -136,13 +137,24 @@ check('and the subsets NOT chosen carry their own verdicts',
                  for k, v in sorted(survey.items())))
 
 
-# -- the honest label when the model carries no reference ----------------------
+# -- a model with no reference builds one, and the survey says so -------------
+# There is no fallback rule to label any more. Until 2026-11-04 a model
+# with no reference answered the withdrawn pair's question under the
+# `on_ring` key, so this very check existed to stop that passing
+# silently -- and on the real stores it was not hypothetical: JP_001 and
+# JP_002 both carried no reference.
 m_noref = CC.CycleModel.from_dict({**m.to_dict(), 'ring_ref': {}})
 origin2, _b, _d = CW.CellCycleWiring._settle_origin(
     None, m_noref, NAME, X_tr, fov_tr, cell_tr, None, True, None, 0.0)
-check('without a reference the survey names on_ring\'s fallback rule',
-      'no ring reference' in (origin2.get('subset_survey') or {}).get('on_ring', {}).get('rule', ''),
-      (origin2.get('subset_survey') or {}).get('on_ring', {}).get('rule', ''))
+rule2 = (origin2.get('subset_survey') or {}).get('on_ring', {}).get('rule', '')
+check('without a reference the survey says the reference was built here',
+      'reference built here' in rule2 and 'fallback' not in rule2 and NAME in m_noref.ring_ref,
+      rule2)
+check('and it is the same question as a model that came with one',
+      abs(origin2['subset_survey']['on_ring']['n']
+          - survey['on_ring']['n']) <= 0.05 * len(X_tr),
+      'n %d (with a reference: %d)' % (origin2['subset_survey']['on_ring']['n'],
+                                       survey['on_ring']['n']))
 
 
 print('')

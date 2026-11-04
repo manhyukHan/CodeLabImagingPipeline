@@ -93,13 +93,15 @@ def main():
     check('a row without a name is skipped', len(p.arcs()) == 2)
     g = p.gates()
     # EVERY VERDICT GATE IS OFF BY DEFAULT. min log BF_ring >= 0 used to be
-    # on, and that gate asks "is this cell NOT at the centre" -- the test
+    # on, and that gate asked "is this cell NOT at the centre" -- the test
     # ring_level replaced, so a new fit was inheriting a withdrawn criterion.
+    # It was removed from the codebase on 2026-11-04 and the panel now
+    # offers min ring_tail in its place, which is the gate that replaced it.
     check('every verdict gate is off by default',
           all(v is None for v in g.values()), str(g))
-    p.set_gates({'min_R': 0.6, 'min_bf_ring': None, 'max_radius': 1.5})
+    p.set_gates({'min_R': 0.6, 'min_ring_tail': None, 'max_radius': 1.5})
     g = p.gates()
-    check('gates round-trip, None = off', g['min_R'] == 0.6 and g['min_bf_ring'] is None and g['max_radius'] == 1.5
+    check('gates round-trip, None = off', g['min_R'] == 0.6 and g['min_ring_tail'] is None and g['max_radius'] == 1.5
           and g['min_fit_z'] is None and g['min_total'] is None and g['min_radius'] is None, str(g))
     p.set_gates({'min_radius': 0.5})
     cat_in = CC.assign(__import__('pandas').DataFrame({'theta_deg': [10.0, 10.0], 'radius': [0.3, 0.9]}), p.arcs(), p.gates())

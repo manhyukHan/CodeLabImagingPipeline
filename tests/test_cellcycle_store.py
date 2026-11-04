@@ -103,7 +103,7 @@ def main():
 
         print('the placement capsule and the model file')
         rows1 = CC.capsule_rows({'theta': np.radians([10.0, 350.0]), 'R': [0.9, 0.4],
-                                 'fit_z': [0.1, -2.5], 'bf_ring': [5.0, -1.0],
+                                 'fit_z': [0.1, -2.5],
                                  'radius': [1.0, 0.4], 'ring_level': [0.03, -0.12],
                                  'ring_tail': [0.6, 0.01]}, [1, 2], [120, 40])
         check('capsule rows carry every column', all(set(r) == set(CC.CAPSULE_COLUMNS) for r in rows1)
@@ -113,7 +113,7 @@ def main():
               set(bare[0]) == set(CC.CAPSULE_COLUMNS) and bare[0]['ring_tail'] != bare[0]['ring_tail'])
         A.write_fov_cellcycle(sp, 1, {'version': CC.CAPSULE_VERSION, 'model': 'm1', 'stamp': {}, 'rows': rows1})
         rows2 = CC.capsule_rows({'theta': np.radians([200.0]), 'R': [0.95], 'fit_z': [0.0],
-                                 'bf_ring': [3.0], 'radius': [1.1], 'ring_level': [0.04],
+                                 'radius': [1.1], 'ring_level': [0.04],
                                  'ring_tail': [0.7]}, [2], [80])
         A.write_fov_cellcycle(sp, 2, {'version': CC.CAPSULE_VERSION, 'model': 'm1', 'stamp': {}, 'rows': rows2})
         back = A.read_fov_cellcycle(sp, 1)
@@ -140,7 +140,7 @@ def main():
         check('lo == hi is the whole circle, still failing the unplaced cell',
               list(gate.PhaseRange(90, 90).mask(pop)) == [True, True, False, True])
         check('min_r demands the concentration', list(gate.PhaseRange(300, 60, min_r=0.5).mask(pop)) == [True, False, False, False])
-        check('CycleRange on bf_ring', list(gate.CycleRange('bf_ring', lo=0).mask(pop)) == [True, False, False, True])
+        check('CycleRange on ring_level', list(gate.CycleRange('ring_level', lo=0).mask(pop)) == [True, False, False, True])
         check('CycleRange on radius (inside the ring)', list(gate.CycleRange('radius', hi=0.6).mask(pop)) == [False, True, False, False])
         try:
             gate.CycleRange('theta_deg')
@@ -163,7 +163,7 @@ def main():
         A.write_cellcycle_model(sp, {'version': 1, 'model': {'K': 2},
                                      'categories': [{'name': 'G1', 'start_deg': 300, 'end_deg': 60},
                                                     {'name': 'G2M', 'start_deg': 100, 'end_deg': 250}],
-                                     'gates': {'min_R': 0.5, 'min_bf_ring': 0.0}})
+                                     'gates': {'min_R': 0.5, 'min_ring_tail': 0.05}})
         pop = popmod.Population.build(sp, [1, 2], jobs=1, mask_intensity=False)
         cat = pop.cellcycle.set_index(['fov', 'cell'])['category']
         check('arcs name the cells that pass every gate; a failed gate reads unassigned',
@@ -175,7 +175,7 @@ def main():
         d = gate.Condition([gate.CycleCategoryIn(['G2M'])]).to_dict()
         check('CycleCategoryIn round-trips', list(gate.Condition.from_dict(d).mask(pop)) == [False, False, False, True])
         a = CC.assign(pd.DataFrame({'theta_deg': [10.0, 10.0, np.nan], 'R': [0.9, 0.3, 0.9], 'fit_z': [0.0, 0.0, 0.0]}),
-                      [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5, 'min_bf_ring': 0.0})
+                      [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5, 'min_ring_tail': 0.05})
         check('assign: a gated verdict the table lacks fails every cell', list(a) == ['', '', ''])
         a = CC.assign(pd.DataFrame({'theta_deg': [10.0, 10.0, np.nan], 'R': [0.9, 0.3, 0.9]}),
                       [{'name': 'G1', 'start_deg': 300, 'end_deg': 60}], {'min_R': 0.5})

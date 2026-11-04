@@ -275,16 +275,19 @@ class CellCyclePanelUI(object):
         gates = QtWidgets.QGridLayout()
         self.MinRCheckBox = QtWidgets.QCheckBox('min R (posterior concentration)')
         self.MinRSpinBox = QtWidgets.QDoubleSpinBox(); self.MinRSpinBox.setRange(0.0, 1.0); self.MinRSpinBox.setSingleStep(0.05); self.MinRSpinBox.setValue(0.5)
-        self.MinBfCheckBox = QtWidgets.QCheckBox('min log BF_ring (ring vs centre)')
-        self.MinBfSpinBox = QtWidgets.QDoubleSpinBox(); self.MinBfSpinBox.setRange(-100.0, 100.0); self.MinBfSpinBox.setValue(0.0)
+        self.MinRingTailCheckBox = QtWidgets.QCheckBox('min ring_tail (on the ring, calibrated)')
+        self.MinRingTailCheckBox.setToolTip('Where the cell\'s ring_level falls among cells that truly sit on the ring, placed '
+                                            'where it is placed and read as deeply. 0.05 loses about 5% of true on-ring cells at '
+                                            'EVERY angle, a fold included -- which is what the withdrawn log BF_ring could not do.')
+        self.MinRingTailSpinBox = QtWidgets.QDoubleSpinBox(); self.MinRingTailSpinBox.setRange(0.0, 1.0); self.MinRingTailSpinBox.setSingleStep(0.01); self.MinRingTailSpinBox.setValue(0.05)
         self.MinFitZCheckBox = QtWidgets.QCheckBox('min fit_z (evidence vs training cells)')
         self.MinFitZSpinBox = QtWidgets.QDoubleSpinBox(); self.MinFitZSpinBox.setRange(-100.0, 100.0); self.MinFitZSpinBox.setValue(-3.0)
         self.MaxRadiusCheckBox = QtWidgets.QCheckBox('max centre ratio (plane radius)')
         self.MaxRadiusSpinBox = QtWidgets.QDoubleSpinBox(); self.MaxRadiusSpinBox.setRange(0.0, 100.0); self.MaxRadiusSpinBox.setValue(2.0)
         self.MinRadiusCheckBox = QtWidgets.QCheckBox('min centre ratio (inside the ring)')
-        self.MinRadiusCheckBox.setToolTip('The inside-the-ring gate the Bayes factor misses on deep cells: with ~1000 counts a cell '
-                                          'near the centre still beats the one centre point (JP_001 hydroxyurea: radius 0.28, '
-                                          'log BF_ring +0.8). 0.5 removes 96% of those and 31% of the cycling cells of that experiment.')
+        self.MinRadiusCheckBox.setToolTip('Plane radius: 1 = on the ring, 0 = its centre. Geometry, and centre-referenced, so it '
+                                          'has no meaning where the ring folds through its own centre -- ring_tail is the gate. '
+                                          '0.5 removes 96% of JP_001\'s hydroxyurea cells and 31% of that experiment\'s cycling ones.')
         self.MinRadiusSpinBox = QtWidgets.QDoubleSpinBox(); self.MinRadiusSpinBox.setRange(0.0, 100.0); self.MinRadiusSpinBox.setSingleStep(0.05); self.MinRadiusSpinBox.setValue(0.5)
         self.MinTotalGateCheckBox = QtWidgets.QCheckBox('min panel total')
         self.MinTotalGateSpinBox = QtWidgets.QDoubleSpinBox(); self.MinTotalGateSpinBox.setRange(0.0, 1e6); self.MinTotalGateSpinBox.setDecimals(0); self.MinTotalGateSpinBox.setValue(10.0)
@@ -293,20 +296,22 @@ class CellCyclePanelUI(object):
         # placed cell gets its arc's name, and nothing but a non-finite
         # angle takes it away.
         #
-        # min log BF_ring >= 0 used to be on. That gate asks "is this
+        # min log BF_ring >= 0 used to be on. That gate asked "is this
         # cell NOT at the centre of the circle", which a random
         # composition also passes -- it is the test ring_level replaced,
         # and leaving it on as a default quietly removed cells on a
-        # criterion the project had already withdrawn. The gates are
-        # still here, still stored with the model, and still applied at
-        # read time: turning one on is a decision an experiment makes
-        # for itself, with its own number, not something a new fit
-        # inherits.
-        for cb in (self.MinRCheckBox, self.MinBfCheckBox,
+        # criterion the project had already withdrawn. It was removed
+        # from the codebase outright on 2026-11-04 and its place here is
+        # now min ring_tail, the gate that answers the question it was
+        # reaching for. The gates are still here, still stored with the
+        # model, and still applied at read time: turning one on is a
+        # decision an experiment makes for itself, with its own number,
+        # not something a new fit inherits.
+        for cb in (self.MinRCheckBox, self.MinRingTailCheckBox,
                    self.MinFitZCheckBox, self.MaxRadiusCheckBox,
                    self.MinRadiusCheckBox, self.MinTotalGateCheckBox):
             cb.setChecked(False)
-        for i, (cb, sb) in enumerate(((self.MinRCheckBox, self.MinRSpinBox), (self.MinBfCheckBox, self.MinBfSpinBox),
+        for i, (cb, sb) in enumerate(((self.MinRCheckBox, self.MinRSpinBox), (self.MinRingTailCheckBox, self.MinRingTailSpinBox),
                                       (self.MinFitZCheckBox, self.MinFitZSpinBox), (self.MaxRadiusCheckBox, self.MaxRadiusSpinBox),
                                       (self.MinRadiusCheckBox, self.MinRadiusSpinBox),
                                       (self.MinTotalGateCheckBox, self.MinTotalGateSpinBox))):
@@ -617,7 +622,7 @@ class CellCyclePanelUI(object):
         """{gate key: value or None} over cellcycle.GATE_KEYS' keys the
         panel offers."""
         return {'min_R': self.MinRSpinBox.value() if self.MinRCheckBox.isChecked() else None,
-                'min_bf_ring': self.MinBfSpinBox.value() if self.MinBfCheckBox.isChecked() else None,
+                'min_ring_tail': self.MinRingTailSpinBox.value() if self.MinRingTailCheckBox.isChecked() else None,
                 'min_fit_z': self.MinFitZSpinBox.value() if self.MinFitZCheckBox.isChecked() else None,
                 'max_radius': self.MaxRadiusSpinBox.value() if self.MaxRadiusCheckBox.isChecked() else None,
                 'min_radius': self.MinRadiusSpinBox.value() if self.MinRadiusCheckBox.isChecked() else None,
@@ -626,7 +631,7 @@ class CellCyclePanelUI(object):
     def set_gates(self, gates):
         gates = gates or {}
         for key, cb, sb in (('min_R', self.MinRCheckBox, self.MinRSpinBox),
-                            ('min_bf_ring', self.MinBfCheckBox, self.MinBfSpinBox),
+                            ('min_ring_tail', self.MinRingTailCheckBox, self.MinRingTailSpinBox),
                             ('min_fit_z', self.MinFitZCheckBox, self.MinFitZSpinBox),
                             ('max_radius', self.MaxRadiusCheckBox, self.MaxRadiusSpinBox),
                             ('min_radius', self.MinRadiusCheckBox, self.MinRadiusSpinBox),

@@ -415,10 +415,10 @@ def test_cellcycle_joins_onto_the_cell_and_derives_the_phase():
     on the cell row or the export says nothing about the cell cycle."""
     capsule = {'version': 1, 'model': 'fit-2026-10-02', 'rows': [
         {'cell': 7, 'theta_deg': 20.0, 'R': 0.8, 'fit_z': 1.0,
-         'bf_ring': 0.5, 'ring_level': 0.4, 'ring_tail': 0.3,
+         'ring_level': 0.4, 'ring_tail': 0.3,
          'radius': 9.0, 'total': 120},
         {'cell': 8, 'theta_deg': 200.0, 'R': 0.1, 'fit_z': 1.0,
-         'bf_ring': 0.5, 'ring_level': 0.4, 'ring_tail': 0.3,
+         'ring_level': 0.4, 'ring_tail': 0.3,
          'radius': 9.0, 'total': 120}]}
     spec = {'model': 'fit-2026-10-02',
             'categories': [{'name': 'G1', 'start_deg': 350, 'end_deg': 90},

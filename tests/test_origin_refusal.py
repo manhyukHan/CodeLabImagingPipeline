@@ -126,7 +126,7 @@ check('the refusal records its subset and its n, which only successes used to',
       '%s on %s cells' % (origin.get('measured_on'), origin.get('n_cells')))
 check('and a REFUSAL surveys the other subsets too -- which is the one '
       'case where that record is the whole point',
-      set(origin.get('subset_survey') or {}) == {'radius', 'on_ring', 'pair', 'all'},
+      set(origin.get('subset_survey') or {}) == {'radius', 'on_ring', 'all'},
       ' | '.join('%s x%s' % (k, v['factor'])
                  for k, v in sorted((origin.get('subset_survey') or {}).items())))
 check('it says what 0 deg is instead', 'NOT division' in origin.get('zero_is', ''),

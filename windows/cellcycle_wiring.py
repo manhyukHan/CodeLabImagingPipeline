@@ -10,8 +10,8 @@ per-FOV store reads fan out to child processes (pmap) inside.
 
 What the stage persists (design 7, store contract of 2026-09-13):
   analysis/fov###/cellcycle.json   every placed cell of the FOV --
-                                   theta_deg, R, fit_z, bf_ring,
-                                   radius, total
+                                   theta_deg, R, fit_z, radius,
+                                   ring_level, ring_tail, total
   analysis/cellcycle_model.json    the one model with its provenance
                                    (sources -> genes, roles, proxy,
                                    alpha, training celltypes, bridges)
@@ -56,12 +56,13 @@ TOTAL_MIN_DROP = 1.8
 #: ("a figure that reads an angle off a population must filter on
 #: radius as well"), measured on JP_001's hydroxyurea arm.
 #:
-#: The four candidates disagree, and that was the reason to doubt all
-#: of them. On chr19's 11-round model they read x1.29 at 280 deg
-#: (on_ring, which is what 0f35d7e left in place), x1.52 at 260 (the
-#: withdrawn pair), x1.33 at 230 (radius) and x1.32 at 230 (every
-#: cell): a subset that moves the VERDICT and the ANGLE by 50 deg looks
-#: like a curve with no step in it rather than one right subset.
+#: The candidates disagreed, and that was the reason to doubt all of
+#: them. On chr19's 11-round model they read x1.29 at 280 deg (on_ring,
+#: which is what 0f35d7e left in place), x1.52 at 260 (the bf_ring
+#: pair, removed from the codebase 2026-11-04 and no longer surveyed),
+#: x1.33 at 230 (radius) and x1.32 at 230 (every cell): a subset that
+#: moves the VERDICT and the ANGLE by 50 deg looks like a curve with no
+#: step in it rather than one right subset.
 #:
 #: SO THE PROXY WAS THE SUSPECT, AND IT WAS MEASURED AND CLEARED.
 #: Candidates scored where 0 deg really is division, by G2/G1 against
@@ -98,19 +99,19 @@ def origin_candidates(m, name, X_tr, placed):
     Keyed so the one in use can be named in `measured_on` and the rest
     surveyed beside it under `subset_survey`.
     """
+    # on_ring BUILDS its reference when the model carries none (a spec
+    # stored before it existed), so the survey says where the reference
+    # came from rather than leaving the rule ambiguous. It used to fall
+    # back to the bf_ring pair here, which is why a model fitted before
+    # the reference existed surveyed a different question under this
+    # same key.
+    had_ref = name in m.ring_ref
     on_ring, _tail = m.on_ring(name, X_tr, placed=placed)
     radius = np.asarray(placed['radius'], float) >= ORIGIN_MIN_RADIUS
-    bf = np.asarray(placed['bf_ring'], float) >= 0.0
-    # on_ring falls back to the pre-ring_level pair when the model
-    # carries no reference (a spec stored before it existed), so the
-    # survey names the rule that actually ran rather than the
-    # calibrated one
-    ring_rule = ('on_ring, the ring_level tail' if name in m.ring_ref
-                 else 'on_ring, with no ring reference: the pre-ring_level pair')
+    ring_rule = ('on_ring, the ring_level tail' if had_ref
+                 else 'on_ring, the ring_level tail (reference built here)')
     return {'radius': (radius, 'radius >= %.2g' % ORIGIN_MIN_RADIUS),
             'on_ring': (on_ring, ring_rule),
-            'pair': (bf & radius,
-                     'the withdrawn pair (bf_ring >= 0 and radius >= %.2g)' % ORIGIN_MIN_RADIUS),
             'all': (np.ones(len(X_tr), bool), 'every training cell')}
 
 
@@ -173,7 +174,7 @@ class CellCycleWiring(QtCore.QObject):
         self.roles = None         # {gene: role}
         self.model = None         # CycleModel
         self.spec = None          # the model file payload
-        self.placed = None        # DataFrame: fov, cell, celltype, theta_deg, R, fit_z, bf_ring, radius, total
+        self.placed = None        # DataFrame: fov, cell, celltype, theta_deg, R, fit_z, radius, ring_level, ring_tail, total
         self.q = None             # (n, T) posteriors of the placed cells
         self.X = None             # (n, G) counts of the placed cells
         self.displayers = []
@@ -593,7 +594,8 @@ class CellCycleWiring(QtCore.QObject):
             'fov': [int(f) for f, _c in keys], 'cell': [int(c) for _f, c in keys],
             'celltype': [str(c) for c in ct],
             'theta_deg': np.degrees(placed['theta']) % 360.0, 'R': placed['R'],
-            'fit_z': placed['fit_z'], 'bf_ring': placed['bf_ring'], 'radius': placed['radius'],
+            'fit_z': placed['fit_z'], 'radius': placed['radius'],
+            'ring_level': placed['ring_level'], 'ring_tail': placed['ring_tail'],
             'total': X.sum(1)})
         self.panel.set_arcs(spec.get('categories') or [])
         self.panel.set_gates(spec.get('gates') or {})
@@ -1072,7 +1074,7 @@ class CellCycleWiring(QtCore.QObject):
             conds = list(dict.fromkeys(placed['celltype']))
             pal = FC.gene_palette(len(conds))
             specs = (('R', 'R (posterior concentration)', (0, 1)), ('fit_z', 'fit_z (vs training cells)', (-8, 4)),
-                     ('bf_ring', 'log BF_ring (ring vs centre)', (-10, 20)), ('radius', 'centre ratio (plane radius)', (0, 3)))
+                     ('ring_tail', 'ring_tail (on-ring, calibrated)', (0, 1)), ('radius', 'centre ratio (plane radius)', (0, 3)))
             for ax, (col, lab, rng) in zip(axes, specs):
                 for cond, c in zip(conds, pal):
                     v = placed.loc[placed['celltype'] == cond, col].to_numpy(float)

@@ -506,14 +506,15 @@ def fig_spectrum_and_totals(model, groups, q, totals, title=None, marks=None, sc
 # -- anchors across experiments ------------------------------------------------
 
 def anchor_table(entries, n_boot=500, seed=0):
-    """entries: [(experiment, condition, theta_deg, R, bf_ring, radius)].
+    """entries: [(experiment, condition, theta_deg, R, ring_tail, radius)].
     Per row: n, circular mean with a bootstrap 95% CI half-width of the
-    mean direction, concentration, median R, fraction log bf_ring > 0,
-    median radius."""
+    mean direction, concentration, median R, the on-ring fraction
+    (ring_tail >= 0.05, on_ring's own operating point), median
+    radius."""
     import pandas as pd
     rng = np.random.default_rng(seed)
     rows = []
-    for exp, cond, th, R, bf, rad in entries:
+    for exp, cond, th, R, tail, rad in entries:
         th = np.asarray(th, float)
         z = np.exp(1j * np.radians(th))
         mean = float(np.degrees(np.angle(z.mean())) % 360.0)
@@ -526,7 +527,7 @@ def anchor_table(entries, n_boot=500, seed=0):
                      'ci95_halfwidth_deg': round(float(np.percentile(np.abs(boots), 95)), 1),
                      'concentration': round(float(np.abs(z.mean())), 2),
                      'median_R': round(float(np.median(R)), 2),
-                     'frac_bf_ring_pos': round(float(np.mean(np.asarray(bf) > 0)), 2),
+                     'frac_on_ring': round(float(np.nanmean(np.asarray(tail, float) >= 0.05)), 2),
                      'median_radius': round(float(np.median(rad)), 2)})
     return pd.DataFrame(rows)
 

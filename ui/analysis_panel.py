@@ -301,7 +301,7 @@ class AnalysisPanelUI(object):
             'All three need the Cell Cycle stage to have placed the cells.')
         form.addRow('Kind:', self.PredicateKindComboBox)
         self.CycleMetricComboBox = QtWidgets.QComboBox()
-        self.CycleMetricComboBox.addItems(['R', 'fit_z', 'bf_ring', 'radius', 'total'])
+        self.CycleMetricComboBox.addItems(['R', 'fit_z', 'ring_level', 'ring_tail', 'radius', 'total'])
         form.addRow('Cycle metric:', self.CycleMetricComboBox)
         self.SourceAPicker = SourcePicker(allow_traced=True)
         form.addRow('Source (A):', self.SourceAPicker)

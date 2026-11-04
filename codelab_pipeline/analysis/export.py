@@ -273,12 +273,12 @@ CELLCYCLE_COLUMNS = (
     # gate reads '' here and still carries its angle below.
     'cellcycle_phase',
     'cellcycle_theta_deg', 'cellcycle_R', 'cellcycle_fit_z',
-    'cellcycle_bf_ring', 'cellcycle_ring_level', 'cellcycle_ring_tail',
+    'cellcycle_ring_level', 'cellcycle_ring_tail',
     'cellcycle_radius', 'cellcycle_total', 'cellcycle_model',
 )
 
 #: the capsule's own names, in the order CELLCYCLE_COLUMNS carries them
-_CELLCYCLE_FIELDS = ('theta_deg', 'R', 'fit_z', 'bf_ring', 'ring_level',
+_CELLCYCLE_FIELDS = ('theta_deg', 'R', 'fit_z', 'ring_level',
                      'ring_tail', 'radius', 'total')
 
 
