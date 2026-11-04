@@ -6,7 +6,8 @@ its ASSEMBLY (MainWindow._frame_resolver reads panel combos and session
 caches). Everything it needs is in the store:
 
   within    read_same_modality_matrices per modality, hybe lists from
-            the manifest-recorded layouts
+            aligned_hybes -- the FOV's OWN manifest record of what it
+            aligned, so nothing outside the project root is consulted
   bridges   read_cross_modal_matrix / _z per modality -- and their
             PRESENCE names the moving modalities, so the hub (`shared`)
             is the one modality without a stored bridge: the hub's own
@@ -29,7 +30,6 @@ import numpy as np
 from codelab_pipeline.alignment import frames
 from codelab_pipeline.io import analysis_store
 from codelab_pipeline.io import paths as store_paths
-from codelab_pipeline.io import preprocess
 
 
 def _modalities(storage_path):
@@ -50,13 +50,22 @@ def resolver_for(storage_path, fov, shared=None):
     if not mods:
         raise ValueError(f'no modalities in the manifest at {root}')
     within, bridges = {}, {}
-    for name, entry in mods.items():
+    for name in mods:
         sp_m = os.path.join(root, name)
-        layout = entry.get('layout_path')
-        hybes = []
-        if layout and os.path.exists(layout):
-            hybes = [r['folder']
-                     for r in preprocess.parse_experiment_layout(layout)]
+        # The FOV layer's hybe list comes from the STORE'S OWN record of
+        # what it aligned, never from the manifest's layout_path. That
+        # path points into the acquisition share -- outside the project
+        # root, and carrying whichever drive letter the last session to
+        # open the project had the NAS mounted on (Z: for one user, Q:
+        # for the next, the same file either way). Unreachable, it left
+        # the hybe list empty, hence the FOV layer empty, and
+        # to_shared's per-hybe identity fallback then dropped the entire
+        # FOV translation without a word: on the MP58 store that is 3116
+        # stored matrices ignored across 41 FOVs, up to 13.7 px of real
+        # translation per FOV arriving as fiducial drift, which the gate
+        # then refuses. aligned_hybes answers from the FOV's own
+        # manifest, so the whole assembly stays inside the root.
+        hybes = sorted(analysis_store.aligned_hybes(sp_m, int(fov)))
         fm = analysis_store.read_same_modality_matrices(sp_m, int(fov), hybes)
         within[name] = {h: H for (h, _m), H in fm.items()}
         H = analysis_store.read_cross_modal_matrix(sp_m, int(fov),
@@ -76,13 +85,32 @@ def resolver_for(storage_path, fov, shared=None):
     resolver = frames.FrameResolver(within, shared, bridges=bridges or None)
     # anchors: modality-level, snapshotted per cell at alignment time;
     # any carrying cell of the FOV testifies for the whole FOV
-    anchors = {}
+    anchors, residual_mods = {}, set()
     cells, _ = analysis_store.read_cells(storage_path, int(fov))
     for c in (cells or []):
         for m, H in (c.get('matrix_anchors') or {}).items():
             anchors.setdefault(m, np.asarray(H, float))
-        if len(anchors) == len(mods):
-            break
+        for (_h, m), e in (c.get('matrices') or {}).items():
+            if (e or {}).get('yx_is_residual'):
+                residual_mods.add(m)
+    # A cell residual is defined RELATIVE to its modality's FOV layer --
+    # it is precisely the part the FOV matrix did not account for. So an
+    # empty FOV layer does not mean "nothing to compose with": it means
+    # the composition cannot be formed at all, and consuming the
+    # residual alone returns a position short by the whole FOV
+    # translation. Refuse with the facts, the way
+    # polymer.layout_records refuses an unreachable layout, rather than
+    # hand back a resolver that answers confidently and wrongly.
+    broken = sorted(m for m in residual_mods if not within.get(m))
+    if broken:
+        raise ValueError(
+            f'FOV {int(fov)}: cells carry per-cell residual matrices for '
+            f'modality {broken}, but the store holds no FOV-level '
+            f'matrices for it, so the two legs cannot be composed and '
+            f'every mapped position would be short by the FOV '
+            f'translation. Re-run FOV alignment for this FOV, or check '
+            f'that {store_paths.analysis_fov_dir(storage_path, int(fov))} '
+            f'still holds its matrices__<modality>.h5.')
     resolver.anchors = anchors
     return resolver
 
