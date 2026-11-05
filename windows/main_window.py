@@ -40,6 +40,7 @@ from codelab_pipeline.io import paths
 from codelab_pipeline.io import preprocess
 from codelab_pipeline.io import analysis_store
 from codelab_pipeline.alignment import chain as alignment
+from codelab_pipeline.analysis import polymer
 from codelab_pipeline.alignment import frames
 from codelab_pipeline.alignment import spot_mapper
 from codelab_pipeline.alignment.convention import as_cv2
@@ -1007,7 +1008,8 @@ class ChromatinTracingWorker(QtCore.QThread):
     finished_ok = QtCore.pyqtSignal(dict)  # {(storage_path, fov): [AnAllele, ...]}
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels, hybe_readout_channels, modality,
+    def __init__(self, jobs, hybes, reference_hybe, hybe_fiducial_channels,
+                 hybe_readout_channels, readout_map, modality,
                 fov_matrices_by_fov, cell_lookup, max_fiducial_drift, spad, z_window,
                 fiducial_params, readout_params, resolver_by_fov=None,
                 max_fiducial_drift_z=22.0, z_boundary_trim=0, workers=None,
@@ -1049,6 +1051,12 @@ class ChromatinTracingWorker(QtCore.QThread):
         self.reference_hybe = reference_hybe
         self.hybe_fiducial_channels = hybe_fiducial_channels
         self.hybe_readout_channels = hybe_readout_channels
+        # THE SETTLED READOUT MAP, stamped onto every allele this worker
+        # traces. Plain data (it pickles), and read once here rather
+        # than per allele: it is the same map for the whole run, and a
+        # run whose alleles disagreed about what their bins ARE would be
+        # the thing stamping exists to prevent.
+        self.readout_map = readout_map
         self.modality = modality
         self.fov_matrices_by_fov = fov_matrices_by_fov
         self.cell_lookup = cell_lookup
@@ -1097,6 +1105,7 @@ class ChromatinTracingWorker(QtCore.QThread):
             allele = futures[future]
             try:
                 tracing_v2.apply_allele_result(allele, future.result())
+                polymer.stamp_readout_bins(allele, self.readout_map)
             except Exception as e:
                 self.n_failed += 1
                 done += 1
@@ -1174,6 +1183,8 @@ class ChromatinTracingWorker(QtCore.QThread):
                                 fiducial_params=self.fiducial_params, readout_params=self.readout_params,
                                 resolver=self.resolver_by_fov.get(fov),
                                 z_boundary_trim=self.z_boundary_trim, executor=executor)
+                            polymer.stamp_readout_bins(allele,
+                                                       self.readout_map)
                         except Exception as e:
                             self.n_failed += 1
                             done += 1
@@ -8770,6 +8781,46 @@ class MainWindow(QtWidgets.QMainWindow):
                 hybe_readout_channels[folder] = have
         return hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe
 
+    def _chromatin_readout_map(self):
+        """The readout map a trace should stamp onto its alleles.
+
+        The one the panel SETTLED when it has settled one -- that is
+        what settling it is for -- and the layout's own otherwise, read
+        through the activated channels so the map describes exactly the
+        bins that run. None when neither is available, which
+        stamp_readout_bins reads as "do not stamp" rather than as an
+        empty map: a trace with no stamp resolved its bins at read time,
+        which is honest, where a stamp saying nothing would not be.
+        """
+        chp = self.ui.ChromatinTracingPanel
+        text = ''
+        try:
+            text = chp.ReadoutMapLineEdit.text().strip()
+        except Exception:                                   # noqa: BLE001
+            text = ''
+        records, modality = [], None
+        try:
+            checked = chp.checked_hybes()
+            mods = {m for _f, m in checked}
+            modality = mods.pop() if len(mods) == 1 else None
+            records = list((self.hybe_records_by_modality or {}).get(
+                modality) or [])
+        except Exception:                                   # noqa: BLE001
+            records = []
+        chosen = [c for c in chp.active_readout_channels() if c != 'auto']
+        try:
+            return polymer.settled_map(
+                text, records=records,
+                channels=[int(c) for c in chosen] or None,
+                modality=modality)
+        except Exception as exc:                            # noqa: BLE001
+            # NOT fatal and NOT silent: a map that cannot be built is a
+            # trace without a stamp, which is the state every trace so
+            # far is already in.
+            self.log(f'chromatin tracing: readout map unavailable, so the '
+                     f'trace will not record its bins -- {exc}')
+            return None
+
     def _chromatin_storage_path_and_modality(self):
         """
         (modality, storage_path) resolved from the Hybes Involved
@@ -9405,6 +9456,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     result, debug = pool.submit(
                         tracing_v2.allele_task_with_debug, payload).result()
                     tracing_v2.apply_allele_result(allele, result)
+                    polymer.stamp_readout_bins(
+                        allele, self._chromatin_readout_map())
                     return debug
                 _, debug = tracing_v2.trace_allele(
                     full_params.get('engine'),
@@ -9417,6 +9470,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     fiducial_params=fiducial_params, readout_params=readout_params, collect_debug=True,
                     resolver=resolver,
                     z_boundary_trim=full_params['z_boundary_trim'], executor=pool)
+                polymer.stamp_readout_bins(
+                    allele, self._chromatin_readout_map())
             finally:
                 if pool is not None:
                     pool.shutdown(wait=True, cancel_futures=True)
@@ -10282,7 +10337,9 @@ class MainWindow(QtWidgets.QMainWindow):
         chp.ProgressBar.setValue(0)
         chp.FitAllFovsPushButton.setEnabled(False)
         self._chromatin_worker = ChromatinTracingWorker(jobs, hybes, reference_hybe, hybe_fiducial_channels,
-                                                         hybe_readout_channels, modality,
+                                                         hybe_readout_channels,
+                                                         self._chromatin_readout_map(),
+                                                         modality,
                                                          fov_matrices_by_fov, self._find_cell_by_id,
                                                          full_params['max_fiducial_drift'], full_params['spad'],
                                                          full_params['z_window'], fiducial_params, readout_params,

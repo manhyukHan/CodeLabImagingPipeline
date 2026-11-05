@@ -276,6 +276,65 @@ def key_hybe(key):
     return split_key(key)[0]
 
 
+def settled_map(text='', records=None, channels=None, modality=None,
+                declared=None):
+    """The readout map a run should use.
+
+    The SETTLED one when the panel has settled it -- that is the whole
+    point of settling it -- and the layout's own otherwise. Returns None
+    when neither is available, which a caller reads as "do not stamp",
+    not as "an empty map".
+    """
+    text = str(text or '').strip()
+    if text:
+        return readout_map.ReadoutMap.from_text(text)
+    if not records:
+        return None
+    return readout_map_for(records, channels=channels, modality=modality,
+                           declared=declared)
+
+
+def stamp_readout_bins(allele, rmap):
+    """Record on the allele what each of ITS OWN keys is.
+
+    {key: {'rindex', 'dtype', 'pindex'}} for every key the trace
+    actually produced, read out of the settled map once, here, and
+    stored. A trace then says what it is without its map being resolved
+    again, and editing the map afterwards cannot silently re-label
+    measurements already taken.
+
+    A bare key resolves through ReadoutMap.for_hybe, and only where the
+    round has ONE bin -- that is the rule that let the key be bare. A
+    key the map does not describe is left out rather than guessed: the
+    absence says "this map does not cover that round", which is a
+    different thing from a bin with no identity.
+    """
+    if rmap is None:
+        return allele
+    get = ((lambda n: allele.get(n)) if isinstance(allele, dict)
+           else (lambda n: getattr(allele, n, None)))
+    keys = set()
+    for name in ('polymer_adj', 'polymer_raw', 'fiducial_trace_adj',
+                 'fiducial_trace_raw', 'rejected_hybes', 'fiducial_drift'):
+        keys.update(get(name) or {})
+    bins = {}
+    for k in keys:
+        hybe, ch = split_key(k)
+        if ch is not None:
+            b = rmap.of(hybe, ch)
+        else:
+            have = rmap.for_hybe(hybe)
+            b = have[0] if len(have) == 1 else None
+        if b is not None:
+            bins[k] = {'rindex': int(b.rindex), 'dtype': str(b.dtype),
+                       'pindex': int(b.pindex)}
+    if isinstance(allele, dict):
+        allele['readout_bins'] = bins
+    else:
+        allele.readout_bins = bins
+    return allele
+
+
 def lookup_bin(d, tries):
     """(key_that_hit, value) for one slot, or (None, None).
 

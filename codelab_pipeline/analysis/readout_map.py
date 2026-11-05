@@ -417,6 +417,18 @@ class ReadoutMap(object):
                 if b.pindex != NOT_A_BIN}
         return offs.pop() if len(offs) == 1 else None
 
+    def for_hybe(self, hybe):
+        """Every bin of one round, in pindex order then channel.
+
+        A BARE key names a round, and the rule that lets it stay bare is
+        that the round has exactly one bin. So a bare key resolves
+        through this, and more than one answer means the key cannot be
+        bare -- which is the same check bin_lookup_keys makes.
+        """
+        return sorted((b for b in self._by_key.values()
+                       if b.hybe == str(hybe)),
+                      key=lambda b: (b.pindex, b.channel))
+
     def channels(self):
         return sorted({b.channel for b in self._by_key.values()})
 

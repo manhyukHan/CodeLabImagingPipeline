@@ -161,6 +161,56 @@ def round_trip():
           str(out['fiducial_trace_adj']))
 
 
+def stamping():
+    print('\nthe settled map is stamped onto what the trace produced')
+    from codelab_pipeline.analysis.readout_map import ReadoutMap
+    m = ReadoutMap.from_text(
+        'slots=52,Hyb_001|635|1|H|0,Hyb_002|635|2|H|1,'
+        'Hyb_001|747|51|H|50,Rep_001|635|1|R|-1')
+    a = AnAllele()
+    a.polymer_adj = {('Hyb_001', 635): [(1., 1., 1., 9.)],
+                     ('Hyb_001', 747): [(9., 9., 9., 9.)]}
+    a.rejected_hybes = {('Hyb_002', 635): 'fiducial not found'}
+    a.fiducial_trace_adj = {'Rep_001': (0., 0., 0., 1., 1.)}
+    P.stamp_readout_bins(a, m)
+    check('every key the trace made is described',
+          sorted(a.readout_bins, key=str)
+          == [('Hyb_001', 635), ('Hyb_001', 747), ('Hyb_002', 635),
+              'Rep_001'],
+          str(sorted(a.readout_bins, key=str)))
+    check('each with its own locus and place',
+          a.readout_bins[('Hyb_001', 747)]
+          == {'rindex': 51, 'dtype': 'H', 'pindex': 50},
+          str(a.readout_bins[('Hyb_001', 747)]))
+    check('a QC round is described too, and is not a bin',
+          a.readout_bins['Rep_001'] == {'rindex': 1, 'dtype': 'R',
+                                        'pindex': -1})
+    check('a rejected bin still says what it was',
+          a.readout_bins[('Hyb_002', 635)]['pindex'] == 1)
+
+    print('  a bare key resolves only where the round has ONE bin')
+    b = AnAllele()
+    b.polymer_adj = {'Hyb_001': [(1., 1., 1., 9.)],
+                     'Hyb_002': [(2., 2., 2., 9.)]}
+    P.stamp_readout_bins(b, m)
+    check('Hyb_002 has one bin, so its bare key resolves',
+          b.readout_bins.get('Hyb_002') == {'rindex': 2, 'dtype': 'H',
+                                            'pindex': 1},
+          str(b.readout_bins))
+    check('Hyb_001 has two, so a bare key is left undescribed, not guessed',
+          'Hyb_001' not in b.readout_bins, str(b.readout_bins))
+
+    print('  and no map means no stamp, not an empty one')
+    c = AnAllele()
+    c.polymer_adj = {'Hyb_001': [(1., 1., 1., 9.)]}
+    c.readout_bins = {'Hyb_001': {'rindex': 7, 'dtype': 'H', 'pindex': 6}}
+    P.stamp_readout_bins(c, None)
+    check('an existing stamp is left alone',
+          c.readout_bins == {'Hyb_001': {'rindex': 7, 'dtype': 'H',
+                                         'pindex': 6}},
+          str(c.readout_bins))
+
+
 def main():
     normalising()
     keys()
@@ -168,6 +218,7 @@ def main():
     builder_source()
     v1_refuses()
     round_trip()
+    stamping()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     return 1 if FAIL else 0
 
