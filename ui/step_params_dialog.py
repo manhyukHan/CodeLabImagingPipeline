@@ -82,9 +82,10 @@ MEASURED_NOT_SET = {
     },
 }
 
-#: the rounds picker edits this one, so the generated form must not also
-#: offer it as a line of text
-PICKER_PARAMS = {('localization_run', 'rounds')}
+#: the rounds and channel pickers edit these, so the generated form must
+#: not also offer them as lines of text
+PICKER_PARAMS = {('localization_run', 'rounds'),
+                 ('localization_run', 'channels')}
 
 #: section -> (the version parameter, the panel attribute holding that
 #: panel's OWN per-engine QStackedWidget). Which parameter belongs to
@@ -225,7 +226,10 @@ def summary_line(mw, step):
         try:
             chosen = mw.ui.PipelinePanel.LocalizationRoundsLineEdit.text().strip()
             n = len([c for c in chosen.split(',') if c.strip()])
-            bits.append(f'{n} round(s)' if chosen else 'all rounds')
+            bits.append('no rounds' if chosen == S.NONE_CHOSEN
+                        else f'{n} round(s)' if chosen else 'all rounds')
+            ch = mw.ui.PipelinePanel.LocalizationChannelsLineEdit.text().strip()
+            bits.append('ch %s' % ch if ch else 'default channels')
         except Exception:                                   # noqa: BLE001
             pass
     line = ', '.join(bits)
@@ -234,16 +238,96 @@ def summary_line(mw, step):
     return line
 
 
-class RoundsPicker(QtWidgets.QWidget):
-    """Which localization rounds the next run touches.
+class ChannelPicker(QtWidgets.QWidget):
+    """Which channels spot localization looks in.
 
-    Shows every expected target (status.localization_targets), grouped by
-    modality. ALL CHECKED IS STORED AS AN EMPTY STRING, not as the 29
-    names: empty keeps following the config, so a tracing round added
-    later is localized without anyone opening this dialog again.
+    A SELECTION over every channel the acquisition carries, the fiducial
+    channel included. Which channel an alignment happens to use is a
+    different question: on MAZ the 555 fiducial is the beads whose spots
+    we wanted, so excluding it was a wrong answer rather than a tidy
+    default. The step had no selector at all and derived the channel as
+    "every one that is not a fiducial", which on a 555/635/747
+    acquisition localizes all of them with nowhere to say otherwise.
+
+    The default set (status.default_localization_channels) is exactly
+    that old derivation, so a project nobody has touched keeps the
+    expectation it had -- but it is shown checked, as a choice, instead
+    of applied out of sight. Checked == the default stores as empty, so
+    the step keeps following the config.
     """
 
-    def __init__(self, targets, chosen, parent=None):
+    def __init__(self, channels, default, chosen, parent=None):
+        super().__init__(parent)
+        self.boxes = []
+        self.default = sorted({int(c) for c in (default or [])})
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        want = sorted({int(c) for c in (chosen or [])}) or self.default
+        for ch in sorted({int(c) for c in (channels or [])}):
+            cb = QtWidgets.QCheckBox(str(ch))
+            cb.key = int(ch)
+            cb.setChecked(ch in want)
+            if ch not in self.default:
+                cb.setToolTip('not in the step\'s default set -- some '
+                              'round uses this channel as its fiducial, '
+                              'which does not stop its spots being found')
+                cb.setStyleSheet(f'color: {GREY};')
+            self.boxes.append(cb)
+            row.addWidget(cb)
+        row.addStretch(1)
+        outer.addLayout(row)
+        self.Note = QtWidgets.QLabel('')
+        self.Note.setWordWrap(True)
+        self.Note.setStyleSheet(f'color: {GREY};')
+        outer.addWidget(self.Note)
+        for cb in self.boxes:
+            cb.toggled.connect(self._note)
+        self._note()
+
+    def _note(self):
+        picked = self.value_list()
+        if not picked:
+            self.Note.setText('No channel selected — the rounds that name '
+                              'no channel of their own are not localized.')
+        elif picked == self.default:
+            self.Note.setText('The step\'s default set, and it keeps '
+                              'following the config.')
+        else:
+            self.Note.setText('Chosen outright: %s.'
+                              % ', '.join(str(c) for c in picked))
+
+    def value_list(self):
+        return sorted(cb.key for cb in self.boxes if cb.isChecked())
+
+    def value(self):
+        """'' when the default set is checked exactly, else '635,747'."""
+        picked = self.value_list()
+        if picked == self.default:
+            return ''
+        return ','.join(str(c) for c in picked)
+
+
+class RoundsPicker(QtWidgets.QWidget):
+    """Which localization rounds and CHANNELS the next run touches.
+
+    Shows everything the acquisition carries
+    (status.localization_choices) -- every round at every non-fiducial
+    channel -- with the config's expectation
+    (status.localization_targets) checked. The two differ, and offering
+    only the expectation is what made the channel unselectable: a second
+    channel the layout carries could be unchecked but never added, so a
+    round could only be localized at the wavelength some other tab had
+    activated.
+
+    THE EXPECTATION CHECKED EXACTLY IS STORED AS AN EMPTY STRING, not as
+    the 29 names: empty keeps following the config, so a tracing round
+    added later is localized without anyone opening this dialog again.
+    Anything else is stored outright, and the run then does that.
+    """
+
+    def __init__(self, choices, chosen, expected=None, parent=None):
         super().__init__(parent)
         self.boxes = []
         outer = QtWidgets.QVBoxLayout(self)
@@ -253,6 +337,16 @@ class RoundsPicker(QtWidgets.QWidget):
             bits = [b.strip() for b in part.split('|')]
             if len(bits) >= 3 and bits[2].isdigit():
                 keep.add((bits[0], bits[1], int(bits[2])))
+        targets = choices
+        # expected=None means nobody stated one, and then everything
+        # offered IS the expectation -- the state before the two lists
+        # were separated, and what a caller with no project to read
+        # still gets.
+        self.expected = ({(m, h, int(c)) for m, rounds in
+                          (expected or {}).items() for h, c in rounds}
+                         if expected is not None
+                         else {(m, h, int(c)) for m, rounds in
+                               (choices or {}).items() for h, c in rounds})
 
         inner = QtWidgets.QWidget()
         grid = QtWidgets.QGridLayout(inner)
@@ -275,9 +369,17 @@ class RoundsPicker(QtWidgets.QWidget):
             grid.addWidget(head, row, 0, 1, ncol)
             row += 1
             for hybe, ch in rounds:
+                key = (modality, hybe, int(ch))
                 cb = QtWidgets.QCheckBox(f'{hybe} · ch{ch}')
-                cb.setChecked(not keep or (modality, hybe, int(ch)) in keep)
-                cb.key = (modality, hybe, int(ch))
+                # an EXPECTED round is marked, so the extra channels the
+                # acquisition carries read as additions rather than as
+                # rounds someone forgot to tick
+                if key not in self.expected:
+                    cb.setStyleSheet(f'color: {GREY};')
+                    cb.setToolTip('the config does not expect this round '
+                                  '-- ticking it localizes it anyway')
+                cb.setChecked(key in keep if keep else key in self.expected)
+                cb.key = key
                 self.boxes.append(cb)
                 grid.addWidget(cb, row, col)
                 col += 1
@@ -292,7 +394,8 @@ class RoundsPicker(QtWidgets.QWidget):
         outer.addWidget(scroll)
 
         bar = QtWidgets.QHBoxLayout()
-        for text, fn in (('All', lambda: self._set_all(True)),
+        for text, fn in (('Expected', self._set_expected),
+                         ('All', lambda: self._set_all(True)),
                          ('None', lambda: self._set_all(False)),
                          ('Clear toeholds', self._clear_toeholds)):
             b = QtWidgets.QPushButton(text)
@@ -311,23 +414,52 @@ class RoundsPicker(QtWidgets.QWidget):
         for cb in self.boxes:
             cb.setChecked(on)
 
+    def _set_expected(self):
+        """Back to what the config states -- the stored empty value."""
+        for cb in self.boxes:
+            cb.setChecked(cb.key in self.expected)
+
     def _clear_toeholds(self):
         for cb in self.boxes:
             if cb.key[1].lower().startswith('toe'):
                 cb.setChecked(False)
 
     def _count(self):
-        n = sum(1 for cb in self.boxes if cb.isChecked())
+        picked = {cb.key for cb in self.boxes if cb.isChecked()}
         total = len(self.boxes)
+        if picked == self.expected:
+            self.CountLabel.setText(
+                f'{len(picked)} of {total} — as the config states, and the '
+                f'list follows it')
+            return
+        if not picked:
+            self.CountLabel.setText(
+                f'0 of {total} — this step localizes nothing')
+            return
+        extra = len(picked - self.expected)
         self.CountLabel.setText(
-            f'{n} of {total} — all rounds, and the list follows the config'
-            if n == total else f'{n} of {total} selected')
+            f'{len(picked)} of {total} selected'
+            + (f', {extra} the config does not expect' if extra else ''))
 
     def value(self):
-        """'' when everything is checked, else 'MOD|HYBE|CH,...'."""
+        """'' when the config's own expectation is checked exactly, else
+        'MOD|HYBE|CH,...'.
+
+        Empty is not "all": it means FOLLOW THE CONFIG, so a tracing
+        round added later is localized without anyone reopening this.
+        Storing the names instead would freeze today's list.
+
+        NOTHING checked is NONE_CHOSEN, not empty. An empty string from
+        an empty selection is how pressing `None` came to mean `All`:
+        the value fell back to "follow the config", so the step ran
+        every expected round and the button it was asked to obey said
+        nothing about it.
+        """
         picked = [cb for cb in self.boxes if cb.isChecked()]
-        if len(picked) == len(self.boxes):
+        if {cb.key for cb in picked} == self.expected:
             return ''
+        if not picked:
+            return S.NONE_CHOSEN
         return ','.join('%s|%s|%d' % cb.key for cb in picked)
 
 
@@ -444,7 +576,7 @@ class StepParamsDialog(QtWidgets.QDialog):
     """The parameters of one step, applied to the tabs they belong to."""
 
     def __init__(self, mw, step, note='', plan_line='', targets=None,
-                 parent=None):
+                 choices=None, project=None, parent=None):
         super().__init__(parent or mw)
         from ui.pipeline_panel import STEP_LABELS
         self.mw, self.step = mw, step
@@ -453,6 +585,7 @@ class StepParamsDialog(QtWidgets.QDialog):
         self._fields = []          # (section, param, editor, original)
         self._machine = []         # (src widget, editor)
         self.rounds = None
+        self.channels = None
         self.names = None
         self.training = None
 
@@ -507,12 +640,49 @@ class StepParamsDialog(QtWidgets.QDialog):
             inner.addWidget(box)
 
         if step == 'localization':
+            # THE CHANNEL SELECTOR, first: it decides what the rounds
+            # list below even contains for the derived rounds
+            cbox = QtWidgets.QGroupBox('Channels to localize')
+            clay = QtWidgets.QVBoxLayout(cbox)
+            if project is not None:
+                try:
+                    all_ch = sorted({c for v in
+                                     S.localization_channels(project).values()
+                                     for c in v})
+                    default = sorted({c for v in
+                                      S.default_localization_channels(
+                                          project).values() for c in v})
+                    self.channels = ChannelPicker(
+                        all_ch, default,
+                        S.chosen_localization_channels(project))
+                    clay.addWidget(self.channels)
+                except Exception as exc:                    # noqa: BLE001
+                    msg = QtWidgets.QLabel(
+                        'Channels unavailable: %s' % exc)
+                    msg.setWordWrap(True)
+                    msg.setStyleSheet(f'color: {GREY};')
+                    clay.addWidget(msg)
+            else:
+                msg = QtWidgets.QLabel(
+                    'No project read yet — press Refresh status first.')
+                msg.setWordWrap(True)
+                msg.setStyleSheet(f'color: {GREY};')
+                clay.addWidget(msg)
+            inner.addWidget(cbox)
+
             box = QtWidgets.QGroupBox('Rounds to localize')
             lay = QtWidgets.QVBoxLayout(box)
-            flat = {m: list(v) for m, v in (targets or {}).items() if v}
+            # the CHOICES, not the expectation: every round at every
+            # non-fiducial channel the acquisition carries, so a second
+            # channel can be ADDED and not only removed. Falls back to
+            # the expectation when the tab could not read the project,
+            # which is the pre-Refresh state the message below covers.
+            flat = {m: list(v) for m, v
+                    in (choices or targets or {}).items() if v}
             if flat:
                 field = mw.ui.PipelinePanel.LocalizationRoundsLineEdit
-                self.rounds = RoundsPicker(flat, field.text())
+                self.rounds = RoundsPicker(flat, field.text(),
+                                           expected=targets or {})
                 lay.addWidget(self.rounds)
             else:
                 msg = QtWidgets.QLabel(
@@ -776,6 +946,12 @@ class StepParamsDialog(QtWidgets.QDialog):
         self.mw._apply_config_params(self.values())
         for src, ed in self._machine:
             src.setValue(ed.value())
+        if self.channels is not None:
+            field = self.mw.ui.PipelinePanel.LocalizationChannelsLineEdit
+            value = self.channels.value()
+            if value != field.text():
+                field.setText(value)
+                changed.append('localization_run/channels')
         if self.rounds is not None:
             field = self.mw.ui.PipelinePanel.LocalizationRoundsLineEdit
             value = self.rounds.value()
@@ -802,10 +978,11 @@ class StepParamsDialog(QtWidgets.QDialog):
         return ', '.join(changed)
 
 
-def open_for(mw, step, note='', plan_line='', targets=None):
+def open_for(mw, step, note='', plan_line='', targets=None, choices=None,
+             project=None):
     """Show the dialog; returns the log line of what changed, or None."""
     dlg = StepParamsDialog(mw, step, note=note, plan_line=plan_line,
-                           targets=targets)
+                           targets=targets, choices=choices, project=project)
     if dlg.exec_() != QtWidgets.QDialog.Accepted:
         return None
     return dlg.apply()

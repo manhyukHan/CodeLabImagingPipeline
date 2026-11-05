@@ -763,7 +763,7 @@ class PipelineTab:
         step = self.panel.step_at(row)
         if step is None or self.runner.running:
             return
-        targets = None
+        targets = choices = None
         project = self.project
         if step == 'localization':
             if project is None:
@@ -772,7 +772,13 @@ class PipelineTab:
                 except Exception:                               # noqa: BLE001
                     project = None
             if project is not None:
+                # TWO LISTS. targets is what the config expects and the
+                # status grid reads; choices is every round at every
+                # non-fiducial channel the acquisition carries, which is
+                # what the picker offers -- otherwise a second channel
+                # could only be unchecked, never added.
                 targets = S.localization_targets(project)
+                choices = S.localization_choices(project)
         plan_line = ''
         if self.rows is not None:
             plan = S.plan(self.rows, self.panel.policies())
@@ -781,7 +787,8 @@ class PipelineTab:
             plan_line = ('This run: %s · %d FOV(s)' % (pol, n) if pol != 'skip'
                          else 'This run: skipped')
         changed = SPD.open_for(self.mw, step, note=PP.STEP_NOTES[step],
-                               plan_line=plan_line, targets=targets)
+                               plan_line=plan_line, targets=targets,
+                               choices=choices, project=project)
         if changed is None:
             return
         self.refresh_settings()

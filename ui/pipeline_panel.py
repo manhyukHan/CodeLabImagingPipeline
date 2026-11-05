@@ -122,12 +122,24 @@ class PipelinePanelUI:
             'A spot is written only if the model gives it at least this '
             'p_exist. The floor is applied AT WRITE TIME, so lowering it '
             'later means re-running the round.')
+        self.LocalizationChannelsLineEdit = QtWidgets.QLineEdit()
+        self.LocalizationChannelsLineEdit.setPlaceholderText(
+            'every non-fiducial channel')
+        self.LocalizationChannelsLineEdit.setToolTip(
+            'Readout channel(s) to localize the DERIVED rounds at, comma '
+            'separated (e.g. 635 or 635,747). Empty means every '
+            'non-fiducial channel the round carries, which is what this '
+            'did before it could be stated. It governs only the rounds '
+            'nobody named a channel for -- the countable readouts. The '
+            'anchor round, the cell-cycle genes and the tracing rounds '
+            'carry their own channel and are left as they say.')
         self.LocalizationPadSpinBox = QtWidgets.QSpinBox()
         self.LocalizationPadSpinBox.setRange(0, 64)
         self.LocalizationPadSpinBox.setValue(_BATCH_DEFAULTS[1])
         self.LocalizationPadSpinBox.setToolTip(
             'Half-width of the crop the model sees around each candidate.')
         for w in (self.LocalizationRoundsLineEdit,
+                  self.LocalizationChannelsLineEdit,
                   self.LocalizationMinPExistSpinBox,
                   self.LocalizationPadSpinBox):
             w.setVisible(False)

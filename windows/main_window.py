@@ -14355,6 +14355,14 @@ One PNG PER MODALITY: each modality has its own reference and its
             # Only the run is narrowed -- the status grid keeps
             # expecting every target (status.localization_run_targets).
             'rounds': ('PipelinePanel', 'LocalizationRoundsLineEdit'),
+            # which READOUT CHANNELS the derived rounds are expected at.
+            # The other contributors to the expectation name a channel
+            # outright -- the anchor round, the cell-cycle genes, the
+            # tracing tab's activation -- but a countable readout round
+            # named none, so it was expected at EVERY non-fiducial
+            # channel it carries. That is a derivation, not a choice,
+            # and on a 555/635/747 acquisition it localizes all of them.
+            'channels': ('PipelinePanel', 'LocalizationChannelsLineEdit'),
         },
         'cellcycle': {
             'fov_list': ('CellCyclePanel', 'FovListLineEdit'),

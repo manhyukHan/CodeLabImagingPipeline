@@ -232,13 +232,112 @@ def localization_targets(project):
         bits = part.strip().split('|')
         if len(bits) >= 3 and bits[2].strip().isdigit():
             add(bits[0].strip(), bits[1].strip(), int(bits[2]))
+    # THE DERIVED ROUNDS, and the only channel in this whole function
+    # nobody states. A countable readout round carries no channel of its
+    # own, so it was expected at every channel that was not a fiducial --
+    # a derivation dressed as a choice, and on a 555/635/747 acquisition
+    # it localizes all of them with nowhere to say otherwise. The
+    # localization step has a channel SELECTOR now; this follows it, and
+    # falls back to the old non-fiducial set only while nothing is
+    # stored, so no store's status moves until someone chooses.
+    want = chosen_localization_channels(project)
+    default = default_localization_channels(project)
     for name, m in project['modalities'].items():
+        allowed = want or default.get(name) or []
         for r in m['records']:
             if CC.countable_round(r.get('readout_name')):
-                fid = r.get('fiducial_channel')
                 for ch in r.get('channels') or []:
-                    if fid is None or int(ch) != int(fid):
+                    if int(ch) in allowed:
                         add(name, r['folder'], ch)
+    return out
+
+
+#: localization_run/rounds for "nothing", as against '' for "follow the
+#: config". The two are not the same answer and one string cannot carry
+#: both -- see localization_run_targets.
+NONE_CHOSEN = 'none'
+
+
+def localization_channels(project):
+    """{modality: [channel]} -- every channel the acquisition carries.
+
+    THE FIDUCIAL IS IN IT. Spot localization finds spots in an image;
+    which channel an alignment happens to use is a different question
+    and not this one's business. On MAZ the 555 fiducial IS the beads
+    whose spots we wanted, so excluding it was not a safe simplification
+    but a wrong answer.
+    """
+    out = {}
+    for name, m in project['modalities'].items():
+        chans = []
+        for r in m['records']:
+            for ch in r.get('channels') or []:
+                if int(ch) not in chans:
+                    chans.append(int(ch))
+        out[name] = sorted(chans)
+    return out
+
+
+def chosen_localization_channels(project):
+    """[channel] the localization step is set to, or [] for "unset".
+
+    The config attribute is `localization_run/channels`, comma
+    separated. It is a SELECTION, over every channel the acquisition
+    has -- not a rule derived from which channel carries the fiducial.
+    """
+    params = project.get('params', {}) or {}
+    raw = str((params.get('localization_run', {}) or {}).get(
+        'channels', '') or '').replace('|', ',')
+    out = []
+    for c in raw.split(','):
+        c = c.strip()
+        if c.isdigit() and int(c) not in out:
+            out.append(int(c))
+    return out
+
+
+def default_localization_channels(project):
+    """What the selector starts on when nothing is stored: every
+    channel that is not some round's fiducial.
+
+    That is what this step did before the channel could be stated at
+    all, so starting there changes no store's status. It is a STARTING
+    POINT shown in the picker, not a rule: the operator sees it and can
+    add the fiducial channel or drop any of them.
+    """
+    fids = set()
+    for m in project['modalities'].values():
+        for r in m['records']:
+            fid = r.get('fiducial_channel')
+            if fid is not None:
+                fids.add(int(fid))
+    return {name: [c for c in chans if c not in fids]
+            for name, chans in localization_channels(project).items()}
+
+
+def localization_choices(project):
+    """{modality: [(hybe, channel)]} that COULD be localized -- every
+    round at every channel it carries.
+
+    THIS IS NOT THE EXPECTATION. localization_targets answers "what
+    should the store hold", which the config states and the status grid
+    reads. This answers "what is there to choose from", which is a
+    property of the acquisition alone.
+
+    They were the same list until now, and that is what made the channel
+    unselectable: the picker offered the expectation, so a channel the
+    layout carries could be unchecked but never added, and a round could
+    only ever be localized at the wavelength some other tab had chosen.
+    """
+    out = {}
+    for name, m in project['modalities'].items():
+        rounds = []
+        for r in m['records']:
+            for ch in r.get('channels') or []:
+                pair = (str(r['folder']), int(ch))
+                if pair not in rounds:
+                    rounds.append(pair)
+        out[name] = rounds
     return out
 
 
@@ -257,6 +356,17 @@ def localization_run_targets(project):
     MEANS EVERY TARGET, and that is not the same as listing them all:
     an empty value keeps following the config, so a tracing round added
     later is localized without anyone revisiting this setting.
+
+    A chosen round is AUTHORITATIVE for the run, not merely a filter on
+    the expectation. It used to be intersected with
+    localization_targets, so a round or channel the config did not
+    already expect was silently dropped -- which made the channel
+    unchoosable: localizing Hyb_015 at 747 while tracing was activated
+    on 635 was not expressible, and asking for it did nothing. It is
+    still validated against what the acquisition HAS
+    (localization_choices), because a channel a round never carried
+    cannot be localized at all, and a run that quietly skipped it would
+    look like one that did the work.
     """
     targets = localization_targets(project)
     params = project.get('params', {}) or {}
@@ -264,13 +374,36 @@ def localization_run_targets(project):
         'rounds', '') or '').strip()
     if not chosen:
         return targets
-    keep = set()
+    if chosen == NONE_CHOSEN:
+        # explicitly nothing, which an empty string cannot say: empty
+        # means "follow the config", so an empty selection used to run
+        # every expected round -- the `None` button meaning `All`
+        return {mod: [] for mod in targets}
+    have = localization_choices(project)
+    keep, unknown = {}, []
     for part in chosen.split(','):
         bits = [b.strip() for b in part.split('|')]
-        if len(bits) >= 3 and bits[2].isdigit():
-            keep.add((bits[0], bits[1], int(bits[2])))
-    return {mod: [(h, c) for h, c in rounds if (mod, h, int(c)) in keep]
-            for mod, rounds in targets.items()}
+        if len(bits) < 3 or not bits[2].isdigit():
+            continue
+        mod, hybe, ch = bits[0], bits[1], int(bits[2])
+        known = have.get(mod) or []
+        # NOT validated where there is nothing to validate against. The
+        # layout lives on the acquisition share, so a project read on a
+        # machine without it mounted carries no records at all (see
+        # load_project), and refusing every chosen round there would
+        # block the run for a file this step never needed.
+        if known and (hybe, ch) not in known:
+            unknown.append('%s|%s|%d' % (mod, hybe, ch))
+        else:
+            keep.setdefault(mod, [])
+            if (hybe, ch) not in keep[mod]:
+                keep[mod].append((hybe, ch))
+    if unknown:
+        raise ValueError(
+            'localization_run/rounds names %d round(s) this acquisition '
+            'does not carry: %s -- a channel a round was not imaged at '
+            'cannot be localized' % (len(unknown), ', '.join(unknown[:6])))
+    return {mod: keep.get(mod, []) for mod in targets}
 
 
 def tracing_configured(project):
