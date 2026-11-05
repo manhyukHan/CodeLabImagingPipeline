@@ -164,6 +164,15 @@ class AnAllele():
         self.polymer_adj = {}
         self.polymer_raw = {}
         self.rejected_hybes = {}
+        # THE SETTLED READOUT MAP, as this trace used it:
+        #   {(hybe, channel) or hybe: {'rindex', 'dtype', 'pindex'}}
+        # Stored, not re-derived from a layout at read time. A trace then
+        # says what it is without its map being resolved again, and
+        # editing the map later cannot silently re-label measurements
+        # already taken. Empty for a trace made before it was recorded --
+        # honest, because those really did resolve their bins at read
+        # time, from whatever layout happened to be reachable.
+        self.readout_bins = {}
         self.final_polymer = np.array([])
         self.linked = False
         self.linked_at = None
@@ -178,8 +187,8 @@ class AnAllele():
         'anchor_channel', 'provenance', 'coordinate',
         'raw_coordinate', 'fiducial_trace_adj', 'fiducial_trace_raw',
         'fiducial_drift', 'polymer_adj', 'polymer_raw',
-        'rejected_hybes', 'final_polymer', 'linked', 'linked_at',
-        'properties',
+        'rejected_hybes', 'readout_bins', 'final_polymer', 'linked',
+        'linked_at', 'properties',
         # v1 spellings read as aliases above -- the same fields,
         # not properties
         'fiducial_trace', 'polymer',
@@ -221,6 +230,9 @@ class AnAllele():
         if 'polymer_raw' in kwargs:
             self.polymer_raw = _lists(kwargs['polymer_raw'])
         if 'rejected_hybes' in kwargs: self.rejected_hybes = dict(kwargs['rejected_hybes'])
+        if 'readout_bins' in kwargs:
+            self.readout_bins = {k: dict(v or {})
+                                 for k, v in (kwargs['readout_bins'] or {}).items()}
         if 'final_polymer' in kwargs: self.final_polymer = np.array(kwargs['final_polymer'])
         if 'linked' in kwargs: self.linked = bool(kwargs['linked'])
         if 'linked_at' in kwargs: self.linked_at = kwargs['linked_at']
@@ -254,6 +266,8 @@ class AnAllele():
                 'polymer_raw': {k: [tuple(r2(x) for x in candidate) for candidate in v]
                                 for k, v in self.polymer_raw.items()},
                 'rejected_hybes': dict(self.rejected_hybes),
+                'readout_bins': {k: dict(v) for k, v
+                                 in self.readout_bins.items()},
                 'final_polymer': np.array(self.final_polymer),
                 'provenance': dict(self.provenance or {}),
                 'linked': bool(self.linked),

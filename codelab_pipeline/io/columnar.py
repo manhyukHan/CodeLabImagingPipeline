@@ -425,6 +425,37 @@ SPOT_WIDTH = 5
 DRIFT_WIDTH = 3
 
 
+#: the channel of a key that names none. A single-channel trace keys
+#: its hybe dicts by the bare folder name, as every store written so far
+#: does, and that is what reads and writes back as 0 here.
+NO_CHANNEL = 0
+
+
+def _key_parts(k):
+    """A hybe-dict key as (hybe, channel).
+
+    The key is the bare hybe for a trace that read one channel per round
+    -- every store so far -- and (hybe, channel) once a round carries two
+    readouts. Both have to survive a round trip through one pair of
+    columns, so the channel is stored beside the hybe and NO_CHANNEL
+    means "the key was bare".
+    """
+    if isinstance(k, (tuple, list)) and len(k) == 2:
+        return str(k[0]), int(k[1])
+    return str(k), NO_CHANNEL
+
+
+def _key_of(hybe, channel):
+    """(hybe, channel) back into a key, bare when no channel was stored.
+
+    A bare key is NOT the same as (hybe, 0): every consumer written
+    before channels existed indexes these dicts by the folder name, so
+    handing them a tuple would silently match nothing.
+    """
+    return str(hybe) if int(channel) == NO_CHANNEL else (str(hybe),
+                                                         int(channel))
+
+
 def _row(v, width):
     """One spot as a float row of exactly `width`, NaN-padded."""
     a = np.asarray(v, dtype=np.float64).ravel()[:width]
@@ -450,7 +481,7 @@ ALLELE_KEYS = frozenset((
     'anchor_channel', 'provenance', 'coordinate', 'raw_coordinate',
     'fiducial_trace_adj', 'fiducial_trace_raw', 'fiducial_drift',
     'polymer_adj', 'polymer_raw', 'rejected_hybes', 'final_polymer',
-    'linked', 'linked_at',
+    'linked', 'linked_at', 'readout_bins',
     # v1 spellings, read as aliases by the model
     'fiducial_trace', 'polymer',
 ))
@@ -475,12 +506,28 @@ def pack_alleles(grp, dicts):
     # guaranteed -- v1 fills adj and no raw at all -- and an index that
     # silently assumes it would mis-assign every hybe the moment one
     # engine wrote a different set.
-    tr = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
-    trr = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
-    pl = {'allele': [], 'hybe': [], 'vals': []}
-    plr = {'allele': [], 'hybe': [], 'vals': []}
-    fd = {'allele': [], 'hybe': [], 'isnone': [], 'vals': []}
-    rj = {'allele': [], 'hybe': [], 'reason': []}
+    #
+    # EVERY hybe-keyed column carries its channel beside it. The key is
+    # the bare folder name for a trace that read one channel per round
+    # -- every store so far -- and (hybe, channel) once a round carries
+    # two readouts, and one pair of columns has to round-trip both. The
+    # channel column's ABSENCE means "written before channels existed",
+    # which reads back as bare keys; NO_CHANNEL in a present column
+    # means the same thing for one key of a newer file.
+    tr = {'allele': [], 'hybe': [], 'channel': [], 'isnone': [], 'vals': []}
+    trr = {'allele': [], 'hybe': [], 'channel': [], 'isnone': [], 'vals': []}
+    pl = {'allele': [], 'hybe': [], 'channel': [], 'vals': []}
+    plr = {'allele': [], 'hybe': [], 'channel': [], 'vals': []}
+    fd = {'allele': [], 'hybe': [], 'channel': [], 'isnone': [], 'vals': []}
+    rj = {'allele': [], 'hybe': [], 'channel': [], 'reason': []}
+    # THE ALLELE'S OWN READOUT BINS, one row per (hybe, channel): which
+    # readout id it is, its datatype, and where it sits on the polymer.
+    # STORED, not derived from a layout at read time -- a trace then says
+    # what it is without its map being re-resolved, and editing the map
+    # later cannot silently re-label measurements already taken. One row
+    # per bin, not per candidate, because the identity belongs to the bin.
+    rb = {'allele': [], 'hybe': [], 'channel': [], 'rindex': [],
+          'dtype': [], 'pindex': []}
     fp, fp_off = [], [0]
     for i, d in enumerate(dicts):
         c, r = d['coordinate'], d['raw_coordinate']
@@ -490,23 +537,39 @@ def pack_alleles(grp, dicts):
             strs[k].append(_s(d.get(k)))
         prov.append(json.dumps(d.get('provenance') or {}, sort_keys=True))
         for col, key in ((tr, 'fiducial_trace_adj'), (trr, 'fiducial_trace_raw')):
-            for hybe, v in (d.get(key) or {}).items():
+            for k, v in (d.get(key) or {}).items():
+                hybe, ch = _key_parts(k)
                 col['allele'].append(i); col['hybe'].append(_s(hybe))
+                col['channel'].append(ch)
                 col['isnone'].append(v is None)
                 col['vals'].append(np.zeros(SPOT_WIDTH) if v is None
                                    else _row(v, SPOT_WIDTH))
-        for hybe, v in (d.get('fiducial_drift') or {}).items():
+        for k, v in (d.get('fiducial_drift') or {}).items():
+            hybe, ch = _key_parts(k)
             fd['allele'].append(i); fd['hybe'].append(_s(hybe))
+            fd['channel'].append(ch)
             fd['isnone'].append(v is None)
             fd['vals'].append(np.zeros(DRIFT_WIDTH) if v is None
                               else _row(v, DRIFT_WIDTH))
         for col, key in ((pl, 'polymer_adj'), (plr, 'polymer_raw')):
-            for hybe, cands in (d.get(key) or {}).items():
+            for k, cands in (d.get(key) or {}).items():
+                hybe, ch = _key_parts(k)
                 for cand in cands:
                     col['allele'].append(i); col['hybe'].append(_s(hybe))
+                    col['channel'].append(ch)
                     col['vals'].append(_row(cand, SPOT_WIDTH))
-        for hybe, reason in (d.get('rejected_hybes') or {}).items():
-            rj['allele'].append(i); rj['hybe'].append(_s(hybe)); rj['reason'].append(_s(reason))
+        for k, reason in (d.get('rejected_hybes') or {}).items():
+            hybe, ch = _key_parts(k)
+            rj['allele'].append(i); rj['hybe'].append(_s(hybe))
+            rj['channel'].append(ch); rj['reason'].append(_s(reason))
+        for k, b in (d.get('readout_bins') or {}).items():
+            hybe, ch = _key_parts(k)
+            b = b or {}
+            rb['allele'].append(i); rb['hybe'].append(_s(hybe))
+            rb['channel'].append(ch)
+            rb['rindex'].append(int(b.get('rindex', -1)))
+            rb['dtype'].append(_s(b.get('dtype', '')))
+            rb['pindex'].append(int(b.get('pindex', -1)))
         f = np.asarray(d.get('final_polymer', np.empty((0, 3))), dtype=np.float64).reshape(-1, 3)
         fp.append(f); fp_off.append(fp_off[-1] + len(f))
     _write(grp, 'table', tab)
@@ -516,25 +579,57 @@ def pack_alleles(grp, dicts):
     for pre, col in (('tr', tr), ('trr', trr)):
         _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
         _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
+        _write(grp, pre + '_channel', np.asarray(col['channel'], dtype=np.int32))
         _write(grp, pre + '_isnone', np.asarray(col['isnone'], dtype=np.uint8))
         _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, SPOT_WIDTH)
                if col['vals'] else np.empty((0, SPOT_WIDTH)))
     _write(grp, 'fd_allele', np.asarray(fd['allele'], dtype=np.int32))
     _write(grp, 'fd_hybe', np.asarray(fd['hybe'], dtype=_STR))
+    _write(grp, 'fd_channel', np.asarray(fd['channel'], dtype=np.int32))
     _write(grp, 'fd_isnone', np.asarray(fd['isnone'], dtype=np.uint8))
     _write(grp, 'fd_vals', np.asarray(fd['vals']).reshape(-1, DRIFT_WIDTH)
            if fd['vals'] else np.empty((0, DRIFT_WIDTH)))
     for pre, col in (('pl', pl), ('plr', plr)):
         _write(grp, pre + '_allele', np.asarray(col['allele'], dtype=np.int32))
         _write(grp, pre + '_hybe', np.asarray(col['hybe'], dtype=_STR))
+        _write(grp, pre + '_channel', np.asarray(col['channel'], dtype=np.int32))
         _write(grp, pre + '_vals', np.asarray(col['vals']).reshape(-1, SPOT_WIDTH)
                if col['vals'] else np.empty((0, SPOT_WIDTH)))
     _write(grp, 'rj_allele', np.asarray(rj['allele'], dtype=np.int32))
     _write(grp, 'rj_hybe', np.asarray(rj['hybe'], dtype=_STR))
+    _write(grp, 'rj_channel', np.asarray(rj['channel'], dtype=np.int32))
     _write(grp, 'rj_reason', np.asarray(rj['reason'], dtype='S256'))
+    _write(grp, 'rb_allele', np.asarray(rb['allele'], dtype=np.int32))
+    _write(grp, 'rb_hybe', np.asarray(rb['hybe'], dtype=_STR))
+    _write(grp, 'rb_channel', np.asarray(rb['channel'], dtype=np.int32))
+    _write(grp, 'rb_rindex', np.asarray(rb['rindex'], dtype=np.int32))
+    _write(grp, 'rb_dtype', np.asarray(rb['dtype'], dtype='S8'))
+    _write(grp, 'rb_pindex', np.asarray(rb['pindex'], dtype=np.int32))
     _write(grp, 'fp', np.concatenate(fp, axis=0) if fp else np.empty((0, 3)))
     _write(grp, 'fp_off', np.asarray(fp_off, dtype=np.int64))
     pack_props(grp, dicts, ALLELE_KEYS)
+
+
+def _channels(grp, pre, n):
+    """The channel column of one hybe-keyed group, or NO_CHANNEL.
+
+    TOLERATE ITS ABSENCE, the way the provenance column is tolerated.
+    Every alleles.h5 written before a round could carry two readouts has
+    no such column, and those files are perfectly good traces keyed by
+    the bare folder name -- which is exactly what NO_CHANNEL reads back
+    as. A missing column is "written before channels existed", not
+    "channel zero".
+    """
+    name = pre + '_channel'
+    if name not in grp:
+        return np.full(n, NO_CHANNEL, dtype=np.int32)
+    col = np.asarray(grp[name][()], dtype=np.int32)
+    if len(col) != n:
+        raise ValueError(
+            '%s has %d rows but %s_hybe has %d -- the channel column must '
+            'index the same rows as the hybe it belongs to'
+            % (name, len(col), pre, n))
+    return col
 
 
 def unpack_alleles(grp):
@@ -560,6 +655,11 @@ def unpack_alleles(grp):
             'fiducial_trace_adj': {}, 'fiducial_trace_raw': {},
             'fiducial_drift': {},
             'polymer_adj': {}, 'polymer_raw': {}, 'rejected_hybes': {},
+            # the allele's own (hybe, channel) -> readout identity, read
+            # from its own rb_* rows below. Empty for a store written
+            # before it was recorded, which is honest: those traces
+            # resolved their bins from a layout at read time.
+            'readout_bins': {},
             # empty comes back shape-(0,) exactly as AnAllele.save()
             # produces it (np.array([]) of an empty polymer)
             'final_polymer': (fp[fpo[i]:fpo[i + 1]] if fpo[i + 1] > fpo[i]
@@ -577,16 +677,31 @@ def unpack_alleles(grp):
         vals = _widen(grp[pre + '_vals'][()], width)
         hybe = grp[pre + '_hybe'][()]
         none = grp[pre + '_isnone'][()]
+        chan = _channels(grp, pre, len(hybe))
         for j, ai in enumerate(grp[pre + '_allele'][()]):
-            out[ai][key][_rd(hybe[j])] = None if none[j] else tuple(vals[j])
+            out[ai][key][_key_of(_rd(hybe[j]), chan[j])] = (
+                None if none[j] else tuple(vals[j]))
     for pre, key in (('pl', 'polymer_adj'), ('plr', 'polymer_raw')):
         if pre + '_allele' not in grp:
             continue
         vals = _widen(grp[pre + '_vals'][()], SPOT_WIDTH)
         hybe = grp[pre + '_hybe'][()]
+        chan = _channels(grp, pre, len(hybe))
         for j, ai in enumerate(grp[pre + '_allele'][()]):
-            out[ai][key].setdefault(_rd(hybe[j]), []).append(tuple(vals[j]))
+            out[ai][key].setdefault(
+                _key_of(_rd(hybe[j]), chan[j]), []).append(tuple(vals[j]))
     rj_hybe, rj_reason = grp['rj_hybe'][()], grp['rj_reason'][()]
+    rj_chan = _channels(grp, 'rj', len(rj_hybe))
     for j, ai in enumerate(grp['rj_allele'][()]):
-        out[ai]['rejected_hybes'][_rd(rj_hybe[j])] = _rd(rj_reason[j])
+        out[ai]['rejected_hybes'][
+            _key_of(_rd(rj_hybe[j]), rj_chan[j])] = _rd(rj_reason[j])
+    if 'rb_allele' in grp:
+        rb_hybe, rb_dtype = grp['rb_hybe'][()], grp['rb_dtype'][()]
+        rb_chan = _channels(grp, 'rb', len(rb_hybe))
+        rb_rid, rb_pi = grp['rb_rindex'][()], grp['rb_pindex'][()]
+        for j, ai in enumerate(grp['rb_allele'][()]):
+            out[ai].setdefault('readout_bins', {})[
+                _key_of(_rd(rb_hybe[j]), rb_chan[j])] = {
+                    'rindex': int(rb_rid[j]), 'dtype': _rd(rb_dtype[j]),
+                    'pindex': int(rb_pi[j])}
     return unpack_props(grp, out)
