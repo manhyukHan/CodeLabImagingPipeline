@@ -21,10 +21,12 @@ QC follows QualityControlORCA with its measured bugs fixed:
   - thresholds are quantile-derived from the data at hand
     (polymeric_qc), never inherited constants -- the repo rule.
 """
+import collections
 import os
 
 import numpy as np
 
+from codelab_pipeline.analysis import readout_map
 from codelab_pipeline.io import analysis_store
 from codelab_pipeline.io import paths as store_paths
 from codelab_pipeline.io import preprocess
@@ -57,21 +59,129 @@ def records_for(storage_path, modality=None):
     return preprocess.parse_experiment_layout(layout)
 
 
-def genomic_bins(records):
-    """[(readout_id, hybe_folder)] for datatype 'H', sorted by readout_id.
+#: the modalities whose readout number IS a genomic coordinate, so that
+#: the layout's numbering can seed the polymer axis directly. Measured
+#: over the 16 layouts this project can reach: every DNA layout is
+#: contiguous (MP58 15-76, chr19 1-91, HEK 5-73, HoxA 6-42 and 10-37), so
+#: readout-id and dense indexing agree exactly there. An RNA layout
+#: numbers its GENES -- 101-400 for 15 acquired readouts -- and three of
+#: them leave Rep_/Toe_ rounds at datatype H, so the same readout id
+#: arrives twice. Neither is a polymer, and neither should be forced onto
+#: a genomic axis by a rule meant for one.
+POLYMER_MODALITIES = ('DNA',)
+
+
+def readout_map_for(records, channels=None, modality=None, declared=None,
+                    pindex_from=None):
+    """The ReadoutMap these layout records seed.
+
+    declared: the DESIGNED readout range ('1-80'), settled in the
+    chromatin tracing panel. It decides the axis outright -- where bin 0
+    sits and how many slots trail the last acquired bin -- because the
+    acquired readouts cannot say whether a number they are missing was
+    skipped by design, not yet acquired, or never contiguous.
+
+    Without one, the LAYOUT seeds it: pindex = rindex for datatype H of a
+    polymer modality (POLYMER_MODALITIES), which is what the numbering
+    means there, and dense packing anywhere else. modality=None is read
+    as "not stated", and takes the dense reading -- the conservative one,
+    since it is exactly what every analysis here did before the axis had
+    a policy at all.
+
+    channels=None keeps the channel-agnostic axis every analysis here has
+    always read: an unnamed readout becomes (hybe, ANY_CHANNEL). Pass the
+    activated channels to get the real wavelengths, and pass a settled
+    map directly wherever the operator has corrected one.
+    """
+    if pindex_from is None:
+        pindex_from = ('rindex' if str(modality or '') in POLYMER_MODALITIES
+                       else 'dense')
+    return readout_map.ReadoutMap.from_layout(
+        records, channels=channels, pindex_from=pindex_from,
+        declared=declared)
+
+
+def _axis_of(records=None, channels=None, rmap=None, modality=None,
+             declared=None):
+    """(ReadoutMap, [ReadoutBin or None] per polymer slot)."""
+    if rmap is None:
+        if records is None:
+            raise ValueError('give either layout records or a readout map')
+        rmap = readout_map_for(records, channels=channels, modality=modality,
+                               declared=declared)
+    return rmap, rmap.axis()
+
+
+def genomic_bins(records=None, channels=None, rmap=None, modality=None,
+                 declared=None):
+    """[(readout_id, hybe_folder)] -- ONE ENTRY PER POLYMER SLOT.
 
     The layout is authoritative for bin identity and order; readout_id is
-    the genomic-locus axis every distance map shares. Returns a list of
-    (readout_id, hybe) pairs; use bin_hybes() for the bare hybe list.
+    the genomic-locus axis every distance map shares.
+
+    A slot the design never imaged -- readouts 1-51 and 54-80, say --
+    comes back as (readout_id, '') and is where every polymer carries
+    NaN. The readout id is still named there, taken from the axis base
+    (see ReadoutMap.rindex_base), because the skipped locus has an
+    identity; where the base is unknowable it is -1. The empty hybe is
+    what makes the slot unmatchable: no allele has data under '', so the
+    collapse leaves it NaN without a special case.
+
+    Use bin_keys() to INDEX an allele's stored data and bin_hybes() for
+    labels. Under a multi-channel design one hybe occupies two slots, so
+    the hybe alone stops being a unique key -- the pair is.
     """
-    rows = [(int(r['readout_id']), str(r['folder'])) for r in records
-            if str(r.get('datatype', '')).upper() == 'H']
-    rows.sort()
-    return rows
+    rmap, axis = _axis_of(records, channels, rmap, modality, declared)
+    base = rmap.rindex_base()
+    return [(b.rindex, b.hybe) if b is not None
+            else ((base + j) if base is not None else -1, '')
+            for j, b in enumerate(axis)]
 
 
-def bin_hybes(records):
-    return [h for _rid, h in genomic_bins(records)]
+def bin_keys(records=None, channels=None, rmap=None, modality=None,
+             declared=None):
+    """[(hybe, channel) or None] -- one per polymer slot, the key an
+    allele's polymer_adj / fiducial_trace_adj is read under.
+
+    None at a slot nothing imaged. collapse_polymer takes this list.
+    """
+    _rmap, axis = _axis_of(records, channels, rmap, modality, declared)
+    return [None if b is None else (b.hybe, b.channel) for b in axis]
+
+
+def bin_hybes(records=None, channels=None, rmap=None, modality=None,
+              declared=None):
+    """[hybe] -- one per polymer slot, '' at a slot nothing imaged.
+
+    LABELS, not keys: a multi-channel round puts the same hybe in two
+    slots, so this list can repeat. Index stored data with bin_keys().
+    """
+    return [h for _rid, h in
+            genomic_bins(records, channels, rmap, modality, declared)]
+
+
+def slot_index(bin_hybes, hybe, bin_channels=None, channel=None):
+    """Which polymer slot a hybe names. Raises KeyError when none does.
+
+    Refuses rather than taking the first when the hybe names SEVERAL
+    slots. A multi-channel round reads two loci in one hybe, so the
+    folder name alone stops identifying a locus there, and answering
+    with the lower-numbered readout would answer about a different
+    stretch of the genome without saying so. Pass `channel` to pick.
+    """
+    hits = [j for j, h in enumerate(bin_hybes) if str(h) == str(hybe)]
+    if channel is not None and bin_channels is not None:
+        hits = [j for j in hits if int(bin_channels[j]) == int(channel)]
+    if not hits:
+        raise KeyError(hybe)
+    if len(hits) > 1:
+        chans = [(bin_channels[j] if bin_channels is not None else '?')
+                 for j in hits]
+        raise ValueError(
+            f'{hybe!r} names {len(hits)} polymer bins (channels {chans}) '
+            f'-- name the channel, the hybe alone does not say which '
+            f'locus is meant')
+    return hits[0]
 
 
 def qc_rounds(records):
@@ -106,22 +216,90 @@ def max_brightness(candidates):
     return max(candidates, key=lambda c: c[3])
 
 
-def collapse_polymer(allele_dict, hybes, selector=max_brightness):
+def bin_lookup_keys(keys):
+    """[(key, ...) per slot] -- which keys to try, in order, when reading
+    one polymer slot out of a stored {key: value} dict.
+
+    A slot arrives as (hybe, channel) from bin_keys(), as a bare hybe
+    from every caller written before channels existed, or as None for a
+    slot nothing imaged (which tries nothing and stays NaN).
+
+    A (hybe, channel) slot also tries the BARE HYBE, because every store
+    written before the channel joined the key holds {hybe: [...]} and
+    that data is this slot's data. The fallback is offered only where the
+    hybe occupies ONE slot: when a multi-channel design puts it in two,
+    the bare key cannot say which it is, and giving the same candidates
+    to both would copy one measurement into a locus never read there.
+    """
+    once = collections.Counter(k[0] if isinstance(k, tuple) else k
+                               for k in keys if k is not None)
+    out = []
+    for k in keys:
+        if k is None:
+            out.append(())
+        elif isinstance(k, tuple):
+            h, c = str(k[0]), int(k[1])
+            out.append(((h, c), h) if once[h] == 1 else ((h, c),))
+        else:
+            out.append((str(k),))
+    return out
+
+
+def lookup_bin(d, tries):
+    """(key_that_hit, value) for one slot, or (None, None).
+
+    PRESENCE decides, not truth: a fiducial key that is present and None
+    records a fit that failed, which a missing key does not.
+    """
+    d = d or {}
+    for t in tries:
+        if t in d:
+            return t, d[t]
+    return None, None
+
+
+def _refuse_channelled_store(d, keys, what):
+    """Raise when the stored dict is keyed by (hybe, channel) and the
+    caller's axis is not.
+
+    Otherwise every lookup misses and the allele comes back as an empty
+    polymer -- a multi-channel store read through a single-channel axis
+    would report 'nothing traced' rather than 'you need bin_keys()'.
+    """
+    bare = {k for k in keys if k is not None and not isinstance(k, tuple)}
+    if not bare:
+        return
+    clash = sorted({k[0] for k in (d or {}) if isinstance(k, tuple)
+                    and k[0] in bare})
+    if clash:
+        raise ValueError(
+            f'{what} is keyed by (hybe, channel) for {clash[:4]} but the '
+            f'polymer axis names bare hybes -- pass polymer.bin_keys(...) '
+            f'so each slot reads its own channel')
+
+
+def collapse_polymer(allele_dict, keys, selector=max_brightness):
     """One allele's polymer_adj -> (pos (n_bins, 3) yxz, amp (n_bins,),
     n_cand (n_bins,) int). NaN / 0 where the bin has no candidate.
+
+    `keys` is one entry per polymer slot: (hybe, channel) from
+    bin_keys(), a bare hybe, or None for a slot nothing imaged. A None
+    slot is NaN by construction -- that is the NaN stripe of a readout
+    the design skipped, and it needs no branch of its own.
 
     `selector` picks ONE position per multi-candidate bin (sister
     chromatids); see max_brightness for the contract. Positions stay in
     px/planes here; the caller scales to um once, so this stays
     unit-agnostic and testable.
     """
-    n = len(hybes)
+    n = len(keys)
     pos = np.full((n, 3), np.nan)
     amp = np.full(n, np.nan)
     n_cand = np.zeros(n, dtype=np.int32)
     poly = allele_dict.get('polymer_adj') or {}
-    for j, h in enumerate(hybes):
-        cands = poly.get(h)
+    _refuse_channelled_store(poly, keys, 'polymer_adj')
+    for j, tries in enumerate(bin_lookup_keys(keys)):
+        _k, cands = lookup_bin(poly, tries)
         if not cands:
             continue
         n_cand[j] = len(cands)
@@ -131,9 +309,13 @@ def collapse_polymer(allele_dict, hybes, selector=max_brightness):
     return pos, amp, n_cand
 
 
-def fov_polymer_table(storage_path, fov, hybes, voxel_um=DEFAULT_VOXEL_UM,
+def fov_polymer_table(storage_path, fov, keys, voxel_um=DEFAULT_VOXEL_UM,
                       selector=max_brightness):
     """Every stored allele of one FOV as stacked arrays, um-scaled.
+
+    keys: one entry per polymer slot, from bin_keys() -- (hybe, channel),
+    a bare hybe, or None for a slot nothing imaged. A None slot is an
+    all-NaN column across every allele of the FOV.
 
     Returns a plain dict (picklable, pmap-friendly):
       pos_um    (n_alleles, n_bins, 3) float  y, x, z in MICROMETRES
@@ -153,7 +335,7 @@ def fov_polymer_table(storage_path, fov, hybes, voxel_um=DEFAULT_VOXEL_UM,
     cells, _ = analysis_store.read_cells(storage_path, fov)
     ct_by_id = {int(c['id']): str(c.get('celltype') or '')
                 for c in (cells or [])}
-    n_a, n_b = len(dicts), len(hybes)
+    n_a, n_b = len(dicts), len(keys)
     pos = np.full((n_a, n_b, 3), np.nan)
     amp = np.full((n_a, n_b), np.nan)
     n_cand = np.zeros((n_a, n_b), dtype=np.int32)
@@ -161,7 +343,7 @@ def fov_polymer_table(storage_path, fov, hybes, voxel_um=DEFAULT_VOXEL_UM,
     cid = np.full(n_a, -1, dtype=np.int64)
     celltype = []
     for i, d in enumerate(dicts):
-        p, a, k = collapse_polymer(d, hybes, selector=selector)
+        p, a, k = collapse_polymer(d, keys, selector=selector)
         pos[i], amp[i], n_cand[i] = p, a, k
         aid[i] = int(d['id'])
         cid[i] = int(d.get('cell', -1))

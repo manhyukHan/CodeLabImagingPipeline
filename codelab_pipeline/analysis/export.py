@@ -46,6 +46,7 @@ import os
 import numpy as np
 
 from . import polymer
+from . import readout_map
 
 from codelab_pipeline.models import spot as spot_model  # noqa: E402
 
@@ -571,8 +572,14 @@ ALLELE_COLUMNS = (
 _NAN3 = (float('nan'),) * 3
 
 
-def _committed_positions(allele_dict, hybes):
+def _committed_positions(allele_dict, keys):
     """((n_bins, 3) y/x/z in bin order, source label).
+
+    keys is one per polymer slot (see _slot_keys), so a slot nothing
+    imaged is NaN here too and final_polymer's length is compared
+    against the full axis, holes included -- a stored collapse that
+    predates a hole would otherwise look long enough and be read off by
+    one past it.
 
     AnAllele.final_polymer is the committed position per bin -- but it is
     EMPTY until the collapse has been run, and on a store where tracing
@@ -585,9 +592,9 @@ def _committed_positions(allele_dict, hybes):
     fp = np.asarray(allele_dict.get('final_polymer')
                     if allele_dict.get('final_polymer') is not None
                     else np.empty((0, 3)), dtype=np.float64).reshape(-1, 3)
-    if len(fp) >= len(hybes) and len(fp):
+    if len(fp) >= len(keys) and len(fp):
         return fp, 'stored'
-    pos, _amp, _n = polymer.collapse_polymer(allele_dict, hybes)
+    pos, _amp, _n = polymer.collapse_polymer(allele_dict, keys)
     return pos, 'computed'
 
 
@@ -598,35 +605,86 @@ def _final_for_bin(positions, j):
     return _xyz(tuple(positions[j]))
 
 
-def _allele_axis(bins, allele, records_by_hybe):
-    """[(bin_index, readout_id, hybe, datatype), ...] -- the rows this
-    allele gets.
+def _slot_keys(bins, bin_channels=None):
+    """[(hybe, channel) | hybe | None] -- one key per polymer slot.
 
-    Every genomic bin of the layout comes first, in genomic order, whether
-    or not this allele saw it. Then any OTHER hybe the allele actually
-    carries data for: polymer_adj/fiducial_trace_adj also hold the R
-    (repeat) and T (toe) QC rounds, and a bin-only export would throw
-    those traced positions away. They get bin_index -1 -- they are real
-    measurements but not genomic-locus bins, and the datatype column is
-    how a reader filters them.
+    bins comes from polymer.genomic_bins and is per SLOT, so a readout
+    the design never imaged is there with an empty hybe; its key is None
+    and nothing in any allele can match it, which is what makes the slot
+    an honest NaN rather than a bin that failed.
+
+    Without bin_channels the key stays the bare hybe -- the
+    channel-agnostic axis every store so far was written under.
     """
-    axis = [(j, int(rid), h, 'H') for j, (rid, h) in enumerate(bins)]
-    in_bins = {h for _r, h in bins}
+    chans = list(bin_channels or [])
+    out = []
+    for j, (_rid, h) in enumerate(bins):
+        if not h:
+            out.append(None)
+        elif j < len(chans):
+            out.append((str(h), int(chans[j])))
+        else:
+            out.append(str(h))
+    return out
+
+
+def _allele_axis(bins, allele, records_by_hybe, bin_channels=None):
+    """[(bin_index, readout_id, hybe, channel, datatype, keys_to_try)] --
+    the rows this allele gets.
+
+    Every polymer SLOT of the layout comes first, in genomic order,
+    whether or not this allele saw it, and including a slot nothing
+    imaged. Then any OTHER key the allele actually carries data for:
+    polymer_adj/fiducial_trace_adj also hold the R (repeat) and T (toe)
+    QC rounds, and a bin-only export would throw those traced positions
+    away. They get bin_index -1 -- they are real measurements but not
+    genomic-locus bins, and the datatype column is how a reader filters
+    them.
+
+    keys_to_try is what each row reads its stored data under, from
+    polymer.bin_lookup_keys: a (hybe, channel) slot also tries the bare
+    hybe, since that is how every store written before channels joined
+    the key holds it. A stored key consumed by a bin row is therefore NOT
+    repeated as an extra -- otherwise an old single-channel store read
+    through a 635 axis would report every bin twice, once as a bin and
+    once as a QC round.
+    """
+    chans = list(bin_channels or [])
+    slots = _slot_keys(bins, chans)
+    tries = polymer.bin_lookup_keys(slots)
+    axis = [(j, int(rid), h, int(chans[j]) if j < len(chans) else 0, 'H',
+             tries[j])
+            for j, (rid, h) in enumerate(bins)]
+    consumed = {t for tr in tries for t in tr}
     have = (set(allele.get('polymer_adj') or {})
             | set(allele.get('fiducial_trace_adj') or {})
             | set(allele.get('rejected_hybes') or {}))
-    for h in sorted(have - in_bins):
+    extra = []
+    for k in have - consumed:
+        h, c = ((str(k[0]), int(k[1])) if isinstance(k, tuple)
+                else (str(k), 0))
         rec = records_by_hybe.get(h) or {}
         rid = rec.get('readout_id')
-        axis.append((-1, int(rid) if rid is not None else -1, h,
-                     str(rec.get('datatype') or '')))
+        extra.append((-1, int(rid) if rid is not None else -1, h, c,
+                      str(rec.get('datatype') or ''), (k,)))
+    axis.extend(sorted(extra, key=lambda t: (t[2], t[3])))
     return axis
 
 
 def allele_rows(allele_dicts, fov=None, bins=(), modality='',
                 celltype_of=None, voxel_um=DEFAULT_VOXEL_UM,
-                records_by_hybe=None):
-    """Long-format rows: one per (allele, genomic bin, candidate).
+                records_by_hybe=None, bin_channels=None):
+    """Long-format rows: one per (allele, polymer slot, candidate).
+
+    bins is one entry per polymer SLOT, so a readout the design skipped
+    is there too, with an empty hybe and NaN coordinates: the row that
+    says this locus was never imaged, as against a bin that was imaged
+    and failed.
+
+    bin_channels: the readout channel of each slot, same length as bins
+    (polymer.bin_keys gives the pair). Without it the slot key is the
+    bare hybe -- the channel-agnostic axis every store so far holds --
+    and the readout_channel column reports 0, meaning nobody named one.
 
     bins: [(readout_id, hybe), ...] in genomic order, from
     analysis.polymer.genomic_bins(layout_records) -- the LAYOUT is
@@ -659,7 +717,8 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
         rejected = a.get('rejected_hybes') or {}
         prov = a.get('provenance') or {}
         prov_modality = str(prov.get('modality') or '')
-        committed, final_source = _committed_positions(a, [h for _r, h in bins])
+        slots = _slot_keys(bins, bin_channels)
+        committed, final_source = _committed_positions(a, slots)
         base = {
             'allele_key': f'F{f:03d}-A{int(a.get("id", 0))}',
             'allele_id': int(a.get('id', 0)),
@@ -677,13 +736,15 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
             'anchor_raw_x': anchor_raw[0], 'anchor_raw_y': anchor_raw[1],
             'anchor_raw_z': anchor_raw[2],
         }
-        for j, readout_id, hybe, datatype in _allele_axis(bins, a, records_by_hybe):
-            cands_adj = list(adj_by_hybe.get(hybe) or [])
-            cands_raw = list(raw_by_hybe.get(hybe) or [])
+        for (j, readout_id, hybe, channel, datatype, tries) in _allele_axis(
+                bins, a, records_by_hybe, bin_channels):
+            cands_adj = list(polymer.lookup_bin(adj_by_hybe, tries)[1] or [])
+            cands_raw = list(polymer.lookup_bin(raw_by_hybe, tries)[1] or [])
             paired = len(cands_raw) == len(cands_adj)
-            fa = _xyz(fid_adj.get(hybe), n=5)
-            fr = _xyz(fid_raw.get(hybe), n=5)
-            fdr = (a.get('fiducial_drift') or {}).get(hybe)
+            fid_key, fid_val = polymer.lookup_bin(fid_adj, tries)
+            fa = _xyz(fid_val, n=5)
+            fr = _xyz(polymer.lookup_bin(fid_raw, tries)[1], n=5)
+            fdr = polymer.lookup_bin(a.get('fiducial_drift') or {}, tries)[1]
             fdr = ((float(fdr[1]), float(fdr[0]), float(fdr[2]))   # x, y, z
                    if fdr is not None else _NAN3)
             # committed positions are indexed by GENOMIC bin; a QC round
@@ -693,15 +754,18 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
             rec = records_by_hybe.get(hybe) or {}
             per_bin = dict(base)
             per_bin.update({
-                'bin_index': j, 'readout_id': int(readout_id), 'hybe': str(hybe),
+                'bin_index': j, 'readout_id': int(readout_id),
+                'hybe': str(hybe), 'readout_channel': int(channel),
                 'readout_name': str(rec.get('readout_name') or ''),
                 'datatype': datatype,
                 'n_candidates': len(cands_adj),
                 'selection_rule': final_source,
                 # a hybe KEY that is present but None means the fiducial
                 # fit failed there; a missing key means it was never tried
-                'fiducial_found': (hybe in fid_adj and fid_adj.get(hybe) is not None),
-                'rejected_reason': str(rejected.get(hybe, '') or ''),
+                'fiducial_found': (fid_key is not None
+                                   and fid_val is not None),
+                'rejected_reason': str(
+                    polymer.lookup_bin(rejected, tries)[1] or ''),
                 'final_x': fin[0], 'final_y': fin[1], 'final_z': fin[2],
                 'final_x_um': fin_um[0], 'final_y_um': fin_um[1],
                 'final_z_um': fin_um[2],
@@ -763,26 +827,40 @@ def allele_rows(allele_dicts, fov=None, bins=(), modality='',
 # -- collecting a whole project ------------------------------------------
 
 def _layouts(storage_paths_by_modality, errors):
-    """({modality: {hybe: record}}, {modality: [(readout_id, hybe)]}).
+    """({modality: {hybe: record}}, {modality: [(readout_id, hybe)]},
+    {modality: [channel] or None}).
 
     The ExperimentLayout is per MODALITY and lives outside the store, so a
     layout that cannot be reached (the acquisition share is not mounted)
     costs the readable NAMES, not the export: coordinates do not need it.
     Every such failure is reported rather than silently blanking columns.
     """
-    by_hybe, bins = {}, {}
+    by_hybe, bins, chans = {}, {}, {}
     for modality, sp in (storage_paths_by_modality or {}).items():
         if not sp:
             continue
         try:
             records = polymer.records_for(sp, modality)
             by_hybe[modality] = {str(r['folder']): r for r in records}
-            bins[modality] = polymer.genomic_bins(records)
+            # channel-agnostic: the export is headless and has no panel
+            # to ask which channels are activated, so it takes whatever
+            # the layout names. Where the layout names nothing -- every
+            # layout written before the readoutChannels column -- the
+            # per-slot channel list is left out entirely rather than
+            # filled with a placeholder, and the slot key stays the bare
+            # hybe exactly as it has always been.
+            rmap = polymer.readout_map_for(records, modality=modality)
+            bins[modality] = polymer.genomic_bins(rmap=rmap)
+            cs = [readout_map.ANY_CHANNEL if k is None else k[1]
+                  for k in polymer.bin_keys(rmap=rmap)]
+            named = set(cs) - {readout_map.ANY_CHANNEL}
+            chans[modality] = cs if named else None
         except Exception as e:
             by_hybe[modality], bins[modality] = {}, []
+            chans[modality] = None
             errors.append(f'{modality}: layout unreadable, so readout names '
                           f'and genomic bins are missing ({e})')
-    return by_hybe, bins
+    return by_hybe, bins, chans
 
 
 class Tables(object):
@@ -850,7 +928,8 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
     from ..io import analysis_store, paths
 
     errors = []
-    layout_by_modality, bins_by_modality = _layouts(storage_paths_by_modality,
+    (layout_by_modality, bins_by_modality,
+     chans_by_modality) = _layouts(storage_paths_by_modality,
                                                     errors)
     # one representative path per ANALYSIS dir -- the shared capsule store
     by_analysis = {}
@@ -901,7 +980,8 @@ def collect(storage_paths_by_modality, fovs=None, voxel_um=DEFAULT_VOXEL_UM,
                 arows.extend(allele_rows(
                     [a], fov, bins_by_modality.get(m, []), modality=m,
                     celltype_of=ct, voxel_um=voxel_um,
-                    records_by_hybe=layout_by_modality.get(m, {})))
+                    records_by_hybe=layout_by_modality.get(m, {}),
+                    bin_channels=chans_by_modality.get(m)))
             n_spots, n_read, n_all = {}, {}, {}
             for r in srows:
                 c = r['cell']

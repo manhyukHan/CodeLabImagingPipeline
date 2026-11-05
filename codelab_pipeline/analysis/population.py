@@ -268,14 +268,25 @@ class Population:
     def build(cls, storage_path, fovs, records=None, hybes=None,
               sources=None, spot_sources=None, voxel_um=DEFAULT_VOXEL_UM,
               mask_intensity=True, resolvers=None, jobs=None,
-              on_done=None, overwrite_cache=False, modality=None):
+              on_done=None, overwrite_cache=False, modality=None,
+              readout_channels=None, readout_range=None):
         """Assemble a Population from the store, headless.
 
         records: parsed layout records (preprocess.parse_experiment_layout)
-        -- or pass hybes directly as the ordered genomic-bin list. sources
+        -- or pass hybes directly as the ordered genomic-bin list, which
+        may be the (hybe, channel) keys of polymer.bin_keys(). sources
         / spot_sources: [(modality, hybe, channel)] for expression / spot
         tables; either may be omitted and the matching predicates then
         refuse with an actionable error rather than a KeyError.
+
+        readout_channels: which readout channels the axis is built over,
+        passed to the readout map. None keeps the channel-agnostic axis
+        this has always built -- one bin per H round, keyed by hybe.
+
+        readout_range: the DESIGNED readout range ('1-80'), as settled in
+        the chromatin tracing panel. Without it the axis is seeded from
+        the layout -- readout-id indexed for a polymer modality, dense
+        otherwise (polymer.readout_map_for).
 
         Computed cell attributes persist per FOV (expression.json beside
         the other capsules) and a rebuild REUSES them per source --
@@ -300,13 +311,25 @@ class Population:
             # and every downstream join then fabricates signal
             raise ValueError(f'duplicate FOVs in {fovs}')
         qc_round_hybes = None
-        bin_ids = None
+        bin_ids = bin_labels = None
         if records is not None:
+            # the polymer axis comes from the readout map, so a readout
+            # the design skipped is a SLOT here and not a closed-up gap:
+            # its key is None, every allele is NaN across it, and
+            # bin_ids still names the locus nobody imaged
             if hybes is None:
-                hybes = P.bin_hybes(records)
-            bin_ids = [rid for rid, _h in P.genomic_bins(records)]
+                hybes = P.bin_keys(records, channels=readout_channels,
+                                   modality=modality,
+                                   declared=readout_range)
+            rows = P.genomic_bins(records, channels=readout_channels,
+                                  modality=modality, declared=readout_range)
+            bin_ids = [rid for rid, _h in rows]
+            bin_labels = [h for _rid, h in rows]
             qc_round_hybes = {'repeat': P.qc_rounds(records)['repeats'],
                               'toe': P.qc_rounds(records)['toes']}
+        if bin_labels is None:
+            bin_labels = [k[0] if isinstance(k, tuple) else (k or '')
+                          for k in (hybes or [])]
         items = [(storage_path, int(f), hybes, sources, spot_sources,
                   tuple(voxel_um), bool(mask_intensity),
                   (resolvers or {}).get(int(f)), qc_round_hybes,
@@ -335,7 +358,14 @@ class Population:
                 'fov': np.concatenate([p['fov'] for p in parts]),
                 'celltype': sum((p['celltype'] for p in parts), []),
                 'n_traced': np.concatenate([p['n_traced'] for p in parts]),
-                'bin_hybes': list(hybes or []),
+                # bin_hybes are LABELS, one per slot, '' where nothing
+                # was imaged; bin_keys are what the stored data was read
+                # under. They differ once a round carries two readouts:
+                # the hybe then names two slots and stops being a key.
+                'bin_hybes': list(bin_labels or []),
+                'bin_keys': list(hybes or []),
+                'bin_channels': [(k[1] if isinstance(k, tuple) else 0)
+                                 for k in (hybes or [])],
                 'bin_ids': list(bin_ids or []),
                 # WHICH modality these bins were traced in -- a
                 # traced distance source names (modality, hybe), and

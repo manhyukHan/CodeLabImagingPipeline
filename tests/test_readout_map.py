@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from codelab_pipeline.analysis.readout_map import (          # noqa: E402
-    ReadoutMap, ReadoutBin, NOT_A_BIN)
+    ReadoutMap, ReadoutBin, NOT_A_BIN, ANY_CHANNEL)
 
 PASS, FAIL = [], []
 
@@ -61,6 +61,34 @@ def main():
           str([b.pindex for b in m.bins()]))
     check('the same hybe maps to different readouts per channel',
           m.of('Hyb_001', 635).rindex == 1 and m.of('Hyb_001', 747).rindex == 51)
+
+    print('\nthe ACTIVATION filters, even where the layout names channels')
+    recs = [rec('Hyb_001', 1, readouts=[(635, 1), (747, 51)]),
+            rec('Hyb_002', 2, readouts=[(635, 2), (747, 52)])]
+    m = ReadoutMap.from_layout(recs, channels=[635])
+    check('a layout-named channel nobody activated is NOT a bin',
+          [(b.hybe, b.channel) for b in m.bins()]
+          == [('Hyb_001', 635), ('Hyb_002', 635)],
+          str([(b.hybe, b.channel) for b in m.bins()]))
+    check('and the axis is only as long as what is activated',
+          m.n_slots() == 2 and m.gaps() == [],
+          '%d slots, gaps %s' % (m.n_slots(), m.gaps()))
+    check('activating both brings both back',
+          len(ReadoutMap.from_layout(recs, channels=[635, 747]).bins()) == 4)
+    check('channels=None takes whatever the layout names',
+          len(ReadoutMap.from_layout(recs).bins()) == 4)
+    check('channels=[] activates nothing, so nothing is a bin',
+          ReadoutMap.from_layout(recs, channels=[]).bins() == [])
+
+    print('\nan unnamed readout with no activation is channel-agnostic')
+    recs = [rec('Hyb_001', 1), rec('Hyb_002', 2)]
+    m = ReadoutMap.from_layout(recs)
+    check('the channel is ANY_CHANNEL, not a guessed wavelength',
+          [b.channel for b in m.bins()] == [ANY_CHANNEL] * 2,
+          str([b.channel for b in m.bins()]))
+    check('so a lookup for 635 misses rather than answering',
+          m.of('Hyb_001', 635) is None
+          and m.of('Hyb_001', ANY_CHANNEL) is not None)
 
     print('\na readout the design skips leaves a NaN stripe')
     recs = ([rec('Hyb_%03d' % i, i) for i in range(1, 52)]

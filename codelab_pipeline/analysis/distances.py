@@ -48,10 +48,11 @@ def _traced_of(pop, source, alleles=None):
                          f'source must name {traced_modality} '
                          f'(spot sources are unrestricted)')
     bins = list(al.get('bin_hybes') or [])
-    if h not in bins:
+    try:
+        j = polymer.slot_index(bins, h, al.get('bin_channels'))
+    except KeyError:
         raise ValueError(f'{h} is not a traced genomic bin '
                          f'(bins: {bins[:6]}{" ..." if len(bins) > 6 else ""})')
-    j = bins.index(h)
     pos = np.asarray(al['pos_um'])[:, j, :]
     cell = np.asarray(al['cell'])
     keep = np.isfinite(pos[:, 0]) & (cell >= 0)

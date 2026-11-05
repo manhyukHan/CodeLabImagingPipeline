@@ -21,6 +21,8 @@ per-predicate summary, never silently dropped from counts.
 import numpy as np
 import pandas as pd
 
+from . import polymer
+
 _REGISTRY = {}
 
 
@@ -357,12 +359,14 @@ class BarcodePresence(Predicate):
         if al is None:
             raise ValueError('population carries no alleles')
         bins = list(al['bin_hybes'])
+        chans = al.get('bin_channels')
         idxs = []
         for h in self.hybes:
-            if h not in bins:
+            try:
+                idxs.append(polymer.slot_index(bins, h, chans))
+            except KeyError:
                 raise ValueError(f'{h!r} is not a genomic bin '
                                  f'(bins: {bins[:5]}...)')
-            idxs.append(bins.index(h))
         present = np.isfinite(al['pos_um'][:, idxs, 0])
         return (~present).all(1) if self.absent else present.all(1)
 
