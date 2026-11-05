@@ -14574,6 +14574,11 @@ One PNG PER MODALITY: each modality has its own reference and its
         # check states. Comma separated: one hybe can carry more than one
         # readout, and an older config holding a single channel restores
         # to exactly what it meant.
+        # the SETTLED readout map, '' while the layout as it stands is
+        # the answer. Written here rather than through _CONFIG_PARAM_MAP
+        # for the same reason `hybes` is: it is list-shaped state the
+        # panel owns, not a scalar a widget happens to hold.
+        out['chromatin_tracing']['readout_map'] =             self.ui.ChromatinTracingPanel.ReadoutMapLineEdit.text().strip()
         out['chromatin_tracing']['readout_channel'] = ','.join(
             str(c) for c in
             self.ui.ChromatinTracingPanel.active_readout_channels())
@@ -14673,6 +14678,10 @@ One PNG PER MODALITY: each modality has its own reference and its
                 if section == 'chromatin_tracing' and param == 'hybes':
                     keys = [tuple(pair.split('|', 1)) for pair in value.split(',') if '|' in pair]
                     self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
+                    continue
+                if section == 'chromatin_tracing' and param == 'readout_map':
+                    self.ui.ChromatinTracingPanel.ReadoutMapLineEdit.setText(
+                        str(value or ''))
                     continue
                 if section == 'chromatin_tracing' and param == 'readout_channel':
                     self.ui.ChromatinTracingPanel.set_active_readout_channels(value)

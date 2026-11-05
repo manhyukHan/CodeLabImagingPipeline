@@ -201,6 +201,16 @@ class ChromatinTracingPanelUI(object):
         buttonCol.addStretch(1)
         readoutRow.addLayout(buttonCol)
         refForm.addRow('Readout channel(s) to trace:', readoutRow)
+        # THE SETTLED READOUT MAP, as one config attribute. A WIDGET
+        # because that is what makes it save and load like every other
+        # parameter; its editor is a pop-up off the Pipeline tab's
+        # tracing step, so it is not shown here. Empty means "the layout
+        # as it stands", which is every project until a round carries
+        # two readouts and somebody has to say which locus each is.
+        self.ReadoutMapLineEdit = QtWidgets.QLineEdit()
+        self.ReadoutMapLineEdit.setVisible(False)
+        refForm.addRow(self.ReadoutMapLineEdit)
+        self.ReadoutMapLineEdit.setVisible(False)
         self._active_readout_channels = ('auto',)
         self.TraceReadoutChannelListWidget.itemChanged.connect(
             self._readout_channel_item_changed)

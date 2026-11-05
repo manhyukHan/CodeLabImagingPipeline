@@ -540,6 +540,7 @@ class StepParamsDialog(QtWidgets.QDialog):
         self._machine = []         # (src widget, editor)
         self.rounds = None
         self.channels = None
+        self.readout_map = None
         self.names = None
         self.training = None
 
@@ -651,6 +652,43 @@ class StepParamsDialog(QtWidgets.QDialog):
                 msg.setWordWrap(True)
                 msg.setStyleSheet(f'color: {GREY};')
                 lay.addWidget(msg)
+            inner.addWidget(box)
+
+        if step == 'tracing':
+            # A BUTTON, not an inline table: the map is one row per
+            # (hybe, channel) -- 85 of them on MP58 -- and a dialog that
+            # tall buries the parameters it sits among.
+            box = QtWidgets.QGroupBox('Readout map')
+            lay = QtWidgets.QVBoxLayout(box)
+            field = None
+            try:
+                field = mw.ui.ChromatinTracingPanel.ReadoutMapLineEdit
+            except Exception:                               # noqa: BLE001
+                field = None
+            self.ReadoutMapLabel = QtWidgets.QLabel('')
+            self.ReadoutMapLabel.setWordWrap(True)
+            self.ReadoutMapLabel.setStyleSheet(f'color: {GREY};')
+            self.EditReadoutMapPushButton = QtWidgets.QPushButton(
+                'Edit readout map\u2026')
+            self.EditReadoutMapPushButton.setToolTip(
+                'Which (hybe, channel) is which readout, and where it sits '
+                'on the polymer. The layout seeds it; a readout number the '
+                'layout does not name -- a second dye on the same adapter '
+                'reads a different barcode -- is yours to settle.')
+            self._map_text = field.text().strip() if field is not None else ''
+            self._map_project = project
+            self._refresh_map_label()
+            self.EditReadoutMapPushButton.clicked.connect(self._edit_map)
+            if field is None:
+                self.EditReadoutMapPushButton.setEnabled(False)
+                self.ReadoutMapLabel.setText(
+                    'The chromatin tracing panel is not loaded.')
+            elif project is None:
+                self.EditReadoutMapPushButton.setEnabled(False)
+                self.ReadoutMapLabel.setText(
+                    'No project read yet \u2014 press Refresh status first.')
+            lay.addWidget(self.ReadoutMapLabel)
+            lay.addWidget(self.EditReadoutMapPushButton)
             inner.addWidget(box)
 
         if MACHINE.get(step):
@@ -898,6 +936,64 @@ class StepParamsDialog(QtWidgets.QDialog):
             out.setdefault(section, {})[param] = MainWindow._widget_value(ed)
         return out
 
+    def _map_rows_and_range(self):
+        """(rows, declared) to open the editor on.
+
+        A SETTLED map is re-opened as itself; otherwise the layout seeds
+        it, through the same activated channels the trace would use, so
+        the table shows exactly the bins that run.
+        """
+        from codelab_pipeline.analysis.readout_map import ReadoutMap
+        if self._map_text:
+            m = ReadoutMap.from_text(self._map_text)
+            lo = m.rindex_base()
+            n = m.declared_slots()
+            rng = ('%d-%d' % (lo, lo + n - 1)
+                   if lo is not None and n else '')
+            return m.rows(), rng
+        chp = self.mw.ui.ChromatinTracingPanel
+        chosen = [c for c in chp.active_readout_channels() if c != 'auto']
+        recs = []
+        for name, m in (self._map_project or {}).get('modalities', {}).items():
+            recs.extend(m.get('records') or [])
+        return ReadoutMap.seed_rows(
+            recs, channels=[int(c) for c in chosen] or None), ''
+
+    def _refresh_map_label(self):
+        from codelab_pipeline.analysis.readout_map import ReadoutMap
+        if not self._map_text:
+            self.ReadoutMapLabel.setText(
+                'Following the layout. Nothing has had to be settled by '
+                'hand yet.')
+            return
+        try:
+            m = ReadoutMap.from_text(self._map_text)
+            self.ReadoutMapLabel.setText(
+                'Settled by hand: %d bin(s) on a %d-slot axis, %d slot(s) '
+                'nothing imaged.'
+                % (len(m.bins()), m.n_slots(), len(m.gaps())))
+        except Exception as exc:                            # noqa: BLE001
+            self.ReadoutMapLabel.setText('Stored map unreadable: %s' % exc)
+
+    def _edit_map(self):
+        from ui.readout_map_editor import ReadoutMapEditor
+        try:
+            rows, rng = self._map_rows_and_range()
+        except Exception as exc:                            # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, 'Readout map', 'Cannot seed the map: %s' % exc)
+            return
+        dlg = ReadoutMapEditor(rows, rng, parent=self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            self.readout_map = self._map_text = dlg.value()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, 'Readout map', 'Not settled: %s' % exc)
+            return
+        self._refresh_map_label()
+
     def apply(self):
         """Write the dialog back to the tabs. Returns a log line."""
         from windows.main_window import MainWindow
@@ -906,6 +1002,11 @@ class StepParamsDialog(QtWidgets.QDialog):
         self.mw._apply_config_params(self.values())
         for src, ed in self._machine:
             src.setValue(ed.value())
+        if self.readout_map is not None:
+            field = self.mw.ui.ChromatinTracingPanel.ReadoutMapLineEdit
+            if self.readout_map != field.text():
+                field.setText(self.readout_map)
+                changed.append('chromatin_tracing/readout_map')
         if self.channels is not None:
             field = self.mw.ui.PipelinePanel.LocalizationChannelsLineEdit
             value = self.channels.value()

@@ -250,6 +250,108 @@ class ReadoutMap(object):
         return cls((ReadoutBin(h, c, rid, dt, pindex.get((h, c), NOT_A_BIN))
                     for h, c, rid, dt in rows), slots=slots)
 
+    @classmethod
+    def seed_rows(cls, records, channels=None, datatypes=('H', 'R', 'T')):
+        """Editable rows for the panel's table -- rindex may be None.
+
+        from_layout REFUSES the case this exists for: the layout names
+        one readout id per round and the operator activated two
+        channels, so both would claim it. That refusal is right -- the
+        second channel's readout id is a design fact, and neither
+        continuing the numbering nor calling it a repeat recovers it --
+        but refusing leaves nothing to EDIT, and the operator is the one
+        who knows the answer.
+
+        So this builds the rows instead of the map. A bin the layout
+        names outright gets its readout id. Where the layout names no
+        channel at all, the LOWEST activated channel the hybe carries
+        takes the round's id -- it is the one the single-channel default
+        would have used -- and every other channel gets rindex None,
+        meaning "the layout does not say": the blank the operator fills.
+
+        pindex is left None too; it follows from rindex and the declared
+        range, which the table derives rather than stores by hand.
+        """
+        want = None if channels is None else [int(c) for c in channels]
+        rows = []
+        for r in records or []:
+            dtype = str(r.get('datatype') or '').upper()
+            if datatypes and dtype not in datatypes:
+                continue
+            hybe = str(r['folder'])
+            have = [int(c) for c in (r.get('channels') or [])]
+            pairs = r.get('readouts') or [(None, r.get('readout_id'))]
+            named = {int(c): int(rid) for c, rid in pairs
+                     if c is not None and rid is not None}
+            unnamed = next((rid for c, rid in pairs
+                            if c is None and rid is not None), None)
+            usable = ([c for c in have if c in want] if want is not None
+                      else sorted(named) or have)
+            # the lowest activated channel inherits the round's own id;
+            # see the docstring for why only one of them can
+            first = min(usable) if usable else None
+            for channel in sorted(usable):
+                rindex = named.get(channel)
+                if rindex is None and channel == first:
+                    rindex = unnamed
+                rows.append({'hybe': hybe, 'channel': int(channel),
+                             'rindex': None if rindex is None else int(rindex),
+                             'dtype': dtype, 'pindex': None})
+        rows.sort(key=lambda d: (d['rindex'] is None,
+                                 d['rindex'] if d['rindex'] is not None else 0,
+                                 d['channel'], d['hybe']))
+        return rows
+
+    @staticmethod
+    def place_rows(rows, declared=None):
+        """Fill each row's pindex from its rindex, and say how long the
+        axis is: (rows, n_slots, [complaints]).
+
+        H rows only -- R/T are measured but are not polymer bins, so
+        they take NOT_A_BIN. A row with no rindex cannot be placed and
+        is reported rather than dropped: it is the blank the operator
+        still has to fill, and a map built without it would quietly be
+        one bin short.
+        """
+        out = [dict(r) for r in rows or []]
+        rng = (parse_range(declared)
+               if not isinstance(declared, (tuple, list))
+               else (int(declared[0]), int(declared[1])))
+        h = [r for r in out if str(r.get('dtype', '')).upper() == 'H']
+        blanks = [r for r in h if r.get('rindex') is None]
+        ids = [int(r['rindex']) for r in h if r.get('rindex') is not None]
+        lo = rng[0] if rng else (min(ids) if ids else 0)
+        hi = rng[1] if rng else (max(ids) if ids else -1)
+        complaints = []
+        for r in out:
+            if str(r.get('dtype', '')).upper() != 'H' or r.get('rindex') is None:
+                r['pindex'] = NOT_A_BIN
+                continue
+            rid = int(r['rindex'])
+            if rng and not lo <= rid <= hi:
+                complaints.append('%s/%s: readout %d is outside the declared '
+                                  'range %d-%d' % (r['hybe'], r['channel'],
+                                                   rid, lo, hi))
+                r['pindex'] = NOT_A_BIN
+                continue
+            r['pindex'] = rid - lo
+        for r in blanks:
+            complaints.append('%s/%s: no readout number -- the layout does '
+                              'not name one for this channel'
+                              % (r['hybe'], r['channel']))
+        seen = {}
+        for r in out:
+            if r['pindex'] == NOT_A_BIN:
+                continue
+            if r['pindex'] in seen:
+                complaints.append(
+                    '%s/%s and %s/%s both sit at polymer index %d'
+                    % (seen[r['pindex']]['hybe'], seen[r['pindex']]['channel'],
+                       r['hybe'], r['channel'], r['pindex']))
+            seen[r['pindex']] = r
+        n_slots = (hi - lo + 1) if hi >= lo else 0
+        return out, n_slots, complaints
+
     # -- reading --------------------------------------------------------
 
     def of(self, hybe, channel):
