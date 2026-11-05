@@ -81,7 +81,20 @@ def load_project(config_path):
     manifest = paths.read_manifest(root) if root else None
     modalities = {}
     for name, fields in cfg.get('modalities', {}).items():
-        lp = ((manifest or {}).get('modalities', {}).get(name, {}) or {}).get('layout_path', '') or fields.get('layout_path', '')
+        # The manifest wins only while it POINTS AT SOMETHING. It records
+        # the acquisition share with whichever drive letter the last
+        # session to open the project had it mounted on -- Z: for one
+        # user, Q: for the next, the same file either way -- so on any
+        # other machine its path is a dead string, and preferring it
+        # blindly gave 'no layout records' for a project whose own config
+        # names a path that opens. Reachability decides; the manifest
+        # still wins every tie, and an unreachable manifest path is kept
+        # as the reported value when the config offers nothing better, so
+        # the warning still names what was tried.
+        m_lp = ((manifest or {}).get('modalities', {}).get(name, {})
+                or {}).get('layout_path', '')
+        c_lp = fields.get('layout_path', '')
+        lp = m_lp if (m_lp and os.path.exists(m_lp)) else (c_lp or m_lp)
         records = []
         if lp and os.path.exists(lp):
             try:
