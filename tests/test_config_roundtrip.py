@@ -83,8 +83,10 @@ def main():
                 combo = combos.get(name)
                 if combo is not None and combo.count() > 1:
                     combo.setCurrentIndex((combo.currentIndex() + 1) % combo.count())
-        # the ACTIVATED trace readout channel (staged combo + Activate)
-        a.ui.ChromatinTracingPanel.set_active_readout_channel('635')
+        # the ACTIVATED trace readout channel(s) (staged list + Activate).
+        # Two of them, so the round trip covers the multi-channel case a
+        # single string used to be unable to express.
+        a.ui.ChromatinTracingPanel.set_active_readout_channels('635,747')
         # Analysis section 1: checked sources (dynamic, list-shaped) --
         # check a few real entries; 1b: the editable QC thresholds
         alp = a.ui.AnalysisPanel

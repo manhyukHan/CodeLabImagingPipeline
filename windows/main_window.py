@@ -2561,8 +2561,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # carry this channel, so leaving the combo on 'auto' would let
             # the per-hybe fallback pick a different wavelength for some of
             # them -- the exact thing this default exists to prevent.
-            if chp.active_readout_channel() == 'auto':
-                chp.set_active_readout_channel(str(_target))
+            if chp.active_readout_channels() == ('auto',):
+                chp.set_active_readout_channels(str(_target))
             self.log(
                 f'chromatin tracing: default readout channel {_target} -- '
                 f'present in {len(_allowed)} of {_n_gated} DNA H/R/T hybe(s)'
@@ -8719,10 +8719,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # first non-fiducial" per hybe, which is a different wavelength in
         # different hybes and is 999, a real brightfield channel, on this
         # project's own Hyb_BF.
-        chosen = chp.active_readout_channel()
+        chosen_set = chp.active_readout_channels()
         selected = [records_by_folder[f] for f in hybes if f in records_by_folder]
-        if chosen == 'auto':
+        if chosen_set == ('auto',):
             chosen = alignment.dominant_readout_channel(selected)
+        else:
+            # THE TRACE PATH STILL TAKES ONE READOUT CHANNEL PER HYBE.
+            # hybe_readout_channels is {folder: channel} all the way down
+            # to trace_allele, and a bin is keyed by its hybe alone, so a
+            # second channel in the same round has nowhere to go yet.
+            # Selecting several is therefore refused here rather than
+            # silently narrowed -- tracing a wavelength the operator did
+            # not get to see chosen is the failure this staging exists to
+            # prevent.
+            if len(chosen_set) > 1:
+                raise ValueError(
+                    'chromatin tracing: %d readout channels are activated '
+                    '(%s), but the trace path still carries one channel per '
+                    'hybe. Activate a single channel, or wait for the '
+                    'multi-channel bin key.'
+                    % (len(chosen_set), ', '.join(str(c) for c in chosen_set)))
+            chosen = chosen_set[0]
         # A hybe that does not carry the chosen channel is left OUT of the
         # map. build_chromatin_trace_allele already treats a hybe with no
         # readout channel as un-traceable and records the reason, which is
@@ -14533,9 +14550,13 @@ One PNG PER MODALITY: each modality has its own reference and its
         # training celltypes: the experiment's panel design, list-shaped
         out['cellcycle']['genes'] = self.ui.CellCyclePanel.gene_config()
         out['cellcycle']['training_celltypes'] = ','.join(self.ui.CellCyclePanel.training_celltypes())
-        # the ACTIVATED readout-channel choice, not the combo's transient
-        out['chromatin_tracing']['readout_channel'] = \
-            self.ui.ChromatinTracingPanel.active_readout_channel()
+        # the ACTIVATED readout-channel choice, not the list's transient
+        # check states. Comma separated: one hybe can carry more than one
+        # readout, and an older config holding a single channel restores
+        # to exactly what it meant.
+        out['chromatin_tracing']['readout_channel'] = ','.join(
+            str(c) for c in
+            self.ui.ChromatinTracingPanel.active_readout_channels())
         # The analysis GATE is config-shaped state: a declarative
         # description (predicate clauses), like a checked-hybe set.
         # Which cells pass is derived data and is deliberately NOT
@@ -14634,7 +14655,7 @@ One PNG PER MODALITY: each modality has its own reference and its
                     self.ui.ChromatinTracingPanel.set_checked_hybes(keys)
                     continue
                 if section == 'chromatin_tracing' and param == 'readout_channel':
-                    self.ui.ChromatinTracingPanel.set_active_readout_channel(value)
+                    self.ui.ChromatinTracingPanel.set_active_readout_channels(value)
                     continue
                 if section == 'cellcycle' and param == 'genes':
                     self.ui.CellCyclePanel.set_gene_config(value)

@@ -173,18 +173,37 @@ class ChromatinTracingPanelUI(object):
         # The combo is a STAGING field: nothing changes until Activate
         # is pressed -- a stray mouse wheel over the combo must never
         # silently retarget what gets traced.
+        # A LIST, not a combo: one hybe can carry more than one readout.
+        # The probe design puts a second dye on the same adapter -- 635
+        # reading R1 and 747 reading R51 in the same round -- which
+        # doubles the bins an experiment can address, and the layout can
+        # now say so (preprocess._parse_readouts). Checking more than one
+        # here is what asks for it.
+        #
+        # 'auto' stays exclusive: it means "the one channel the selected
+        # hybes most share", which is a statement about a single channel
+        # and cannot be combined with naming others.
         readoutRow = QtWidgets.QHBoxLayout()
-        self.TraceReadoutChannelComboBox = QtWidgets.QComboBox()
-        self.TraceReadoutChannelComboBox.addItem(
-            'auto (most shared)', 'auto')
-        readoutRow.addWidget(self.TraceReadoutChannelComboBox, stretch=1)
+        self.TraceReadoutChannelListWidget = QtWidgets.QListWidget()
+        self.TraceReadoutChannelListWidget.setMaximumHeight(74)
+        self.TraceReadoutChannelListWidget.setToolTip(
+            'Check one or more readout channels to trace. "auto" means the '
+            'non-fiducial channel the selected hybes most share, and cannot '
+            'be combined with naming channels explicitly.')
+        readoutRow.addWidget(self.TraceReadoutChannelListWidget, stretch=1)
+        buttonCol = QtWidgets.QVBoxLayout()
         self.ActivateReadoutChannelPushButton = QtWidgets.QPushButton(
             'Activate')
-        readoutRow.addWidget(self.ActivateReadoutChannelPushButton)
+        buttonCol.addWidget(self.ActivateReadoutChannelPushButton)
         self.ActiveReadoutChannelLabel = QtWidgets.QLabel('active: auto')
-        readoutRow.addWidget(self.ActiveReadoutChannelLabel)
-        refForm.addRow('Readout channel to trace:', readoutRow)
-        self._active_readout_channel = 'auto'
+        self.ActiveReadoutChannelLabel.setWordWrap(True)
+        buttonCol.addWidget(self.ActiveReadoutChannelLabel)
+        buttonCol.addStretch(1)
+        readoutRow.addLayout(buttonCol)
+        refForm.addRow('Readout channel(s) to trace:', readoutRow)
+        self._active_readout_channels = ('auto',)
+        self.TraceReadoutChannelListWidget.itemChanged.connect(
+            self._readout_channel_item_changed)
         self.ActivateReadoutChannelPushButton.clicked.connect(
             self._activate_readout_channel)
         hybesLayout.addLayout(refForm)
@@ -614,24 +633,70 @@ class ChromatinTracingPanelUI(object):
         if lw.count():
             lw.itemChanged.emit(lw.item(0))
 
+    def _checked_readout_channels(self):
+        lw = self.TraceReadoutChannelListWidget
+        out = []
+        for i in range(lw.count()):
+            it = lw.item(i)
+            if it.checkState() == QtCore.Qt.Checked:
+                out.append(it.data(QtCore.Qt.UserRole))
+        return out
+
+    def _readout_channel_item_changed(self, item):
+        """'auto' is exclusive -- it names ONE channel by a rule, so it
+        cannot stand beside channels named outright."""
+        lw = self.TraceReadoutChannelListWidget
+        if item.checkState() != QtCore.Qt.Checked:
+            return
+        is_auto = item.data(QtCore.Qt.UserRole) == 'auto'
+        lw.blockSignals(True)
+        for i in range(lw.count()):
+            other = lw.item(i)
+            if other is item:
+                continue
+            if is_auto or other.data(QtCore.Qt.UserRole) == 'auto':
+                other.setCheckState(QtCore.Qt.Unchecked)
+        lw.blockSignals(False)
+
     def _activate_readout_channel(self):
-        self._active_readout_channel = (
-            self.TraceReadoutChannelComboBox.currentData() or 'auto')
+        chosen = tuple(self._checked_readout_channels()) or ('auto',)
+        self._active_readout_channels = chosen
         self.ActiveReadoutChannelLabel.setText(
-            f'active: {self._active_readout_channel}')
+            'active: ' + ', '.join(str(c) for c in chosen))
 
-    def active_readout_channel(self):
-        """The ACTIVATED choice, not the combo's transient value."""
-        return self._active_readout_channel
+    def active_readout_channels(self):
+        """The ACTIVATED choice, not the list's transient check states.
 
-    def set_active_readout_channel(self, value):
-        """Config-restore door: select AND activate in one step."""
-        value = str(value or 'auto')
-        i = self.TraceReadoutChannelComboBox.findData(value)
-        if i >= 0:
-            self.TraceReadoutChannelComboBox.setCurrentIndex(i)
-        self._active_readout_channel = value
-        self.ActiveReadoutChannelLabel.setText(f'active: {value}')
+        A tuple: either ('auto',) or one or more channel numbers as
+        strings. Staged behind Activate for the reason the combo was --
+        a stray wheel or click must never silently retarget a run.
+        """
+        return self._active_readout_channels
+
+    def set_active_readout_channels(self, value):
+        """Config-restore door: check AND activate in one step.
+
+        Accepts 'auto', '635', or '635,747' -- the config attribute is a
+        single string, and an older config holding one channel restores
+        to exactly what it meant.
+        """
+        if isinstance(value, (list, tuple)):
+            wanted = [str(v) for v in value if str(v).strip()]
+        else:
+            wanted = [v.strip() for v in str(value or 'auto').split(',')
+                      if v.strip()]
+        wanted = tuple(wanted) or ('auto',)
+        lw = self.TraceReadoutChannelListWidget
+        lw.blockSignals(True)
+        for i in range(lw.count()):
+            it = lw.item(i)
+            it.setCheckState(QtCore.Qt.Checked
+                             if it.data(QtCore.Qt.UserRole) in wanted
+                             else QtCore.Qt.Unchecked)
+        lw.blockSignals(False)
+        self._active_readout_channels = wanted
+        self.ActiveReadoutChannelLabel.setText(
+            'active: ' + ', '.join(wanted))
 
     def populate_readout_channel_choices(self, channels, dominant=None):
         """'auto' + the concrete channels; the ACTIVE choice survives.
@@ -646,21 +711,42 @@ class ChromatinTracingPanelUI(object):
         number is what lets an operator see the choice before pressing
         Activate.
         """
-        combo = self.TraceReadoutChannelComboBox
-        current = combo.currentData()
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem(f'auto (most shared: {dominant})' if dominant is not None
-                      else 'auto (most shared)', 'auto')
-        for ch in channels:
-            combo.addItem(str(ch), str(ch))
-        i = combo.findData(current)
-        combo.setCurrentIndex(max(i, 0))
-        combo.blockSignals(False)
-        if self._active_readout_channel == 'auto':
+        lw = self.TraceReadoutChannelListWidget
+        active = set(self._active_readout_channels)
+        lw.blockSignals(True)
+        lw.clear()
+        for label, data in ([(f'auto (most shared: {dominant})'
+                              if dominant is not None else 'auto (most shared)',
+                              'auto')]
+                            + [(str(ch), str(ch)) for ch in channels]):
+            it = QtWidgets.QListWidgetItem(label)
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setData(QtCore.Qt.UserRole, data)
+            it.setCheckState(QtCore.Qt.Checked if data in active
+                             else QtCore.Qt.Unchecked)
+            lw.addItem(it)
+        # the ACTIVE choice survives a repopulate; a channel that has
+        # disappeared from the layout is dropped rather than carried as a
+        # name nothing can resolve
+        kept = tuple(c for c in self._active_readout_channels
+                     if c == 'auto' or str(c) in {str(x) for x in channels})
+        self._active_readout_channels = kept or ('auto',)
+        if kept != self._active_readout_channels:
+            for i in range(lw.count()):
+                it = lw.item(i)
+                it.setCheckState(
+                    QtCore.Qt.Checked
+                    if it.data(QtCore.Qt.UserRole) in self._active_readout_channels
+                    else QtCore.Qt.Unchecked)
+        lw.blockSignals(False)
+        if self._active_readout_channels == ('auto',):
             self.ActiveReadoutChannelLabel.setText(
                 f'active: auto ({dominant})' if dominant is not None
                 else 'active: auto')
+        else:
+            self.ActiveReadoutChannelLabel.setText(
+                'active: ' + ', '.join(str(c)
+                                       for c in self._active_readout_channels))
 
     def populate_reference_hybe_choices(self, total_active_hybe_list):
         current = self.current_reference_hybe_key()
