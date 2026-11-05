@@ -8741,40 +8741,33 @@ class MainWindow(QtWidgets.QMainWindow):
         chosen_set = chp.active_readout_channels()
         selected = [records_by_folder[f] for f in hybes if f in records_by_folder]
         if chosen_set == ('auto',):
-            chosen = alignment.dominant_readout_channel(selected)
+            # 'auto' is a rule that names ONE channel, so it stays one
+            chosen = [alignment.dominant_readout_channel(selected)]
         else:
-            # THE TRACE PATH STILL TAKES ONE READOUT CHANNEL PER HYBE.
-            # hybe_readout_channels is {folder: channel} all the way down
-            # to trace_allele, and a bin is keyed by its hybe alone, so a
-            # second channel in the same round has nowhere to go yet.
-            # Selecting several is therefore refused here rather than
-            # silently narrowed -- tracing a wavelength the operator did
-            # not get to see chosen is the failure this staging exists to
-            # prevent.
-            if len(chosen_set) > 1:
-                raise ValueError(
-                    'chromatin tracing: %d readout channels are activated '
-                    '(%s), but the trace path still carries one channel per '
-                    'hybe. Activate a single channel, or wait for the '
-                    'multi-channel bin key.'
-                    % (len(chosen_set), ', '.join(str(c) for c in chosen_set)))
-            chosen = chosen_set[0]
-        # A hybe that does not carry the chosen channel is left OUT of the
-        # map. build_chromatin_trace_allele already treats a hybe with no
-        # readout channel as un-traceable and records the reason, which is
-        # the same "do what can be done, say what was not" this pipeline
-        # uses everywhere -- and is why the default hybe selection prefers
-        # hybes that share one channel in the first place.
+            chosen = [c for c in chosen_set]
+        # A hybe that does not carry a chosen channel is left OUT of the
+        # map for that channel. build_chromatin_trace_allele already
+        # treats a hybe with no readout channel as un-traceable and
+        # records the reason, which is the same "do what can be done, say
+        # what was not" this pipeline uses everywhere -- and is why the
+        # default hybe selection prefers hybes that share one channel in
+        # the first place.
+        #
+        # The value is a LIST per hybe. A round that carries two readouts
+        # -- a second dye on the same adapter reading a different barcode
+        # -- fits each of them and stores them under (hybe, channel);
+        # tracing_v2.bin_key keeps the bare hybe wherever the round has
+        # only one, which is every store written so far.
         for folder in hybes:
             record = records_by_folder.get(folder)
             if record is None:
                 continue
             fiducial_channel = record['fiducial_channel']
-            readout = next((c for c in record.get('channels', [])
-                            if str(c) == str(chosen) and c != fiducial_channel),
-                           None)
-            if readout is not None:
-                hybe_readout_channels[folder] = readout
+            have = [c for c in record.get('channels', [])
+                    if c != fiducial_channel
+                    and any(str(c) == str(w) for w in chosen)]
+            if have:
+                hybe_readout_channels[folder] = have
         return hybes, hybe_fiducial_channels, hybe_readout_channels, modality, storage_path, reference_hybe
 
     def _chromatin_storage_path_and_modality(self):

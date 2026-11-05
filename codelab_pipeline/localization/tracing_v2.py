@@ -1155,7 +1155,7 @@ def _fiducial_learned(cube, z0, p, ref=None):
 
 def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
                    to_shared, debug=None, seed_yx=None, display_offset=(0, 0),
-                   display_shape=None):
+                   display_shape=None, key=None):
     """Every readout candidate in one crop, via a learned engine.
 
     Returns (wrote_anything, reason). Fills polymer_adj / polymer_raw with
@@ -1173,7 +1173,15 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     _peak_above says why). analysis.polymer.max_brightness compares it,
     so it has to be finite and comparable within this crop; it is not a
     quantity to compare against a v1/v2 amplitude from another run.
+
+    `key` is where the results are STORED -- the bare hybe, or
+    (hybe, channel) once the round carries two readouts. `hybe` stays
+    the round, because to_shared maps through THAT round's matrices and
+    a bin key would not name one. They are the same value in every
+    single-channel trace, which is why one argument carried both until a
+    round could hold two bins.
     """
+    key = hybe if key is None else key
     # THE SEARCH IS THE FIDUCIAL'S SLAB, not the whole column. The crop
     # carries every plane of the stack, and a learned engine handed all
     # of it found real emitters forty planes from this locus -- other
@@ -1225,9 +1233,9 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
                  if -0.5 <= float(c.y) - oy < h_d - 0.5
                  and -0.5 <= float(c.x) - ox < w_d - 0.5]
     if debug is not None:
-        debug[hybe]['readout_engine'] = 'v3'
-        debug[hybe]['readout_p_exist'] = [float(c.p_exist) for c in cands]
-        debug[hybe]['readout_n_before_p_gate'] = len(cands)
+        debug[key]['readout_engine'] = 'v3'
+        debug[key]['readout_p_exist'] = [float(c.p_exist) for c in cands]
+        debug[key]['readout_n_before_p_gate'] = len(cands)
     if not cands:
         return False, 'readout found nothing'
 
@@ -1293,7 +1301,7 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         kept = [c for c in kept
                 if np.isfinite(c.p) and float(cal.score(c.p)) >= p.min_p3]
         if debug is not None:
-            debug[hybe]['readout_n_below_p3'] = before - len(kept)
+            debug[key]['readout_n_below_p3'] = before - len(kept)
     n_pre = len(kept)
     refined = [c for c in kept if PSFM.is_refined(c)]
     for c in kept:
@@ -1302,9 +1310,9 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
     kept = refined
     oy, ox = (float(display_offset[0]), float(display_offset[1]))
     if debug is not None:
-        debug[hybe]['readout_n_unrefined'] = n_pre - len(kept)
-        debug[hybe]['readout_n_out_of_reach'] = len(cands) - len(in_reach)
-        debug[hybe]['readout_search'] = {'z0': int(z0), 'z1': int(z1),
+        debug[key]['readout_n_unrefined'] = n_pre - len(kept)
+        debug[key]['readout_n_out_of_reach'] = len(cands) - len(in_reach)
+        debug[key]['readout_search'] = {'z0': int(z0), 'z1': int(z1),
                                          'reach': int(z_half),
                                          'lateral_px': int(r_lat),
                                          'trim': int(z_off)}
@@ -1313,13 +1321,13 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
         # see the p_exist distribution and decide where to cut. Drawn in
         # the DISPLAY crop's coordinates: the search crop is wider by the
         # engine's box, and the grid shows the crop the fiducial shows.
-        debug[hybe]['readout_rejected_centroids'] = (
+        debug[key]['readout_rejected_centroids'] = (
             [(float(c.x) - ox, float(c.y) - oy, float(c.z))
              for c, _w in dropped] or None)
-        debug[hybe]['readout_rejected_labels'] = (
+        debug[key]['readout_rejected_labels'] = (
             [f'{float(c.p_exist):.2f}{alt_marker(w)}' for c, w in dropped]
             or None)
-        debug[hybe]['readout_dropped_why'] = [w for _c, w in dropped]
+        debug[key]['readout_dropped_why'] = [w for _c, w in dropped]
     if not kept:
         if not dropped:
             return False, 'readout found nothing'
@@ -1348,12 +1356,12 @@ def _readout_multi(allele, hybe, cube, z_r, p, dy, dx, dz, ymin, xmin,
                     float(c.amplitude), q))
         raw.append((float(c.y + ymin), float(c.x + xmin), float(c.z),
                     float(c.amplitude), q))
-    allele.polymer_adj[hybe] = adj
-    allele.polymer_raw[hybe] = raw
+    allele.polymer_adj[key] = adj
+    allele.polymer_raw[key] = raw
     if debug is not None:
-        debug[hybe]['readout_centroids'] = [(float(c.x) - ox, float(c.y) - oy,
+        debug[key]['readout_centroids'] = [(float(c.x) - ox, float(c.y) - oy,
                                              float(c.z)) for c in kept]
-        debug[hybe]['readout_labels'] = [f'{float(c.p_exist):.2f}'
+        debug[key]['readout_labels'] = [f'{float(c.p_exist):.2f}'
                                          for c in kept]
     return True, ''
 
@@ -1567,6 +1575,42 @@ def qc_shift(reference_cube, cube, z_ref, z_here, half=15):
     return (s[0], s[1], s[2] + (float(z_ref) - float(z_here)))
 
 
+def readout_bins_of(hybe_readout_channels):
+    """{hybe: [channel, ...]} from either shape of the argument.
+
+    One channel per hybe is what every engine took and what every store
+    holds; a round that carries two readouts -- a second dye on the same
+    adapter reading a different barcode -- gives a list. Normalised once
+    here so the fit loop below has one shape to reason about.
+    """
+    out = {}
+    for hybe, v in (hybe_readout_channels or {}).items():
+        if v is None:
+            continue
+        chans = [int(c) for c in v] if isinstance(v, (list, tuple, set)) \
+            else [int(v)]
+        seen = []
+        for c in chans:
+            if c not in seen:
+                seen.append(c)
+        if seen:
+            out[str(hybe)] = seen
+    return out
+
+
+def bin_key(hybe, channel, n_bins):
+    """The key this hybe's results are stored under.
+
+    The bare hybe while the round has ONE readout -- which is every store
+    written so far, and what every consumer indexes by -- and
+    (hybe, channel) once it has two, because the folder name then names
+    two loci and cannot say which. The rule is the same one
+    polymer.bin_lookup_keys reads by, which is what lets a single-channel
+    store and a multi-channel one be read through the same axis.
+    """
+    return str(hybe) if int(n_bins) <= 1 else (str(hybe), int(channel))
+
+
 def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                  hybe_fiducial_channels, hybe_readout_channels,
                                  storage_path, fov, modality, cell, fov_matrices,
@@ -1594,6 +1638,28 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
     from codelab_pipeline.localization import localization as L
 
     p = params or V2Params()
+    # {hybe: [channel, ...]}. A round with two readouts fits each of them
+    # in turn and stores them under their own keys; the FIDUCIAL is cut
+    # once per round and shared by both, because it is the round's, not
+    # the bin's.
+    _bins = readout_bins_of(hybe_readout_channels)
+
+    def _keys(hybe):
+        chans = _bins.get(str(hybe)) or []
+        return [bin_key(hybe, c, len(chans)) for c in chans] or [str(hybe)]
+
+    def _put(d, hybe, value):
+        """A per-ROUND fact, written under every bin of that round.
+
+        The fiducial, its drift and a rejection that happened before any
+        readout was touched belong to the round, and both of its bins
+        carry them. Writing them under the bare hybe instead would make
+        them invisible to a multi-channel axis, which does not offer the
+        bare key when a hybe names two slots -- see
+        polymer.bin_lookup_keys, and the reason it does not.
+        """
+        for k in _keys(hybe):
+            d[k] = value
     # ALWAYS a full re-derivation. v2 has no merge mode, deliberately.
     #
     # It briefly had one, mirroring v1's, and it is now unreachable: an
@@ -1922,24 +1988,26 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
             # gated, no circle = no fit at all.
             if debug is not None and f is not None:
                 debug[hybe]['fiducial_rejected_centroid'] = (f.x, f.y, f.z)
-            allele.rejected_hybes[hybe] = f'fiducial {why}'
+            _put(allele.rejected_hybes, hybe, f'fiducial {why}')
             # THE KEY STAYS, WITH None: looked for and not accepted, which
             # v1 has always written and readers (export's fiducial_found)
             # already distinguish from 'never tried'.
-            allele.fiducial_trace_adj[hybe] = None
-            allele.fiducial_trace_raw[hybe] = None
-            allele.fiducial_drift[hybe] = None
+            _put(allele.fiducial_trace_adj, hybe, None)
+            _put(allele.fiducial_trace_raw, hybe, None)
+            _put(allele.fiducial_drift, hybe, None)
             continue
         ymin, xmin = fid_origin[hybe]
         q = fiducial_quality(f)
-        allele.fiducial_trace_adj[hybe] = _to_shared(hybe, f.y, f.x, f.z, ymin, xmin) \
-            + (float(f.amplitude), q)
+        _put(allele.fiducial_trace_adj, hybe,
+             _to_shared(hybe, f.y, f.x, f.z, ymin, xmin)
+             + (float(f.amplitude), q))
         # The SAME fit, before any matrix: crop-local plus the crop's own
         # origin. ymin/xmin are the actual origin, clamp included, so this
         # indexes that hybe's full frame directly and the image can be
         # re-reached without inverting anything.
-        allele.fiducial_trace_raw[hybe] = (float(f.y + ymin), float(f.x + xmin),
-                                           float(f.z), float(f.amplitude), q)
+        _put(allele.fiducial_trace_raw, hybe,
+             (float(f.y + ymin), float(f.x + xmin),
+              float(f.z), float(f.amplitude), q))
         fid_local[hybe] = (f.y, f.x, f.z)
         if hybe == reference_hybe and wants_ref:
             ref_ctx = _template_crop(hybe, f, fid_origin[hybe], cube)
@@ -1989,7 +2057,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                                     'readout_seed': None,
                                     'readout_zexp': float('nan')})
         if debug is not None and debug[hybe].get('readout_cubic') is None:
-            ch0 = hybe_readout_channels.get(hybe)
+            # the FIRST bin's channel: the preview tile shows one
+            # crop, and a round with two readouts has no single one
+            ch0 = (_bins.get(hybe) or [None])[0]
             if ch0 is not None:
                 try:
                     c0, y0, x0 = _cut(hybe, ch0)
@@ -2003,26 +2073,28 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                         precut[hybe] = (c0, y0, x0)
                 except (OSError, ValueError):
                     pass
-        if hybe in allele.rejected_hybes:
+        if any(k in allele.rejected_hybes for k in _keys(hybe)):
             continue
-        fid = allele.fiducial_trace_adj.get(hybe)
+        fid = allele.fiducial_trace_adj.get(_keys(hybe)[0])
         if baseline is None:
-            allele.rejected_hybes[hybe] = 'reference hybe fiducial not found'
-            allele.fiducial_drift[hybe] = None
+            _put(allele.rejected_hybes, hybe,
+                 'reference hybe fiducial not found')
+            _put(allele.fiducial_drift, hybe, None)
             continue
         if fid is None:
-            allele.rejected_hybes[hybe] = 'fiducial not found'
-            allele.fiducial_drift[hybe] = None
+            _put(allele.rejected_hybes, hybe, 'fiducial not found')
+            _put(allele.fiducial_drift, hybe, None)
             continue
         dy, dx, dz = (baseline[0] - fid[0], baseline[1] - fid[1],
                       baseline[2] - fid[2])
         # Recorded BEFORE the gates: a drift past the gate is a fact
         # about this hybe worth keeping, and rejected_hybes says it was
         # refused. See AnAllele.fiducial_drift.
-        allele.fiducial_drift[hybe] = (float(dy), float(dx), float(dz))
+        _put(allele.fiducial_drift, hybe, (float(dy), float(dx), float(dz)))
         drift = float(np.hypot(dx, dy))
         if drift > max_fiducial_drift:
-            allele.rejected_hybes[hybe] = f'drift {drift:.1f}px > max {max_fiducial_drift}px'
+            _put(allele.rejected_hybes, hybe,
+                 f'drift {drift:.1f}px > max {max_fiducial_drift}px')
             continue
         # Z gated SEPARATELY, in planes: a fiducial fit can pass the XY
         # bound while landing on entirely different content in depth --
@@ -2030,8 +2102,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
         # 1.4 px of lateral drift, and using it would have "corrected"
         # every readout in that round by a bogus dz.
         if abs(dz) > max_fiducial_drift_z:
-            allele.rejected_hybes[hybe] = (f'z drift {dz:.1f} planes > max '
-                                           f'{max_fiducial_drift_z} planes')
+            _put(allele.rejected_hybes, hybe,
+                 f'z drift {dz:.1f} planes > max '
+                 f'{max_fiducial_drift_z} planes')
             continue
 
         # QC only, never the correction. See qc_shift.
@@ -2040,115 +2113,128 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe,
                 fid_cubes.get(reference_hybe), fid_cubes.get(hybe),
                 zexp.get(reference_hybe, 0), zexp.get(hybe, 0))
 
-        channel = hybe_readout_channels.get(hybe)
-        if channel is None:
-            allele.rejected_hybes[hybe] = 'no readout channel configured'
+        chans = _bins.get(hybe) or []
+        if not chans:
+            _put(allele.rejected_hybes, hybe, 'no readout channel configured')
             continue
-        if hybe in precut:
-            cube, ymin, xmin = precut.pop(hybe)
-        else:
-            try:
-                cube, ymin, xmin = _cut(hybe, channel)
-            except (OSError, ValueError):
-                allele.rejected_hybes[hybe] = 'readout crop unreadable'
+        # ONE FIT PER BIN. A round that carries two readouts reads two
+        # different loci through two dyes on the same adapter, so each
+        # gets its own fit, its own gates and its own key. The fiducial
+        # above was cut once and belongs to the round; everything from
+        # here down belongs to the bin. `continue` now skips a BIN, which
+        # is what a rejection here means.
+        for channel in chans:
+            bk = bin_key(hybe, channel, len(chans))
+            # the preview crop was cut for chans[0] only; any other
+            # bin of this round is a different wavelength and must be
+            # cut for itself rather than handed that one's pixels
+            if channel == chans[0] and hybe in precut:
+                cube, ymin, xmin = precut.pop(hybe)
+            else:
+                try:
+                    cube, ymin, xmin = _cut(hybe, channel)
+                except (OSError, ValueError):
+                    allele.rejected_hybes[bk] = 'readout crop unreadable'
+                    continue
+            if cube is None or cube.size == 0:
+                allele.rejected_hybes[bk] = 'readout crop empty'
                 continue
-        if cube is None or cube.size == 0:
-            allele.rejected_hybes[hybe] = 'readout crop empty'
-            continue
-        if debug is not None:
-            debug[hybe]['readout_cubic'] = cube
-        # The readout box sits at this hybe's OWN fiducial depth. The
-        # fiducial images the whole traced region and the readout is one
-        # locus inside it, so the region's fitted z is the right prior --
-        # and it carries this hybe's own drift, unlike the old cross-hybe
-        # consensus. With the z bound (2.8 um) anchored at the seed inside
-        # this box, the readout's axial reach is now measured FROM ITS OWN
-        # FIDUCIAL, which is the physically meaningful anchor.
-        z_r = (float(fid_local[hybe][2]) if hybe in fid_local
-               else own_native_z(cube, p.voxel_um))
-        if debug is not None:
-            debug[hybe]['readout_zexp'] = float(z_r)
-            debug[hybe]['readout_z_reach'] = int(p.z_reach())
-            debug[hybe]['readout_seed'] = _seed(
-                cube, z_r, p.voxel_um,
-                _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
-        if p.readout_engine is not None:
-            # THE LEARNED PATH. One call, every readout candidate in this
-            # crop, then a posterior p_exist cut -- the same shape as the
-            # max_uncert gate below, applied to a different number.
-            # `_to_shared` is the builder's own closure -- it carries this
-            # run's resolver, fov matrices, modality and cell -- so it is
-            # passed in rather than reached for. A module-level helper
-            # that rebuilt that mapping would be a second implementation
-            # of the frame conversion, which is the divergence this
-            # codebase keeps having to hunt down.
-            # THE SEED IS THE FIDUCIAL'S OWN FITTED POSITION in this crop
-            # -- both channels are cut by _cut around the same mapped
-            # centre with the same pad, so fid_local's (y, x) is valid
-            # here -- and that, not the crop centre, is what a readout
-            # candidate has to be near.
-            # THE SEARCH CROP IS WIDER THAN THE DISPLAY CROP by the
-            # engine's own lateral box: a candidate within reach of the
-            # fiducial but near the display crop's edge would otherwise
-            # get a padded feature box and no template room (the
-            # boundary pinning the matcher had before). Same centre,
-            # same channel; the hits are reported in the display crop's
-            # coordinates so the grid keeps showing the fiducial's box.
-            from .psfmatcher import BOX_R
-            try:
-                cube_s, ymin_s, xmin_s = _cut(hybe, channel, pad=spad + BOX_R)
-            except (OSError, ValueError):
-                cube_s, ymin_s, xmin_s = cube, ymin, xmin
-            oy, ox = ymin - ymin_s, xmin - xmin_s
-            seed_yx = ((float(fid_local[hybe][0]) + oy,
-                        float(fid_local[hybe][1]) + ox)
-                       if hybe in fid_local else None)
-            done, why_multi = _readout_multi(allele, hybe, cube_s, z_r, p,
-                                             dy, dx, dz, ymin_s, xmin_s,
-                                             _to_shared, debug,
-                                             seed_yx=seed_yx,
-                                             display_offset=(oy, ox),
-                                             display_shape=cube.shape[:2])
-            if not done:
-                allele.rejected_hybes[hybe] = why_multi
-            continue
-        r = fit_readout(cube, z_r, p)
-        ok, why = gate(r, cube, p.readout_gates, p.voxel_um)
-        # Same as the fiducial: before the reject, so a gated-out readout
-        # still reports the number it was gated on.
-        if debug is not None:
-            debug[hybe]['readout_occupancy'] = occupancy(cube, r, p.voxel_um)
-            debug[hybe]['readout_uncert_nm'] = uncertainty_nm(r)
-            debug[hybe]['readout_at_bound'] = tuple(
-                getattr(r, 'at_bound', None) or ())
-        if not ok:
-            if debug is not None and r is not None:
-                debug[hybe]['readout_rejected_centroids'] = [(r.x, r.y, r.z)]
-            allele.rejected_hybes[hybe] = f'readout {why}'
-            continue
-        sy, sx, sz = _to_shared(hybe, r.y, r.x, r.z, ymin, xmin)
-        # the same fiducial(ref) - fiducial(round) correction v1 applies,
-        # in the shared frame
-        # (y, x, z, amplitude) -- y FIRST, matching v1's actual code at
-        # localization.py:995 and the whole store's yx convention (see
-        # legacy/migrate_store_to_yx.py, which exists purely to enforce it
-        # and swaps polymer_adj entries along with coordinate/fiducial_trace_adj).
-        #
-        # v1's DOCSTRING for _localize_readout_hybe says "(x, y, z,
-        # amplitude)" and is stale -- it predates that migration. Writing
-        # this tuple x-first, as the docstring implies, mirrors every
-        # traced position relative to v1 while remaining a perfectly
-        # well-formed 4-tuple that nothing downstream can detect.
-        allele.polymer_adj[hybe] = [(float(sy + dy), float(sx + dx), float(sz + dz),
-                                     float(r.amplitude), float('nan'))]
-        # Raw carries NO correction of any kind -- neither the alignment
-        # nor the fiducial drift. adj - raw for a READOUT is therefore
-        # alignment PLUS fiducial correction, one term more than the same
-        # difference on a fiducial. See AnAllele's docstring.
-        allele.polymer_raw[hybe] = [(float(r.y + ymin), float(r.x + xmin),
-                                     float(r.z), float(r.amplitude), float('nan'))]
-        if debug is not None:
-            debug[hybe]['readout_centroids'] = [(r.x, r.y, r.z)]
+            if debug is not None:
+                debug.setdefault(bk, dict(debug.get(hybe) or {}))
+                debug[bk]['readout_cubic'] = cube
+            # The readout box sits at this hybe's OWN fiducial depth. The
+            # fiducial images the whole traced region and the readout is one
+            # locus inside it, so the region's fitted z is the right prior --
+            # and it carries this hybe's own drift, unlike the old cross-hybe
+            # consensus. With the z bound (2.8 um) anchored at the seed inside
+            # this box, the readout's axial reach is now measured FROM ITS OWN
+            # FIDUCIAL, which is the physically meaningful anchor.
+            z_r = (float(fid_local[hybe][2]) if hybe in fid_local
+                   else own_native_z(cube, p.voxel_um))
+            if debug is not None:
+                debug[bk]['readout_zexp'] = float(z_r)
+                debug[bk]['readout_z_reach'] = int(p.z_reach())
+                debug[bk]['readout_seed'] = _seed(
+                    cube, z_r, p.voxel_um,
+                    _seed_z_half(READOUT_FIT_RADIUS_UM, p.voxel_um))
+            if p.readout_engine is not None:
+                # THE LEARNED PATH. One call, every readout candidate in this
+                # crop, then a posterior p_exist cut -- the same shape as the
+                # max_uncert gate below, applied to a different number.
+                # `_to_shared` is the builder's own closure -- it carries this
+                # run's resolver, fov matrices, modality and cell -- so it is
+                # passed in rather than reached for. A module-level helper
+                # that rebuilt that mapping would be a second implementation
+                # of the frame conversion, which is the divergence this
+                # codebase keeps having to hunt down.
+                # THE SEED IS THE FIDUCIAL'S OWN FITTED POSITION in this crop
+                # -- both channels are cut by _cut around the same mapped
+                # centre with the same pad, so fid_local's (y, x) is valid
+                # here -- and that, not the crop centre, is what a readout
+                # candidate has to be near.
+                # THE SEARCH CROP IS WIDER THAN THE DISPLAY CROP by the
+                # engine's own lateral box: a candidate within reach of the
+                # fiducial but near the display crop's edge would otherwise
+                # get a padded feature box and no template room (the
+                # boundary pinning the matcher had before). Same centre,
+                # same channel; the hits are reported in the display crop's
+                # coordinates so the grid keeps showing the fiducial's box.
+                from .psfmatcher import BOX_R
+                try:
+                    cube_s, ymin_s, xmin_s = _cut(hybe, channel, pad=spad + BOX_R)
+                except (OSError, ValueError):
+                    cube_s, ymin_s, xmin_s = cube, ymin, xmin
+                oy, ox = ymin - ymin_s, xmin - xmin_s
+                seed_yx = ((float(fid_local[hybe][0]) + oy,
+                            float(fid_local[hybe][1]) + ox)
+                           if hybe in fid_local else None)
+                done, why_multi = _readout_multi(allele, hybe, cube_s, z_r, p,
+                                                 dy, dx, dz, ymin_s, xmin_s,
+                                                 _to_shared, debug,
+                                                 seed_yx=seed_yx,
+                                                 display_offset=(oy, ox),
+                                                 display_shape=cube.shape[:2],
+                                                 key=bk)
+                if not done:
+                    allele.rejected_hybes[bk] = why_multi
+                continue
+            r = fit_readout(cube, z_r, p)
+            ok, why = gate(r, cube, p.readout_gates, p.voxel_um)
+            # Same as the fiducial: before the reject, so a gated-out readout
+            # still reports the number it was gated on.
+            if debug is not None:
+                debug[bk]['readout_occupancy'] = occupancy(cube, r, p.voxel_um)
+                debug[bk]['readout_uncert_nm'] = uncertainty_nm(r)
+                debug[bk]['readout_at_bound'] = tuple(
+                    getattr(r, 'at_bound', None) or ())
+            if not ok:
+                if debug is not None and r is not None:
+                    debug[bk]['readout_rejected_centroids'] = [(r.x, r.y, r.z)]
+                allele.rejected_hybes[bk] = f'readout {why}'
+                continue
+            sy, sx, sz = _to_shared(hybe, r.y, r.x, r.z, ymin, xmin)
+            # the same fiducial(ref) - fiducial(round) correction v1 applies,
+            # in the shared frame
+            # (y, x, z, amplitude) -- y FIRST, matching v1's actual code at
+            # localization.py:995 and the whole store's yx convention (see
+            # legacy/migrate_store_to_yx.py, which exists purely to enforce it
+            # and swaps polymer_adj entries along with coordinate/fiducial_trace_adj).
+            #
+            # v1's DOCSTRING for _localize_readout_hybe says "(x, y, z,
+            # amplitude)" and is stale -- it predates that migration. Writing
+            # this tuple x-first, as the docstring implies, mirrors every
+            # traced position relative to v1 while remaining a perfectly
+            # well-formed 4-tuple that nothing downstream can detect.
+            allele.polymer_adj[bk] = [(float(sy + dy), float(sx + dx), float(sz + dz),
+                                         float(r.amplitude), float('nan'))]
+            # Raw carries NO correction of any kind -- neither the alignment
+            # nor the fiducial drift. adj - raw for a READOUT is therefore
+            # alignment PLUS fiducial correction, one term more than the same
+            # difference on a fiducial. See AnAllele's docstring.
+            allele.polymer_raw[bk] = [(float(r.y + ymin), float(r.x + xmin),
+                                         float(r.z), float(r.amplitude), float('nan'))]
+            if debug is not None:
+                debug[bk]['readout_centroids'] = [(r.x, r.y, r.z)]
     return allele, debug
 
 
@@ -2274,7 +2360,9 @@ def stored_allele_debug(payload):
                      float(fpos[2])) if fpos else None)
             except OSError:
                 pass
-        rch = hybe_readout_channels.get(hybe)
+        # the FIRST bin's channel: this prefetch fills one preview tile
+        # and a round with two readouts has no single one
+        rch = (readout_bins_of(hybe_readout_channels).get(hybe) or [None])[0]
         if rch is not None:
             try:
                 cube, (ymin, xmin) = spot_mapper.crop_for_localization(

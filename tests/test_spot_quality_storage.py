@@ -175,13 +175,17 @@ def test_readout_writes_p_exist():
     bsrc = inspect.getsource(T2.build_chromatin_trace_allele)
     check("v2's Gaussian readout writes NaN there (no gate number of its own)",
           bsrc.count("float(r.amplitude), float('nan'))]") == 2)
+    # _put writes a per-ROUND fact under every bin key of that round:
+    # one key for a single-channel round, two once it carries two
+    # readouts. The fiducial, its drift and a pre-readout rejection are
+    # the round's, not the bin's.
     check('a refused fiducial is written as None under its key, with a None drift',
-          'allele.fiducial_trace_adj[hybe] = None' in bsrc
-          and 'allele.fiducial_trace_raw[hybe] = None' in bsrc
-          and 'allele.fiducial_drift[hybe] = None' in bsrc)
+          '_put(allele.fiducial_trace_adj, hybe, None)' in bsrc
+          and '_put(allele.fiducial_trace_raw, hybe, None)' in bsrc
+          and '_put(allele.fiducial_drift, hybe, None)' in bsrc)
     check('the drift is recorded before the gates, as data',
-          'allele.fiducial_drift[hybe] = (float(dy), float(dx), float(dz))' in bsrc
-          and bsrc.index('allele.fiducial_drift[hybe] = (float(dy)') < bsrc.index("f'drift {drift:.1f}px"))
+          '_put(allele.fiducial_drift, hybe, (float(dy), float(dx), float(dz)))' in bsrc
+          and bsrc.index('_put(allele.fiducial_drift, hybe, (float(dy)') < bsrc.index("f'drift {drift:.1f}px"))
     check('the fiducial rows carry fiducial_quality(f)',
           'q = fiducial_quality(f)' in bsrc and '(float(f.amplitude), q)' in bsrc)
     # the child -> parent hand-off carries the drift

@@ -1176,7 +1176,9 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
        (_localize_readout_hybe) and stores its delta-corrected candidates
        in allele.polymer_adj[hybe].
 
-    hybe_fiducial_channels/hybe_readout_channels: {hybe: channel(int)} --
+    hybe_fiducial_channels/hybe_readout_channels: {hybe: channel(int)};
+      the readout map may also carry a LIST per hybe, which v1 refuses
+      with more than one in it -- see phase 2a. Originally: {hybe: channel(int)} --
     one entry per hybe each, independently resolved from that hybe's own
     ExperimentLayout record (hybe_record['fiducial_channel'] and whichever
     of hybe_record['channels'] isn't the fiducial one). Deliberately NOT
@@ -1348,7 +1350,22 @@ def build_chromatin_trace_allele(allele, hybes, reference_hybe, hybe_fiducial_ch
                 elif abs(dz) > max_fiducial_drift_z:
                     reject_reason = f'z drift {abs(dz):.1f} planes > max {max_fiducial_drift_z}'
 
+        # v1 IS SINGLE-CHANNEL, deliberately. The map may now carry a
+        # LIST per hybe -- a round with two readouts -- and v1 keys every
+        # result by the hybe alone, so a second one has nowhere to go.
+        # Refuse by name rather than silently tracing the first: v1 is
+        # the reference implementation and a quiet half-run of it is a
+        # worse answer than none.
         readout_channel = hybe_readout_channels.get(hybe)
+        if isinstance(readout_channel, (list, tuple, set)):
+            chans = list(readout_channel)
+            if len(chans) > 1:
+                raise ValueError(
+                    'v1 chromatin tracing: %s carries %d readout channels '
+                    '(%s) and v1 keys a bin by its hybe alone. Trace it '
+                    'with v2, or activate one channel.'
+                    % (hybe, len(chans), ', '.join(str(c) for c in chans)))
+            readout_channel = chans[0] if chans else None
         if readout_channel is None and reject_reason is None:
             reject_reason = 'no readout channel configured'
         gate[hybe] = (reject_reason, delta, readout_channel)

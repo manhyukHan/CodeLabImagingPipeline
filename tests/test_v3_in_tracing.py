@@ -702,10 +702,13 @@ def test_main_window_wiring():
           and src.count("_z_extras(d, 'readout')") == 2
           and "out['z_display_pad'] = int(half) + 2" in src)
     bsrc2 = inspect.getsource(T2.build_chromatin_trace_allele)
+    # the readout debug is keyed by the BIN (bk), the fiducial by the
+    # round (hybe): a round with two readouts has one fiducial crop and
+    # two readout fits
     check('and the builder records the expected depth and the reach',
           "debug[hybe]['fiducial_zexp'] = float(z0)" in bsrc2
           and "debug[hybe]['fiducial_z_window']" in bsrc2
-          and "debug[hybe]['readout_z_reach'] = int(p.z_reach())" in bsrc2)
+          and "debug[bk]['readout_z_reach'] = int(p.z_reach())" in bsrc2)
 
 
 def main():

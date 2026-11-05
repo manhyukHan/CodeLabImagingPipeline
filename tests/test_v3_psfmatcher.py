@@ -498,9 +498,13 @@ def test_the_readout_writes_a_list_and_the_gate_cuts_it():
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     src = open(os.path.join(here, 'codelab_pipeline', 'localization',
                             'tracing_v2.py'), encoding='utf-8').read()
-    line = src[src.index('allele.fiducial_trace_adj[hybe] ='):].split('\n')[0]
-    check('fiducial_trace_adj is still assigned ONE tuple, not a list',
-          not line.split('=', 1)[1].strip().startswith('['), line[:72])
+    # _put writes the ROUND's fiducial under every bin key of that round
+    # -- one key normally, two once the round carries two readouts -- so
+    # the assignment reads as a call now. The value is still one tuple.
+    i = src.index('_put(allele.fiducial_trace_adj, hybe,')
+    line = src[i:].split('\n')[1]
+    check('fiducial_trace_adj is still given ONE tuple, not a list',
+          not line.strip().startswith('['), line[:72])
     # THE FIDUCIAL MAY ALSO BE LEARNED NOW -- by its own, optional model
     # -- but it still answers with ONE fit, never a list: best of one.
     check('a learned fiducial is one answer, not a list',
