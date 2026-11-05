@@ -131,6 +131,74 @@ def create_or_replace_dataset(group, name, data, dtype):
 _LAYOUT_CACHE = {}
 
 
+def _parse_readouts(row, channels, fiducial_channel):
+    """[(channel, readout_id), ...] for one hybe.
+
+    ONE HYBE CAN CARRY MORE THAN ONE READOUT. The probe design allows a
+    second dye on the same adapter -- 635-dye/adapter1 reading R1 and
+    747-dye/adapter1 reading R51 in the same round -- which doubles the
+    number of bins an experiment can address. No layout in hand uses it
+    yet; this is the column that will carry it when one does.
+
+    The optional `readoutChannels` column names the mapping EXPLICITLY,
+    e.g. `635:1, 747:51`. Explicit because the alternative -- matching a
+    list of readout ids positionally against the non-fiducial channels --
+    has to guess which of them is a readout at all: a layout listing
+    [475, 555, 635] with 555 fiducial leaves 475 (a DAPI-like channel)
+    and 635 indistinguishable by position.
+
+    WITHOUT the column, the channel is reported as None rather than
+    guessed. None means "this layout did not say", and the caller
+    resolves it the way it always has (chain.dominant_readout_channel),
+    so every existing layout behaves exactly as before.
+
+    Refuses rather than falls back when the column IS present but wrong:
+    a named channel the hybe does not have, a channel that is the
+    fiducial, or a duplicate readout id, is a layout error whose silent
+    repair would mean fitting a wavelength nobody chose.
+    """
+    import pandas as pd_  # local: this module is imported before pandas use
+
+    raw = row.get('readoutChannels') if hasattr(row, 'get') else None
+    if raw is None or (isinstance(raw, float) and pd_.isna(raw)) \
+            or not str(raw).strip():
+        return [(None, int(row['Readouts']))]
+    folder = str(row['FolderName'])
+    out, seen = [], set()
+    for piece in str(raw).replace(';', ',').split(','):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if ':' not in piece:
+            raise ValueError(
+                f'{folder}: readoutChannels entry {piece!r} is not '
+                f'"channel:readout_id"')
+        c_s, r_s = piece.split(':', 1)
+        try:
+            channel, readout = int(c_s.strip()), int(r_s.strip())
+        except ValueError:
+            raise ValueError(
+                f'{folder}: readoutChannels entry {piece!r} is not two '
+                f'integers') from None
+        if channel not in channels:
+            raise ValueError(
+                f'{folder}: readoutChannels names channel {channel}, which '
+                f'this hybe does not have ({channels})')
+        if channel == fiducial_channel:
+            raise ValueError(
+                f'{folder}: readoutChannels names {channel}, which is this '
+                f'hybe\'s FIDUCIAL channel')
+        if readout in seen:
+            raise ValueError(
+                f'{folder}: readout id {readout} appears twice in '
+                f'readoutChannels')
+        seen.add(readout)
+        out.append((channel, readout))
+    if not out:
+        return [(None, int(row['Readouts']))]
+    return out
+
+
 def parse_experiment_layout(xlsx_path):
     """
     Parse an ExperimentLayout.xlsx sheet into one record per hybe -- the
@@ -140,12 +208,20 @@ def parse_experiment_layout(xlsx_path):
     only: alignment logic must never branch on them (the alignment reference
     is always an explicit input, not inferred from e.g. a 'barcode' datatype).
 
-    Returns a list of dicts: folder, readout_id, datatype, hybe_num,
+    Returns a list of dicts: folder, readout_id, readouts, datatype,
+    hybe_num,
     channels (list[int]), fiducial_channel (int), channel_layout (str),
     total_frames (int), readout_name (str or None -- DNA layouts have no
     rnaNames column, so target rounds are anonymous), buffer_frames and
     buffer_frames_end (int, 0 when the optional bufferFrames /
     bufferFramesEnd columns are absent or blank).
+
+    `readouts` is [(channel, readout_id), ...] -- ONE HYBE MAY CARRY MORE
+    THAN ONE READOUT, from the optional `readoutChannels` column (see
+    _parse_readouts). Without that column it is [(None, readout_id)]:
+    the channel is reported as unknown rather than guessed, and callers
+    resolve it as they always have. `readout_id` stays the scalar it was,
+    so nothing that reads it needs to change.
 
     bufferFrames / bufferFramesEnd: frames the acquisition recorded at
     the home z BEFORE the z scan started and AFTER it ended (Hal's
@@ -187,6 +263,8 @@ def parse_experiment_layout(xlsx_path):
         records.append({
             'folder': str(row['FolderName']),
             'readout_id': int(row['Readouts']),
+            'readouts': _parse_readouts(row, channels,
+                                        int(row['fiducialChannel'])),
             'datatype': str(row['DataType']),
             'hybe_num': int(row['HybNum']),
             'channels': channels,
