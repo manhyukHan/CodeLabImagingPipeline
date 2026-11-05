@@ -245,6 +245,37 @@ def bin_lookup_keys(keys):
     return out
 
 
+def split_key(key, channel=None):
+    """(hybe, channel) from a STORAGE key.
+
+    A stored key is the bare hybe while its round has one readout -- that
+    is what keeps every store written so far readable -- and
+    (hybe, channel) once the round has two. So a key is not a hybe, and
+    anything BELOW the trace that needs one (a crop, a stack read, a
+    FrameResolver) cannot take it as it stands: handed a tuple it would
+    look up a frame under the text "('Hyb_001', 635)" and answer wrongly
+    or not at all.
+
+    This is the one place that turns a key back into the pair. `channel`
+    stands in where the key names none, so a caller that knows which
+    wavelength it configured can pass it and get a complete answer
+    rather than a half one.
+    """
+    if isinstance(key, (tuple, list)) and len(key) == 2:
+        return str(key[0]), int(key[1])
+    return str(key), (None if channel is None else int(channel))
+
+
+def key_hybe(key):
+    """Just the hybe of a storage key -- for a frame, which is per ROUND.
+
+    A FrameResolver maps a whole round, not one of its readouts: both
+    bins of a two-readout hybe share its matrices. So the channel is not
+    dropped here, it was never part of the question.
+    """
+    return split_key(key)[0]
+
+
 def lookup_bin(d, tries):
     """(key_that_hit, value) for one slot, or (None, None).
 

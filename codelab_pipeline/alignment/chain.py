@@ -1563,6 +1563,24 @@ def resolve_channel(record, channel_type):
     return (readout[0] if readout else fiducial), False
 
 
+def _chan_order(channel):
+    """Sort key for a channel: the NUMBER, then its text.
+
+    The tie-break both pickers below document is "the lower channel
+    number", and it was sorting the string. 635 before 747 comes out
+    right either way, which is why nothing caught it; 999 against a
+    4-digit channel does not, and '1024' < '999' would have taken the
+    higher one. Every channel in every store this project can reach is
+    three digits (390-999 across MAZ, MP58, JP and HoxA), so this has
+    never decided anything yet -- which is the reason to fix it now
+    rather than after it has.
+    """
+    try:
+        return (0, int(channel), '')
+    except (TypeError, ValueError):
+        return (1, 0, str(channel))
+
+
 def dominant_readout_channel(records):
     """The non-fiducial channel the MOST of `records` carry, or None.
 
@@ -1590,7 +1608,7 @@ def dominant_readout_channel(records):
                 counts[channel] += 1
     if not counts:
         return None
-    return sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+    return sorted(counts.items(), key=lambda kv: (-kv[1], _chan_order(kv[0])))[0][0]
 
 
 def fiducial_channel_of(records):
@@ -1612,7 +1630,7 @@ def fiducial_channel_of(records):
         if record.get('fiducial_channel') is not None)
     if not counts:
         return None
-    return sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))[0][0]
+    return sorted(counts.items(), key=lambda kv: (-kv[1], _chan_order(kv[0])))[0][0]
 
 
 def channel_coverage(records, channel_type):

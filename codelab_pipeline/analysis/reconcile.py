@@ -32,6 +32,7 @@ own atomic doors (write_spots / write_allele_dicts).
 """
 import numpy as np
 
+from codelab_pipeline.analysis import polymer as P
 from codelab_pipeline.io import analysis_store
 from codelab_pipeline.models.cell import ACell
 from codelab_pipeline.models.spot import ASpot
@@ -176,8 +177,15 @@ def reconcile_allele_dicts(alleles, resolver, cells_by_id, modality=None,
             if v is None:
                 new_fid[h] = None
                 continue
-            fy, fx = _project_yx(resolver, h, mod, cell, v[0], v[1])
-            fz = float(v[2]) + resolver.z_to_shared(h, mod, cell)
+            # h IS A STORAGE KEY, not a hybe: it is the bare folder
+            # name while the round has one readout and (hybe, channel)
+            # once it has two. A FrameResolver maps a whole ROUND -- both
+            # bins of a two-readout hybe share its matrices -- so the
+            # hybe is what it is asked for. Handing it the key would look
+            # up a frame under the text "('Hyb_001', 635)".
+            hy = P.key_hybe(h)
+            fy, fx = _project_yx(resolver, hy, mod, cell, v[0], v[1])
+            fz = float(v[2]) + resolver.z_to_shared(hy, mod, cell)
             old = (d.get('fiducial_trace_adj') or {}).get(h)
             if old is not None:
                 shifts_fid.append(float(np.hypot(fy - old[0], fx - old[1])))
@@ -202,6 +210,7 @@ def reconcile_allele_dicts(alleles, resolver, cells_by_id, modality=None,
             else:
                 new_poly = dict(d.get('polymer_adj') or {})
                 for h, cands in poly_raw.items():
+                    hy = P.key_hybe(h)
                     fid_h = new_fid.get(h)
                     if fid_h is None:
                         continue    # no fiducial, no correction -- leave as-is
@@ -210,9 +219,9 @@ def reconcile_allele_dicts(alleles, resolver, cells_by_id, modality=None,
                     dz = base[2] - fid_h[2]
                     out = []
                     for c in cands:
-                        cy, cx = _project_yx(resolver, h, mod, cell,
+                        cy, cx = _project_yx(resolver, hy, mod, cell,
                                              c[0], c[1])
-                        cz = float(c[2]) + resolver.z_to_shared(h, mod, cell)
+                        cz = float(c[2]) + resolver.z_to_shared(hy, mod, cell)
                         old = (d.get('polymer_adj') or {}).get(h)
                         if old:
                             shifts_poly.append(float(np.hypot(
