@@ -721,7 +721,16 @@ def resolve_paths(spots, clustering, n_slots, engine=None, **kw):
 CLEAR_SEPARATION_UM = 2.0
 
 
-def clearly_separated(spots, k, reach_um=None, min_bins=None):
+#: how many spots of one site may repeat a bin it already holds,
+#: as a FRACTION of that site's spots. Not zero: 62 bins carrying ~100
+#: spots will repeat a few by chance, and measured on MP58 FOVs 1-4
+#: only 19 % of cells have none at all while the median is 3. Zero
+#: tolerance rejected four cells in five for something normal.
+DEFAULT_DUP_FRACTION = 0.15
+
+
+def clearly_separated(spots, k, reach_um=None, min_bins=None,
+                      dup_fraction=DEFAULT_DUP_FRACTION):
     """(verdict, labels, centres, reason) -- is this cell simply split?
 
     THE EXPENSIVE OBJECTIVE IS FOR THE HARD CASES. A cell whose sites
@@ -740,11 +749,14 @@ def clearly_separated(spots, k, reach_um=None, min_bins=None):
     clu = kmeans_cluster(spots, k, radius_um=reach, min_bins=mb)
     if clu.k != k or clu.k < 1:
         return False, None, None, 'the cell does not support %d site(s)' % k
+    allow = float(dup_fraction)
     if clu.k == 1:
         dup = _duplicate_bins(spots.bin, clu.labels, 0)
-        if dup:
+        n_here = int((clu.labels == 0).sum())
+        if dup > allow * max(n_here, 1):
             return (False, None, None,
-                    'one site, but %d bin(s) appear twice in it' % dup)
+                    'one site, but %d of its %d spot(s) repeat a bin'
+                    % (dup, n_here))
         return True, clu.labels, clu.centres, 'a single compact site'
     c = np.asarray(clu.centres, dtype=np.float64)
     lat = np.linalg.norm(c[:, None, :2] - c[None, :, :2], axis=2)
@@ -755,9 +767,11 @@ def clearly_separated(spots, k, reach_um=None, min_bins=None):
                 'two sites only %.2f um apart laterally' % gap)
     for j in range(clu.k):
         dup = _duplicate_bins(spots.bin, clu.labels, j)
-        if dup:
+        n_here = int((clu.labels == j).sum())
+        if dup > allow * max(n_here, 1):
             return (False, None, None,
-                    'site %d claims %d bin(s) twice' % (j, dup))
+                    'site %d repeats a bin in %d of its %d spot(s)'
+                    % (j, dup, n_here))
     return (True, clu.labels, c,
             '%d site(s), %.2f um apart, no bin claimed twice'
             % (clu.k, gap))
@@ -793,6 +807,39 @@ def rows_from_labels(spots, labels, k, n_slots):
     for (j, b), (i, _a) in best.items():
         rows[j, b] = int(spots.row[i])
     return rows
+
+
+#: how many times over a new path must pay for itself before it is
+#: believed. A PRIOR, not a threshold fitted to a dataset: a spurious
+#: path puts real loci on an allele that does not exist, while a
+#: missing one leaves a trace that stops short and says so, and the
+#: first is the worse error. Raising it makes the route more
+#: conservative and nothing else.
+DEFAULT_PATH_ODDS = 3.0
+
+
+def _typical_radius(spots, reach_um):
+    """The distance a spot usually sits from its own site's centre.
+
+    Measured from the cell at hand rather than assumed: it is what a
+    path SAVES per spot it collects, so the charge that has to beat
+    that saving is built from it.
+    """
+    p = spots.pos
+    if len(p) < 3:
+        return 0.0
+    # WITHIN A SITE, not within the cell. Measuring from the cell's own
+    # centre gave a radius near `reach` whenever the cell held two
+    # alleles -- the two are microns apart -- which made the charge
+    # collapse and the route LESS conservative exactly where it needed
+    # to be more so. The local neighbourhood is a site by construction.
+    d = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=2)
+    out = []
+    for i in range(len(p)):
+        near = d[i][(d[i] > 0) & (d[i] <= float(reach_um))]
+        if len(near) >= 2:
+            out.append(float(np.median(near)))
+    return float(np.median(out)) if out else 0.0
 
 
 Fit = collections.namedtuple(
@@ -926,21 +973,43 @@ def fit_paths(spots, n_slots, k, iters=25, reach_um=None, min_bins=None):
                % (len(by_bin), k))
 
 
-def choose_paths(spots, n_slots, k_max=6, path_cost_um=None, **kw):
+def choose_paths(spots, n_slots, k_max=6, path_cost_um=None,
+                 path_odds=None, **kw):
     """How many paths, decided by whether another one pays for itself.
 
-    Sweeps k and keeps the cheapest. The per-path charge is
-    `reach x min_bins` by default -- the cost of leaving that many
-    spots unassigned -- so a path earns its place only by taking spots
-    a path's worth of bins would otherwise have abandoned. It is built
-    out of the constants already here, not fitted to a dataset.
+    ADDING A PATH IS CONSERVATIVE, and the first charge was not. It was
+    `reach x min_bins`, which looks like a price and is not one: an
+    unassigned spot costs `reach` while an assigned one costs its
+    distance -- a median of about 0.35 um inside an allele -- so each
+    spot a new path collects SAVES about 0.65, and a path taking
+    fifteen of them saves ten. Against a charge of three it was free.
+    Measured on MP58 FOVs 1-4, that charge gave a median k of 3 and
+    over-counted by +1.09 against the stored count.
 
-    k is no longer handed in from outside. multiplicity_gate still
-    proposes one, and it is reported, but what decides is the cost.
+    So the charge is the saving a path would have to beat, times how
+    strongly a second path is disbelieved:
+
+        charge = path_odds x min_bins x (reach - typical_radius)
+
+    `path_odds` is the only free number and it is a prior, not a fitted
+    threshold: how many times over a path must pay before it is
+    believed. The default is deliberately high, because the thing a
+    spurious path costs -- a locus assigned to an allele that does not
+    exist -- is worse than the thing a missing one costs, which is a
+    trace that stops short and says so.
+
+    THE SWEEP IS REPORTED WHOLE. per_k carries every k and its cost, so
+    a cell where two answers are a hair apart is visible as that rather
+    than as a verdict.
     """
     reach = float(kw.get('reach_um') or DEFAULT_REACH_UM)
     mb = int(kw.get('min_bins') or DEFAULT_MIN_BINS)
-    charge = float(path_cost_um if path_cost_um is not None else reach * mb)
+    odds = float(DEFAULT_PATH_ODDS if path_odds is None else path_odds)
+    if path_cost_um is not None:
+        charge = float(path_cost_um)
+    else:
+        typical = _typical_radius(spots, reach)
+        charge = odds * mb * max(reach - typical, 0.05 * reach)
     best, table = None, []
     for k in range(1, int(k_max) + 1):
         f = fit_paths(spots, n_slots, k, **kw)
