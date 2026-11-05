@@ -708,31 +708,292 @@ def resolve_paths(spots, clustering, n_slots, engine=None, **kw):
 
 # --------------------------------------------------------- composition
 
+
+# --------------------------------------- the two questions, asked once
+
+
+#: how far apart two sites must be, laterally, before their separation
+#: is taken as settled. Measured on MP58 FOVs 1-4 against the stored
+#: counts: two sites >= 2.0 um apart agree 83 % of the time (n=155) and
+#: >= 3.0 um 86 % (n=120), consistent across all four FOVs. Spots within
+#: one allele sit a few hundred nm apart, so a micron-scale gap is not a
+#: close call.
+CLEAR_SEPARATION_UM = 2.0
+
+
+def clearly_separated(spots, k, reach_um=None, min_bins=None):
+    """(verdict, labels, centres, reason) -- is this cell simply split?
+
+    THE EXPENSIVE OBJECTIVE IS FOR THE HARD CASES. A cell whose sites
+    sit microns apart with no bin claimed twice is not a close call, and
+    sweeping k under an exact per-bin assignment to re-derive what the
+    geometry already says costs time and changes nothing. This answers
+    cheaply, and says no whenever anything is ambiguous.
+
+    No is the safe answer and it is the default: an unclear verdict
+    sends the cell to fit_paths, which is where the judgement lives.
+    """
+    reach = float(DEFAULT_REACH_UM if reach_um is None else reach_um)
+    mb = int(DEFAULT_MIN_BINS if min_bins is None else min_bins)
+    if k < 1:
+        return False, None, None, 'no sites proposed'
+    clu = kmeans_cluster(spots, k, radius_um=reach, min_bins=mb)
+    if clu.k != k or clu.k < 1:
+        return False, None, None, 'the cell does not support %d site(s)' % k
+    if clu.k == 1:
+        dup = _duplicate_bins(spots.bin, clu.labels, 0)
+        if dup:
+            return (False, None, None,
+                    'one site, but %d bin(s) appear twice in it' % dup)
+        return True, clu.labels, clu.centres, 'a single compact site'
+    c = np.asarray(clu.centres, dtype=np.float64)
+    lat = np.linalg.norm(c[:, None, :2] - c[None, :, :2], axis=2)
+    lat += np.eye(len(c)) * 1e9
+    gap = float(lat.min())
+    if gap < CLEAR_SEPARATION_UM:
+        return (False, None, None,
+                'two sites only %.2f um apart laterally' % gap)
+    for j in range(clu.k):
+        dup = _duplicate_bins(spots.bin, clu.labels, j)
+        if dup:
+            return (False, None, None,
+                    'site %d claims %d bin(s) twice' % (j, dup))
+    return (True, clu.labels, c,
+            '%d site(s), %.2f um apart, no bin claimed twice'
+            % (clu.k, gap))
+
+
+def _duplicate_bins(bins, labels, j):
+    """How many spots of one site repeat a bin that site already has.
+
+    A round images one locus, so a site holding two spots of one bin is
+    either two alleles merged or a spurious detection -- either way, not
+    a cell to wave through.
+    """
+    b = np.asarray(bins)[labels == j]
+    return int(len(b) - len(set(b.tolist())))
+
+
+def rows_from_labels(spots, labels, k, n_slots):
+    """(k, n_slots) rows from a settled partition, one spot per bin.
+
+    The brightest candidate where a site does hold two of a bin -- the
+    same rule collapse_polymer has always used. Only reached on the
+    clear path, where duplicates have already been ruled out.
+    """
+    rows = np.full((int(k), int(n_slots)), NO_SPOT, dtype=np.int64)
+    best = {}
+    for i, (b, j) in enumerate(zip(spots.bin, labels)):
+        if j < 0 or not (0 <= b < n_slots):
+            continue
+        key = (int(j), int(b))
+        a = spots.amp[i]
+        if key not in best or (np.isfinite(a) and a > best[key][1]):
+            best[key] = (i, a if np.isfinite(a) else -np.inf)
+    for (j, b), (i, _a) in best.items():
+        rows[j, b] = int(spots.row[i])
+    return rows
+
+
+Fit = collections.namedtuple(
+    'Fit', 'k labels rows cost unassigned per_k reason')
+Fit.__doc__ = """One cell's paths, chosen by what they cost.
+
+k           how many paths the cost chose
+labels      (n,) which path each spot went to, UNASSIGNED for none
+rows        (k, n_slots) the spot row id each path takes in each bin
+cost        the total
+unassigned  how many spots no path would pay for
+per_k       [(k, cost), ...] -- what every k was worth, so a close call
+            is visible rather than hidden behind the winner
+reason      in words
+"""
+
+
+def _assign_bin(d, lam):
+    """One bin's spots to the k paths, at most one each. (take, cost).
+
+    d is (n_spots, k) distances. A spot may be left to NOBODY at cost
+    `lam`, which is what makes a bin's SECOND spot cost something: one
+    round images one locus, so a path can take one spot from this bin
+    and the rest are either another path's or nobody's.
+
+    Exact. A bin holds a handful of spots and k is 2 or 3, so every
+    assignment is enumerated.
+    """
+    n, k = d.shape
+    best, best_cost = [None] * k, float('inf')
+    for m in range(min(n, k) + 1):
+        for spots in itertools.permutations(range(n), m):
+            for slots in itertools.combinations(range(k), m):
+                picks = [None] * k
+                c = 0.0
+                ok = True
+                for sl, sp in zip(slots, spots):
+                    if not np.isfinite(d[sp, sl]):
+                        ok = False
+                        break
+                    picks[sl] = sp
+                    c += float(d[sp, sl])
+                if not ok:
+                    continue
+                c += lam * (n - m)          # every spot nobody took
+                if c < best_cost:
+                    best, best_cost = list(picks), c
+    return best, best_cost
+
+
+def fit_paths(spots, n_slots, k, iters=25, reach_um=None, min_bins=None):
+    """Cluster AND assign in one objective, for a given k.
+
+    THE TWO WERE SEPARATE AND THAT WAS THE DEFECT. Clustering by
+    position alone and enforcing one-spot-per-bin afterwards meant bin
+    identity never touched the partition: shuffling the bin labels of a
+    cell's spots changed nothing -- measured, 48% of cells had three or
+    more sites before and 47% after. A dense blob satisfies "many
+    distinct bins nearby" whatever the labels are.
+
+    Here the assignment IS the partition. Each bin is solved on its own
+    (_assign_bin), a path takes at most one of its spots, and a spot no
+    path will pay `reach_um` for is left unassigned. A cluster that
+    would need two spots of one bin therefore pays for the second, every
+    round, which is the cost a position-only split could not see.
+    """
+    reach = float(DEFAULT_REACH_UM if reach_um is None else reach_um)
+    mb = int(DEFAULT_MIN_BINS if min_bins is None else min_bins)
+    p = spots.pos
+    n = int(n_slots)
+    if k <= 0 or not len(p):
+        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
+                   np.full((0, n), NO_SPOT, dtype=np.int64),
+                   reach * len(p), len(p), [], 'nothing to fit')
+    sup = bin_support(p, spots.bin, reach)
+    live = np.flatnonzero(sup >= mb)
+    if not len(live):
+        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
+                   np.full((0, n), NO_SPOT, dtype=np.int64),
+                   reach * len(p), len(p), [],
+                   'no spot has %d distinct bin(s) within %.2f um' % (mb, reach))
+    centres = supported_seeds(p[live], spots.bin[live], k,
+                              radius_um=reach, min_bins=mb)
+    if not len(centres):
+        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
+                   np.full((0, n), NO_SPOT, dtype=np.int64),
+                   reach * len(p), len(p), [], 'no seed has support')
+    k = len(centres)
+    by_bin = collections.defaultdict(list)
+    for i, b in enumerate(spots.bin):
+        if 0 <= b < n:
+            by_bin[int(b)].append(i)
+    labels = np.full(len(p), UNASSIGNED, dtype=np.int64)
+    rows = np.full((k, n), NO_SPOT, dtype=np.int64)
+    total = float('inf')
+    for _ in range(int(iters)):
+        new_labels = np.full(len(p), UNASSIGNED, dtype=np.int64)
+        new_rows = np.full((k, n), NO_SPOT, dtype=np.int64)
+        cost = 0.0
+        for b, idxs in by_bin.items():
+            d = np.linalg.norm(p[idxs][:, None, :] - centres[None, :, :],
+                               axis=2)
+            # beyond reach is not merely expensive, it is not this path's
+            d = np.where(d <= reach, d, np.inf)
+            take, c = _assign_bin(d, reach)
+            cost += c
+            for j, loc in enumerate(take):
+                if loc is None:
+                    continue
+                i = idxs[loc]
+                new_labels[i] = j
+                new_rows[j, b] = int(spots.row[i])
+        moved = not np.array_equal(new_labels, labels)
+        labels, rows, total = new_labels, new_rows, cost
+        for j in range(k):
+            m = labels == j
+            if m.any():
+                centres[j] = p[m].mean(0)
+        if not moved:
+            break
+    return Fit(k, labels, rows, float(total),
+               int((labels == UNASSIGNED).sum()), [],
+               'one-per-bin assignment over %d bin(s), %d path(s)'
+               % (len(by_bin), k))
+
+
+def choose_paths(spots, n_slots, k_max=6, path_cost_um=None, **kw):
+    """How many paths, decided by whether another one pays for itself.
+
+    Sweeps k and keeps the cheapest. The per-path charge is
+    `reach x min_bins` by default -- the cost of leaving that many
+    spots unassigned -- so a path earns its place only by taking spots
+    a path's worth of bins would otherwise have abandoned. It is built
+    out of the constants already here, not fitted to a dataset.
+
+    k is no longer handed in from outside. multiplicity_gate still
+    proposes one, and it is reported, but what decides is the cost.
+    """
+    reach = float(kw.get('reach_um') or DEFAULT_REACH_UM)
+    mb = int(kw.get('min_bins') or DEFAULT_MIN_BINS)
+    charge = float(path_cost_um if path_cost_um is not None else reach * mb)
+    best, table = None, []
+    for k in range(1, int(k_max) + 1):
+        f = fit_paths(spots, n_slots, k, **kw)
+        if f.k == 0:
+            table.append((k, float('inf')))
+            continue
+        total = f.cost + charge * f.k
+        table.append((f.k, round(total, 3)))
+        if best is None or total < best[0]:
+            best = (total, f)
+        if f.k < k:
+            break                      # the cell cannot support more
+    if best is None:
+        return Fit(0, np.full(len(spots.pos), UNASSIGNED, dtype=np.int64),
+                   np.full((0, int(n_slots)), NO_SPOT, dtype=np.int64),
+                   float('inf'), len(spots.pos), table, 'no fit')
+    f = best[1]
+    return f._replace(per_k=table,
+                      reason=f.reason + '; chosen over %s at %.1f um per path'
+                      % ([t[0] for t in table], charge))
+
+
 Trace = collections.namedtuple('Trace', 'rows multiplicity clustering paths')
 
 
 def build_cell_traces(spots, n_slots, k=None, engines=None, **kw):
-    """The three questions in order, for one cell.
+    """One cell, end to end.
 
-    k: given, it is used; None asks multiplicity_gate. A caller that
-    knows the ploidy should say so -- the count is a measurement with
-    an error bar, and a known answer beats an estimated one.
+    The count is no longer decided before the split. choose_paths sweeps
+    k and keeps the one that pays for itself, with the assignment -- one
+    spot per bin per path -- deciding the partition rather than tidying
+    it afterwards. multiplicity_gate still runs and is reported beside
+    it, because a proposal that disagrees with the cost is worth seeing.
 
-    engines: {'multiplicity': f, 'cluster': f, 'paths': f} -- any left
-    out takes this module's default. The three are separable on purpose:
-    a learned model that is better at one of them should not have to
-    bring the other two.
+    k: given, it is used as-is and no sweep happens. engines: as before,
+    for the pieces that are still separable.
     """
     engines = engines or {}
     mult = multiplicity_gate(spots, n_slots,
                              engine=engines.get('multiplicity'),
                              **(kw.get('multiplicity') or {}))
-    use = int(k) if k is not None else mult.k
-    if not use:
-        return Trace(np.full((0, int(n_slots)), NO_SPOT, dtype=np.int64),
-                     mult, None, None)
-    clu = cluster_cell(spots, use, engine=engines.get('cluster'),
-                       **(kw.get('cluster') or {}))
-    paths = resolve_paths(spots, clu, n_slots, engine=engines.get('paths'),
-                          **(kw.get('paths') or {}))
-    return Trace(paths.rows, mult, clu, paths)
+    opts = dict(kw.get('paths') or {})
+    if k is not None:
+        fit = fit_paths(spots, n_slots, int(k), **opts)
+        return Trace(fit.rows, mult, fit, fit)
+    # THE CLEAR CASES DO NOT NEED THE SWEEP. Sites microns apart with no
+    # bin claimed twice are separated, and re-deriving that under an
+    # exact per-bin assignment costs time to reach the same answer.
+    # Anything ambiguous falls through to fit_paths, which is the point
+    # of having it.
+    if not kw.get('always_fit'):
+        ok, labels, centres, why = clearly_separated(
+            spots, mult.k or 0, reach_um=opts.get('reach_um'),
+            min_bins=opts.get('min_bins'))
+        if ok:
+            kk = int(labels.max()) + 1 if len(labels) else 0
+            rows = rows_from_labels(spots, labels, kk, n_slots)
+            fit = Fit(kk, labels, rows, float('nan'),
+                      int((labels == UNASSIGNED).sum()), [],
+                      'taken as settled: ' + why)
+            return Trace(rows, mult, fit, fit)
+    fit = choose_paths(spots, n_slots, **opts)
+    return Trace(fit.rows, mult, fit, fit)

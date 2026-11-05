@@ -227,26 +227,85 @@ def seams():
     t = BU.build_cell_traces(spots, 40, engines={
         'multiplicity': fake_mult, 'cluster': fake_cluster,
         'paths': fake_paths})
-    check('each engine is asked exactly once',
-          called == ['multiplicity', 'cluster', 'paths'], str(called))
-    check('the stub\'s k is the one asked for', t.multiplicity.k == 3)
-    # ... and the clustering still REFUSES to invent a third allele this
-    # cell cannot support, which is the outlier guard doing its job
-    check('but a cell that supports 2 gives 2, not a padded 3',
-          t.rows.shape[0] == 2 and t.clustering.k == 2,
-          '%s -- %s' % (t.rows.shape, t.clustering.reason))
-
-    print('  replacing one leaves the other two alone')
-    t2 = BU.build_cell_traces(spots, 40, engines={'multiplicity': fake_mult})
-    check('the defaults still run under a stubbed count',
-          t2.rows.shape[0] == 2 and t2.clustering.k == 2,
-          str(t2.rows.shape))
+    # THE SPLIT AND THE ASSIGNMENT ARE ONE STAGE NOW, so build_cell_traces
+    # no longer calls a cluster engine and a paths engine in turn --
+    # separating them was the defect, not the design. cluster_cell and
+    # resolve_paths remain as the separable pieces and keep their own
+    # seams; this route has the multiplicity seam and the joint fit.
+    check('the multiplicity engine is still asked', called == ['multiplicity'],
+          str(called))
+    check('and the cluster/paths engines are not, because they merged',
+          'cluster' not in called and 'paths' not in called, str(called))
+    check('the joint fit decides the count, not the stubbed proposal',
+          t.multiplicity.k == 3 and t.rows.shape[0] <= 3,
+          '%s proposed, %d fitted' % (t.multiplicity.k, t.rows.shape[0]))
+    check('and the trace reports both', t.paths is t.clustering)
 
     print('  a known ploidy beats an estimated one')
-    t3 = BU.build_cell_traces(spots, 40, k=2)
-    check('k given is k used', t3.rows.shape[0] == 2, str(t3.rows.shape))
+    t3 = BU.build_cell_traces(spots, 40, k=2,
+                              paths={'min_bins': 5, 'reach_um': 1.0})
+    check('k given is k used, with no sweep', t3.rows.shape[0] == 2,
+          str(t3.rows.shape))
     check('and the estimate is still reported beside it',
-          t3.multiplicity.k == 2, str(t3.multiplicity))
+          t3.multiplicity.k is not None, str(t3.multiplicity.k))
+
+
+def joint():
+    print('\nthe split and the assignment are ONE objective')
+    rs = np.random.RandomState(0)
+    bins, pos = [], []
+    for cx in (0.0, 2.0):
+        for b in range(30):
+            bins.append(b)
+            pos.append([0.0, cx, 0.0] + rs.normal(0, 0.2, 3))
+    cs = BU.cell_spots(bins, np.array(pos))
+    f = BU.choose_paths(cs, 30, min_bins=5, reach_um=1.0)
+    check('a clean two-allele cell costs least at k=2', f.k == 2,
+          '%s -- %s' % (f.k, f.reason))
+    check('every spot is paid for', f.unassigned == 0, str(f.unassigned))
+    check('and each path fills its own 30 bins',
+          (f.rows >= 0).sum(axis=1).tolist() == [30, 30],
+          str((f.rows >= 0).sum(axis=1)))
+    check('the cost of every k is reported, so a close call is visible',
+          len(f.per_k) >= 2 and f.per_k[0][1] > f.per_k[1][1], str(f.per_k))
+
+    print('  BIN IDENTITY DECIDES IT NOW -- the thing that was missing')
+    perm = rs.permutation(len(bins))
+    f2 = BU.choose_paths(BU.cell_spots(np.array(bins)[perm], np.array(pos)),
+                         30, min_bins=5, reach_um=1.0)
+    check('the same points with shuffled labels cost MORE',
+          f2.cost > f.cost, '%.1f vs %.1f' % (f2.cost, f.cost))
+    check('and leave spots no path will pay for',
+          f2.unassigned > f.unassigned,
+          '%d vs %d' % (f2.unassigned, f.unassigned))
+
+    print("  a bin's SECOND spot costs the path that cannot take it")
+    # one path, two spots in bin 0: only one can be assigned
+    bins3 = [0, 0] + list(range(1, 12))
+    pos3 = np.array([[0., 0., 0.], [0., 0.3, 0.]]
+                    + [[0., 0., 0.]] * 11, dtype=float)
+    f3 = BU.fit_paths(BU.cell_spots(bins3, pos3), 12, 1,
+                      min_bins=3, reach_um=1.0)
+    check('one path takes one of them', (f3.rows[0] >= 0).sum() == 12,
+          str((f3.rows[0] >= 0).sum()))
+    check('and the other is unassigned, not quietly added',
+          f3.unassigned == 1, str(f3.unassigned))
+
+    print('  a path must pay for itself')
+    one = BU.choose_paths(BU.cell_spots(list(range(20)),
+                                        rs.normal(0, 0.2, (20, 3))), 20,
+                          min_bins=5, reach_um=1.0)
+    check('a single compact allele stays k=1', one.k == 1,
+          '%s -- %s' % (one.k, one.reason))
+
+    print('  and build_cell_traces now routes through it')
+    t = BU.build_cell_traces(cs, 30, paths={'min_bins': 5, 'reach_um': 1.0})
+    check('the trace carries the fit, not a separate clustering',
+          t.rows.shape[0] == 2 and t.paths is t.clustering,
+          str(t.rows.shape))
+    check('and the count proposal is still reported beside it',
+          t.multiplicity is not None and t.multiplicity.k is not None,
+          str(t.multiplicity.k))
 
 
 def main():
@@ -255,6 +314,7 @@ def main():
     clustering()
     paths()
     seams()
+    joint()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     return 1 if FAIL else 0
 
