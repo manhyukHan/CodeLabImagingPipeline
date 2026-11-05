@@ -332,7 +332,10 @@ def main():
     check('and takes no append flag at all -- it has no append concept',
           'append' not in sig.parameters, str(list(sig.parameters)))
 
-    ctw = ChromatinTracingWorker([(dna_sp, 9, [a1, a2])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
+    # readout_map=None: no map, so no stamp -- which is what every
+    # trace made before the map existed already carries
+    ctw = ChromatinTracingWorker([(dna_sp, 9, [a1, a2])], ['H1', 'H2', 'H3'],
+                                 'H1', {}, {}, None, 'DNA',
                                  {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
                                  workers=1)
     traced = []
@@ -348,7 +351,7 @@ def main():
     # no path left by which the worker fits a subset.
     a3 = types.SimpleNamespace(id=3, cell=-1, coordinate=(0, 0, 0),
                                polymer_adj={}, rejected_hybes={}, fiducial_trace_adj={})
-    ctw2 = ChromatinTracingWorker([(dna_sp, 9, [a3])], ['H1', 'H2', 'H3'], 'H1', {}, {}, 'DNA',
+    ctw2 = ChromatinTracingWorker([(dna_sp, 9, [a3])], ['H1', 'H2', 'H3'], 'H1', {}, {}, None, 'DNA',
                                   {}, lambda fov, cid: None, 5.0, 8, 15, {}, {},
                                   workers=1)
     traced.clear()
