@@ -818,29 +818,36 @@ def _assign_bin(d, lam):
     round images one locus, so a path can take one spot from this bin
     and the rest are either another path's or nobody's.
 
-    Exact. A bin holds a handful of spots and k is 2 or 3, so every
-    assignment is enumerated.
+    THIS IS AN ASSIGNMENT PROBLEM, and solving it by enumeration was a
+    mistake rather than a simplification. A bin can hold far more than a
+    handful: measured on MP58 FOV 1 the median is 2 spots but the
+    maximum is 15, and 15 spots over 6 paths is 6.3 million assignments
+    -- per bin, per iteration, per k. That is why a run over four FOVs
+    of pure arithmetic, with no image touched, took longer than the
+    image work had.
+
+    linear_sum_assignment gives the SAME answer in O(n^3). "Nobody" is
+    expressed as n extra columns costing `lam` each, one per spot, so
+    every spot takes exactly one column while a path column can be taken
+    only once -- which is the constraint, stated exactly.
     """
+    from scipy.optimize import linear_sum_assignment
     n, k = d.shape
-    best, best_cost = [None] * k, float('inf')
-    for m in range(min(n, k) + 1):
-        for spots in itertools.permutations(range(n), m):
-            for slots in itertools.combinations(range(k), m):
-                picks = [None] * k
-                c = 0.0
-                ok = True
-                for sl, sp in zip(slots, spots):
-                    if not np.isfinite(d[sp, sl]):
-                        ok = False
-                        break
-                    picks[sl] = sp
-                    c += float(d[sp, sl])
-                if not ok:
-                    continue
-                c += lam * (n - m)          # every spot nobody took
-                if c < best_cost:
-                    best, best_cost = list(picks), c
-    return best, best_cost
+    if n == 0 or k == 0:
+        return [None] * k, lam * n
+    big = 1e9
+    cost = np.full((n, k + n), lam, dtype=np.float64)
+    cost[:, :k] = np.where(np.isfinite(d), d, big)
+    rows, cols = linear_sum_assignment(cost)
+    take = [None] * k
+    total = 0.0
+    for r, c in zip(rows, cols):
+        if c < k and cost[r, c] < big:
+            take[c] = int(r)
+            total += float(cost[r, c])
+        else:
+            total += lam
+    return take, float(total)
 
 
 def fit_paths(spots, n_slots, k, iters=25, reach_um=None, min_bins=None):
