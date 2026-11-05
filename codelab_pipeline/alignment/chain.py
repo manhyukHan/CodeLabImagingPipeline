@@ -2282,6 +2282,74 @@ def run_hybe_tasks(work, executor=None, on_group=None):
     return results
 
 
+def apply_z_consensus(results, min_cells=8):
+    """Give a cell whose own z fit was refused this round's consensus
+    depth, instead of zero.
+
+    WHY ZERO IS THE WORST AVAILABLE ANSWER. A refused z fit stored
+    `dz = 0.0`, i.e. "no depth correction needed" -- while the other
+    cells of the same (hybe, FOV) were being moved by tens of planes.
+    Measured on MP58 FOV 1, the rounds Hyb_021-025 and Hyb_041-049 sit
+    38-48 planes off the reference, 12-18 % of their cells were refused,
+    and each of those was left 38-48 planes (7.6-9.6 um) out of place.
+    The crop is then cut at the wrong depth and everything downstream --
+    the fiducial correlation, its lateral shift, the readout box -- is
+    measured somewhere the locus is not. It is the same failure as a
+    silent identity matrix: identity is known to be wrong here, and
+    asserting it anyway is worse than admitting ignorance.
+
+    WHY THE CONSENSUS IS A GOOD ANSWER. Within one (hybe, modality, FOV)
+    the accepted depths are extremely tight: measured across 100+ cells
+    of the affected rounds, IQR 0-2 planes and sd 1.4-2.9. So the median
+    places a refused cell within about 2 planes instead of 45 -- a 20x
+    improvement -- and it costs nothing when there is nothing wrong.
+
+    It must be per (hybe, modality) of ONE FOV, never pooled across
+    FOVs: the same Hyb_048 needs -42 planes on FOV 1 and -19 on FOV 2.
+    `results` is one FOV's worth, which is exactly the right scope.
+
+    The consensus is computed from the ACCEPTED fits only -- a refused
+    fit cannot vote on its own replacement -- and is applied only where
+    at least `min_cells` of them exist, since a median over three cells
+    is not a consensus. Every substitution is recorded in the entry's
+    provenance, so a later reader can tell a measured depth from an
+    imputed one.
+
+    results: {cell_key: {hybe: (entry, provenance)}} from run_hybe_tasks,
+             mutated in place. Returns {(hybe, modality): (dz, n_used,
+             n_filled)} for the caller to log.
+    """
+    accepted, refused = {}, {}
+    for key, by_hybe in results.items():
+        modality = key[1] if isinstance(key, tuple) and len(key) > 1 else None
+        for hybe, value in by_hybe.items():
+            if not (isinstance(value, tuple) and len(value) == 2):
+                continue
+            entry, prov = value
+            if not isinstance(prov, dict) or 'z_rejected' not in prov:
+                continue
+            slot = refused if prov.get('z_rejected') else accepted
+            slot.setdefault((hybe, modality), []).append((key, entry, prov))
+
+    report = {}
+    for gkey, rows in refused.items():
+        ok = accepted.get(gkey) or []
+        if len(ok) < min_cells:
+            continue
+        dz = float(np.median([float(e.get('dz', 0.0)) for _k, e, _p in ok]))
+        if dz == 0.0:
+            continue
+        for _k, entry, prov in rows:
+            entry['dz'] = dz
+            prov['z_consensus_applied'] = dz
+            prov['reference_sequence'] = str(prov.get('reference_sequence', '')) + (
+                f' [z CONSENSUS applied: {dz:+.1f}px from {len(ok)} accepted '
+                f'cells of this hybe in this FOV, replacing the 0.0px '
+                f'fallback -- IMPUTED, not measured]')
+        report[gkey] = (dz, len(ok), len(rows))
+    return report
+
+
 def make_cell_hybe_pool(work, n_workers, inner_init=None):
     """A spawn pool whose children already hold `work`'s contexts.
 
@@ -2612,4 +2680,11 @@ def _cell_hybe_task(ctx, record, zx_read=None):
         return hybe, {'yx': H_yx, 'dz': float(z_shift), 'yx_is_residual': True}, {
             'reference_sequence': f'{hybe}(cell {ctx["cell_id"]})->{reference_hybe}' + reject_note + zx_note,
             'steps': np.stack([H1, H2]),
+            # IN-MEMORY ONLY, for apply_z_consensus: which cells of this
+            # (hybe, modality) got a real depth and which fell back. The
+            # columnar store keeps reference_sequence and steps and drops
+            # the rest, which is right -- by the time anything is written
+            # the fallback has already been filled in.
+            'z_rejected': bool(including_z and z_rejected),
+            'z_fitted': (float(z_shift_fitted) if including_z else 0.0),
         }

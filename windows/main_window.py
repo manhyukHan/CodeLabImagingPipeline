@@ -849,6 +849,20 @@ class CellAlignmentWorker(QtCore.QThread):
                         # of finishing every other hybe first and reporting
                         # minutes later.
                         pool.shutdown(wait=True, cancel_futures=True)
+                # BEFORE THE COMMIT, and only now that the whole FOV is
+                # in: a cell whose own z fit was refused gets this
+                # (hybe, FOV)'s consensus depth rather than zero. Zero
+                # asserts "no correction needed" in rounds where the
+                # other cells are being moved 38-48 planes, and the crop
+                # is then cut 7-9 um from the locus. See
+                # alignment.apply_z_consensus.
+                filled = alignment.apply_z_consensus(fitted)
+                z_note = ''
+                if filled:
+                    n = sum(v[2] for v in filled.values())
+                    z_note = (f', z consensus filled {n} refused entr'
+                              f'{"y" if n == 1 else "ies"} over {len(filled)} '
+                              f'hybe(s)')
                 # THE COMMIT, in the parent, on the real ACell objects.
                 # Whole-pass and in hybe_records order, so cell.matrices
                 # carries exactly what this run fitted in exactly the order
@@ -857,7 +871,8 @@ class CellAlignmentWorker(QtCore.QThread):
                     alignment.commit_cell_alignment(cell, plan, fitted[key])
                 done += fov_share
                 self.progress.emit(done, total,
-                                   f'FOV{fov:03d}: {len(todo)} cell(s) aligned')
+                                   f'FOV{fov:03d}: {len(todo)} cell(s) aligned'
+                                   + z_note)
                 self.fov_done.emit(fov, cells)
                 done_fovs.append(fov)
 
