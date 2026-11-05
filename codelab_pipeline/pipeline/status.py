@@ -136,6 +136,42 @@ def _parse_source_label(text):
     return None, text
 
 
+def _tracing_rounds(tracing):
+    """[(modality, hybe)] from chromatin_tracing/hybes.
+
+    'HYBE|MOD' here -- the opposite order from the cellcycle genes,
+    which is the config's own spelling in each tab.
+    """
+    out = []
+    for part in str(tracing.get('hybes', '') or '').split(','):
+        bits = [b.strip() for b in part.split('|')]
+        if len(bits) >= 2 and bits[0] and bits[1]:
+            out.append((bits[1], bits[0]))
+    return out
+
+
+def _tracing_channels(tracing, records):
+    """[channel] the tracing tab has activated, resolved.
+
+    The config attribute is comma separated ('635', '635,747') or
+    'auto'. 'auto' is not a channel but a rule, and it resolves here the
+    way the tracing tab resolves it -- against the modality's own
+    records -- so that the expectation names the wavelength a run will
+    actually read instead of naming nothing.
+    """
+    from codelab_pipeline.alignment import chain as alignment
+    out = []
+    for piece in str(tracing.get('readout_channel', '') or '').split(','):
+        piece = piece.strip()
+        if piece.isdigit():
+            out.append(int(piece))
+        elif piece == 'auto' and records:
+            dom = alignment.dominant_readout_channel(records)
+            if dom is not None:
+                out.append(int(dom))
+    return [c for i, c in enumerate(out) if c not in out[:i]]
+
+
 def localization_targets(project):
     """{modality: [(hybe, channel)]} the store should hold spot slices
     for: the config's spot_localization hybe/channel (the anchor round
@@ -174,14 +210,24 @@ def localization_targets(project):
         if mod is not None:
             add(mod, hybe, int(loc['channel']))
     tracing = params.get('chromatin_tracing', {}) or {}
-    tracing_ch = str(tracing.get('readout_channel', '') or '').strip()
-    if tracing_ch.isdigit():
-        # 'HYBE|MOD' here -- the opposite order from the cellcycle
-        # genes below, which is the config's own spelling in each tab
-        for part in str(tracing.get('hybes', '') or '').split(','):
-            bits = [b.strip() for b in part.split('|')]
-            if len(bits) >= 2 and bits[0] and bits[1]:
-                add(bits[1], bits[0], int(tracing_ch))
+    # The activated readout channel(s). A COMMA-SEPARATED LIST, because
+    # one hybe can carry two readouts, and 'auto' for the rule "the
+    # non-fiducial channel the most hybes share" -- the same resolution
+    # the tracing tab itself applies. This used to demand a bare number
+    # and drop every tracing round otherwise, so a project left on
+    # 'auto' -- the default until a run sets it -- expected only the one
+    # anchor round, and the localization status read `done` with the
+    # tracing rounds missing. Exactly the defect the one-round
+    # expectation above was already fixed for, through a second door.
+    for mod_name, hybe in _tracing_rounds(tracing):
+        # NOT filtered against the round's own channel list: the config
+        # NAMES this dependency, and a configured round that the records
+        # say lacks the channel is a disagreement to surface as
+        # `partial`, not one to resolve by quietly expecting less. That
+        # is the same reasoning as expecting Toe_ rounds here at all.
+        recs = (project['modalities'].get(mod_name) or {}).get('records') or []
+        for ch in _tracing_channels(tracing, recs):
+            add(mod_name, hybe, ch)
     for part in str((params.get('cellcycle', {}) or {}).get('genes', '')).split(','):
         bits = part.strip().split('|')
         if len(bits) >= 3 and bits[2].strip().isdigit():

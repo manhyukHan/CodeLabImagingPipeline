@@ -140,6 +140,27 @@ def main():
               'no channel to expect them on)',
               S.localization_targets(no_ch) == S.localization_targets(project),
               str(S.localization_targets(no_ch)))
+        # 'auto' is the tracing tab's DEFAULT until a run sets a channel,
+        # and it is a rule, not a number. Demanding a bare number here
+        # dropped every tracing round for exactly those projects, so the
+        # localization status read `done` with the tracing rounds absent
+        # -- the one-round defect above, through a second door.
+        auto = dict(project, params=dict(
+            project['params'],
+            chromatin_tracing={'hybes': 'Hyb_002|DNA',
+                               'readout_channel': 'auto'}))
+        check("'auto' resolves to a channel rather than dropping the round",
+              ('Hyb_002', 555) in S.localization_targets(auto)['DNA'],
+              str(S.localization_targets(auto)['DNA']))
+        multi = dict(project, params=dict(
+            project['params'],
+            chromatin_tracing={'hybes': 'Hyb_002|DNA',
+                               'readout_channel': '635,747'}))
+        check('two activated channels expect a slice per channel, since '
+              'each is its own readout',
+              {('Hyb_002', 635), ('Hyb_002', 747)}
+              <= set(S.localization_targets(multi)['DNA']),
+              str(S.localization_targets(multi)['DNA']))
         with_genes = dict(project, params=dict(project['params'], cellcycle={'genes': 'RNA|Hyb_003|635|MCM2_nascent|-'}))
         check('cell-cycle gene sources from the config are expected too', ('Hyb_003', 635) in S.localization_targets(with_genes)['RNA'])
         shallow = S.fov_status(project, 1, deep=False)
