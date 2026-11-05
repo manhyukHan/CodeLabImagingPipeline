@@ -658,8 +658,31 @@ class ChromatinTracingPanelUI(object):
                 other.setCheckState(QtCore.Qt.Unchecked)
         lw.blockSignals(False)
 
+    @staticmethod
+    def _exclusive_auto(values):
+        """The activated tuple, with 'auto' enforced as exclusive.
+
+        'auto' names ONE channel by a rule -- the most shared
+        non-fiducial channel of the gated hybes -- so it cannot stand
+        beside a channel named outright: the two would disagree about
+        which single wavelength the round is read in, and nothing
+        downstream could say which was meant. The list widget already
+        keeps them apart by hand; this is the same rule on the config
+        door, where a hand-edited 'auto,635' would otherwise come in
+        and activate both.
+        """
+        vals = tuple(str(v) for v in values)
+        if 'auto' in vals and len(vals) > 1:
+            raise ValueError(
+                "readout channel: 'auto' is exclusive -- it resolves to a "
+                "single channel, so it cannot be activated beside %s"
+                % ', '.join(v for v in vals if v != 'auto'))
+        seen = [v for i, v in enumerate(vals) if v not in vals[:i]]
+        return tuple(seen)
+
     def _activate_readout_channel(self):
-        chosen = tuple(self._checked_readout_channels()) or ('auto',)
+        chosen = self._exclusive_auto(
+            self._checked_readout_channels()) or ('auto',)
         self._active_readout_channels = chosen
         self.ActiveReadoutChannelLabel.setText(
             'active: ' + ', '.join(str(c) for c in chosen))
@@ -679,13 +702,18 @@ class ChromatinTracingPanelUI(object):
         Accepts 'auto', '635', or '635,747' -- the config attribute is a
         single string, and an older config holding one channel restores
         to exactly what it meant.
+
+        Refuses 'auto' beside a named channel (see _exclusive_auto). The
+        app can never write that pair, so seeing it means a hand edit,
+        and loading it as 'both' would start a run on a channel set the
+        operator never saw activated.
         """
         if isinstance(value, (list, tuple)):
             wanted = [str(v) for v in value if str(v).strip()]
         else:
             wanted = [v.strip() for v in str(value or 'auto').split(',')
                       if v.strip()]
-        wanted = tuple(wanted) or ('auto',)
+        wanted = self._exclusive_auto(wanted) or ('auto',)
         lw = self.TraceReadoutChannelListWidget
         lw.blockSignals(True)
         for i in range(lw.count()):

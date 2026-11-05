@@ -101,6 +101,31 @@ def main():
     check('747 is gone, 635 stays', p.active_readout_channels() == ('635',),
           str(p.active_readout_channels()))
 
+    print('\nauto is exclusive on the config door too')
+    p.populate_readout_channel_choices([555, 635, 747], dominant=635)
+    try:
+        p.set_active_readout_channels('auto,635')
+        check('auto beside a named channel is refused', False, 'accepted')
+    except ValueError as e:
+        check('auto beside a named channel is refused',
+              'exclusive' in str(e), str(e))
+    p.set_active_readout_channels('auto')
+    check('auto alone restores', p.active_readout_channels() == ('auto',),
+          str(p.active_readout_channels()))
+    # and ticking auto beside one in the WIDGET clears the other, so the
+    # pair can never reach the activated tuple in the first place
+    lw = p.TraceReadoutChannelListWidget
+    for i in range(lw.count()):
+        if lw.item(i).data(QtCore.Qt.UserRole) == '635':
+            lw.item(i).setCheckState(QtCore.Qt.Checked)
+    for i in range(lw.count()):
+        if lw.item(i).data(QtCore.Qt.UserRole) == 'auto':
+            lw.item(i).setCheckState(QtCore.Qt.Checked)
+    p._activate_readout_channel()
+    check('ticking auto unticks the named channel',
+          p.active_readout_channels() == ('auto',),
+          str(p.active_readout_channels()))
+
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     return 1 if FAIL else 0
 

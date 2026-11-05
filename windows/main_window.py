@@ -2555,10 +2555,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.total_active_hybe_list,
             default_checked=lambda record, modality:
                 (record['folder'], modality) in _allowed)
+        # THE LAYOUT'S OWN readoutChannels COLUMN WINS THE DEFAULT. Where
+        # it names the channels -- '635:1, 747:51' -- the experiment has
+        # already said which wavelengths read a locus, and every one of
+        # them is activated. The operator then unchecks and re-activates
+        # to narrow it; the design is the starting point, not a proposal
+        # waiting on a click. Only where the layout names nothing does
+        # the dominant-channel rule below decide, as it always has.
+        _named = sorted({int(ch) for r in all_records
+                         for ch, _rid in (r.get('readouts') or [])
+                         if ch is not None})
+        if _named and chp.active_readout_channels() == ('auto',):
+            chp.set_active_readout_channels(
+                ','.join(str(c) for c in _named))
+            self.log(
+                'chromatin tracing: readout channel(s) '
+                + ', '.join(str(c) for c in _named)
+                + ' -- named by the ExperimentLayout\'s readoutChannels '
+                  'column, so they are active; uncheck and Activate to '
+                  'narrow it.')
         if _n_gated and _target is not None:
             dropped = _n_gated - len(_allowed)
             # Activate it too. The checked hybes were chosen BECAUSE they
-            # carry this channel, so leaving the combo on 'auto' would let
+            # carry this channel, so leaving the list on 'auto' would let
             # the per-hybe fallback pick a different wavelength for some of
             # them -- the exact thing this default exists to prevent.
             if chp.active_readout_channels() == ('auto',):
