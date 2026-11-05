@@ -172,7 +172,7 @@ def _tracing_channels(tracing, records):
     return [c for i, c in enumerate(out) if c not in out[:i]]
 
 
-def localization_targets(project):
+def _raw_localization_targets(project):
     """{modality: [(hybe, channel)]} the store should hold spot slices
     for: the config's spot_localization hybe/channel (the anchor round
     for tracing), EVERY round chromatin tracing is configured for, the
@@ -232,24 +232,44 @@ def localization_targets(project):
         bits = part.strip().split('|')
         if len(bits) >= 3 and bits[2].strip().isdigit():
             add(bits[0].strip(), bits[1].strip(), int(bits[2]))
-    # THE DERIVED ROUNDS, and the only channel in this whole function
-    # nobody states. A countable readout round carries no channel of its
-    # own, so it was expected at every channel that was not a fiducial --
-    # a derivation dressed as a choice, and on a 555/635/747 acquisition
-    # it localizes all of them with nowhere to say otherwise. The
-    # localization step has a channel SELECTOR now; this follows it, and
-    # falls back to the old non-fiducial set only while nothing is
-    # stored, so no store's status moves until someone chooses.
-    want = chosen_localization_channels(project)
-    default = default_localization_channels(project)
+    # a countable readout round names no channel of its own, so it
+    # contributes every channel it carries that is not a fiducial. The
+    # channel SELECTOR below is what narrows this; it is not narrowed
+    # here, so that turning the selector off restores exactly the list
+    # this step has always had.
+    fids = {int(r['fiducial_channel']) for m in project['modalities'].values()
+            for r in m['records'] if r.get('fiducial_channel') is not None}
     for name, m in project['modalities'].items():
-        allowed = want or default.get(name) or []
         for r in m['records']:
             if CC.countable_round(r.get('readout_name')):
                 for ch in r.get('channels') or []:
-                    if int(ch) in allowed:
+                    if int(ch) not in fids:
                         add(name, r['folder'], ch)
     return out
+
+
+def localization_targets(project):
+    """The expectation, with the step's CHANNEL SELECTOR applied.
+
+    Spot localization had no channel of its own: which channels it
+    looked in fell out of what each contributor happened to name, and
+    for the rounds that named none, out of which channel was somebody's
+    fiducial. So a 555/635/747 acquisition was localized at all of them
+    with nowhere to say otherwise.
+
+    One selector decides it now -- `localization_run/channels` -- and it
+    FILTERS. Every round still comes from the config exactly as before;
+    the selector only says which channels of them this project
+    localizes. Unset means every channel the rounds bring, which is the
+    list this step has always had, so no store's status moves until
+    someone chooses.
+    """
+    raw = _raw_localization_targets(project)
+    want = chosen_localization_channels(project)
+    if not want:
+        return raw
+    return {mod: [(h, c) for h, c in rounds if int(c) in want]
+            for mod, rounds in raw.items()}
 
 
 #: localization_run/rounds for "nothing", as against '' for "follow the
@@ -298,46 +318,34 @@ def chosen_localization_channels(project):
 
 def default_localization_channels(project):
     """What the selector starts on when nothing is stored: every
-    channel that is not some round's fiducial.
+    channel the configured rounds actually bring.
 
-    That is what this step did before the channel could be stated at
-    all, so starting there changes no store's status. It is a STARTING
-    POINT shown in the picker, not a rule: the operator sees it and can
-    add the fiducial channel or drop any of them.
+    That is the list this step has always localized, so starting there
+    changes no store's status. It is a STARTING POINT shown in the
+    picker, not a rule -- the point of the selector is that it can be
+    narrowed, and that a channel it leaves out is one a reader can see
+    was left out.
     """
-    fids = set()
-    for m in project['modalities'].values():
-        for r in m['records']:
-            fid = r.get('fiducial_channel')
-            if fid is not None:
-                fids.add(int(fid))
-    return {name: [c for c in chans if c not in fids]
-            for name, chans in localization_channels(project).items()}
+    raw = _raw_localization_targets(project)
+    return sorted({int(c) for rounds in raw.values() for _h, c in rounds})
 
 
-def localization_choices(project):
-    """{modality: [(hybe, channel)]} that COULD be localized -- every
-    round at every channel it carries.
+def localization_rounds(project):
+    """{modality: [hybe]} -- the configured rounds, each named ONCE.
 
-    THIS IS NOT THE EXPECTATION. localization_targets answers "what
-    should the store hold", which the config states and the status grid
-    reads. This answers "what is there to choose from", which is a
-    property of the acquisition alone.
-
-    They were the same list until now, and that is what made the channel
-    unselectable: the picker offered the expectation, so a channel the
-    layout carries could be unchecked but never added, and a round could
-    only ever be localized at the wavelength some other tab had chosen.
+    The rounds picker shows these. It used to show one entry per (round,
+    channel), so a project printed `· ch635` 85 times down a list whose
+    only real question was which ROUNDS to run -- and the channel, the
+    thing being repeated, was not a choice anywhere on the dialog. The
+    channel selector answers that once; this answers the other half.
     """
     out = {}
-    for name, m in project['modalities'].items():
-        rounds = []
-        for r in m['records']:
-            for ch in r.get('channels') or []:
-                pair = (str(r['folder']), int(ch))
-                if pair not in rounds:
-                    rounds.append(pair)
-        out[name] = rounds
+    for mod, rounds in _raw_localization_targets(project).items():
+        seen = []
+        for h, _c in rounds:
+            if h not in seen:
+                seen.append(h)
+        out[mod] = seen
     return out
 
 
@@ -352,21 +360,16 @@ def localization_run_targets(project):
     the runner asks it.
 
     The choice lives in the config as `localization_run/rounds`, comma
-    separated `MOD|HYBE|CH` (the cellcycle genes' spelling). EMPTY
-    MEANS EVERY TARGET, and that is not the same as listing them all:
-    an empty value keeps following the config, so a tracing round added
-    later is localized without anyone revisiting this setting.
+    separated `MOD|HYBE`. EMPTY MEANS EVERY TARGET, and that is not the
+    same as listing them all: an empty value keeps following the config,
+    so a tracing round added later is localized without anyone revisiting
+    this setting. NONE_CHOSEN means nothing, which an empty string cannot
+    say -- that is how the picker's `None` button came to mean `All`.
 
-    A chosen round is AUTHORITATIVE for the run, not merely a filter on
-    the expectation. It used to be intersected with
-    localization_targets, so a round or channel the config did not
-    already expect was silently dropped -- which made the channel
-    unchoosable: localizing Hyb_015 at 747 while tracing was activated
-    on 635 was not expressible, and asking for it did nothing. It is
-    still validated against what the acquisition HAS
-    (localization_choices), because a channel a round never carried
-    cannot be localized at all, and a run that quietly skipped it would
-    look like one that did the work.
+    ROUNDS, not (round, channel): which channels the step looks in is the
+    channel selector's one question, asked once, and it is already
+    applied in localization_targets. A stored `MOD|HYBE|CH` from before
+    reads as its round, so an older config narrows to the same rounds.
     """
     targets = localization_targets(project)
     params = project.get('params', {}) or {}
@@ -375,35 +378,14 @@ def localization_run_targets(project):
     if not chosen:
         return targets
     if chosen == NONE_CHOSEN:
-        # explicitly nothing, which an empty string cannot say: empty
-        # means "follow the config", so an empty selection used to run
-        # every expected round -- the `None` button meaning `All`
         return {mod: [] for mod in targets}
-    have = localization_choices(project)
-    keep, unknown = {}, []
+    keep = set()
     for part in chosen.split(','):
         bits = [b.strip() for b in part.split('|')]
-        if len(bits) < 3 or not bits[2].isdigit():
-            continue
-        mod, hybe, ch = bits[0], bits[1], int(bits[2])
-        known = have.get(mod) or []
-        # NOT validated where there is nothing to validate against. The
-        # layout lives on the acquisition share, so a project read on a
-        # machine without it mounted carries no records at all (see
-        # load_project), and refusing every chosen round there would
-        # block the run for a file this step never needed.
-        if known and (hybe, ch) not in known:
-            unknown.append('%s|%s|%d' % (mod, hybe, ch))
-        else:
-            keep.setdefault(mod, [])
-            if (hybe, ch) not in keep[mod]:
-                keep[mod].append((hybe, ch))
-    if unknown:
-        raise ValueError(
-            'localization_run/rounds names %d round(s) this acquisition '
-            'does not carry: %s -- a channel a round was not imaged at '
-            'cannot be localized' % (len(unknown), ', '.join(unknown[:6])))
-    return {mod: keep.get(mod, []) for mod in targets}
+        if len(bits) >= 2 and bits[0] and bits[1]:
+            keep.add((bits[0], bits[1]))
+    return {mod: [(h, c) for h, c in rounds if (mod, h) in keep]
+            for mod, rounds in targets.items()}
 
 
 def tracing_configured(project):

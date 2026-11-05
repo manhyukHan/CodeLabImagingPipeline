@@ -30,6 +30,7 @@ from codelab_pipeline.pipeline import status as S            # noqa: E402
 APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 TARGETS = {'DNA': [('Hyb_104', 635), ('Hyb_105', 635), ('Toe_113', 635)]}
+ROUNDS = {'DNA': ['Hyb_104', 'Hyb_105', 'Toe_113']}
 
 
 class FakeWindow(QtWidgets.QMainWindow):
@@ -120,18 +121,21 @@ def test_all_rounds_is_stored_as_empty_not_as_every_name():
     """Empty keeps following the config: a tracing round added later is
     localized without anyone opening this dialog again."""
     from ui.step_params_dialog import RoundsPicker
-    picker = RoundsPicker(TARGETS, '')
+    picker = RoundsPicker(ROUNDS, '')
     assert len(picker.boxes) == 3
     assert picker.value() == '', picker.value()
     picker._clear_toeholds()
-    assert picker.value() == 'DNA|Hyb_104|635,DNA|Hyb_105|635', picker.value()
+    assert picker.value() == 'DNA|Hyb_104,DNA|Hyb_105', picker.value()
     picker._set_all(False)
     # nothing checked is NOT empty: empty means "follow the config", so
     # it used to come back as every expected round -- None meaning All
     assert picker.value() == S.NONE_CHOSEN, picker.value()
     # and a stored subset comes back checked exactly as it was
-    again = RoundsPicker(TARGETS, 'DNA|Toe_113|635')
+    again = RoundsPicker(ROUNDS, 'DNA|Toe_113')
     assert [cb.isChecked() for cb in again.boxes] == [False, False, True]
+    # an older config spelling the channel out still names its rounds
+    old = RoundsPicker(ROUNDS, 'DNA|Toe_113|635')
+    assert [cb.isChecked() for cb in old.boxes] == [False, False, True]
 
 
 def test_a_chosen_subset_narrows_the_run_and_not_the_expectation():
@@ -149,7 +153,7 @@ def test_a_chosen_subset_narrows_the_run_and_not_the_expectation():
     assert S.localization_run_targets(project) == full, 'empty must mean all'
 
     project['params']['localization_run'] = {
-        'rounds': 'DNA|Hyb_104|635,DNA|Hyb_105|635'}
+        'rounds': 'DNA|Hyb_104,DNA|Hyb_105'}
     run = S.localization_run_targets(project)
     assert sorted(run['DNA']) == [('Hyb_104', 635), ('Hyb_105', 635)], run
     assert sorted(S.localization_targets(project)['DNA']) == sorted(full['DNA']), (
@@ -158,39 +162,40 @@ def test_a_chosen_subset_narrows_the_run_and_not_the_expectation():
 
 
 def test_the_spot_localization_channel_is_a_choice_not_a_derivation():
-    """A countable readout round names no channel, so it was expected at
-    EVERY non-fiducial channel it carries -- the one channel in the
-    whole expectation nobody could state. On a 555/635/747 acquisition
-    that localizes all of them."""
+    """The step had no channel of its own: which channels it looked in
+    fell out of what each contributor named, and for the rounds naming
+    none, out of which channel was somebody else's fiducial. One
+    selector decides it now, and it FILTERS -- the rounds are untouched.
+    """
     recs = [{'folder': 'Hyb_001', 'channels': [555, 635, 747],
              'fiducial_channel': 555, 'readout_name': 'MCM2_mRNA'},
             {'folder': 'Hyb_002', 'channels': [555, 635, 747],
              'fiducial_channel': 555, 'readout_name': 'CCNB1_exon'}]
     project = {'modalities': {'RNA': {'records': recs}}, 'params': {}}
-    # unset: the old derivation, so no store's status moves
+    # unset: the list this step has always had, so no status moves
     every = sorted(S.localization_targets(project)['RNA'])
     assert every == [('Hyb_001', 635), ('Hyb_001', 747),
                      ('Hyb_002', 635), ('Hyb_002', 747)], every
-    assert S.default_localization_channels(project) == {'RNA': [635, 747]}, (
+    assert S.default_localization_channels(project) == [635, 747], (
         S.default_localization_channels(project))
     assert S.localization_channels(project) == {'RNA': [555, 635, 747]}, (
-        'the selector must offer the fiducial channel too')
+        'the selector must offer every channel, the fiducial included')
+
     project['params']['localization_run'] = {'channels': '635'}
     one = sorted(S.localization_targets(project)['RNA'])
     assert one == [('Hyb_001', 635), ('Hyb_002', 635)], one
     project['params']['localization_run'] = {'channels': '635,747'}
     assert sorted(S.localization_targets(project)['RNA']) == every
-    # AND the fiducial channel can be chosen: on MAZ the 555 fiducial is
-    # the beads whose spots we wanted, so excluding it was a wrong
-    # answer, not a tidy default
-    project['params']['localization_run'] = {'channels': '555'}
-    assert sorted(S.localization_targets(project)['RNA']) == [
-        ('Hyb_001', 555), ('Hyb_002', 555)], S.localization_targets(project)
+
+    # the rounds are untouched by it: the same two, at fewer channels
+    project['params']['localization_run'] = {'channels': '635'}
+    assert S.localization_rounds(project) == {'RNA': ['Hyb_001', 'Hyb_002']}, (
+        S.localization_rounds(project))
 
 
 def test_the_channel_selector_offers_every_channel_and_starts_on_the_old_set():
     """A selector, not a rule. The fiducial channel is offered because
-    spot localization finds spots in an image and which channel an
+    spot localization finds spots in an image, and which channel an
     alignment uses is a different question -- on MAZ the 555 fiducial is
     the beads whose spots we wanted."""
     from ui.step_params_dialog import ChannelPicker
@@ -199,67 +204,24 @@ def test_the_channel_selector_offers_every_channel_and_starts_on_the_old_set():
     assert picker.value_list() == [635, 747], 'it must start on the default'
     assert picker.value() == '', 'the default set keeps following the config'
 
-    # the fiducial channel can be added
     next(cb for cb in picker.boxes if cb.key == 555).setChecked(True)
     assert picker.value() == '555,635,747', picker.value()
 
-    # and narrowed to one
     picker = ChannelPicker([555, 635, 747], [635, 747], [635])
     assert picker.value_list() == [635]
     assert picker.value() == '635', picker.value()
 
-    # nothing selected is said outright, not folded back into the default
     for cb in picker.boxes:
         cb.setChecked(False)
     assert picker.value_list() == []
     assert 'not localized' in picker.Note.text(), picker.Note.text()
 
 
-def test_a_channel_can_be_added_and_not_only_removed():
-    """The picker offered the EXPECTATION, so a second channel the
-    acquisition carries could be unchecked but never ticked on -- the
-    round could only be localized at the wavelength another tab chose."""
-    from ui.step_params_dialog import RoundsPicker
-    recs = [{'folder': 'Hyb_001', 'channels': [555, 635, 747],
-             'fiducial_channel': 555, 'readout_name': None}]
-    project = {'modalities': {'DNA': {'records': recs}},
-               'params': {'chromatin_tracing': {'hybes': 'Hyb_001|DNA',
-                                                'readout_channel': '635'}}}
-    expected = S.localization_targets(project)
-    choices = S.localization_choices(project)
-    assert sorted(expected['DNA']) == [('Hyb_001', 635)], expected
-    assert sorted(choices['DNA']) == [('Hyb_001', 555), ('Hyb_001', 635),
-                                      ('Hyb_001', 747)], choices
-
-    picker = RoundsPicker(choices, '', expected=expected)
-    assert len(picker.boxes) == 3, 'every channel must be offerable'
-    state = {cb.key[2]: cb.isChecked() for cb in picker.boxes}
-    assert state == {555: False, 635: True, 747: False}, state
-    assert picker.value() == '', 'the expectation exactly means follow it'
-
-    # tick the extra one: the RUN takes it, the expectation does not move
-    next(cb for cb in picker.boxes if cb.key[2] == 747).setChecked(True)
-    assert picker.value() == 'DNA|Hyb_001|635,DNA|Hyb_001|747', picker.value()
-    project['params']['localization_run'] = {'rounds': picker.value()}
-    assert sorted(S.localization_run_targets(project)['DNA']) == [
-        ('Hyb_001', 635), ('Hyb_001', 747)], S.localization_run_targets(project)
-    assert sorted(S.localization_targets(project)['DNA']) == [
-        ('Hyb_001', 635)], 'the chosen channel moved the expectation'
-
-    # a channel the round was never imaged at cannot be localized
-    project['params']['localization_run'] = {'rounds': 'DNA|Hyb_001|488'}
-    try:
-        S.localization_run_targets(project)
-        raise AssertionError('a channel the acquisition lacks was accepted')
-    except ValueError as e:
-        assert 'does not carry' in str(e), str(e)
-
-
 def test_none_is_none_and_not_all():
     """Empty means FOLLOW THE CONFIG, so an empty selection came back as
     every expected round: pressing None ran everything."""
     from ui.step_params_dialog import RoundsPicker
-    picker = RoundsPicker(TARGETS, '', expected=TARGETS)
+    picker = RoundsPicker(ROUNDS, '')
     picker._set_all(False)
     assert picker.value() == S.NONE_CHOSEN, picker.value()
     project = {'modalities': {'DNA': {'records': []}},
@@ -270,7 +232,7 @@ def test_none_is_none_and_not_all():
         S.localization_run_targets(project))
     assert S.localization_targets(project)['DNA'] == [('Hyb_104', 635)], (
         'naming no round changed the expectation')
-    picker._set_expected()
+    picker._set_all(True)
     assert picker.value() == '', picker.value()
 
 
