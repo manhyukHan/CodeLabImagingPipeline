@@ -634,12 +634,54 @@ class PipelineRunner(QtCore.QObject):
         return busy, finish
 
     def _run_tracing(self, fovs, mode):
+        """Trace the given FOVs, building anchors only where there are none.
+
+        BUILDING ANCHORS IS A SEPARATE DECISION FROM TRACING, and running
+        it unconditionally destroyed one. Headless, the Alleles combo
+        boxes are not restored from the config -- it carries no field for
+        them -- so they fall to their defaults: the FIRST hybe in the
+        list, and (deliberately, so that a human does not pick the
+        fiducial by accident) the first READOUT channel. On MP58 that is
+        Hyb_015 ch635, while the store's own anchors are Hyb_038 ch555.
+        A tracing re-run therefore turned every ch635 spot of an
+        unrelated round into an allele: 696 added across 4 FOVs, on top
+        of anchors that were already there.
+
+        So anchors are built only for FOVs that have none. A store whose
+        anchors exist is traced on the anchors it has; a FOV with none
+        still gets them, which is what the first run of an experiment
+        needs. Choosing a different anchor scheme is then an explicit act
+        in the app, not a side effect of asking for a trace.
+        """
         mw = self.mw
         if self.project is not None and not S.tracing_configured(self.project):
             raise ValueError('chromatin tracing is not configured (no tracing hybes checked): not building alleles')
-        mw._build_chromatin_alleles_all_fovs()
+        if self._fovs_without_alleles(fovs):
+            mw._build_chromatin_alleles_all_fovs()
         mw._run_chromatin_tracing_fit_all()
         return (lambda: _running(getattr(mw, '_chromatin_worker', None))), (lambda: 'chromatin tracing batch ended')
+
+    def _fovs_without_alleles(self, fovs):
+        """Which of `fovs` hold no allele yet. Unreadable counts as empty.
+
+        A FOV whose capsule cannot be read is treated as having none, so
+        a genuinely first run is never blocked by a missing file; the
+        cost of being wrong that way is the old behaviour, and the cost
+        of being wrong the other way is the overwrite this guards.
+        """
+        from codelab_pipeline.io import analysis_store
+        _modality, storage_path = self.mw._chromatin_storage_path_and_modality()
+        if not storage_path:
+            return list(fovs or [])
+        out = []
+        for fov in (fovs or []):
+            try:
+                have = analysis_store.read_fov_alleles(storage_path, fov) or []
+            except Exception:                                   # noqa: BLE001
+                have = []
+            if not have:
+                out.append(fov)
+        return out
 
 
 def project_from_app(mw):
@@ -794,6 +836,33 @@ class PipelineTab:
         if self.rows is None or self.project is None:
             self.refresh(then=self.start)
             return
+        # THE PARAMETERS ARE READ AT START, NOT AT REFRESH. `self.project`
+        # is the snapshot Refresh status took, and every parameter dialog
+        # since then wrote to the TABS instead -- the dialog updates the
+        # widgets and the settings column and never this. So a run used
+        # whatever the parameters were when someone last pressed Refresh.
+        #
+        # The round picker is where that became wrong rather than merely
+        # stale: an empty `localization_run/rounds` means EVERY target by
+        # design (so a tracing round added later is localized without
+        # anyone revisiting the setting), and a stale snapshot reads
+        # empty. Refresh, then pick one round, then Start localized all
+        # 84 -- reported from the real pipeline on MP58, where picking
+        # Hyb_107 alone started Hyb_025.
+        #
+        # `project_from_app` reads the live widgets, so nothing has to be
+        # saved first. What it cannot do is re-read the STORE, and
+        # `self.rows` came from the store under the old FOV list and
+        # storage paths -- so those two are checked rather than silently
+        # carried over.
+        fresh = project_from_app(self.mw)
+        def _paths(pr):
+            return {k: v['storage_path'] for k, v in pr['modalities'].items()}
+        if fresh['fovs'] != self.project['fovs'] or _paths(fresh) != _paths(self.project):
+            raise ValueError('The FOV list or a storage path changed since '
+                             'Refresh status, so the status below is for a '
+                             'different set. Press Refresh status again.')
+        self.project = fresh
         pol = self.panel.policies()
         plan = S.plan(self.rows, pol)
         if not any(plan[s] for s in S.STEPS if pol[s] != 'skip'):
