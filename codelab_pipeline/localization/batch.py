@@ -41,7 +41,21 @@ from codelab_pipeline.models.cell import ACell
 from codelab_pipeline.models.spot import ASpot, Z_ACCEPTED as SPOT_Z_ACCEPTED
 
 DEFAULT_PAD = 10
-DEFAULT_MIN_P_EXIST = 0.5
+# A MINIMAL FLOOR, NOT THE REVIEW THRESHOLD. The gate here is applied
+# BEFORE the store, so whatever it drops is gone and the only way back is
+# re-reading the NAS -- 64-85 s per (FOV, hybe) MEASURED on chr19 FOV 17.
+# At 0.5 that silently threw away the evidence every later question needs:
+# MEASURED on chr19 FOV 17, Hyb_064/028/014 with the pinned default model,
+# only 1.6-2.3% of scored candidates sit at p_exist 0 and 89-96% land in
+# (0, 0.5), so the old floor removed the bulk of the distribution rather
+# than a dead tail. Relative to 0.5 the stored count is x2.2 at 0.1, x5.5
+# at 0.01 and x23.2 at 0.0; 0.1 buys back the usable part without the
+# twenty-fold store.
+#
+# The REVIEW threshold stays where it belongs -- p_gate.py, posterior,
+# chosen off a histogram -- and a caller that wants the old behaviour
+# passes min_p_exist=0.5 explicitly.
+DEFAULT_MIN_P_EXIST = 0.1
 
 
 def make_engine_state(model_dir):

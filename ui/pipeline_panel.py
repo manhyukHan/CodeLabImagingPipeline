@@ -25,7 +25,7 @@ try:
     from codelab_pipeline.localization import batch as _batch
     _BATCH_DEFAULTS = (float(_batch.DEFAULT_MIN_P_EXIST), int(_batch.DEFAULT_PAD))
 except Exception:                                           # noqa: BLE001
-    _BATCH_DEFAULTS = (0.5, 10)
+    _BATCH_DEFAULTS = (0.1, 10)
 
 STEP_LABELS = {'ingestion': 'Ingestion', 'segmentation': 'Cell segmentation', 'fov_alignment': 'FOV alignment',
                'cross_modal': 'Cross-modal alignment', 'cell_alignment': 'Cell alignment', 'localization': 'Spot localization',
@@ -121,7 +121,10 @@ class PipelinePanelUI:
         self.LocalizationMinPExistSpinBox.setToolTip(
             'A spot is written only if the model gives it at least this '
             'p_exist. The floor is applied AT WRITE TIME, so lowering it '
-            'later means re-running the round.')
+            'later means re-running the round -- which is why the default '
+            'is a minimal floor rather than a review threshold. Gate for '
+            'analysis afterwards instead; p, p1 and p_exist are all '
+            'stored.')
         self.LocalizationChannelsLineEdit = QtWidgets.QLineEdit()
         self.LocalizationChannelsLineEdit.setPlaceholderText(
             'every non-fiducial channel')
