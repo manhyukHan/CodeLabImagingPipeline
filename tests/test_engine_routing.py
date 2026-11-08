@@ -138,8 +138,21 @@ def test_the_popup_choice_survives_a_restart():
     block = ms[i:i + 900]
     check("spot_localization now carries an 'engine' key",
           "'engine': (" in block, block.split('\n')[0])
-    check('mapped to the popup that owns it',
-          'Localize3DDisplayer' in block)
+    # THE ATTRIBUTE, NOT THE CLASS NAME. The popup is a QMainWindow in
+    # canvas/, held on the WINDOW as self.localize_3d_displayer and not
+    # on self.ui, so the map entry names that attribute. Asserting the
+    # class spelling here only ever described an entry nobody could
+    # resolve -- see _config_widget's docstring: Save Config raised
+    # AttributeError on every press until it learned to look a panel
+    # name up on self.ui first and then on the window itself. That
+    # two-step lookup is the whole reason this one entry works, so it
+    # is what gets pinned.
+    check('mapped to the popup attribute that owns it',
+          "'localize_3d_displayer'" in block)
+    rs = ms[ms.index('def _config_widget'):][:900]
+    check('and the resolver falls back from self.ui to the window',
+          'getattr(self.ui, panel, None)' in rs
+          and 'getattr(self, panel)' in rs)
 
 
 def main():
