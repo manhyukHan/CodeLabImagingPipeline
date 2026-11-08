@@ -38,7 +38,7 @@
   <cell_alignment
     channel_type="fiducial"
     pad="10"
-    max_z_shift="15"
+    max_z_shift="55"
     overlay_autosave_threshold_px="0"
     reference_hybe_DNA="Hyb_003" />
   <spot_localization

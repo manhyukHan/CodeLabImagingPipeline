@@ -3,12 +3,14 @@
   fov_list="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
   celltype_names="WT,4A3,8B1">
   <modality
-    name="DNA" />
+    name="DNA"
+    probe_design_path="E:\Oligos\Library004\CriGri-PICRH_MP58\MP58_4M_v7\AllRegions_bed.txt" />
   <modality
     name="RNA" />
   <acquisition
     voxel_xy_um="0.208"
-    voxel_z_um="0.2" />
+    voxel_z_um="0.2"
+    genomic_resolution_kb="50" />
   <cell_segmentation
     reference_hybe="Hyb_015 (DNA)"
     channel="555"
@@ -27,19 +29,19 @@
     z_start="0"
     z_end="109" />
   <fov_alignment
-    channel_type="fiducial"
+    overlay_channel_type="555"
     border_trim="0"
     max_shift="0"
     reference_hybe_DNA="Hyb_015"
     reference_hybe_RNA="Hyb_101" />
   <cross_modal_alignment
-    channel_type="readout"
+    channel_type="635"
     border_trim="0"
     max_shift="0"
     reference_hybe_DNA="Hyb_015"
     reference_hybe_RNA="Hyb_101" />
   <cell_alignment
-    channel_type="fiducial"
+    channel_type="555"
     pad="10"
     max_z_shift="55"
     overlay_autosave_threshold_px="5"
@@ -52,7 +54,8 @@
     threshold_absolute=""
     min_distance="3"
     pad="10"
-    append_mode="0" />
+    append_mode="0"
+    engine="v2-anchor-fit (PSF fit + quality gates)" />
   <celltype
     barcode_hybe="Hyb_130 (DNA)"
     barcode_channel="635"

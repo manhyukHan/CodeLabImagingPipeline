@@ -1,0 +1,104 @@
+<settings
+  project_root="G:\Seeun\toy_ingested"
+  fov_list="3,12,20,38,50,64"
+  celltype_names="">
+  <modality
+    name="DNA" />
+  <acquisition
+    voxel_xy_um="0.20752"
+    voxel_z_um="0.14459" />
+  <cell_segmentation
+    reference_hybe="Hyb_IF (DNA)"
+    channel="390"
+    method="Cellpose"
+    diameter="40"
+    min_size="1000"
+    max_size="10000"
+    classical_algorithm="Otsu"
+    classical_absolute_cutoff="1000.0"
+    classical_min_distance="7"
+    classical_min_size="500"
+    classical_max_size="10000"
+    append_mode="0"
+    projection="MIP (stored)"
+    z_plane="0"
+    z_start="0"
+    z_end="128" />
+  <fov_alignment
+    overlay_channel_type="555"
+    border_trim="0"
+    max_shift="0"
+    reference_hybe_DNA="Hyb_IF" />
+  <cross_modal_alignment
+    channel_type="635"
+    border_trim="0"
+    max_shift="0"
+    reference_hybe_DNA="Hyb_IF" />
+  <cell_alignment
+    channel_type="555"
+    pad="10"
+    max_z_shift="55"
+    overlay_autosave_threshold_px="0"
+    reference_hybe_DNA="Hyb_IF" />
+  <spot_localization
+    hybe="Hyb_002 (DNA)"
+    channel="635"
+    threshold_percent="50"
+    threshold_absolute=""
+    min_distance="3"
+    pad="10"
+    append_mode="0" />
+  <celltype
+    barcode_hybe=""
+    barcode_channel=""
+    method="Vote (200-sample)"
+    fov_ranges=""
+    calibration_fov=""
+    scale="1.0"
+    lower_bound_mode="Quantile"
+    lower_bound_value="0.3"
+    upper_bound_mode="Quantile"
+    upper_bound_value="0.999"
+    include_transient="1" />
+  <chromatin_tracing
+    reference_hybe="Hyb_IF (DNA)"
+    engine="v2"
+    v2_fiducial_min_occupancy="0.25"
+    v2_readout_min_occupancy="0.4"
+    v2_fiducial_max_uncert_xy_nm="0.0"
+    v2_readout_max_uncert_xy_nm="0.0"
+    v2_fiducial_max_uncert_z_nm="0.0"
+    v2_readout_max_uncert_z_nm="150.0"
+    v2_qc_shift="1"
+    readout_psf="universal-default"
+    spad="8"
+    z_window="15"
+    z_boundary_trim="10"
+    max_fiducial_drift="7.0"
+    max_fiducial_drift_z="15.0"
+    fiducial_peak_bound="2.0"
+    readout_peak_bound="2.0"
+    fiducial_max_sigma="2.5"
+    readout_max_sigma="2.5"
+    fiducial_max_uncert="2.0"
+    readout_max_uncert="2.0"
+    fiducial_min_hb_ratio="1.2"
+    readout_min_hb_ratio="1.2"
+    fiducial_min_ah_ratio="0.25"
+    readout_min_ah_ratio="0.25"
+    readout_min_sep="3.0"
+    multi_component_fit="0"
+    hybes="Hyb_113|DNA,Hyb_114|DNA,Toe_114|DNA,Hyb_002|DNA,Hyb_003|DNA,Hyb_004|DNA,Hyb_005|DNA,Hyb_006|DNA,Hyb_007|DNA,Hyb_008|DNA"
+    readout_channel="635" />
+  <analysis_population
+    fov_list=""
+    mask_intensity="1"
+    sources="" />
+  <analysis_polymer_qc
+    min_traced="2"
+    apply_qc="1"
+    min_brightness=""
+    max_brightness=""
+    max_jump_um=""
+    max_dist_um="" />
+</settings>

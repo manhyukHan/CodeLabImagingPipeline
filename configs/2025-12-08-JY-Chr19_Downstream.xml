@@ -3,7 +3,8 @@
   fov_list="1,2"
   celltype_names="">
   <modality
-    name="DNA" />
+    name="DNA"
+    probe_design_path="E:\Oligos\Library007\Chr19_downstream\trial7\Chr19_downtrial7_bed.txt" />
   <acquisition
     genomic_resolution_kb="200" />
   <cell_segmentation
@@ -36,7 +37,7 @@
   <cell_alignment
     channel_type="fiducial"
     pad="10"
-    max_z_shift="15"
+    max_z_shift="55"
     overlay_autosave_threshold_px="0"
     reference_hybe_DNA="Hyb_001" />
   <spot_localization

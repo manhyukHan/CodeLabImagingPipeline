@@ -1,0 +1,63 @@
+<settings
+  project_root="P:\Jihyun\2_Data\1_ORCA\2024-03-12_20240308_JP_001\RNA_Expt\Results"
+  fov_list="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79"
+  celltype_names="DMSO,Nocodazole,Nocodazole+3hr,Nocodazole+6hr">
+  <modality
+    name="RNA" />
+  <acquisition
+    voxel_xy_um="0.208"
+    voxel_z_um="0.202" />
+  <cell_segmentation
+    reference_hybe="Hyb_400 (RNA)"
+    channel="635"
+    method="Cellpose"
+    diameter="95"
+    min_size="2000"
+    max_size="25000"
+    classical_algorithm="Otsu"
+    classical_absolute_cutoff="1000.0"
+    classical_min_distance="7"
+    classical_min_size="500"
+    classical_max_size="10000"
+    append_mode="0"
+    projection="single plane"
+    z_plane="72"
+    z_start="62"
+    z_end="82" />
+  <fov_alignment
+    overlay_channel_type="555"
+    border_trim="0"
+    max_shift="0"
+    reference_hybe_RNA="Hyb_101" />
+  <cell_alignment
+    channel_type="555"
+    pad="10"
+    max_z_shift="55"
+    overlay_autosave_threshold_px="1000"
+    reference_hybe_RNA="Hyb_101" />
+  <spot_localization
+    hybe="Hyb_101 (RNA)"
+    channel="635"
+    threshold_percent="50"
+    threshold_absolute=""
+    min_distance="3"
+    pad="10"
+    append_mode="0"
+    engine="v3-psfmatcher (learned, automatic)" />
+  <celltype
+    barcode_hybe=""
+    barcode_channel=""
+    method="Vote (200-sample)"
+    fov_ranges=""
+    calibration_fov=""
+    scale="1.0"
+    lower_bound_mode="Quantile"
+    lower_bound_value="0.3"
+    upper_bound_mode="Quantile"
+    upper_bound_value="0.999"
+    include_transient="1" />
+  <analysis_population
+    fov_list=""
+    mask_intensity="1"
+    sources="" />
+</settings>
