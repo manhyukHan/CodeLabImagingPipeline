@@ -16,8 +16,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np                                            # noqa: E402
 
 from codelab_pipeline.localization import bottom_up as BU     # noqa: E402
+from codelab_pipeline.localization import pathfind as PF      # noqa: E402
+from codelab_pipeline.physics import chain as PH              # noqa: E402
 
 PASS, FAIL = [], []
+CAL = PH.Calibration()
+
+#: every cell here is 30 or 40 slots of a regular panel; the separation
+#: is stated rather than assumed anywhere downstream
+SEP30 = PF.Separation.uniform(30, 50.0)
+SEP40 = PF.Separation.uniform(40, 50.0)
 
 
 def check(name, cond, detail=''):
@@ -40,6 +48,33 @@ def make_cell(k, n_slots, efficiency=1.0, sep_um=2.0, rg_um=0.25, seed=0):
             pos.append(centres[j] + rs.normal(0, rg_um, 3))
             truth.append(j)
     return (BU.cell_spots(bins, np.array(pos)), np.array(truth), centres)
+
+
+def chain_cell(k, n_slots, step_kb=50.0, efficiency=1.0, sep_um=2.0, seed=0):
+    """k alleles that are actually CHAINS, not blobs. (CellSpots, truth).
+
+    Positions obey Var(x_i - x_j) = sigma_poly(s_ij)^2 at every pair, so
+    the fixture is drawn from the same law the loss scores with. A
+    compact Gaussian cloud -- which is what make_cell gives, and what
+    the k-means pieces above are rightly tested on -- is NOT a chain,
+    and the chain loss correctly takes one apart into three paths.
+    """
+    rs = np.random.RandomState(seed)
+    g = np.arange(n_slots) * float(step_kb)
+    v = CAL.sigma_poly(np.maximum(np.abs(g[:, None] - g[None, :]), 1e-9)) ** 2
+    vi = CAL.sigma_poly(np.maximum(g, 1e-9)) ** 2
+    w, q = np.linalg.eigh(0.5 * (vi[:, None] + vi[None, :] - v))
+    root = q @ np.diag(np.sqrt(np.maximum(w, 0)))
+    bins, pos, truth = [], [], []
+    for j in range(k):
+        walk = root @ rs.normal(size=(n_slots, 3)) + np.array([0., j * sep_um, 0.])
+        for b in range(n_slots):
+            if rs.rand() > efficiency:
+                continue
+            bins.append(b)
+            truth.append(j)
+            pos.append(walk[b] + rs.normal(0, CAL.sigma_loc_xy, 3))
+    return BU.cell_spots(bins, np.array(pos)), np.array(truth)
 
 
 def inputs():
@@ -224,7 +259,7 @@ def seams():
         called.append('paths')
         return BU.nearest_path(s, c, n)
 
-    t = BU.build_cell_traces(spots, 40, engines={
+    t = BU.build_cell_traces(spots, 40, SEP40, engines={
         'multiplicity': fake_mult, 'cluster': fake_cluster,
         'paths': fake_paths})
     # THE SPLIT AND THE ASSIGNMENT ARE ONE STAGE NOW, so build_cell_traces
@@ -242,8 +277,7 @@ def seams():
     check('and the trace reports both', t.paths is t.clustering)
 
     print('  a known ploidy beats an estimated one')
-    t3 = BU.build_cell_traces(spots, 40, k=2,
-                              paths={'min_bins': 5, 'reach_um': 1.0})
+    t3 = BU.build_cell_traces(spots, 40, SEP40, k=2)
     check('k given is k used, with no sweep', t3.rows.shape[0] == 2,
           str(t3.rows.shape))
     check('and the estimate is still reported beside it',
@@ -252,60 +286,108 @@ def seams():
 
 def joint():
     print('\nthe split and the assignment are ONE objective')
-    rs = np.random.RandomState(0)
-    bins, pos = [], []
-    for cx in (0.0, 2.0):
-        for b in range(30):
-            bins.append(b)
-            pos.append([0.0, cx, 0.0] + rs.normal(0, 0.2, 3))
-    cs = BU.cell_spots(bins, np.array(pos))
-    f = BU.choose_paths(cs, 30, min_bins=5, reach_um=1.0)
+    cs, truth = chain_cell(2, 30, seed=0)
+    f = BU.choose_paths(cs, 30, SEP30)
     check('a clean two-allele cell costs least at k=2', f.k == 2,
           '%s -- %s' % (f.k, f.reason))
     check('every spot is paid for', f.unassigned == 0, str(f.unassigned))
     check('and each path fills its own 30 bins',
           (f.rows >= 0).sum(axis=1).tolist() == [30, 30],
           str((f.rows >= 0).sum(axis=1)))
+    check('each allele gets its own evidence, not a pooled number',
+          len(f.weights) == 2 and max(f.weights) < 0,
+          '%s nats' % [round(w) for w in f.weights])
     check('the cost of every k is reported, so a close call is visible',
           len(f.per_k) >= 2 and f.per_k[0][1] > f.per_k[1][1], str(f.per_k))
 
     print('  BIN IDENTITY DECIDES IT NOW -- the thing that was missing')
-    perm = rs.permutation(len(bins))
-    f2 = BU.choose_paths(BU.cell_spots(np.array(bins)[perm], np.array(pos)),
-                         30, min_bins=5, reach_um=1.0)
+    rs = np.random.RandomState(0)
+    perm = rs.permutation(len(cs.bin))
+    f2 = BU.choose_paths(BU.cell_spots(np.asarray(cs.bin)[perm], cs.pos),
+                         30, SEP30)
     check('the same points with shuffled labels cost MORE',
-          f2.cost > f.cost, '%.1f vs %.1f' % (f2.cost, f.cost))
+          f2.cost > f.cost, '%.1f vs %.1f nats' % (f2.cost, f.cost))
     check('and leave spots no path will pay for',
           f2.unassigned > f.unassigned,
           '%d vs %d' % (f2.unassigned, f.unassigned))
 
     print("  a bin's SECOND spot costs the path that cannot take it")
-    # one path, two spots in bin 0: only one can be assigned
+    # one path, two spots in bin 0: a chain walks the slots forward, so
+    # taking both is not expensive -- it is not expressible
     bins3 = [0, 0] + list(range(1, 12))
     pos3 = np.array([[0., 0., 0.], [0., 0.3, 0.]]
                     + [[0., 0., 0.]] * 11, dtype=float)
     f3 = BU.fit_paths(BU.cell_spots(bins3, pos3), 12, 1,
-                      min_bins=3, reach_um=1.0)
+                      PF.Separation.uniform(12, 50.0))
     check('one path takes one of them', (f3.rows[0] >= 0).sum() == 12,
           str((f3.rows[0] >= 0).sum()))
     check('and the other is unassigned, not quietly added',
           f3.unassigned == 1, str(f3.unassigned))
 
     print('  a path must pay for itself')
-    one = BU.choose_paths(BU.cell_spots(list(range(20)),
-                                        rs.normal(0, 0.2, (20, 3))), 20,
-                          min_bins=5, reach_um=1.0)
-    check('a single compact allele stays k=1', one.k == 1,
-          '%s -- %s' % (one.k, one.reason))
+    one, _t = chain_cell(1, 30, seed=4)
+    r1 = BU.choose_paths(one, 30, SEP30)
+    check('a single allele stays k=1', r1.k == 1,
+          '%s -- %s' % (r1.k, r1.reason))
 
     print('  and build_cell_traces now routes through it')
-    t = BU.build_cell_traces(cs, 30, paths={'min_bins': 5, 'reach_um': 1.0})
+    t = BU.build_cell_traces(cs, 30, SEP30)
     check('the trace carries the fit, not a separate clustering',
           t.rows.shape[0] == 2 and t.paths is t.clustering,
           str(t.rows.shape))
     check('and the count proposal is still reported beside it',
           t.multiplicity is not None and t.multiplicity.k is not None,
           str(t.multiplicity.k))
+
+    print('  the genomic separation is an INPUT, and it changes the answer')
+    # the same cell told its panel is 50 kb per slot and 5 Mb per slot:
+    # at 5 Mb every step spans so much genome that the law expects the
+    # loci anywhere, and the chain stops being evidence
+    wide = BU.choose_paths(cs, 30, PF.Separation.uniform(30, 5000.0))
+    check('a panel claimed 100x coarser buys far less evidence',
+          wide.cost > f.cost, '%.0f vs %.0f nats' % (wide.cost, f.cost))
+    check('which is why Separation has no default',
+          'ASSUMED' in f.reason, f.reason)
+
+
+def cap():
+    print('\nthe path count is CAPPED, because the cost cannot cap it')
+    # eight real alleles, each a full 30-slot chain. Every one of them
+    # pays for itself many times over, so only the cap refuses them.
+    cs, _t = chain_cell(8, 30, sep_um=3.0, seed=1)
+    f = BU.choose_paths(cs, 30, SEP30)
+    check('eight real sites are still capped at the default',
+          f.k <= pathfind_k_max(), '%s -- %s' % (f.k, f.reason))
+    check('and the cap says so in the reason', 'capped at' in f.reason,
+          f.reason)
+    check('the cap is a default, not a law',
+          BU.choose_paths(cs, 30, SEP30, k_max=8).k > pathfind_k_max(),
+          str(BU.choose_paths(cs, 30, SEP30, k_max=8).k))
+    two, _t2 = chain_cell(2, 30, sep_um=3.0, seed=1)
+    check('a cell within the cap is untouched by it',
+          BU.choose_paths(two, 30, SEP30).k == 2,
+          str(BU.choose_paths(two, 30, SEP30).k))
+
+    print('  and the count proposals are capped at the same number')
+    m = BU.spatial_multiplicity(cs, 30, radius_um=1.0, min_bins=5)
+    check('spatial_multiplicity stops at the cap', m.k <= BU.DEFAULT_K_MAX,
+          '%s -- %s' % (m.k, m.reason))
+    check('raised per call, it counts further',
+          BU.spatial_multiplicity(cs, 30, radius_um=1.0, min_bins=5,
+                                  k_max=8).k > BU.DEFAULT_K_MAX,
+          str(BU.spatial_multiplicity(cs, 30, radius_um=1.0, min_bins=5,
+                                      k_max=8).k))
+    counts = np.array([BU.DEFAULT_K_MAX + 3] * 30)
+    check('binomial_multiplicity cannot exceed it either',
+          BU.binomial_multiplicity(counts).k <= BU.DEFAULT_K_MAX,
+          str(BU.binomial_multiplicity(counts).k))
+
+
+def pathfind_k_max():
+    """The path cap lives with the loss now, beside the prior it works
+    with; BU.DEFAULT_K_MAX still caps the COUNT PROPOSALS, which are a
+    different question asked of the per-bin counts."""
+    return PF.DEFAULT_K_MAX
 
 
 def main():
@@ -315,6 +397,7 @@ def main():
     paths()
     seams()
     joint()
+    cap()
     print(f'\n{len(PASS)} passed, {len(FAIL)} failed')
     return 1 if FAIL else 0
 

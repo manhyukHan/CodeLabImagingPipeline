@@ -40,6 +40,8 @@ import itertools
 
 import numpy as np
 
+from codelab_pipeline.localization import pathfind
+
 #: a spot that belongs to no allele
 UNASSIGNED = -1
 
@@ -127,6 +129,28 @@ reason      why this k, in words, or why no k could be chosen
 """
 
 
+#: THE HARD CAP ON HOW MANY ALLELES ANY ROUTE MAY REPORT.
+#:
+#: A cap is not a cosmetic bound here, it is the only thing standing
+#: between the cost sweep and an answer the cell cannot hold. Measured
+#: on JP chr19 FOVs 7-10, choose_paths returned a median k of 8 against
+#: a store count of 2, and it was not a bug in the search: the objective
+#: charges a CONSTANT per path while a path's saving grows with the
+#: number of spots it collects, so the rule it actually implements is
+#: "believe a path once it collects more than path_odds x min_bins = 9
+#: spots" -- nine, whatever the panel's size, which on a 90-bin panel is
+#: a 10% trace. Nothing in the objective knows how many alleles a
+#: nucleus can have, so that knowledge goes here instead, as a number
+#: and not as a tuned threshold.
+#:
+#: 3, not 2: two homologues is the diploid expectation, but these lines
+#: are not reliably diploid, and the store's own merged counts run to 4
+#: in a minority of cells. 3 admits the common aneuploid case while
+#: still refusing the sweep's 8. Raise it per call, deliberately, for an
+#: experiment that needs more -- every entry point takes k_max.
+DEFAULT_K_MAX = 3
+
+
 #: how often a bin is expected to hold a count no allele count can
 #: explain -- a spurious detection, two spots the localizer split, a
 #: neighbouring cell's spot inside this mask. Small and FIXED rather
@@ -134,7 +158,7 @@ reason      why this k, in words, or why no k could be chosen
 DEFAULT_CONTAMINATION = 0.05
 
 
-def binomial_multiplicity(counts, k_max=6, min_support=8,
+def binomial_multiplicity(counts, k_max=None, min_support=8,
                           contamination=DEFAULT_CONTAMINATION):
     """THE DEFAULT ENGINE: fit Binomial(k, e) to the per-bin counts.
 
@@ -165,6 +189,7 @@ def binomial_multiplicity(counts, k_max=6, min_support=8,
     a larger k can always absorb a smaller e and the likelihood barely
     moves.
     """
+    k_max = DEFAULT_K_MAX if k_max is None else k_max
     c = np.asarray(counts, dtype=np.int64).ravel()
     if len(c) < int(min_support):
         return Multiplicity(None, float('nan'), float('nan'), len(c), c,
@@ -222,7 +247,7 @@ DEFAULT_SITE_FRACTION = 0.24
 
 def spatial_multiplicity(spots, n_slots, radius_um=1.5,
                          site_fraction=DEFAULT_SITE_FRACTION,
-                         min_bins=None):
+                         min_bins=None, k_max=None):
     """THE DEFAULT ENGINE: count the places that look like an allele.
 
     A SITE is a position with at least `min_bins` DISTINCT bins within
@@ -269,6 +294,7 @@ def spatial_multiplicity(spots, n_slots, radius_um=1.5,
     this table, so the next person sees what they are inheriting.
     """
     n = int(n_slots or 0)
+    kcap = int(DEFAULT_K_MAX if k_max is None else k_max)
     mb = int(min_bins if min_bins is not None
              else max(2, round(float(site_fraction) * n)))
     p = spots.pos
@@ -285,12 +311,17 @@ def spatial_multiplicity(spots, n_slots, radius_um=1.5,
                for j in taken):
             continue
         taken.append(i)
+        # the sites are visited in order of decreasing support, so the
+        # cap keeps the best-supported ones rather than the first found
+        if len(taken) >= kcap:
+            break
     counts, _ = bin_counts(spots, n)
     k = len(taken)
     e = (float(np.minimum(counts, k).mean()) / k) if k else 0.0
     return Multiplicity(k, e, float('nan'), n, counts,
                         '%d site(s) with >=%d distinct bin(s) within '
-                        '%.2f um' % (k, mb, radius_um))
+                        '%.2f um, capped at %d'
+                        % (k, mb, radius_um, kcap))
 
 
 def multiplicity_gate(spots, n_slots=None, engine=None, **kw):
@@ -330,9 +361,15 @@ reason    in words
 
 
 #: how far an allele reaches, for deciding what is near it. Roughly a
-#: chromatin domain's own size; it is a SEEDING radius, not a gate on
-#: any measurement.
-DEFAULT_REACH_UM = 1.0
+#: chromatin domain's own size.
+#:
+#: IT IS A SEEDING RADIUS AND NOTHING ELSE NOW. It used to be four
+#: things at once -- support radius, seed spacing, a hard cutoff on what
+#: a path could take, and the price of leaving a spot unassigned -- and
+#: the last two are gone: the loss is a likelihood over chain steps
+#: (localization/pathfind.py), whose scale comes from each step's own
+#: genomic separation. Nothing here gates a measurement.
+SEED_RADIUS_UM = 1.0
 
 #: how many DISTINCT bins must be near a spot before it can start an
 #: allele. Distinct is the whole point: three spots of one barcode is
@@ -341,7 +378,7 @@ DEFAULT_REACH_UM = 1.0
 DEFAULT_MIN_BINS = 3
 
 
-def bin_support(pos, bins, radius_um=DEFAULT_REACH_UM):
+def bin_support(pos, bins, radius_um=SEED_RADIUS_UM):
     """(n,) how many DISTINCT bins sit within radius_um of each spot.
 
     The measure of "something is really here". A spurious detection is
@@ -361,7 +398,7 @@ def bin_support(pos, bins, radius_um=DEFAULT_REACH_UM):
     return out
 
 
-def supported_seeds(pos, bins, k, radius_um=DEFAULT_REACH_UM,
+def supported_seeds(pos, bins, k, radius_um=SEED_RADIUS_UM,
                     min_bins=DEFAULT_MIN_BINS):
     """k starting centres, each with real support, and deterministic.
 
@@ -451,7 +488,7 @@ def kmeans_cluster(spots, k, iters=50, engine=None, **kw):
     # cluster -- the outlier did not just become an allele, it cost one.
     # Excluding it up front leaves the geometry to the spots that have
     # company, which is the only geometry an allele is in.
-    radius = float(kw.get('radius_um', DEFAULT_REACH_UM))
+    radius = float(kw.get('radius_um', SEED_RADIUS_UM))
     min_bins = int(kw.get('min_bins', DEFAULT_MIN_BINS))
     sup = bin_support(p, spots.bin, radius)
     live = sup >= min_bins
@@ -729,7 +766,7 @@ CLEAR_SEPARATION_UM = 2.0
 DEFAULT_DUP_FRACTION = 0.15
 
 
-def clearly_separated(spots, k, reach_um=None, min_bins=None,
+def clearly_separated(spots, k, radius_um=None, min_bins=None,
                       dup_fraction=DEFAULT_DUP_FRACTION):
     """(verdict, labels, centres, reason) -- is this cell simply split?
 
@@ -742,7 +779,7 @@ def clearly_separated(spots, k, reach_um=None, min_bins=None,
     No is the safe answer and it is the default: an unclear verdict
     sends the cell to fit_paths, which is where the judgement lives.
     """
-    reach = float(DEFAULT_REACH_UM if reach_um is None else reach_um)
+    reach = float(SEED_RADIUS_UM if radius_um is None else radius_um)
     mb = int(DEFAULT_MIN_BINS if min_bins is None else min_bins)
     if k < 1:
         return False, None, None, 'no sites proposed'
@@ -809,243 +846,95 @@ def rows_from_labels(spots, labels, k, n_slots):
     return rows
 
 
-#: how many times over a new path must pay for itself before it is
-#: believed. A PRIOR, not a threshold fitted to a dataset: a spurious
-#: path puts real loci on an allele that does not exist, while a
-#: missing one leaves a trace that stops short and says so, and the
-#: first is the worse error. Raising it makes the route more
-#: conservative and nothing else.
-DEFAULT_PATH_ODDS = 3.0
-
-
-def _typical_radius(spots, reach_um):
-    """The distance a spot usually sits from its own site's centre.
-
-    Measured from the cell at hand rather than assumed: it is what a
-    path SAVES per spot it collects, so the charge that has to beat
-    that saving is built from it.
-    """
-    p = spots.pos
-    if len(p) < 3:
-        return 0.0
-    # WITHIN A SITE, not within the cell. Measuring from the cell's own
-    # centre gave a radius near `reach` whenever the cell held two
-    # alleles -- the two are microns apart -- which made the charge
-    # collapse and the route LESS conservative exactly where it needed
-    # to be more so. The local neighbourhood is a site by construction.
-    d = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=2)
-    out = []
-    for i in range(len(p)):
-        near = d[i][(d[i] > 0) & (d[i] <= float(reach_um))]
-        if len(near) >= 2:
-            out.append(float(np.median(near)))
-    return float(np.median(out)) if out else 0.0
-
-
 Fit = collections.namedtuple(
-    'Fit', 'k labels rows cost unassigned per_k reason')
+    'Fit', 'k labels rows cost weights unassigned per_k reason')
 Fit.__doc__ = """One cell's paths, chosen by what they cost.
 
 k           how many paths the cost chose
 labels      (n,) which path each spot went to, UNASSIGNED for none
 rows        (k, n_slots) the spot row id each path takes in each bin
-cost        the total
+cost        the total, in NATS and relative to calling every spot
+            clutter -- negative is better than nothing, and the scale is
+            a log-likelihood rather than micrometres
+weights     per path, in nats: the evidence for THAT allele, separately,
+            so a cell with one strong and one marginal site reads as
+            that rather than as a number
 unassigned  how many spots no path would pay for
-per_k       [(k, cost), ...] -- what every k was worth, so a close call
-            is visible rather than hidden behind the winner
-reason      in words
+per_k       [(k, priced total), ...] -- what every k was worth, so a
+            close call is visible rather than hidden behind the winner
+reason      in words, including which calibration and which separation
 """
 
 
-def _assign_bin(d, lam):
-    """One bin's spots to the k paths, at most one each. (take, cost).
+def fit_paths(spots, n_slots, k, sep, cal=None, **kw):
+    """The k cheapest chains through this cell. See localization/pathfind.
 
-    d is (n_spots, k) distances. A spot may be left to NOBODY at cost
-    `lam`, which is what makes a bin's SECOND spot cost something: one
-    round images one locus, so a path can take one spot from this bin
-    and the rest are either another path's or nobody's.
+    THE OBJECTIVE IS A CHAIN, NOT A CLOUD, and that is the whole of what
+    changed here. A path used to be a centroid with a radius: every bin
+    went to the nearest centre, a spot beyond `reach` was refused
+    outright, and genomic separation never entered, so bin 1 and bin 90
+    were asked the same question. Now a path is an ordered walk through
+    the slots scored by its own steps, each step priced by the measured
+    chain law at the separation that step actually spans
+    (physics/MEASUREMENT.md), against the alternative that the spot is
+    clutter.
 
-    THIS IS AN ASSIGNMENT PROBLEM, and solving it by enumeration was a
-    mistake rather than a simplification. A bin can hold far more than a
-    handful: measured on MP58 FOV 1 the median is 2 spots but the
-    maximum is 15, and 15 spots over 6 paths is 6.3 million assignments
-    -- per bin, per iteration, per k. That is why a run over four FOVs
-    of pure arithmetic, with no image touched, took longer than the
-    image work had.
-
-    linear_sum_assignment gives the SAME answer in O(n^3). "Nobody" is
-    expressed as n extra columns costing `lam` each, one per spot, so
-    every spot takes exactly one column while a path column can be taken
-    only once -- which is the constraint, stated exactly.
+    `sep` says what the genomic separation between two slots IS -- from
+    the panel's probe design, or `pathfind.Separation.uniform` which
+    assumes a regular step and says so in its source string. There is no
+    default: a chain loss with no genomic axis is the thing this
+    replaced.
     """
-    from scipy.optimize import linear_sum_assignment
-    n, k = d.shape
-    if n == 0 or k == 0:
-        return [None] * k, lam * n
-    big = 1e9
-    cost = np.full((n, k + n), lam, dtype=np.float64)
-    cost[:, :k] = np.where(np.isfinite(d), d, big)
-    rows, cols = linear_sum_assignment(cost)
-    take = [None] * k
-    total = 0.0
-    for r, c in zip(rows, cols):
-        if c < k and cost[r, c] < big:
-            take[c] = int(r)
-            total += float(cost[r, c])
-        else:
-            total += lam
-    return take, float(total)
-
-
-def fit_paths(spots, n_slots, k, iters=25, reach_um=None, min_bins=None):
-    """Cluster AND assign in one objective, for a given k.
-
-    THE TWO WERE SEPARATE AND THAT WAS THE DEFECT. Clustering by
-    position alone and enforcing one-spot-per-bin afterwards meant bin
-    identity never touched the partition: shuffling the bin labels of a
-    cell's spots changed nothing -- measured, 48% of cells had three or
-    more sites before and 47% after. A dense blob satisfies "many
-    distinct bins nearby" whatever the labels are.
-
-    Here the assignment IS the partition. Each bin is solved on its own
-    (_assign_bin), a path takes at most one of its spots, and a spot no
-    path will pay `reach_um` for is left unassigned. A cluster that
-    would need two spots of one bin therefore pays for the second, every
-    round, which is the cost a position-only split could not see.
-    """
-    reach = float(DEFAULT_REACH_UM if reach_um is None else reach_um)
-    mb = int(DEFAULT_MIN_BINS if min_bins is None else min_bins)
-    p = spots.pos
-    n = int(n_slots)
-    if k <= 0 or not len(p):
-        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
-                   np.full((0, n), NO_SPOT, dtype=np.int64),
-                   reach * len(p), len(p), [], 'nothing to fit')
-    sup = bin_support(p, spots.bin, reach)
-    live = np.flatnonzero(sup >= mb)
-    if not len(live):
-        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
-                   np.full((0, n), NO_SPOT, dtype=np.int64),
-                   reach * len(p), len(p), [],
-                   'no spot has %d distinct bin(s) within %.2f um' % (mb, reach))
-    centres = supported_seeds(p[live], spots.bin[live], k,
-                              radius_um=reach, min_bins=mb)
-    if not len(centres):
-        return Fit(0, np.full(len(p), UNASSIGNED, dtype=np.int64),
-                   np.full((0, n), NO_SPOT, dtype=np.int64),
-                   reach * len(p), len(p), [], 'no seed has support')
-    k = len(centres)
-    by_bin = collections.defaultdict(list)
-    for i, b in enumerate(spots.bin):
-        if 0 <= b < n:
-            by_bin[int(b)].append(i)
-    labels = np.full(len(p), UNASSIGNED, dtype=np.int64)
-    rows = np.full((k, n), NO_SPOT, dtype=np.int64)
-    total = float('inf')
-    for _ in range(int(iters)):
-        new_labels = np.full(len(p), UNASSIGNED, dtype=np.int64)
-        new_rows = np.full((k, n), NO_SPOT, dtype=np.int64)
-        cost = 0.0
-        for b, idxs in by_bin.items():
-            d = np.linalg.norm(p[idxs][:, None, :] - centres[None, :, :],
-                               axis=2)
-            # beyond reach is not merely expensive, it is not this path's
-            d = np.where(d <= reach, d, np.inf)
-            take, c = _assign_bin(d, reach)
-            cost += c
-            for j, loc in enumerate(take):
-                if loc is None:
-                    continue
-                i = idxs[loc]
-                new_labels[i] = j
-                new_rows[j, b] = int(spots.row[i])
-        moved = not np.array_equal(new_labels, labels)
-        labels, rows, total = new_labels, new_rows, cost
-        for j in range(k):
-            m = labels == j
-            if m.any():
-                centres[j] = p[m].mean(0)
-        if not moved:
-            break
-    return Fit(k, labels, rows, float(total),
+    labels, weights = pathfind.find_paths(
+        spots.pos, spots.bin, int(k), sep, cal=cal, **kw)
+    kk = len(weights)
+    rows = pathfind.path_rows(labels, spots.bin, spots.row, kk, n_slots)
+    return Fit(kk, labels, rows, float(sum(weights)), weights,
                int((labels == UNASSIGNED).sum()), [],
-               'one-per-bin assignment over %d bin(s), %d path(s)'
-               % (len(by_bin), k))
+               '%d chain(s) over %d slot(s)' % (kk, int(n_slots)))
 
 
-def choose_paths(spots, n_slots, k_max=6, path_cost_um=None,
-                 path_odds=None, **kw):
-    """How many paths, decided by whether another one pays for itself.
+def choose_paths(spots, n_slots, sep, cal=None, **kw):
+    """How many chains, decided by whether another one pays for itself.
 
-    ADDING A PATH IS CONSERVATIVE, and the first charge was not. It was
-    `reach x min_bins`, which looks like a price and is not one: an
-    unassigned spot costs `reach` while an assigned one costs its
-    distance -- a median of about 0.35 um inside an allele -- so each
-    spot a new path collects SAVES about 0.65, and a path taking
-    fifteen of them saves ten. Against a charge of three it was free.
-    Measured on MP58 FOVs 1-4, that charge gave a median k of 3 and
-    over-counted by +1.09 against the stored count.
-
-    So the charge is the saving a path would have to beat, times how
-    strongly a second path is disbelieved:
-
-        charge = path_odds x min_bins x (reach - typical_radius)
-
-    `path_odds` is the only free number and it is a prior, not a fitted
-    threshold: how many times over a path must pay before it is
-    believed. The default is deliberately high, because the thing a
-    spurious path costs -- a locus assigned to an allele that does not
-    exist -- is worse than the thing a missing one costs, which is a
-    trace that stops short and says so.
-
-    THE SWEEP IS REPORTED WHOLE. per_k carries every k and its cost, so
-    a cell where two answers are a hair apart is visible as that rather
-    than as a verdict.
+    Every extra path lowers the cost -- its weight is <= 0 by
+    construction -- so this is settled by a prior and a cap, not by the
+    sweep finding a minimum. pathfind.DEFAULT_PATH_PRIOR_NATS carries
+    what the prior is worth and what it was measured against.
     """
-    reach = float(kw.get('reach_um') or DEFAULT_REACH_UM)
-    mb = int(kw.get('min_bins') or DEFAULT_MIN_BINS)
-    odds = float(DEFAULT_PATH_ODDS if path_odds is None else path_odds)
-    if path_cost_um is not None:
-        charge = float(path_cost_um)
-    else:
-        typical = _typical_radius(spots, reach)
-        charge = odds * mb * max(reach - typical, 0.05 * reach)
-    best, table = None, []
-    for k in range(1, int(k_max) + 1):
-        f = fit_paths(spots, n_slots, k, **kw)
-        if f.k == 0:
-            table.append((k, float('inf')))
-            continue
-        total = f.cost + charge * f.k
-        table.append((f.k, round(total, 3)))
-        if best is None or total < best[0]:
-            best = (total, f)
-        if f.k < k:
-            break                      # the cell cannot support more
-    if best is None:
-        return Fit(0, np.full(len(spots.pos), UNASSIGNED, dtype=np.int64),
-                   np.full((0, int(n_slots)), NO_SPOT, dtype=np.int64),
-                   float('inf'), len(spots.pos), table, 'no fit')
-    f = best[1]
-    return f._replace(per_k=table,
-                      reason=f.reason + '; chosen over %s at %.1f um per path'
-                      % ([t[0] for t in table], charge))
+    res = pathfind.choose_paths(spots.pos, spots.bin, sep, cal=cal, **kw)
+    rows = pathfind.path_rows(res.labels, spots.bin, spots.row, res.k, n_slots)
+    return Fit(res.k, res.labels, rows, res.cost, res.weights,
+               int((res.labels == UNASSIGNED).sum()), res.per_k, res.reason)
+
 
 
 Trace = collections.namedtuple('Trace', 'rows multiplicity clustering paths')
 
 
-def build_cell_traces(spots, n_slots, k=None, engines=None, **kw):
+def build_cell_traces(spots, n_slots, sep, k=None, engines=None, **kw):
     """One cell, end to end.
 
     The count is no longer decided before the split. choose_paths sweeps
-    k and keeps the one that pays for itself, with the assignment -- one
-    spot per bin per path -- deciding the partition rather than tidying
-    it afterwards. multiplicity_gate still runs and is reported beside
-    it, because a proposal that disagrees with the cost is worth seeing.
+    k and keeps the one that pays for itself, with the chain loss
+    deciding the partition rather than tidying it afterwards.
+    multiplicity_gate still runs and is reported beside it, because a
+    proposal that disagrees with the cost is worth seeing.
+
+    `sep` is where every step's genomic separation comes from and has no
+    default; `pathfind.Separation` builds one from a probe design, or
+    from an assumed uniform step that labels itself as assumed.
 
     k: given, it is used as-is and no sweep happens. engines: as before,
     for the pieces that are still separable.
+
+    THE CLEAR-CASE SHORTCUT IS GONE. It answered a cell whose sites sit
+    microns apart from a DIFFERENT objective -- k-means plus a
+    one-per-bin repair -- which was defensible while the real objective
+    was a slow enumeration over every bin. It is not any more: the chain
+    loss is a DP over the slot order, measured at 0.11 s for a 282-spot
+    cell, and two objectives answering the same question is how two
+    answers start disagreeing.
     """
     engines = engines or {}
     mult = multiplicity_gate(spots, n_slots,
@@ -1053,23 +942,7 @@ def build_cell_traces(spots, n_slots, k=None, engines=None, **kw):
                              **(kw.get('multiplicity') or {}))
     opts = dict(kw.get('paths') or {})
     if k is not None:
-        fit = fit_paths(spots, n_slots, int(k), **opts)
+        fit = fit_paths(spots, n_slots, int(k), sep, **opts)
         return Trace(fit.rows, mult, fit, fit)
-    # THE CLEAR CASES DO NOT NEED THE SWEEP. Sites microns apart with no
-    # bin claimed twice are separated, and re-deriving that under an
-    # exact per-bin assignment costs time to reach the same answer.
-    # Anything ambiguous falls through to fit_paths, which is the point
-    # of having it.
-    if not kw.get('always_fit'):
-        ok, labels, centres, why = clearly_separated(
-            spots, mult.k or 0, reach_um=opts.get('reach_um'),
-            min_bins=opts.get('min_bins'))
-        if ok:
-            kk = int(labels.max()) + 1 if len(labels) else 0
-            rows = rows_from_labels(spots, labels, kk, n_slots)
-            fit = Fit(kk, labels, rows, float('nan'),
-                      int((labels == UNASSIGNED).sum()), [],
-                      'taken as settled: ' + why)
-            return Trace(rows, mult, fit, fit)
-    fit = choose_paths(spots, n_slots, **opts)
+    fit = choose_paths(spots, n_slots, sep, **opts)
     return Trace(fit.rows, mult, fit, fit)
