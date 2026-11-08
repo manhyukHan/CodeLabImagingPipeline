@@ -48,6 +48,7 @@ from codelab_pipeline.segmentation import segment
 from codelab_pipeline.localization import assignment
 from codelab_pipeline.localization import localization
 from codelab_pipeline.localization import tracing_v2
+from codelab_pipeline.physics import panel as probe_panel
 from codelab_pipeline.models.cell_container import CellContainer
 from codelab_pipeline.models.spot import (ASpot, z_status_of as spot_z_status_of,
                                           Z_ACCEPTED as SPOT_Z_ACCEPTED,
@@ -2021,12 +2022,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _blank_modality_state():
-        return {'layout_path': '', 'dax_directory': '', 'storage_path': '', 'active_hybe_list': []}
+        return {'layout_path': '', 'dax_directory': '', 'probe_design_path': '',
+                'storage_path': '', 'active_hybe_list': []}
 
     def _flush_modality_inputs(self):
         """
         Read the live combinatorial form -- every modality's own
-        (layout, DAX) row pair plus the ONE project root -- into
+        (layout, DAX, probe design) row group plus the ONE project root -- into
         modality_data, the registry every accessor
         (_storage_path_for_modality and its ~50 callers) answers from.
         Replaces the old stash-on-switch-away dance
@@ -2059,9 +2061,42 @@ class MainWindow(QtWidgets.QMainWindow):
             data.update({
                 'layout_path': fields.get('layout_path', ''),
                 'dax_directory': fields.get('dax_directory', ''),
+                'probe_design_path': fields.get('probe_design_path', ''),
                 'storage_path': os.path.join(root, name) if root else '',
             })
             analysis_store.declare_modality(data['storage_path'], name)
+
+    def _log_probe_design(self, name, design_path):
+        """
+        Report what a modality's probe design actually contains, right
+        after its layout parse. Blank is silent -- the design is optional
+        (an RNA modality has none) and nothing in ingestion, alignment or
+        segmentation reads it; it exists so an analysis can ask how far
+        apart two readouts are on the genome.
+
+        A misread design is worse than a missing one, since it yields a
+        plausible wrong separation rather than an error -- so log the
+        readout count, chromosome(s) and the design's OWN median step,
+        and say so when that step disagrees with the configured
+        genomic_resolution_kb (the usual cause is a design pointed at a
+        different panel of the same library). A failure is logged, never
+        raised: it must not block a parse the rest of the app depends on.
+        """
+        if not str(design_path or '').strip():
+            return
+        try:
+            design = probe_panel.read_probe_design(design_path)
+        except Exception as e:
+            self.log(f"  {name} probe design NOT read ({type(e).__name__}: {e}) -- "
+                     f"genomic separations are unavailable for {name}")
+            return
+        self.log(f"  {name} probe design: {design.summary()}  [{design_path}]")
+        step = design.step_kb()
+        configured = self._genomic_resolution_kb()
+        if step and configured and abs(step - float(configured)) > 0.1 * float(configured):
+            self.log(f"  WARNING: {name}'s design steps {step:.1f} kb but this "
+                     f"experiment is configured at {configured} kb -- is this the "
+                     f"right panel?")
 
     def _wire_modality_input_rows(self):
         """
@@ -2128,6 +2163,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if row is not None:
                 row['layout'].setText(layout_path)
             self._parse_layouts()
+
+        # the probe design the same way -- a store that recorded one can
+        # show it to a session that opened without a config. No re-parse:
+        # the design changes no hybe record, only what an analysis can
+        # ask about the genome.
+        design_path = params.get('probe_design_path')
+        if design_path and data is not None and not data['probe_design_path']:
+            data['probe_design_path'] = design_path
+            row = ip.modality_input_rows.get(this_modality)
+            if row is not None:
+                row['design'].setText(design_path)
 
         # this storage_path's own persisted reference hybe -- select it in
         # the combo (now shared across every modality, tagged by
@@ -2223,7 +2269,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _activate_modalities(self, names, modality_fields=None):
         """
         names: ordered list[str] becoming the live modality set. modality_
-        fields: optional {name: {layout_path/dax_directory/storage_path}}
+        fields: optional {name: {layout_path/dax_directory/
+        probe_design_path/storage_path}}
         to pre-seed from (e.g. a loaded config's 'modalities' dict) --
         omitted fields default blank. A config saved before this app's
         modality decoupling may still carry old reference_hybe/
@@ -2727,11 +2774,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if root:
             dp = os.path.abspath(root)
-            layouts, daxes = {}, {}
+            layouts, daxes, designs = {}, {}, {}
             m = paths.read_manifest(dp) or {'modalities': {}}
             for n, v in m.get('modalities', {}).items():
                 layouts[n] = v.get('layout_path', '')
                 daxes[n] = v.get('dax_directory', '')
+                designs[n] = v.get('probe_design_path', '')
             for name, data in configured:
                 if name not in parsed:
                     continue
@@ -2744,10 +2792,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 analysis_store.declare_modality(data['storage_path'], name)
                 layouts[name] = data['layout_path']
                 daxes[name] = data['dax_directory']
+                designs[name] = data['probe_design_path']
             # ONE manifest write for the whole pass -- the manifest is the
             # project's modality registry (readable with no HDF5 at all).
             names = sorted(set(list(m.get('modalities', {}).keys()) + list(ip.modality_names)))
-            paths.write_manifest(dp, names, layouts, daxes)
+            paths.write_manifest(dp, names, layouts, daxes, designs)
             for name, data in configured:
                 if name not in parsed:
                     continue
@@ -2755,12 +2804,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 # ExperimentLayout it uses) -- lets a completely fresh
                 # session reconstruct hybe_records/combo choices from
                 # vlinks.h5 alone (see _refresh_params_from_vlinks),
-                # without ever loading a config file.
-                analysis_store.write_global_params(data['storage_path'], layout_path=data['layout_path'])
+                # without ever loading a config file. Same for the probe
+                # design: an analysis asking "how far apart on the genome
+                # are these two readouts" has only the store to go on.
+                analysis_store.write_global_params(
+                    data['storage_path'], layout_path=data['layout_path'],
+                    probe_design_path=data['probe_design_path'])
         for name in ip.modality_names:
             if name in parsed:
                 self.log(f"Parsed {len(parsed[name])} hybe(s) for {name} from "
                          f"{ip.modality_data[name]['layout_path']}")
+                self._log_probe_design(name, ip.modality_data[name]['probe_design_path'])
 
         # Parsing is really three separable jobs, per explicit review of
         # the earlier "just refuse Parse Layout during ingestion" fix:
@@ -14821,7 +14875,8 @@ One PNG PER MODALITY: each modality has its own reference and its
         """
         Config is modality-nested (see preprocess.make_xml_file): a
         {name: fields} 'modalities' dict for anything genuinely per-
-        modality (layout_path/dax_directory/storage_path, that modality's
+        modality (layout_path/dax_directory/probe_design_path/
+        storage_path, that modality's
         own within-experiment reference_hybe + same_modality_channel_type, and
         its own cross_modality_reference_hybe -- the hybe THAT modality
         uses as the cross-modal bridge), plus a flat 'global' dict for
@@ -14845,11 +14900,15 @@ One PNG PER MODALITY: each modality has its own reference and its
         Configs name a project_root -- REQUIRED, the v2 project directory
         holding manifest.json (legacy per-modality-path configs are
         retired; construction phase, per explicit decision). The manifest
-        is the modality registry (names, layout_path, dax_directory --
-        see paths.write_manifest) and each modality's storage_path IS
+        is the modality registry (names, layout_path, dax_directory,
+        probe_design_path -- see paths.write_manifest) and each
+        modality's storage_path IS
         <project_root>/<name> by the v2 layout contract, so the config
         carries only genuinely-config state on top of it. <modality>
-        entries fix the modality ORDER (first = active). Analysis
+        entries fix the modality ORDER (first = active) and may carry a
+        probe_design_path, which WINS over the manifest's -- that is how
+        a store that was ingested before the slot existed is told which
+        probe design it was imaged with. Analysis
         parameters arrive as per-stage <section> elements (see
         _CONFIG_PARAM_MAP) and are applied LAST, after activation/parse
         has populated the combos they set -- so a freshly loaded config
@@ -14888,6 +14947,7 @@ One PNG PER MODALITY: each modality has its own reference and its
             m = manifest.get('modalities', {}).get(name, {})
             merged[name] = {'layout_path': m.get('layout_path', ''),
                             'dax_directory': m.get('dax_directory', ''),
+                            'probe_design_path': m.get('probe_design_path', ''),
                             'storage_path': os.path.join(project_root, name),
                             **modalities.get(name, {})}
         modalities = merged
@@ -14967,7 +15027,15 @@ One PNG PER MODALITY: each modality has its own reference and its
                     f"(expected <project>/{name} beside a manifest.json): {sp}")
                 return
             roots.add(paths.project_root(sp))
-            modalities[name] = {}   # order only -- the manifest owns the paths
+            # Order, plus the ONE path the manifest cannot be the source
+            # of: a probe design is not established by ingesting or
+            # parsing anything (an already-ingested store gains one the
+            # day someone points at the library), so the config is where
+            # it is stated and the next Parse Layouts copies it into the
+            # manifest. Written only when set, so a modality without a
+            # design (every RNA one) stays a bare <modality name="..."/>.
+            design = state.get('probe_design_path', '').strip()
+            modalities[name] = {'probe_design_path': design} if design else {}
         if len(roots) != 1:
             QtWidgets.QMessageBox.critical(
                 self, 'Save Config',

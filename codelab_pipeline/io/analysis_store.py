@@ -119,6 +119,7 @@ def modality_of(storage_path):
 
 MODALITY_SCOPED_PARAMS = frozenset({
     'layout_path',
+    'probe_design_path',
     'dax_directory',
     'same_modality_reference_hybe',
     'same_modality_channel_type',
@@ -1330,6 +1331,34 @@ def read_global_params(storage_path):
     if modality:
         out.update(data.get('modalities', {}).get(modality, {}))
     return out
+
+
+def probe_design_path(storage_path):
+    """The probe design recorded for this store, or '' when none is.
+
+    TWO PLACES CARRY IT, and the store's own params win: params.json is
+    written by the parse that actually established this modality's
+    inputs, while the manifest is rewritten at every startup from
+    whatever config happens to be loaded. The manifest is still read as
+    the fallback, because a project can be set up and its manifest
+    written before any parse has run.
+
+    Returns '' rather than raising: the design is optional (an RNA
+    modality has none, and a DNA store ingested before the slot existed
+    has none recorded), and the caller that needs a genomic separation
+    is the one that must say so. Read it with
+    codelab_pipeline.physics.panel.read_probe_design.
+    """
+    recorded = str(read_global_params(storage_path).get('probe_design_path', '') or '')
+    if recorded.strip():
+        return recorded.strip()
+    m = paths.read_manifest(paths.project_root(storage_path)) or {}
+    try:
+        modality = modality_of(storage_path)
+    except ValueError:
+        return ''
+    entry = m.get('modalities', {}).get(modality, {})
+    return str(entry.get('probe_design_path', '') or '').strip()
 
 
 # -- celltype config -----------------------------------------------------

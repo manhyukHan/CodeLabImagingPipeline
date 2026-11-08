@@ -364,7 +364,7 @@ def make_xml_file(config, save_path):
     Persist this app's config as a <settings> root with one <modality>
     child per modality -- a real multi-layer structure (not hardcoded to
     exactly RNA/DNA) since some of what a modality carries is genuinely
-    per-modality (layout_path/dax_directory/storage_path, its own within-
+    per-modality (layout_path/dax_directory/probe_design_path/storage_path, its own within-
     experiment reference_hybe + same_modality_channel_type, and its own
     cross_modality_reference_hybe -- the hybe THIS modality uses as the
     cross-modal bridge point), while other settings are genuinely global

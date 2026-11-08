@@ -80,16 +80,28 @@ def read_manifest(dp):
     return m
 
 
-def write_manifest(dp, modalities, layout_paths=None, dax_directories=None):
+def write_manifest(dp, modalities, layout_paths=None, dax_directories=None,
+                   probe_design_paths=None):
     """
-    modalities: [name, ...]; layout_paths/dax_directories: optional
-    {name: path}. Overwrites atomically. The manifest is the project's
-    modality registry -- readable with no HDF5 at all, which is what
-    retires the modality_of bootstrapping problem for v2 stores.
+    modalities: [name, ...]; layout_paths/dax_directories/
+    probe_design_paths: optional {name: path}. Overwrites atomically.
+    The manifest is the project's modality registry -- readable with no
+    HDF5 at all, which is what retires the modality_of bootstrapping
+    problem for v2 stores.
+
+    probe_design_path is the modality's PROBE DESIGN (a region BED or
+    FASTA, see codelab_pipeline/physics/panel.py) -- the only place a
+    readout's genomic coordinate exists. The layout says which readout
+    was imaged in which hybe; it never says where on the genome that
+    readout sits, so without this slot a genomic separation `s` cannot
+    be computed from a store at all. Blank is normal (an RNA modality
+    has no such design, and a DNA store set up before this slot
+    existed simply has none recorded yet).
     """
     m = {'layout_version': LAYOUT_VERSION,
          'modalities': {name: {'layout_path': (layout_paths or {}).get(name, ''),
-                               'dax_directory': (dax_directories or {}).get(name, '')}
+                               'dax_directory': (dax_directories or {}).get(name, ''),
+                               'probe_design_path': (probe_design_paths or {}).get(name, '')}
                         for name in modalities}}
     os.makedirs(dp, exist_ok=True)
     target = manifest_path(dp)

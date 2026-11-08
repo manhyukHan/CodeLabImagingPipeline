@@ -49,7 +49,8 @@ def _probe_dax_presence(pairs, refresh=False):
 class IngestionPanelUI(object):
     """
     The combinatorial ingestion form: EVERY modality's own
-    (ExperimentLayout.xlsx, DAX repository) input pair is visible at once,
+    (ExperimentLayout.xlsx, DAX repository, probe design) input group is
+    visible at once,
     with ONE project root (storage) and ONE FOV list shared by all of
     them -- per explicit design, there is no per-modality storage path or
     FOV list left to mismatch (storage_path IS <project root>/<modality>,
@@ -114,8 +115,8 @@ class IngestionPanelUI(object):
         layout.addWidget(modalityGroup)
         self.build_modality_name_fields(2)
 
-        # -- combinatorial inputs: one (layout, DAX) row pair per
-        # modality, all always visible; rebuilt wholesale by
+        # -- combinatorial inputs: one (layout, DAX, probe design) row
+        # group per modality, all always visible; rebuilt wholesale by
         # build_modality_input_rows on activation, so MainWindow re-wires
         # the rows' signals after every rebuild (same
         # rebuild-then-reconnect convention as AlignmentPanel's
@@ -124,7 +125,7 @@ class IngestionPanelUI(object):
         self.ModalityInputsLayout = QtWidgets.QFormLayout(self.ModalityInputsContainer)
         self.ModalityInputsLayout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.ModalityInputsContainer)
-        self.modality_input_rows = {}     # {name: {'layout': QLineEdit, 'dax': QLineEdit}}
+        self.modality_input_rows = {}     # {name: {'layout': QLineEdit, 'dax': QLineEdit, 'design': QLineEdit}}
         self.build_modality_input_rows(self.modality_names)
 
         form = QtWidgets.QFormLayout()
@@ -427,8 +428,9 @@ class IngestionPanelUI(object):
 
     def build_modality_input_rows(self, names):
         """
-        Rebuild the per-modality (ExperimentLayout.xlsx, DAX directory)
-        row pairs -- one pair per modality, ALL always visible: the
+        Rebuild the per-modality (ExperimentLayout.xlsx, DAX directory,
+        probe design) row groups -- one group per modality, ALL always
+        visible: the
         combinatorial form has no current-modality switching, per
         explicit design. Rebuilding replaces the row widgets wholesale,
         so MainWindow must re-wire their signals after every call
@@ -444,22 +446,37 @@ class IngestionPanelUI(object):
             self.ModalityInputsLayout.addRow(f'{name} ExperimentLayout.xlsx:', layout_row)
             dax_edit, dax_row = self._path_row(f'Select {name} DAX directory', is_file=False)
             self.ModalityInputsLayout.addRow(f'{name} DAX directory:', dax_row)
-            self.modality_input_rows[name] = {'layout': layout_edit, 'dax': dax_edit}
+            # The probe design: the ONLY place a readout's genomic
+            # coordinate exists (the layout says which readout was imaged
+            # in which hybe, never where on the genome it sits), so the
+            # genomic separation the physics term needs is unavailable
+            # without it. Optional -- an RNA modality has no such design,
+            # and nothing in ingestion or alignment reads this.
+            design_edit, design_row = self._path_row(
+                f'Select {name} probe design (region BED or FASTA)', is_file=True,
+                name_filter='Probe design (*_bed.txt *.bed *.fasta *.fa);;All files (*)')
+            design_edit.setPlaceholderText(
+                'optional -- region BED / LibRegions FASTA, e.g. E:/Oligos/.../AllRegions_bed.txt')
+            self.ModalityInputsLayout.addRow(f'{name} probe design (optional):', design_row)
+            self.modality_input_rows[name] = {'layout': layout_edit, 'dax': dax_edit,
+                                              'design': design_edit}
 
     def modality_input_values(self):
-        """{name: {'layout_path':..., 'dax_directory':...}} read live off the N row pairs."""
+        """{name: {'layout_path':..., 'dax_directory':..., 'probe_design_path':...}} read live off the N row groups."""
         return {name: {'layout_path': edits['layout'].text().strip(),
-                       'dax_directory': edits['dax'].text().strip()}
+                       'dax_directory': edits['dax'].text().strip(),
+                       'probe_design_path': edits['design'].text().strip()}
                 for name, edits in self.modality_input_rows.items()}
 
     def set_modality_input_values(self, fields_by_name):
-        """Fill the row pairs from {name: {'layout_path', 'dax_directory'}} -- names without a row (not activated) are ignored."""
+        """Fill the row groups from {name: {'layout_path', 'dax_directory', 'probe_design_path'}} -- names without a row (not activated) are ignored."""
         for name, fields in (fields_by_name or {}).items():
             edits = self.modality_input_rows.get(name)
             if not edits:
                 continue
             edits['layout'].setText(fields.get('layout_path', ''))
             edits['dax'].setText(fields.get('dax_directory', ''))
+            edits['design'].setText(fields.get('probe_design_path', ''))
 
     def lock_modality_setup(self):
         self.NumModalitiesLineEdit.setEnabled(False)
