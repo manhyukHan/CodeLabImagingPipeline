@@ -29,8 +29,8 @@ import numpy as np
 LocalizedSpot = namedtuple(
     'LocalizedSpot',
     ['y', 'x', 'z', 'p', 'amplitude', 'sigma_y', 'sigma_x', 'sigma_z',
-     'offset', 'p_exist'],
-    defaults=(float('nan'),))
+     'offset', 'p_exist', 'p1'],
+    defaults=(float('nan'), float('nan')))
 LocalizedSpot.__doc__ = """One emitter: (y, x, z) crop-local sub-pixel, plus p.
 
 `p` IS NOT A PROBABILITY. It is a per-engine quality scalar in (0, 1],
@@ -57,6 +57,18 @@ probability and the threshold a person chose on v3 means nothing. With a
 separate field the gate is simply unavailable there: NaN is not a
 threshold you can set.
 
+`p1` IS p_exist's FIRST FACTOR, kept because the product alone cannot
+be taken apart. In the learned engine p_exist = p1 * cal(p3), where p1
+is the classifier's pillar-level answer ("does this pillar hold a real
+spot at all") and cal(p3) the multispot Platt on this match's own NCC
+(`psfmatcher._joint`). The calibration is near a step -- MEASURED on the
+pinned default model, cal is 0.002 at p3 = 0.6 and 0.964 at 0.8 -- so
+over most of its range cal(p3) = 0 exactly and p1 cannot be recovered
+from p_exist by dividing. Carrying it costs one float and is the
+difference between a stored spot that can be re-gated on either factor
+and one that can only be compared against a single near-binary product.
+NaN for any engine without a classifier.
+
 The remaining fields are Gaussian-shaped and may be NaN for an engine
 that does not fit a Gaussian (a learned detector returns positions and
 p, and has no sigma to report). Never require them.
@@ -65,13 +77,14 @@ p, and has no sigma to report). Never require them.
 
 def _spot(y, x, z, p, amplitude=float('nan'), sigma_y=float('nan'),
           sigma_x=float('nan'), sigma_z=float('nan'), offset=float('nan'),
-          p_exist=float('nan')):
+          p_exist=float('nan'), p1=float('nan')):
     """LocalizedSpot with the shape fields defaulted -- so an engine that
     has no Gaussian to report does not have to invent one."""
     return LocalizedSpot(y=float(y), x=float(x), z=float(z), p=float(p),
                          amplitude=float(amplitude), sigma_y=float(sigma_y),
                          sigma_x=float(sigma_x), sigma_z=float(sigma_z),
-                         offset=float(offset), p_exist=float(p_exist))
+                         offset=float(offset), p_exist=float(p_exist),
+                         p1=float(p1))
 
 
 class LocalizeEngine:

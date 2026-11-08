@@ -472,7 +472,7 @@ class PsfMatcherV3Engine(LocalizeEngine):
         _joint below for why that is a chain rule and not an assumption.
         """
         if not self.refines:
-            return [_spot(y, x, z, float('nan'), p_exist=p1,
+            return [_spot(y, x, z, float('nan'), p_exist=p1, p1=p1,
                           amplitude=_peak_above(stack, y, x, z, bg))]
         st = np.asarray(stack, float)
         h, w, d = st.shape
@@ -506,6 +506,7 @@ class PsfMatcherV3Engine(LocalizeEngine):
                              p_exist=_joint(p1, hh.p, cal,
                                             (self.context or {}).get(
                                                 'genomic_resolution_kb')),
+                             p1=p1,
                              amplitude=_peak_above(st, fy, fx, fz, bg)))
         if out:
             return out
@@ -514,5 +515,5 @@ class PsfMatcherV3Engine(LocalizeEngine):
         # what is_refined() reads. Pushing these to ~0 instead would be
         # inventing a measurement, and would contradict one: MEASURED,
         # 3 of the 4 unrefined spots in 613 labels were real.
-        return [_spot(y, x, z, float('nan'), p_exist=p1,
+        return [_spot(y, x, z, float('nan'), p_exist=p1, p1=p1,
                       amplitude=_peak_above(st, y, x, z, bg))]

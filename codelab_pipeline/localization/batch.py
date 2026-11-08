@@ -86,7 +86,26 @@ def _spot_dict(s, rymin, rxmin, H, Hz, fov, hybe, channel, modality, cell):
         size=0.0,
         brightness=(float(s.amplitude) if np.isfinite(s.amplitude) else 0.0),
         z_status=SPOT_Z_ACCEPTED,
-        p_exist=float(s.p_exist))
+        p_exist=float(s.p_exist),
+        # BOTH FACTORS, not only the product. p_exist = p1 * cal(p3) in
+        # the learned engine, and the calibration is near a STEP --
+        # MEASURED on the pinned default model, cal is 0.002 at p3 = 0.6
+        # and 0.964 at 0.8 -- so over most of its range cal(p3) = 0
+        # exactly and p1 cannot be recovered from the product by
+        # dividing. A store written without them can only ever be
+        # re-gated on a single near-binary number.
+        #
+        # Neither is in ASpot._KNOWN, on purpose: set_metadata routes an
+        # undeclared key into `properties`, save() flattens those back to
+        # top level (only for names the model does not declare, so a
+        # property cannot shadow a field), and io/columnar gives each its
+        # own column. So no model field and no store schema changed.
+        #
+        # NaN rides through as NaN. An engine with no classifier reports
+        # nothing rather than 0.0 -- a zero would read as "certainly not
+        # a spot", which is a measurement nobody made.
+        p=float(s.p),
+        p1=float(s.p1))
     return spot.save()
 
 
