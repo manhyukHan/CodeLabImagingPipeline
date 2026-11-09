@@ -5522,6 +5522,30 @@ class MainWindow(QtWidgets.QMainWindow):
         cells = self.cell_container_permanent.get_cells(fov)
         reference_hybe = cells[0].reference_hybe
         frame_shape = cells[0].frame_shape
+
+        # STAGE FIRST, DRAW SECOND. Per confirmed real data loss on the
+        # MP58-Q store (2026-11-09): the staging below used to sit AFTER
+        # the reference-MIP read, so a FOV whose display image could not
+        # be resolved returned False with its cells already loaded into
+        # cell_container_permanent and never copied into the TRANSIENT
+        # container. _reassign_fov_spots reads the transient container --
+        # and by explicit spec treats "no cells" as "every spot is
+        # unassigned" -- so the next save wrote cell = -1 for the WHOLE
+        # FOV. MEASURED: 18,584 spots on FOV025, recoverable only by
+        # re-assigning from the store.
+        #
+        # Failing to draw a picture must never cost the data. The
+        # transient container is the authority at save time, so it is
+        # populated before anything that can fail for display reasons,
+        # and a missing MIP now costs exactly the picture.
+        if self.cell_container is None:
+            self.cell_container = CellContainer([fov])
+        self.cell_container.sync_from(self.cell_container_permanent, fov)
+        # the CELLS' own segmentation modality, not the app's current one
+        # (see cell_container.load_new_cells on why these can differ)
+        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
+                                      'modality': cells[0].reference_modality}
+
         # same cross-modality mismatch _show_celltype_result guards against
         # -- these cells may have been segmented under a DIFFERENT modality
         # than the one currently active (they're mirrored into every
@@ -5533,13 +5557,40 @@ class MainWindow(QtWidgets.QMainWindow):
         # modality can still read 'DNA'; pairing the hybe with the wrong
         # modality asked DNA_queue for an RNA hybe -> None -> the loader
         # silently bailed and the FOV showed no cells at all.
-        cell_storage_path = (self.ui.IngestionPanel.modality_data
-                             .get(cells[0].reference_modality or '', {})
-                             .get('storage_path') or storage_path)
+        #
+        # AND NO FALLBACK TO storage_path WHEN THE MODALITY IS NAMED BUT
+        # UNCONFIGURED. MEASURED on MP58-Q: every FOV's cells carry
+        # reference frame (Hyb_113, RNA), and Hyb_113 exists ONLY in the
+        # RNA store -- mip_meta under DNA returns None for FOV001 and
+        # FOV025 alike, under RNA both read fine. So the old
+        # `or storage_path` turned one missing Ingestion-tab entry into a
+        # guaranteed read failure for EVERY FOV, and (before the reorder
+        # above) into the data loss. An UNNAMED modality still falls back,
+        # because then there is nothing to resolve and the current path is
+        # the only answer there is.
+        ref_modality = cells[0].reference_modality or ''
+        if ref_modality:
+            cell_storage_path = (self.ui.IngestionPanel.modality_data
+                                 .get(ref_modality, {}).get('storage_path') or '')
+            if not cell_storage_path:
+                self.log(f'FOV{fov:03d}: {len(cells)} cell(s) staged, but their reference '
+                         f'modality {ref_modality!r} has no storage path configured on the '
+                         f'Ingestion tab -- cannot show them. The cells ARE loaded, so '
+                         f'saving spots is safe.')
+                return True
+        else:
+            cell_storage_path = storage_path
         reference_image = analysis_store.fiducial_channel_mip(cell_storage_path, fov, reference_hybe)
         if reference_image is None:
-            self.log(f'{reference_hybe} not ingested for FOV{fov:03d} -- cannot show existing cells.')
-            return False
+            # STAGED, just not displayed -- hence True. self._activated_fovs
+            # means "already staged into self.cell_container this session"
+            # (see its own comment), which is now exactly what happened.
+            # Returning False would leave the FOV unlatched and re-sync it
+            # from permanent on every later activation -- the very clobber
+            # that latch exists to prevent.
+            self.log(f'{reference_hybe} not ingested for FOV{fov:03d} under '
+                     f'{cell_storage_path} -- {len(cells)} cell(s) staged, not shown.')
+            return True
 
         # same uint8 label convention segment_fov/segment_fov_classical
         # already use elsewhere in this app (max 255 cells/FOV) -- not a
@@ -5549,13 +5600,6 @@ class MainWindow(QtWidgets.QMainWindow):
             y, x = cell.area
             mask[y.astype(int), x.astype(int)] = cell.id
 
-        if self.cell_container is None:
-            self.cell_container = CellContainer([fov])
-        self.cell_container.sync_from(self.cell_container_permanent, fov)
-        # the CELLS' own segmentation modality, not the app's current one
-        # (see cell_container.load_new_cells on why these can differ)
-        self._last_segment_context = {'fov': fov, 'reference_hybe': reference_hybe,
-                                      'modality': cells[0].reference_modality}
         self.cell_displayer.set_data(reference_image, mask)
         ap = self.ui.AlignmentPanel
         ap.CellOverlayFovSpinBox.blockSignals(True)
@@ -7925,6 +7969,34 @@ class MainWindow(QtWidgets.QMainWindow):
         spots = list(self.spot_container.all(fov))
         if not spots:
             return 0, 0
+
+        # "NO CELLS" HAS TWO MEANINGS AND ONLY ONE OF THEM IS A RESULT.
+        # The uniform flow below deliberately writes cell = -1 for every
+        # spot when no cells are loaded, because emptying a FOV is a
+        # legitimate thing to save (see _staged_transient_fovs). But a FOV
+        # this session never managed to STAGE has the same empty container
+        # and means the opposite: its cells exist, on disk, and -1 would
+        # destroy their ownership. _transient_staged_fovs tells the two
+        # apart -- _commit_cell_edit records every deliberate edit,
+        # including the one that removed the last cell.
+        #
+        # Per confirmed real data loss (MP58-Q FOV025, 2026-11-09, 18,584
+        # spots): the staging failure itself was upstream in
+        # _try_show_existing_cells and is fixed there. This is the second
+        # line of defence -- whatever the reason the transient container
+        # comes up empty, an UNEDITED FOV re-reads its cells from the
+        # store instead of unassigning every spot in it.
+        if not cells and int(fov) not in self._transient_staged_fovs:
+            any_path = next(iter(self._all_analysis_storage_paths()), None)
+            if any_path:
+                cell_dicts, cells_modality = analysis_store.read_cells(any_path, fov)
+                if cell_dicts:
+                    cells = (CellContainer.load({fov: cell_dicts}, modality=cells_modality)
+                             .get_cells(fov))
+                    self.log(f'FOV{fov:03d}: the transient container held no cells and this '
+                             f'FOV was never edited this session -- re-read {len(cells)} '
+                             f'cell(s) from the store for assignment rather than '
+                             f'unassigning every spot.')
 
         def to_shared(hybe, modality, owner):
             # owner=None is a real case (unassigned spots): the resolver's
