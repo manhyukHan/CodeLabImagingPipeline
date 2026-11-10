@@ -14579,6 +14579,19 @@ One PNG PER MODALITY: each modality has its own reference and its
         },
         'chromatin_tracing': {
             'reference_hybe': ('ChromatinTracingPanel', 'ReferenceHybeComboBox'),
+            # THE ALLELE ANCHOR SCOPE -- which round and channel every
+            # spot becomes an allele from. It was in no config at all
+            # (0 of 20 checked in), so the runner's tracing step read it
+            # off the live widgets and, headless, got whatever they had
+            # defaulted to: the FIRST hybe in the list and the first
+            # READOUT channel. On MP58 that is Hyb_015 ch635 while the
+            # store's own anchors are Hyb_038 ch555, and a re-run turned
+            # every ch635 spot of an unrelated round into an allele --
+            # 696 added across 4 FOVs. The hybe saves its text, the same
+            # shape reference_hybe already uses ('Hyb_038 (DNA)'); the
+            # channel saves its itemData, because its text is decorated.
+            'allele_hybe': ('ChromatinTracingPanel', 'AlleleHybeComboBox'),
+            'allele_channel': ('ChromatinTracingPanel', 'AlleleChannelComboBox'),
             # Which engine ran, what a voxel measures, and WHICH readout PSF
             # was used. The PSF entry is stored as its library label rather
             # than as its parameters: the parameters are copied into the
@@ -14686,8 +14699,16 @@ One PNG PER MODALITY: each modality has its own reference and its
                 # non-QVariant Python payloads by object IDENTITY, not by
                 # value, so it silently misses every string that is not the
                 # very object stored -- the bug that broke the hybe combo.
+                # STRINGIFIED ON BOTH SIDES. _widget_value writes
+                # str(currentData()), so the comparison here has to be
+                # against str(itemData) too -- comparing the raw payload
+                # meant a combo holding non-str data (the allele channel
+                # holds int(ch)) captured '555' and then matched nothing
+                # on the way back, silently keeping whatever was
+                # selected. Every other opt-in combo stores str data, so
+                # this was latent rather than broken.
                 for i in range(w.count()):
-                    if w.itemData(i) == value:
+                    if w.itemData(i) is not None and str(w.itemData(i)) == value:
                         w.setCurrentIndex(i)
                         return True
                 # AN ENTRY WITH NO DATA saves its text (the fiducial

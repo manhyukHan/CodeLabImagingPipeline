@@ -656,7 +656,29 @@ class PipelineRunner(QtCore.QObject):
         mw = self.mw
         if self.project is not None and not S.tracing_configured(self.project):
             raise ValueError('chromatin tracing is not configured (no tracing hybes checked): not building alleles')
-        if self._fovs_without_alleles(fovs):
+        without = self._fovs_without_alleles(fovs)
+        if without:
+            # AND THE ANCHOR SCOPE IS STATED, OR THIS REFUSES. The two
+            # Alleles combos no longer invent a selection, so an
+            # unconfigured project reaches here holding nothing -- and
+            # building anchors from nothing is the one thing that must
+            # not happen quietly. Quiet turns QMessageBox.question into
+            # an automatic Yes while a step runs, so the tab's own
+            # "turn EVERY spot in <hybe> ch<channel> into an allele"
+            # confirmation cannot stop it either.
+            chp = mw.ui.ChromatinTracingPanel
+            hybe, hybe_modality = chp.current_allele_hybe_key()
+            channel = chp.current_allele_channel()
+            if not hybe or channel is None:
+                raise ValueError(
+                    'chromatin tracing: no allele anchor hybe/channel in the config, and '
+                    f'{len(without)} FOV(s) have no alleles ({without[:6]}...). Pick them in '
+                    'the Alleles section and Save Config, or trace a store that already has '
+                    'anchors. Refusing to guess: the first hybe and first readout channel are '
+                    'not the anchor scheme, and building alleles on the wrong round is not '
+                    'reversible by re-running.')
+            self.log(f'building alleles for {len(without)} FOV(s) with none, '
+                     f'anchored on {hybe} ({hybe_modality}) ch{channel}')
             mw._build_chromatin_alleles_all_fovs()
         mw._run_chromatin_tracing_fit_all()
         return (lambda: _running(getattr(mw, '_chromatin_worker', None))), (lambda: 'chromatin tracing batch ended')

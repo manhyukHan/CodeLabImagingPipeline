@@ -239,6 +239,13 @@ class ChromatinTracingPanelUI(object):
         scopeLayout.addWidget(self.AlleleHybeComboBox)
         scopeLayout.addWidget(QtWidgets.QLabel('Channel:'))
         self.AlleleChannelComboBox = QtWidgets.QComboBox()
+        # Its display text is DECORATED -- '555 (fiducial)' -- and the
+        # tag comes from record['fiducial_channel'], so it changes when a
+        # layout is re-parsed with a different fiducial assignment. A
+        # decorated text cannot round-trip through the config (see
+        # MainWindow._CONFIG_DATA_PROPERTY), so this one saves its
+        # itemData, the bare channel number.
+        self.AlleleChannelComboBox.setProperty('config_uses_item_data', True)
         scopeLayout.addWidget(self.AlleleChannelComboBox)
         allelesLayout.addWidget(scopeRow)
 
@@ -823,8 +830,14 @@ class ChromatinTracingPanelUI(object):
         for record, modality in total_active_hybe_list:
             self.AlleleHybeComboBox.addItem(f"{record['folder']} ({modality})", (record, modality))
         if self.AlleleHybeComboBox.count():
+            # NO INVENTED DEFAULT. This used to fall to index 0 -- the
+            # first hybe in the list -- which is how a headless tracing
+            # run anchored on an unrelated round. There is no safe guess
+            # here: the anchor round is a property of the experiment, not
+            # of the list order, so an unstated scope stays unstated and
+            # the callers that need it say so.
             restore_index = next((i for i in range(self.AlleleHybeComboBox.count())
-                                  if self._allele_hybe_item_key(i) == current), 0)
+                                  if self._allele_hybe_item_key(i) == current), -1)
             self.AlleleHybeComboBox.setCurrentIndex(restore_index)
         self.AlleleHybeComboBox.blockSignals(False)
 
@@ -857,16 +870,17 @@ class ChromatinTracingPanelUI(object):
             tag = 'fiducial' if ch == fiducial_channel else 'readout'
             self.AlleleChannelComboBox.addItem(f'{ch} ({tag})', int(ch))
         if self.AlleleChannelComboBox.count():
-            # Prefer restoring the previous selection; failing that,
-            # default to the first READOUT channel rather than index 0 --
-            # channels are frequently listed fiducial-first, and index 0
-            # defaulting straight to the fiducial channel is exactly the
-            # trap this combobox exists to avoid (see class docstring).
+            # Restore the previous selection, and otherwise SELECT
+            # NOTHING. This used to fall to the first READOUT channel,
+            # on the reasoning that index 0 is often the fiducial and
+            # picking the fiducial by accident is the trap this combo
+            # exists to avoid. But the readout default is not safe
+            # either -- MP58's real anchors ARE on the fiducial channel
+            # (Hyb_038 ch555), so the safe-looking guess is exactly
+            # wrong for the store this project knows best. Neither
+            # channel is a defensible default, so there is no default.
             restore_index = next((i for i in range(self.AlleleChannelComboBox.count())
-                                  if self.AlleleChannelComboBox.itemData(i) == current), None)
-            if restore_index is None:
-                restore_index = next((i for i in range(self.AlleleChannelComboBox.count())
-                                      if self.AlleleChannelComboBox.itemData(i) != fiducial_channel), 0)
+                                  if self.AlleleChannelComboBox.itemData(i) == current), -1)
             self.AlleleChannelComboBox.setCurrentIndex(restore_index)
         self.AlleleChannelComboBox.blockSignals(False)
 
