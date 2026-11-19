@@ -42,6 +42,14 @@ cell table only summarises. That is the export: three tables, every
 field, as sheets of one .xlsx (`--format csv` writes a file each --
 CSV has no sheets).
 
+**The `_um` columns use the project's voxel size**, read from the
+config's `<acquisition>` (`voxel_xy_um`, `voxel_z_um`): the one .xml in
+the project root whose `project_root` names it, or `--config <xml>`, or
+`--voxel DY,DX,DZ`. With none of these the tool refuses. Until
+2026-11-13 it passed nothing and every `*_z_um` was planes x 0.2 on
+stores imaged at 0.145 um (38% too deep); exports made before then carry
+that error in their z micrometres.
+
 `--combined` adds a fourth table for analysis: one row per spot with
 its cell joined on, and COMPACT. It keeps the keys, the position, and
 every field the pipeline's own schema does not declare -- which is to

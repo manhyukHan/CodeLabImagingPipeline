@@ -44,6 +44,61 @@ SPOT = {'uid': 5, 'fov': 3, 'modality': 'DNA', 'hybe': 'Hyb_015', 'channel': 555
         'linked': True, 'linked_at': 'now'}
 
 
+def _config_xml(path, project_root, xy='0.208', z='0.145'):
+    acq = ('  <acquisition\n    voxel_xy_um="%s"\n    voxel_z_um="%s" />\n' % (xy, z)
+           if xy is not None else '')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('<settings\n  project_root="%s"\n  fov_list="1,2"\n  celltype_names="">\n'
+                '  <modality\n    name="DNA" />\n%s</settings>\n' % (project_root, acq))
+
+
+def test_export_tool_takes_voxel_from_config():
+    """tools/export_tables.py once passed no voxel, so every *_z_um was
+    planes x 0.2 on stores imaged at 0.145 um. The voxel now comes from
+    the project's config, and with none to be found the tool refuses
+    rather than falling back to that default."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'tools'))
+    import export_tables as XT
+    d = tempfile.mkdtemp()
+    try:
+        root = os.path.join(d, 'proj')
+        os.makedirs(root)
+
+        def refused(**kw):
+            try:
+                XT.voxel_um_for(root, **kw)
+            except SystemExit as e:
+                return str(e)
+            return ''
+
+        check('no config at all -> refused, not the 0.2 default',
+              'no config .xml' in refused())
+        _config_xml(os.path.join(root, 'other.xml'), os.path.join(d, 'elsewhere'))
+        check('a config naming another root is not taken',
+              'no config .xml' in refused())
+        _config_xml(os.path.join(root, 'proj.xml'), root)
+        v, src = XT.voxel_um_for(root)
+        check('the root\'s own config is found and read as (dy, dx, dz)',
+              v == (0.208, 0.208, 0.145) and src.endswith('proj.xml'), (v, src))
+        _config_xml(os.path.join(root, 'proj_copy.xml'), root, z='0.3')
+        check('two configs naming the root -> refused, names both',
+              'proj.xml' in refused() and 'proj_copy.xml' in refused())
+        copy = os.path.join(d, 'session_copy.xml')
+        _config_xml(copy, root, z='0.1484')
+        v, src = XT.voxel_um_for(root, config=copy)
+        check('--config is read as given', v == (0.208, 0.208, 0.1484), v)
+        v, src = XT.voxel_um_for(root, config=copy, voxel='0.2,0.2,0.1')
+        check('--voxel wins over any config', v == (0.2, 0.2, 0.1) and src == '--voxel', v)
+        check('--voxel needs three positive numbers', '--voxel' in refused(voxel='0.2,0.2'))
+        bare = os.path.join(d, 'bare.xml')
+        _config_xml(bare, root, xy=None)
+        check('a config without <acquisition> voxels -> refused',
+              'states no voxel' in refused(config=bare))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_spot_row_coordinate_mapping():
     rows = E.spot_rows([SPOT], fov=3, celltype_of={7: 'real'},
                        voxel_um=(0.208, 0.208, 0.2))
@@ -510,7 +565,8 @@ def test_combined_joins_cell_onto_spot():
 
 
 def main():
-    for fn in (test_spot_row_coordinate_mapping,
+    for fn in (test_export_tool_takes_voxel_from_config,
+               test_spot_row_coordinate_mapping,
                test_layout_join_and_channel_role,
                test_fov_comes_from_the_spot_not_the_caller,
                test_allele_long_format,

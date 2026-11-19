@@ -39,8 +39,13 @@ so).
 NO FIELD LIST LIVES HERE. The columns are discovered from the data, so
 a field a project writes onto its cells or spots comes out without this
 tool or export.py naming it.
+
+THE VOXEL SIZE COMES FROM THE PROJECT'S CONFIG (see voxel_um_for): the
+*_um columns are pixels and planes times it, and a wrong one cannot be
+seen in the numbers it produces.
 """
 import argparse
+import glob
 import os
 import sys
 
@@ -94,6 +99,80 @@ def modalities_of(root):
         'HOLDS the DNA/RNA stores.' % (root, name, parent))
 
 
+def _acquisition_voxel(config_path):
+    """(dy, dx, dz) um from a config's <acquisition>, or None when the
+    config does not state both values."""
+    from codelab_pipeline.io import preprocess
+    cfg = preprocess.load_xml_file(config_path)
+    acq = (cfg.get('params') or {}).get('acquisition') or {}
+    try:
+        xy, z = float(acq['voxel_xy_um']), float(acq['voxel_z_um'])
+    except (KeyError, TypeError, ValueError):
+        return None, cfg
+    return (xy, xy, z), cfg
+
+
+def _same_dir(a, b):
+    def norm(p):
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(p))))
+    return norm(a) == norm(b)
+
+
+def voxel_um_for(root, config=None, voxel=None):
+    """((dy, dx, dz) um, where it came from) for exporting `root`.
+
+    The export's own default (polymer.DEFAULT_VOXEL_UM, z 0.2 um) is
+    deliberately NOT a fallback. This tool used to pass nothing, so every
+    *_z_um column it wrote was planes x 0.2 while the MAZ stores it ran
+    on were imaged at 0.145 um -- 38% too deep, read as a 3.5 um offset
+    against the nucleus (2026-11-13). The app's export takes the voxel
+    from the Ingestion panel, i.e. from the config; this does the same:
+
+      voxel   'DY,DX,DZ' given outright
+      config  that config's <acquisition>
+      neither the one *.xml directly in `root` whose project_root names
+              `root` (a copy elsewhere is passed with --config)
+
+    Anything else refuses, naming what it found.
+    """
+    if voxel:
+        try:
+            v = tuple(float(s) for s in str(voxel).split(','))
+        except ValueError:
+            v = ()
+        if len(v) != 3 or min(v) <= 0:
+            raise SystemExit('--voxel takes three positive numbers DY,DX,DZ in um, '
+                             'got %r' % (voxel,))
+        return v, '--voxel'
+    if config:
+        v, _cfg = _acquisition_voxel(config)
+        if v is None:
+            raise SystemExit('%s states no voxel_xy_um / voxel_z_um in <acquisition>; '
+                             'pass --voxel DY,DX,DZ' % config)
+        return v, config
+    found = []
+    for path in sorted(glob.glob(os.path.join(root, '*.xml'))):
+        try:
+            v, cfg = _acquisition_voxel(path)
+        except Exception:                                   # noqa: BLE001
+            continue                                        # not a config
+        pr = (cfg.get('global') or {}).get('project_root', '')
+        if pr and _same_dir(pr, root):
+            found.append((path, v))
+    if len(found) == 1 and found[0][1] is not None:
+        return found[0][1], found[0][0]
+    if len(found) == 1:
+        raise SystemExit('%s states no voxel_xy_um / voxel_z_um in <acquisition>; '
+                         'pass --voxel DY,DX,DZ' % found[0][0])
+    if found:
+        raise SystemExit('%d configs in %s name this project root (%s); pass the '
+                         'one to use with --config'
+                         % (len(found), root, ', '.join(os.path.basename(p) for p, _ in found)))
+    raise SystemExit('no config .xml in %s names this project root, so the voxel '
+                     'size is unknown and every *_um column would be a guess. Pass '
+                     '--config <the project xml> or --voxel DY,DX,DZ (um).' % root)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('project', help='the project root (holds manifest.json)')
@@ -109,9 +188,15 @@ def main(argv=None):
                          'analysis-relevant ones')
     ap.add_argument('--no-arrays', action='store_true',
                     help='skip the masks and matrices (.npz)')
+    ap.add_argument('--config', default=None,
+                    help="the project's config .xml, for its voxel size "
+                         '(default: the one in the project root)')
+    ap.add_argument('--voxel', default=None,
+                    help="'DY,DX,DZ' in um; overrides the config")
     a = ap.parse_args(argv)
 
     root, by_modality = modalities_of(a.project)
+    voxel, voxel_from = voxel_um_for(root, config=a.config, voxel=a.voxel)
     out = os.path.abspath(a.out or os.path.join(root, 'export'))
     os.makedirs(out, exist_ok=True)
     fovs = parse_fovs(a.fovs)
@@ -120,6 +205,7 @@ def main(argv=None):
                                      for m, p in sorted(by_modality.items())))
     print('fovs      %s' % ('every one in the store' if fovs is None
                             else '%d listed' % len(fovs)))
+    print('voxel     (y, x, z) = (%g, %g, %g) um  from %s' % (voxel + (voxel_from,)))
     print('out       %s' % out)
     print()
 
@@ -128,7 +214,7 @@ def main(argv=None):
         sys.stdout.flush()
 
     t = export.collect(by_modality, fovs=fovs, progress=progress,
-                       want_arrays=not a.no_arrays)
+                       want_arrays=not a.no_arrays, voxel_um=voxel)
     print()
     s = t.summary
     print('read %d FOV(s): %d cells, %d spots, %d allele rows'
